@@ -1,0 +1,41 @@
+# Cargo / Rust build output
+/target/
+**/*.rs.bk
+*.pdb
+*.ilk
+*.obj
+*.lib
+*.exp
+*.idb
+
+# Built binaries that might be copied out of target/
+*.exe
+*.dll
+*.so
+*.dylib
+*.a
+
+# Local Cargo config (compiler paths, etc.)
+.cargo/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# CAD drawings and generated previews (tens of MB; keep only source in git)
+test-data/*.dwg
+test-data/*.dxf
+test-data/*.ppm
+test-data/MyCad-preview.*
+test-data/_*.png
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+Thumbs.db
+Desktop.ini
+.DS_Store

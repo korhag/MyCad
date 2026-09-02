@@ -1,0 +1,12 @@
+[package]
+name = "dwg-import"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "LibreDWG-backed DWG import, converting into cad-core documents"
+
+[dependencies]
+cad-core.workspace = true
+libredwg-sys.workspace = true
+libc.workspace = true
+thiserror.workspace = true

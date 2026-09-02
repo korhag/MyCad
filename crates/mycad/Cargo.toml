@@ -1,0 +1,20 @@
+[package]
+name = "mycad"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Linux-native 2D CAD application (Milestone 1: DWG viewer)"
+
+[[bin]]
+name = "mycad"
+path = "src/main.rs"
+
+[dependencies]
+cad-core.workspace = true
+cad-viewport.workspace = true
+cad-render.workspace = true
+dwg-import.workspace = true
+eframe.workspace = true
+egui.workspace = true
+egui-wgpu.workspace = true
+rfd.workspace = true

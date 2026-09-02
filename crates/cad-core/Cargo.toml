@@ -1,0 +1,9 @@
+[package]
+name = "cad-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native CAD document model, independent of any DWG library"
+
+[dependencies]
+thiserror.workspace = true
