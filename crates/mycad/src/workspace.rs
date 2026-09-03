@@ -1,14 +1,11 @@
 //! Persistent dockable workspace: Properties, Viewport, Diagnostics.
 
-use cad_render::{stroke_edges, DisplayList, PickKind};
-use cad_viewport::Camera2;
 use eframe::egui::{self, Color32, Pos2, Rect, Stroke, StrokeKind, Ui};
 use egui_dock::{DockArea, DockState, NodeIndex, Style, TabViewer};
 use serde::{Deserialize, Serialize};
 
 use crate::app::MyCadApp;
 use crate::properties;
-use crate::selection::Selection;
 
 // ------------------------------------------------------------
 // Type: WorkspaceTab
@@ -160,70 +157,6 @@ impl TabViewer for WorkspaceViewer<'_> {
     }
 }
 
-// ------------------------------------------------------------
-// Function: paint_selection_overlay
-// Purpose: Constant-pixel highlight from independent pick edges
-//          so the accent stays readable at every zoom level.
-// ------------------------------------------------------------
-pub fn paint_selection_overlay(
-    painter: &egui::Painter,
-    camera: Camera2,
-    rect: Rect,
-    display: &DisplayList,
-    selection: &Selection,
-) {
-    paint_entity_highlights(
-        painter,
-        camera,
-        rect,
-        display,
-        selection.indices(),
-        Stroke::new(2.0, Color32::from_rgb(255, 196, 72)),
-        Color32::from_rgba_unmultiplied(255, 196, 72, 36),
-    );
-}
-
-pub fn paint_entity_highlights(
-    painter: &egui::Painter,
-    camera: Camera2,
-    rect: Rect,
-    display: &DisplayList,
-    indices: &[usize],
-    stroke: Stroke,
-    fill: Color32,
-) {
-    if indices.is_empty() {
-        return;
-    }
-    let origin = cad_core::Point2::new(rect.min.x as f64, rect.min.y as f64);
-    let size = cad_core::Point2::new(rect.width() as f64, rect.height() as f64);
-    let to_screen = |p: cad_core::Point2| {
-        let s = camera.world_to_screen(p, origin, size);
-        Pos2::new(s.x as f32, s.y as f32)
-    };
-    for index in indices {
-        let Some(pick) = display.pick_for(*index) else {
-            continue;
-        };
-        for primitive in &pick.primitives {
-            if let PickKind::Fill = primitive.kind {
-                if primitive.points.len() >= 3 {
-                    let points: Vec<Pos2> =
-                        primitive.points.iter().copied().map(to_screen).collect();
-                    painter.add(egui::Shape::convex_polygon(points, fill, Stroke::NONE));
-                }
-            }
-            let closed = match primitive.kind {
-                PickKind::Stroke { closed } => closed,
-                PickKind::Fill => true,
-            };
-            for [a, b] in stroke_edges(&primitive.points, closed) {
-                painter.line_segment([to_screen(a), to_screen(b)], stroke);
-            }
-        }
-    }
-}
-
 pub fn paint_box_select_rect(
     painter: &egui::Painter,
     start: Pos2,
@@ -246,8 +179,8 @@ pub fn paint_box_select_rect(
 
 #[cfg(test)]
 mod highlight_tests {
-    use cad_core::Geometry;
-    use cad_render::{stroke_edges, tessellate_document, PickKind};
+    use cad_core::{Extents2, Geometry};
+    use cad_render::{box_select, stroke_edges, tessellate_document, PickKind, SelectBoxMode};
 
     fn reference_dwg() -> std::path::PathBuf {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -316,6 +249,22 @@ mod highlight_tests {
                 max_extra > max_pair.max(1.0),
                 "flattened polyline would add long connectors (extra={max_extra}, pairwise={max_pair})"
             );
+            let overlay = display.overlay_batches(&[index]);
+            let edge_count = pairwise.len();
+            assert!(
+                overlay.range_count() <= 2,
+                "GPU overlay should batch by entity range, not emit {edge_count} highlight edges"
+            );
+            assert!(
+                edge_count > overlay.range_count(),
+                "LOGISTICS overlay must be cheaper than per-edge painting ({edge_count} edges, {} ranges)",
+                overlay.range_count()
+            );
+            let region = Extents2::from_corners(pick.bounds.min, pick.bounds.center());
+            let brute = box_select(&display.picks, region, SelectBoxMode::Crossing);
+            let mut indexed = Vec::new();
+            display.box_select_into(region, SelectBoxMode::Crossing, &mut indexed);
+            assert_eq!(brute, indexed);
         }
         assert!(found > 0, "expected at least one LOGISTICS INSERT");
     }

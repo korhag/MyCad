@@ -2,15 +2,15 @@
 //! Geometry is sampled in f64, then stored relative to a document origin as f32.
 
 use cad_core::{
-    CadColor, Document, Entity, Geometry, HatchEdge, HatchPath, LineType, Point2, Point3, Rgb,
-    Transform2,
+    CadColor, Document, Entity, Extents2, Geometry, HatchEdge, HatchPath, LineType, Point2, Point3,
+    Rgb, Transform2,
 };
 
 use crate::curves::{
     arc_points, bspline_points, circle_points, ellipse_points, polyline_points, CIRCLE_SEGMENTS,
 };
 use crate::dash::{generate_path_dashes, line_chain, polyline_path_segs, scaled_pattern, PathSeg};
-use crate::pick::EntityPick;
+use crate::pick::{box_select_into, EntityPick, SelectBoxMode, SpatialIndex};
 use crate::stroke_font::{strip_mtext, stroke_text};
 
 #[repr(C)]
@@ -18,6 +18,38 @@ use crate::stroke_font::{strip_mtext, stroke_text};
 pub struct GpuVertex {
     pub position: [f32; 2],
     pub color: [f32; 4],
+}
+
+// ------------------------------------------------------------
+// Type: EntityDrawRange
+// Purpose: GPU vertex span belonging to one top-level entity.
+// ------------------------------------------------------------
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EntityDrawRange {
+    pub line_start: u32,
+    pub line_end: u32,
+    pub fill_start: u32,
+    pub fill_end: u32,
+}
+
+// ------------------------------------------------------------
+// Type: OverlayBatches
+// Purpose: Merged GPU draw ranges for selection or live preview.
+// ------------------------------------------------------------
+#[derive(Debug, Clone, Default)]
+pub struct OverlayBatches {
+    pub lines: Vec<std::ops::Range<u32>>,
+    pub fills: Vec<std::ops::Range<u32>>,
+}
+
+impl OverlayBatches {
+    pub fn is_empty(&self) -> bool {
+        self.lines.is_empty() && self.fills.is_empty()
+    }
+
+    pub fn range_count(&self) -> usize {
+        self.lines.len() + self.fills.len()
+    }
 }
 
 // ------------------------------------------------------------
@@ -31,6 +63,9 @@ pub struct DisplayList {
     pub line_vertices: Vec<GpuVertex>,
     pub triangle_vertices: Vec<GpuVertex>,
     pub picks: Vec<EntityPick>,
+    pub draw_ranges: Vec<EntityDrawRange>,
+    pick_of: Vec<Option<u32>>,
+    spatial: SpatialIndex,
 }
 
 impl DisplayList {
@@ -43,10 +78,62 @@ impl DisplayList {
     }
 
     pub fn pick_for(&self, entity_index: usize) -> Option<&EntityPick> {
-        self.picks
-            .iter()
-            .find(|pick| pick.entity_index == entity_index)
+        let slot = (*self.pick_of.get(entity_index)?)?;
+        self.picks.get(slot as usize)
     }
+
+    pub fn draw_range_for(&self, entity_index: usize) -> Option<EntityDrawRange> {
+        let slot = (*self.pick_of.get(entity_index)?)?;
+        self.draw_ranges.get(slot as usize).copied()
+    }
+
+    pub fn spatial(&self) -> &SpatialIndex {
+        &self.spatial
+    }
+
+    pub fn box_select_into(&self, region: Extents2, mode: SelectBoxMode, out: &mut Vec<usize>) {
+        box_select_into(&self.picks, Some(&self.spatial), region, mode, out);
+    }
+
+    pub fn overlay_batches(&self, indices: &[usize]) -> OverlayBatches {
+        overlay_batches(self, indices)
+    }
+}
+
+pub fn overlay_batches(display: &DisplayList, indices: &[usize]) -> OverlayBatches {
+    let mut lines = Vec::with_capacity(indices.len());
+    let mut fills = Vec::with_capacity(indices.len());
+    for &entity_index in indices {
+        let Some(range) = display.draw_range_for(entity_index) else {
+            continue;
+        };
+        if range.line_end > range.line_start {
+            lines.push(range.line_start..range.line_end);
+        }
+        if range.fill_end > range.fill_start {
+            fills.push(range.fill_start..range.fill_end);
+        }
+    }
+    merge_vertex_ranges(&mut lines);
+    merge_vertex_ranges(&mut fills);
+    OverlayBatches { lines, fills }
+}
+
+pub fn merge_vertex_ranges(ranges: &mut Vec<std::ops::Range<u32>>) {
+    if ranges.len() <= 1 {
+        return;
+    }
+    ranges.sort_unstable_by_key(|range| range.start);
+    let mut write = 0usize;
+    for read in 1..ranges.len() {
+        if ranges[read].start <= ranges[write].end {
+            ranges[write].end = ranges[write].end.max(ranges[read].end);
+        } else {
+            write += 1;
+            ranges[write] = ranges[read].clone();
+        }
+    }
+    ranges.truncate(write + 1);
 }
 
 struct TessSink<'a> {
@@ -138,9 +225,14 @@ pub fn tessellate_document(document: &Document) -> DisplayList {
         line_vertices: Vec::with_capacity(64 * 1024),
         triangle_vertices: Vec::new(),
         picks: Vec::with_capacity(document.model_space.len()),
+        draw_ranges: Vec::with_capacity(document.model_space.len()),
+        pick_of: vec![None; document.model_space.len()],
+        spatial: SpatialIndex::empty(),
     };
     let mut stack = Vec::new();
     for (entity_index, entity) in document.model_space.iter().enumerate() {
+        let line_start = list.line_vertices.len() as u32;
+        let fill_start = list.triangle_vertices.len() as u32;
         let mut pick = EntityPick::new(entity_index);
         {
             let mut sink = TessSink {
@@ -158,9 +250,26 @@ pub fn tessellate_document(document: &Document) -> DisplayList {
             );
         }
         if !pick.is_empty() {
+            pick.finalize();
+            if entity_index >= list.pick_of.len() {
+                list.pick_of.resize(entity_index + 1, None);
+            }
+            list.pick_of[entity_index] = Some(list.picks.len() as u32);
             list.picks.push(pick);
+            list.draw_ranges.push(EntityDrawRange {
+                line_start,
+                line_end: list.line_vertices.len() as u32,
+                fill_start,
+                fill_end: list.triangle_vertices.len() as u32,
+            });
         }
     }
+    list.spatial = SpatialIndex::build(
+        list.picks
+            .iter()
+            .enumerate()
+            .map(|(slot, pick)| (slot as u32, pick.bounds)),
+    );
     list
 }
 

@@ -7,17 +7,21 @@ use std::thread;
 use std::time::Instant;
 
 use cad_core::{Document, Point2};
-use cad_render::{tessellate_document, CadFrame, CadGpu, DisplayList, SelectBoxMode};
+use cad_render::{
+    tessellate_document, CadFrame, CadGpu, DisplayList, OverlayBatches, SelectBoxMode,
+};
 use cad_viewport::Camera2;
 use dwg_import::ImportError;
-use eframe::egui::{self, PointerButton, Rect, Stroke, Ui};
+use eframe::egui::{self, PointerButton, Rect, Ui};
 
 use crate::input::InputAction;
-use crate::selection::{box_pick_entities, pick_entity, Selection};
-use crate::settings::{scroll_to_zoom_factor, AppSettings};
+use crate::selection::{box_pick_entities_into, pick_entity, Selection};
+use crate::settings::{scroll_to_zoom_factor, AppSettings, RgbColor};
 use crate::settings_ui::{self, CaptureTarget, SettingsAction, SettingsTab};
 use crate::theme;
 use crate::workspace::{self, WorkspaceTab};
+
+const SELECTION_OVERLAY_COLOR: [f32; 4] = [255.0 / 255.0, 196.0 / 255.0, 72.0 / 255.0, 1.0];
 
 enum LoadMsg {
     Success {
@@ -266,23 +270,10 @@ impl MyCadApp {
         }
 
         let aspect = (rect.width() as f64 / rect.height().max(1.0) as f64).max(1e-6);
-        painter.add(egui_wgpu::Callback::new_paint_callback(
-            rect,
-            CadFrame {
-                camera: self.camera,
-                origin: self.display.origin,
-                generation: self.display_generation,
-                display: Arc::clone(&self.display),
-                aspect,
-            },
-        ));
-        workspace::paint_selection_overlay(
-            &painter,
-            self.camera,
-            rect,
-            &self.display,
-            &self.selection,
-        );
+        let selection_overlay = self.display.overlay_batches(self.selection.indices());
+        let mut preview_overlay = OverlayBatches::default();
+        let mut preview_color = RgbColor::WINDOW.to_gpu();
+        let mut box_rect = None;
         if let Some(drag) = &self.box_select {
             let colors = if self.show_settings {
                 &self.settings_draft.display
@@ -295,19 +286,29 @@ impl MyCadApp {
                 SelectBoxMode::Window => colors.window_selection,
                 SelectBoxMode::Crossing => colors.crossing_selection,
             };
-            workspace::paint_entity_highlights(
-                &painter,
-                self.camera,
-                rect,
-                &self.display,
-                &drag.candidates,
-                Stroke::new(2.0, color.to_color32()),
-                color.to_fill(),
-            );
+            preview_overlay = self.display.overlay_batches(&drag.candidates);
+            preview_color = color.to_gpu();
+            box_rect = Some((drag.start, drag.current, color));
+        }
+        painter.add(egui_wgpu::Callback::new_paint_callback(
+            rect,
+            CadFrame {
+                camera: self.camera,
+                origin: self.display.origin,
+                generation: self.display_generation,
+                display: Arc::clone(&self.display),
+                aspect,
+                selection: selection_overlay,
+                selection_color: SELECTION_OVERLAY_COLOR,
+                preview: preview_overlay,
+                preview_color,
+            },
+        ));
+        if let Some((start, current, color)) = box_rect {
             workspace::paint_box_select_rect(
                 &painter,
-                drag.start,
-                drag.current,
+                start,
+                current,
                 color.to_color32(),
                 color.to_fill(),
             );
@@ -325,7 +326,7 @@ impl MyCadApp {
 
 impl eframe::App for MyCadApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        if self.load_rx.is_some() || self.capture.is_some() || self.box_select.is_some() {
+        if self.load_rx.is_some() || self.capture.is_some() {
             ctx.request_repaint();
         }
 
@@ -581,24 +582,44 @@ fn update_box_select(
         }
     }
 
-    let Some(drag) = app.box_select.as_mut() else {
-        return;
-    };
-    if let Some(pos) = ui
-        .input(|i| i.pointer.latest_pos())
-        .or(response.interact_pointer_pos())
-    {
-        if pos != drag.current {
-            drag.current = pos;
+    let (moved, start, current, button, mut candidates) = {
+        let Some(drag) = app.box_select.as_mut() else {
+            return;
+        };
+        let mut moved = started_this_frame;
+        if let Some(pos) = ui
+            .input(|i| i.pointer.latest_pos())
+            .or(response.interact_pointer_pos())
+        {
+            if pos != drag.current {
+                drag.current = pos;
+                moved = true;
+            }
         }
         let start = Point2::new(drag.start.x as f64, drag.start.y as f64);
         let current = Point2::new(drag.current.x as f64, drag.current.y as f64);
-        let (_mode, candidates) =
-            box_pick_entities(&app.display, &app.camera, start, current, origin, size);
-        drag.candidates = candidates;
+        let button = drag.button;
+        let candidates = if moved {
+            std::mem::take(&mut drag.candidates)
+        } else {
+            Vec::new()
+        };
+        (moved, start, current, button, candidates)
+    };
+    if moved {
+        box_pick_entities_into(
+            &app.display,
+            &app.camera,
+            start,
+            current,
+            origin,
+            size,
+            &mut candidates,
+        );
+        if let Some(drag) = app.box_select.as_mut() {
+            drag.candidates = candidates;
+        }
     }
-
-    let button = drag.button;
     let released = response.drag_stopped_by(button)
         || ui.input(|i| i.pointer.button_released(button));
     if released && !started_this_frame {

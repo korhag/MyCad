@@ -39,6 +39,15 @@ impl RgbColor {
     pub fn to_fill(self) -> eframe::egui::Color32 {
         eframe::egui::Color32::from_rgba_unmultiplied(self.r, self.g, self.b, BOX_FILL_ALPHA)
     }
+
+    pub fn to_gpu(self) -> [f32; 4] {
+        [
+            self.r as f32 / 255.0,
+            self.g as f32 / 255.0,
+            self.b as f32 / 255.0,
+            1.0,
+        ]
+    }
 }
 
 impl Default for RgbColor {

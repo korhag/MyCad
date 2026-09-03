@@ -684,3 +684,185 @@ fn crossing_ignores_empty_gaps_inside_a_block() {
     );
     assert!(box_select(&list.picks, around_child, SelectBoxMode::Window).is_empty());
 }
+
+fn indexed_select(list: &DisplayList, region: Extents2, mode: SelectBoxMode) -> Vec<usize> {
+    let mut out = Vec::new();
+    list.box_select_into(region, mode, &mut out);
+    out
+}
+
+fn assert_index_matches_brute(list: &DisplayList, region: Extents2, mode: SelectBoxMode) {
+    assert_eq!(
+        box_select(&list.picks, region, mode),
+        indexed_select(list, region, mode)
+    );
+}
+
+#[test]
+fn indexed_box_select_matches_brute_window_and_crossing() {
+    let mut document = Document::default();
+    layer0(&mut document);
+    document.model_space.push(Entity::new(Geometry::Line {
+        start: Point3::from_xy(1.0, 1.0),
+        end: Point3::from_xy(2.0, 1.0),
+    }));
+    document.model_space.push(Entity::new(Geometry::Line {
+        start: Point3::from_xy(5.0, 1.0),
+        end: Point3::from_xy(20.0, 1.0),
+    }));
+    let list = tessellate_document(&document);
+    let region = Extents2::from_corners(Point2::new(0.0, 0.0), Point2::new(10.0, 10.0));
+    assert_index_matches_brute(&list, region, SelectBoxMode::Window);
+    assert_index_matches_brute(&list, region, SelectBoxMode::Crossing);
+    assert_eq!(list.pick_for(0).map(|pick| pick.entity_index), Some(0));
+    assert_eq!(list.pick_for(1).map(|pick| pick.entity_index), Some(1));
+}
+
+#[test]
+fn indexed_crossing_matches_brute_for_fills_and_block_gaps() {
+    let through = box_doc_line(-10.0, 5.0, 30.0, 5.0);
+    let through_list = tessellate_document(&through);
+    let region = Extents2::from_corners(Point2::new(0.0, 0.0), Point2::new(10.0, 10.0));
+    assert_index_matches_brute(&through_list, region, SelectBoxMode::Window);
+    assert_index_matches_brute(&through_list, region, SelectBoxMode::Crossing);
+
+    let mut fill_doc = Document::default();
+    layer0(&mut fill_doc);
+    fill_doc.model_space.push(Entity::new(Geometry::Solid {
+        corners: [
+            Point3::from_xy(0.0, 0.0),
+            Point3::from_xy(20.0, 0.0),
+            Point3::from_xy(20.0, 20.0),
+            Point3::from_xy(0.0, 20.0),
+        ],
+        extrusion: Point3::new(0.0, 0.0, 1.0),
+    }));
+    let fill_list = tessellate_document(&fill_doc);
+    let inside = Extents2::from_corners(Point2::new(8.0, 8.0), Point2::new(12.0, 12.0));
+    assert_index_matches_brute(&fill_list, inside, SelectBoxMode::Window);
+    assert_index_matches_brute(&fill_list, inside, SelectBoxMode::Crossing);
+
+    let mut document = Document::default();
+    layer0(&mut document);
+    document.blocks.insert(
+        "GAP".into(),
+        BlockDefinition {
+            name: "GAP".into(),
+            base_pt: Point3::from_xy(0.0, 0.0),
+            entities: vec![
+                Entity::new(Geometry::Line {
+                    start: Point3::from_xy(0.0, 0.0),
+                    end: Point3::from_xy(10.0, 0.0),
+                }),
+                Entity::new(Geometry::Line {
+                    start: Point3::from_xy(100.0, 0.0),
+                    end: Point3::from_xy(110.0, 0.0),
+                }),
+            ],
+        },
+    );
+    document.model_space.push(insert_entity(
+        "GAP",
+        Point3::from_xy(0.0, 0.0),
+        Point3::new(1.0, 1.0, 1.0),
+        0.0,
+    ));
+    let list = tessellate_document(&document);
+    let gap = Extents2::from_corners(Point2::new(40.0, -5.0), Point2::new(50.0, 5.0));
+    let around_child = Extents2::from_corners(Point2::new(-1.0, -1.0), Point2::new(11.0, 1.0));
+    assert_index_matches_brute(&list, gap, SelectBoxMode::Crossing);
+    assert_index_matches_brute(&list, around_child, SelectBoxMode::Crossing);
+    assert_index_matches_brute(&list, around_child, SelectBoxMode::Window);
+}
+
+fn spaced_grid_document(count: usize, spacing: f64) -> Document {
+    let mut document = Document::default();
+    layer0(&mut document);
+    for i in 0..count {
+        for j in 0..count {
+            let x = i as f64 * spacing;
+            let y = j as f64 * spacing;
+            document.model_space.push(Entity::new(Geometry::Line {
+                start: Point3::from_xy(x, y),
+                end: Point3::from_xy(x + 1.0, y),
+            }));
+        }
+    }
+    document
+}
+
+#[test]
+fn spatial_index_prunes_a_local_query() {
+    let list = tessellate_document(&spaced_grid_document(40, 50.0));
+    let region = Extents2::from_corners(Point2::new(-0.5, -0.5), Point2::new(2.0, 2.0));
+    let mut slots = Vec::new();
+    list.spatial().gather(region, &mut slots);
+    assert!(
+        slots.len() < 80,
+        "local query should skip most of {} picks, gathered {}",
+        list.picks.len(),
+        slots.len()
+    );
+    assert_index_matches_brute(&list, region, SelectBoxMode::Window);
+    assert_index_matches_brute(&list, region, SelectBoxMode::Crossing);
+    assert_eq!(indexed_select(&list, region, SelectBoxMode::Window), vec![0]);
+}
+
+#[test]
+fn overlay_batches_merge_adjacent_ranges_not_edge_count() {
+    let mut document = Document::default();
+    layer0(&mut document);
+    for i in 0..3 {
+        let x = i as f64 * 10.0;
+        document.model_space.push(Entity::new(Geometry::Line {
+            start: Point3::from_xy(x, 0.0),
+            end: Point3::from_xy(x + 5.0, 0.0),
+        }));
+    }
+    let verts: Vec<_> = (0..40)
+        .map(|i| PolyVertex {
+            point: Point3::from_xy(i as f64, 20.0),
+            bulge: 0.0,
+        })
+        .collect();
+    document.model_space.push(Entity::new(Geometry::LwPolyline {
+        vertices: verts,
+        closed: false,
+        extrusion: Point3::new(0.0, 0.0, 1.0),
+        linetype_generation_continuous: false,
+    }));
+    let list = tessellate_document(&document);
+    let adjacent = list.overlay_batches(&[0, 1]);
+    assert_eq!(adjacent.lines.len(), 1);
+    assert!(adjacent.fills.is_empty());
+    let skipped = list.overlay_batches(&[0, 2]);
+    assert_eq!(skipped.lines.len(), 2);
+    let dense = list.overlay_batches(&[3]);
+    assert_eq!(dense.range_count(), 1);
+    assert!(
+        list.draw_range_for(3).unwrap().line_end - list.draw_range_for(3).unwrap().line_start > 4,
+        "dense polyline should emit many vertices in one range"
+    );
+}
+
+#[test]
+fn adaptive_primitive_index_is_memory_bounded() {
+    use crate::pick::{EntityPick, COMPLEX_PRIMITIVE_COUNT};
+    let mut simple = EntityPick::new(0);
+    simple.add_stroke(&[Point2::new(0.0, 0.0), Point2::new(1.0, 0.0)], false);
+    simple.finalize();
+    assert!(!simple.has_primitive_index());
+
+    let mut complex = EntityPick::new(1);
+    for i in 0..COMPLEX_PRIMITIVE_COUNT {
+        let x = i as f64 * 10.0;
+        complex.add_stroke(&[Point2::new(x, 0.0), Point2::new(x + 1.0, 0.0)], false);
+    }
+    complex.finalize();
+    assert!(complex.has_primitive_index());
+    assert!(
+        complex.primitive_index_refs() <= complex.primitives.len() * 16,
+        "primitive grid should not store a dense full-drawing map ({})",
+        complex.primitive_index_refs()
+    );
+}

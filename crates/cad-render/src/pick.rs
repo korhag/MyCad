@@ -4,6 +4,7 @@ use cad_core::{Extents2, Point2};
 use cad_viewport::Camera2;
 
 pub const DEFAULT_PICK_TOLERANCE_PX: f64 = 6.0;
+pub(crate) const COMPLEX_PRIMITIVE_COUNT: usize = 48;
 
 // ------------------------------------------------------------
 // Type: PickKind
@@ -23,6 +24,7 @@ pub enum PickKind {
 pub struct PickPrimitive {
     pub kind: PickKind,
     pub points: Vec<Point2>,
+    pub bounds: Extents2,
 }
 
 // ------------------------------------------------------------
@@ -35,6 +37,7 @@ pub struct EntityPick {
     pub entity_index: usize,
     pub bounds: Extents2,
     pub primitives: Vec<PickPrimitive>,
+    primitive_index: Option<SpatialIndex>,
 }
 
 impl EntityPick {
@@ -43,6 +46,7 @@ impl EntityPick {
             entity_index,
             bounds: Extents2::empty(),
             primitives: Vec::new(),
+            primitive_index: None,
         }
     }
 
@@ -67,8 +71,40 @@ impl EntityPick {
             }
         }
         if points.len() >= 2 || matches!(kind, PickKind::Fill) && points.len() >= 3 {
-            self.primitives.push(PickPrimitive { kind, points });
+            let mut bounds = Extents2::empty();
+            for p in &points {
+                bounds.include(*p);
+            }
+            self.primitives.push(PickPrimitive {
+                kind,
+                points,
+                bounds,
+            });
         }
+    }
+
+    pub fn finalize(&mut self) {
+        if self.primitives.len() >= COMPLEX_PRIMITIVE_COUNT {
+            self.primitive_index = Some(SpatialIndex::build(
+                self.primitives
+                    .iter()
+                    .enumerate()
+                    .map(|(i, primitive)| (i as u32, primitive.bounds)),
+            ));
+        } else {
+            self.primitive_index = None;
+        }
+    }
+
+    pub fn has_primitive_index(&self) -> bool {
+        self.primitive_index.is_some()
+    }
+
+    pub fn primitive_index_refs(&self) -> usize {
+        self.primitive_index
+            .as_ref()
+            .map(SpatialIndex::ref_count)
+            .unwrap_or(0)
     }
 
     pub fn stroke_edges(&self) -> impl Iterator<Item = [Point2; 2]> + '_ {
@@ -129,61 +165,227 @@ impl SelectBoxMode {
 }
 
 // ------------------------------------------------------------
+// Type: SpatialIndex
+// Purpose: Uniform AABB grid over entity or primitive bounds.
+// ------------------------------------------------------------
+#[derive(Debug, Clone, Default)]
+pub struct SpatialIndex {
+    cells: Vec<Vec<u32>>,
+    origin_x: f64,
+    origin_y: f64,
+    inv_cell: f64,
+    cols: usize,
+    rows: usize,
+}
+
+impl SpatialIndex {
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.cells.is_empty()
+    }
+
+    pub fn build(bounds: impl IntoIterator<Item = (u32, Extents2)>) -> Self {
+        let items: Vec<(u32, Extents2)> = bounds
+            .into_iter()
+            .filter(|(_, extents)| extents.is_valid())
+            .collect();
+        if items.is_empty() {
+            return Self::default();
+        }
+        let mut world = Extents2::empty();
+        for (_, extents) in &items {
+            world.union(*extents);
+        }
+        if !world.is_valid() {
+            return Self::default();
+        }
+        let n = items.len().max(1);
+        let target = ((n as f64).sqrt().ceil() as usize).clamp(8, 96);
+        let span = world.width().max(world.height()).max(1e-9);
+        let cell = (span / target as f64).max(1e-9);
+        let cols = ((world.width() / cell).ceil() as usize).clamp(1, 96);
+        let rows = ((world.height() / cell).ceil() as usize).clamp(1, 96);
+        let mut index = Self {
+            cells: vec![Vec::new(); cols * rows],
+            origin_x: world.min.x,
+            origin_y: world.min.y,
+            inv_cell: 1.0 / cell,
+            cols,
+            rows,
+        };
+        for (id, extents) in items {
+            index.insert(id, extents);
+        }
+        index
+    }
+
+    pub fn gather(&self, region: Extents2, out: &mut Vec<u32>) {
+        out.clear();
+        if self.cells.is_empty() || !region.is_valid() {
+            return;
+        }
+        let (x0, x1, y0, y1) = self.cell_range(region);
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                out.extend_from_slice(&self.cells[y * self.cols + x]);
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+    }
+
+    pub fn ref_count(&self) -> usize {
+        self.cells.iter().map(Vec::len).sum()
+    }
+
+    fn insert(&mut self, id: u32, extents: Extents2) {
+        let (x0, x1, y0, y1) = self.cell_range(extents);
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                self.cells[y * self.cols + x].push(id);
+            }
+        }
+    }
+
+    fn cell_range(&self, region: Extents2) -> (usize, usize, usize, usize) {
+        let x0 = self.clamp_col((region.min.x - self.origin_x) * self.inv_cell);
+        let x1 = self.clamp_col((region.max.x - self.origin_x) * self.inv_cell);
+        let y0 = self.clamp_row((region.min.y - self.origin_y) * self.inv_cell);
+        let y1 = self.clamp_row((region.max.y - self.origin_y) * self.inv_cell);
+        (x0.min(x1), x0.max(x1), y0.min(y1), y0.max(y1))
+    }
+
+    fn clamp_col(&self, value: f64) -> usize {
+        if !value.is_finite() {
+            return 0;
+        }
+        value.floor().clamp(0.0, (self.cols.saturating_sub(1)) as f64) as usize
+    }
+
+    fn clamp_row(&self, value: f64) -> usize {
+        if !value.is_finite() {
+            return 0;
+        }
+        value.floor().clamp(0.0, (self.rows.saturating_sub(1)) as f64) as usize
+    }
+}
+
+// ------------------------------------------------------------
 // Function: box_select
 // Purpose: Return every top-level entity that matches a window or
 //          crossing box in world coordinates.
 // ------------------------------------------------------------
 pub fn box_select(picks: &[EntityPick], region: Extents2, mode: SelectBoxMode) -> Vec<usize> {
-    if !region.is_valid() || region.width() < 1e-15 || region.height() < 1e-15 {
-        return Vec::new();
-    }
     let mut out = Vec::new();
-    for pick in picks {
-        if pick.is_empty() {
-            continue;
-        }
-        let matched = match mode {
-            SelectBoxMode::Window => region.contains_extents(pick.bounds),
-            SelectBoxMode::Crossing => {
-                region.intersects(pick.bounds) && pick_crosses_region(pick, region)
-            }
-        };
-        if matched {
-            out.push(pick.entity_index);
-        }
-    }
+    box_select_into(picks, None, region, mode, &mut out);
     out
 }
 
-fn pick_crosses_region(pick: &EntityPick, region: Extents2) -> bool {
-    let corners = [
-        region.min,
-        Point2::new(region.max.x, region.min.y),
-        region.max,
-        Point2::new(region.min.x, region.max.y),
-    ];
-    for primitive in &pick.primitives {
-        if primitive.points.iter().any(|p| region.contains(*p)) {
-            return true;
-        }
-        for [a, b] in primitive.stroke_edges() {
-            if segment_intersects_extents(a, b, region) {
-                return true;
+pub fn box_select_into(
+    picks: &[EntityPick],
+    spatial: Option<&SpatialIndex>,
+    region: Extents2,
+    mode: SelectBoxMode,
+    out: &mut Vec<usize>,
+) {
+    out.clear();
+    if !region.is_valid() || region.width() < 1e-15 || region.height() < 1e-15 {
+        return;
+    }
+    let mut scratch = Vec::new();
+    let mut slots = Vec::new();
+    if let Some(index) = spatial.filter(|index| !index.is_empty()) {
+        index.gather(region, &mut slots);
+        for slot in slots {
+            let Some(pick) = picks.get(slot as usize) else {
+                continue;
+            };
+            if pick_matches(pick, region, mode, &mut scratch) {
+                out.push(pick.entity_index);
             }
         }
-        if matches!(primitive.kind, PickKind::Fill)
-            && primitive.points.len() >= 3
-            && corners
-                .iter()
-                .any(|c| point_in_polygon(*c, &primitive.points))
-        {
+    } else {
+        for pick in picks {
+            if pick_matches(pick, region, mode, &mut scratch) {
+                out.push(pick.entity_index);
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+}
+
+fn pick_matches(
+    pick: &EntityPick,
+    region: Extents2,
+    mode: SelectBoxMode,
+    scratch: &mut Vec<u32>,
+) -> bool {
+    if pick.is_empty() {
+        return false;
+    }
+    match mode {
+        SelectBoxMode::Window => region.contains_extents(pick.bounds),
+        SelectBoxMode::Crossing => {
+            region.intersects(pick.bounds)
+                && (region.contains_extents(pick.bounds)
+                    || pick_crosses_region(pick, region, scratch))
+        }
+    }
+}
+
+fn pick_crosses_region(pick: &EntityPick, region: Extents2, scratch: &mut Vec<u32>) -> bool {
+    if let Some(index) = pick.primitive_index.as_ref() {
+        index.gather(region, scratch);
+        return scratch.iter().copied().any(|slot| {
+            pick.primitives
+                .get(slot as usize)
+                .is_some_and(|primitive| primitive_crosses_region(primitive, region))
+        });
+    }
+    pick.primitives
+        .iter()
+        .any(|primitive| primitive_crosses_region(primitive, region))
+}
+
+fn primitive_crosses_region(primitive: &PickPrimitive, region: Extents2) -> bool {
+    if !region.intersects(primitive.bounds) {
+        return false;
+    }
+    if primitive.points.iter().any(|point| region.contains(*point)) {
+        return true;
+    }
+    for [a, b] in primitive.stroke_edges() {
+        if segment_intersects_extents(a, b, region) {
             return true;
         }
+    }
+    if matches!(primitive.kind, PickKind::Fill) && primitive.points.len() >= 3 {
+        let corners = [
+            region.min,
+            Point2::new(region.max.x, region.min.y),
+            region.max,
+            Point2::new(region.min.x, region.max.y),
+        ];
+        return corners
+            .iter()
+            .any(|corner| point_in_polygon(*corner, &primitive.points));
     }
     false
 }
 
 fn segment_intersects_extents(a: Point2, b: Point2, region: Extents2) -> bool {
+    let min_x = a.x.min(b.x);
+    let max_x = a.x.max(b.x);
+    let min_y = a.y.min(b.y);
+    let max_y = a.y.max(b.y);
+    if max_x < region.min.x || min_x > region.max.x || max_y < region.min.y || min_y > region.max.y
+    {
+        return false;
+    }
     if region.contains(a) || region.contains(b) {
         return true;
     }

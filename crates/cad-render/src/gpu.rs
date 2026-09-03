@@ -2,17 +2,28 @@
 
 use std::sync::Arc;
 
+use cad_core::Point2;
 use cad_viewport::Camera2;
 use egui::PaintCallbackInfo;
 use egui_wgpu::wgpu;
 use egui_wgpu::wgpu::util::DeviceExt;
 
-use crate::tessellate::{DisplayList, GpuVertex};
+use crate::tessellate::{DisplayList, GpuVertex, OverlayBatches};
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Uniforms {
     view_proj: [[f32; 4]; 4],
+    overlay_color: [f32; 4],
+    overlay_params: [f32; 4],
+}
+
+const UNIFORM_SIZE: u64 = std::mem::size_of::<Uniforms>() as u64;
+const _: () = assert!(UNIFORM_SIZE == 96);
+
+struct UniformSlot {
+    buffer: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
 }
 
 // ------------------------------------------------------------
@@ -23,8 +34,9 @@ pub struct CadGpu {
     line_pipeline: wgpu::RenderPipeline,
     fill_pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
-    uniform_buffer: wgpu::Buffer,
-    bind_group: wgpu::BindGroup,
+    scene: UniformSlot,
+    selection: UniformSlot,
+    preview: UniformSlot,
     line_buffer: Option<wgpu::Buffer>,
     fill_buffer: Option<wgpu::Buffer>,
     line_count: u32,
@@ -46,7 +58,7 @@ impl CadGpu {
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
-                    min_binding_size: None,
+                    min_binding_size: wgpu::BufferSize::new(UNIFORM_SIZE),
                 },
                 count: None,
             }],
@@ -90,26 +102,13 @@ impl CadGpu {
             wgpu::PrimitiveTopology::TriangleList,
             "mycad.fill",
         );
-        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("mycad.uniforms"),
-            size: std::mem::size_of::<Uniforms>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("mycad.bg"),
-            layout: &bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform_buffer.as_entire_binding(),
-            }],
-        });
         Self {
             line_pipeline,
             fill_pipeline,
+            scene: UniformSlot::new(device, &bind_group_layout, "mycad.scene"),
+            selection: UniformSlot::new(device, &bind_group_layout, "mycad.selection"),
+            preview: UniformSlot::new(device, &bind_group_layout, "mycad.preview"),
             bind_group_layout,
-            uniform_buffer,
-            bind_group,
             line_buffer: None,
             fill_buffer: None,
             line_count: 0,
@@ -134,6 +133,43 @@ impl CadGpu {
         }
         let _ = queue;
         let _ = &self.bind_group_layout;
+    }
+}
+
+impl UniformSlot {
+    fn new(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, label: &str) -> Self {
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: UNIFORM_SIZE,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(label),
+            layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: buffer.as_entire_binding(),
+            }],
+        });
+        Self { buffer, bind_group }
+    }
+
+    fn write(
+        &self,
+        queue: &wgpu::Queue,
+        camera: Camera2,
+        origin: Point2,
+        aspect: f64,
+        overlay_color: [f32; 4],
+        overlay_mix: f32,
+    ) {
+        let uniforms = Uniforms {
+            view_proj: camera.view_proj_f32(origin, aspect),
+            overlay_color,
+            overlay_params: [overlay_mix, 0.0, 0.0, 0.0],
+        };
+        queue.write_buffer(&self.buffer, 0, bytemuck::bytes_of(&uniforms));
     }
 }
 
@@ -193,17 +229,6 @@ fn make_pipeline(
     })
 }
 
-use cad_core::Point2;
-
-impl CadGpu {
-    pub fn write_camera(&self, queue: &wgpu::Queue, camera: Camera2, origin: Point2, aspect: f64) {
-        let uniforms = Uniforms {
-            view_proj: camera.view_proj_f32(origin, aspect),
-        };
-        queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
-    }
-}
-
 /// Paint callback that also writes the camera matrix during prepare.
 pub struct CadFrame {
     pub camera: Camera2,
@@ -211,6 +236,10 @@ pub struct CadFrame {
     pub generation: u64,
     pub display: Arc<DisplayList>,
     pub aspect: f64,
+    pub selection: OverlayBatches,
+    pub selection_color: [f32; 4],
+    pub preview: OverlayBatches,
+    pub preview_color: [f32; 4],
 }
 
 impl egui_wgpu::CallbackTrait for CadFrame {
@@ -226,7 +255,30 @@ impl egui_wgpu::CallbackTrait for CadFrame {
             return Vec::new();
         };
         gpu.upload(device, queue, &self.display, self.generation);
-        gpu.write_camera(queue, self.camera, self.origin, self.aspect);
+        gpu.scene.write(
+            queue,
+            self.camera,
+            self.origin,
+            self.aspect,
+            [0.0; 4],
+            0.0,
+        );
+        gpu.selection.write(
+            queue,
+            self.camera,
+            self.origin,
+            self.aspect,
+            self.selection_color,
+            1.0,
+        );
+        gpu.preview.write(
+            queue,
+            self.camera,
+            self.origin,
+            self.aspect,
+            self.preview_color,
+            1.0,
+        );
         Vec::new()
     }
 
@@ -243,20 +295,74 @@ impl egui_wgpu::CallbackTrait for CadFrame {
         if vp.width_px == 0 || vp.height_px == 0 {
             return;
         }
-        render_pass.set_bind_group(0, &gpu.bind_group, &[]);
+        draw_scene(gpu, render_pass);
+        draw_overlay(gpu, render_pass, &gpu.selection.bind_group, &self.selection);
+        draw_overlay(gpu, render_pass, &gpu.preview.bind_group, &self.preview);
+    }
+}
+
+fn draw_scene(gpu: &CadGpu, render_pass: &mut wgpu::RenderPass<'static>) {
+    let has_fill = gpu.fill_buffer.is_some() && gpu.fill_count >= 3;
+    let has_lines = gpu.line_buffer.is_some() && gpu.line_count >= 2;
+    if !has_fill && !has_lines {
+        return;
+    }
+    render_pass.set_bind_group(0, &gpu.scene.bind_group, &[]);
+    if has_fill {
         if let Some(buf) = gpu.fill_buffer.as_ref() {
-            if gpu.fill_count >= 3 {
-                render_pass.set_pipeline(&gpu.fill_pipeline);
-                render_pass.set_vertex_buffer(0, buf.slice(..));
-                render_pass.draw(0..gpu.fill_count, 0..1);
-            }
+            render_pass.set_pipeline(&gpu.fill_pipeline);
+            render_pass.set_vertex_buffer(0, buf.slice(..));
+            render_pass.draw(0..gpu.fill_count, 0..1);
         }
+    }
+    if has_lines {
         if let Some(buf) = gpu.line_buffer.as_ref() {
-            if gpu.line_count >= 2 {
-                render_pass.set_pipeline(&gpu.line_pipeline);
-                render_pass.set_vertex_buffer(0, buf.slice(..));
-                render_pass.draw(0..gpu.line_count, 0..1);
+            render_pass.set_pipeline(&gpu.line_pipeline);
+            render_pass.set_vertex_buffer(0, buf.slice(..));
+            render_pass.draw(0..gpu.line_count, 0..1);
+        }
+    }
+}
+
+fn draw_overlay(
+    gpu: &CadGpu,
+    render_pass: &mut wgpu::RenderPass<'static>,
+    bind_group: &wgpu::BindGroup,
+    overlay: &OverlayBatches,
+) {
+    if overlay.is_empty() {
+        return;
+    }
+    render_pass.set_bind_group(0, bind_group, &[]);
+    if let Some(buf) = gpu.fill_buffer.as_ref() {
+        if !overlay.fills.is_empty() {
+            render_pass.set_pipeline(&gpu.fill_pipeline);
+            render_pass.set_vertex_buffer(0, buf.slice(..));
+            for range in &overlay.fills {
+                if range.end.saturating_sub(range.start) >= 3 {
+                    render_pass.draw(range.start..range.end, 0..1);
+                }
             }
         }
+    }
+    if let Some(buf) = gpu.line_buffer.as_ref() {
+        if !overlay.lines.is_empty() {
+            render_pass.set_pipeline(&gpu.line_pipeline);
+            render_pass.set_vertex_buffer(0, buf.slice(..));
+            for range in &overlay.lines {
+                if range.end.saturating_sub(range.start) >= 2 {
+                    render_pass.draw(range.start..range.end, 0..1);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn overlay_uniforms_are_96_bytes() {
+        assert_eq!(super::UNIFORM_SIZE, 96);
+        assert_eq!(std::mem::size_of::<super::Uniforms>(), 96);
     }
 }

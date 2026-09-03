@@ -1,34 +1,45 @@
-has ---
-description: Keep CHANGELOG.md current for user-visible and geometry/behavior changes
+---
+description: Bump the workspace version and update CHANGELOG.md for every git-bound product change
 alwaysApply: true
 ---
 
-# Changelog
+# Changelog and version
 
-Maintain root `CHANGELOG.md` in [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) form, versions following [SemVer](https://semver.org/). Newest section first.
+Any change that will be committed, pushed, or included in a PR must update **both** root `CHANGELOG.md` and `workspace.package.version` in `Cargo.toml` in the **same** change as the code. Do not leave shippable work only under `[Unreleased]`.
 
-## When to update
+Keep [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) form and [SemVer](https://semver.org/). Newest version first. An empty `## [Unreleased]` section stays on top.
 
-In the **same change** as the code, add a bullet under `[Unreleased]` when the work:
+## When
 
-- Fixes rendering, import, tessellation, transforms, or viewport behavior
-- Adds or changes a user-facing command, UI, or `--import-only` output
-- Changes a public crate API or the workspace version in `Cargo.toml`
+Update version notes when the work:
 
-Do **not** log formatting-only edits, comment-only edits, or plan/rule files.
+- Fixes rendering, import, tessellation, transforms, picking, selection, or viewport behavior
+- Adds or changes a user-facing command, UI, settings, or `--import-only` output
+- Changes a public crate API or build/runtime packaging
 
-Do **not** bump `workspace.package.version` unless the user asked for a release. Unreleased work stays under `[Unreleased]`.
+Skip only formatting-only edits, comment-only edits, and uncommitted plan files. `.cursor/rules` that change project process **do** get a changelog bullet.
+
+## Version bump (0.x)
+
+- **Patch** (`0.2.0` → `0.2.1`): fixes and robustness with no new user-facing capability
+- **Minor** (`0.1.0` → `0.2.0`): new commands, UI, or selection/rendering features
+- Never reuse a released version number; match `CHANGELOG.md` to `Cargo.toml`
 
 ## How to write entries
 
-- Start with a verb: `Fix`, `Add`, `Change`, `Remove`
-- Say **why it matters**, not the file list
-- Group under `### Added`, `### Changed`, `### Fixed`, or `### Removed`
-- Name DWG/entity types in caps (`LWPOLYLINE`, `INSERT`, bulge, OCS)
+Move new bullets into `## [X.Y.Z] - YYYY-MM-DD` (today’s date). Start with a verb: `Fix`, `Add`, `Change`, `Remove`. Say **why it matters**, not the file list. Group under `### Added`, `### Changed`, `### Fixed`, or `### Removed`. Name DWG/entity types in caps (`LWPOLYLINE`, `INSERT`).
 
 ```markdown
+## [Unreleased]
+
+## [0.2.1] - 2026-09-03
+
 ### Fixed
 - Correct LWPOLYLINE bulge sign so positive bulge is CCW in world XY.
 ```
 
-When the user asks to release, move `[Unreleased]` items into `## [X.Y.Z] - YYYY-MM-DD`, match `Cargo.toml`, and leave an empty `[Unreleased]` section on top.
+```toml
+# Cargo.toml — must match the new changelog version
+[workspace.package]
+version = "0.2.1"
+```

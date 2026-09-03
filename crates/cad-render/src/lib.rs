@@ -9,10 +9,13 @@ pub mod tessellate;
 
 pub use gpu::{CadFrame, CadGpu};
 pub use pick::{
-    box_select, hit_test, stroke_edges, EntityPick, PickKind, PickPrimitive, SelectBoxMode,
-    DEFAULT_PICK_TOLERANCE_PX,
+    box_select, box_select_into, hit_test, stroke_edges, EntityPick, PickKind, PickPrimitive,
+    SelectBoxMode, SpatialIndex, DEFAULT_PICK_TOLERANCE_PX,
 };
-pub use tessellate::{tessellate_document, DisplayList, GpuVertex};
+pub use tessellate::{
+    merge_vertex_ranges, overlay_batches, tessellate_document, DisplayList, EntityDrawRange,
+    GpuVertex, OverlayBatches,
+};
 
 #[cfg(test)]
 mod tests;
