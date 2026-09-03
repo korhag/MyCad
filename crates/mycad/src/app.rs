@@ -12,6 +12,10 @@ use cad_viewport::Camera2;
 use dwg_import::ImportError;
 use eframe::egui::{self, PointerButton, Rect, Ui};
 
+use crate::settings::{
+    scroll_to_zoom_factor, sanitize_zoom_speed, AppSettings, DEFAULT_ZOOM_SPEED, ZOOM_SPEED_MAX,
+    ZOOM_SPEED_MIN,
+};
 use crate::theme;
 
 enum LoadMsg {
@@ -39,6 +43,9 @@ pub struct MyCadApp {
     status: String,
     error: Option<String>,
     show_diagnostics: bool,
+    show_settings: bool,
+    settings: AppSettings,
+    settings_draft: AppSettings,
     pending_open: Option<PathBuf>,
     last_pointer: Option<egui::Pos2>,
 }
@@ -62,9 +69,13 @@ impl MyCadApp {
             status: "Ready".to_string(),
             error: None,
             show_diagnostics: true,
+            show_settings: false,
+            settings: AppSettings::load(cc.storage),
+            settings_draft: AppSettings::default(),
             pending_open: initial_path,
             last_pointer: None,
         };
+        app.settings_draft = app.settings.clone();
         if let Some(path) = app.pending_open.take() {
             app.start_load(path);
         }
@@ -158,10 +169,29 @@ impl MyCadApp {
             self.start_load(path);
         }
     }
+
+    fn open_settings(&mut self) {
+        self.settings_draft = self.settings.clone();
+        self.show_settings = true;
+    }
+
+    fn apply_settings(&mut self, storage: Option<&mut (dyn eframe::Storage + 'static)>) {
+        self.settings_draft.sanitize();
+        self.settings = self.settings_draft.clone();
+        if let Some(storage) = storage {
+            self.settings.save(storage);
+        }
+        self.show_settings = false;
+    }
+
+    fn cancel_settings(&mut self) {
+        self.settings_draft = self.settings.clone();
+        self.show_settings = false;
+    }
 }
 
 impl eframe::App for MyCadApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         if self.load_rx.is_some() {
             ctx.request_repaint();
         }
@@ -196,6 +226,12 @@ impl eframe::App for MyCadApp {
                         }
                     }
                     ui.checkbox(&mut self.show_diagnostics, "Diagnostics");
+                });
+                ui.menu_button("Settings", |ui| {
+                    if ui.button("Preferences…").clicked() {
+                        ui.close();
+                        self.open_settings();
+                    }
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if self.loading_path.is_some() {
@@ -267,6 +303,16 @@ impl eframe::App for MyCadApp {
                 },
             ));
         });
+
+        match show_settings_window(ctx, self) {
+            SettingsAction::Apply => self.apply_settings(frame.storage_mut()),
+            SettingsAction::Cancel => self.cancel_settings(),
+            SettingsAction::None => {}
+        }
+    }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        self.settings.save(storage);
     }
 }
 
@@ -296,7 +342,7 @@ fn handle_navigation(app: &mut MyCadApp, ui: &Ui, response: &egui::Response, rec
                     origin,
                     size,
                 );
-                let factor = 1.001_f64.powf(scroll as f64);
+                let factor = scroll_to_zoom_factor(scroll as f64, app.settings.zoom_speed);
                 app.camera.zoom_at(world, factor);
             }
         }
@@ -315,6 +361,76 @@ fn handle_navigation(app: &mut MyCadApp, ui: &Ui, response: &egui::Response, rec
                 app.camera.zoom_extents(e, size.x, size.y);
             }
         }
+    }
+}
+
+enum SettingsAction {
+    None,
+    Apply,
+    Cancel,
+}
+
+fn show_settings_window(ctx: &egui::Context, app: &mut MyCadApp) -> SettingsAction {
+    if !app.show_settings {
+        return SettingsAction::None;
+    }
+    let mut open = true;
+    let mut action = SettingsAction::None;
+    egui::Window::new("Settings")
+        .open(&mut open)
+        .resizable(false)
+        .collapsible(false)
+        .default_width(360.0)
+        .show(ctx, |ui| {
+            ui.heading("Viewport");
+            ui.add_space(6.0);
+            ui.label("Zoom speed");
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::Slider::new(
+                        &mut app.settings_draft.zoom_speed,
+                        ZOOM_SPEED_MIN..=ZOOM_SPEED_MAX,
+                    )
+                    .logarithmic(true)
+                    .show_value(false),
+                );
+                ui.add(
+                    egui::DragValue::new(&mut app.settings_draft.zoom_speed)
+                        .speed(0.05)
+                        .range(ZOOM_SPEED_MIN..=ZOOM_SPEED_MAX)
+                        .suffix("×")
+                        .max_decimals(2),
+                );
+            });
+            app.settings_draft.zoom_speed = sanitize_zoom_speed(app.settings_draft.zoom_speed);
+            ui.weak("1.0× is the original smooth wheel zoom. Raise it to zoom faster without changing the curve. Apply saves and uses the value; Cancel leaves the current session unchanged.");
+            ui.add_space(8.0);
+            if ui
+                .add_enabled(
+                    (app.settings_draft.zoom_speed - DEFAULT_ZOOM_SPEED).abs() > 1e-9,
+                    egui::Button::new("Reset zoom speed"),
+                )
+                .clicked()
+            {
+                app.settings_draft.reset_zoom_speed();
+            }
+            ui.add_space(12.0);
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Apply").clicked() {
+                        action = SettingsAction::Apply;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        action = SettingsAction::Cancel;
+                    }
+                });
+            });
+        });
+    if !open {
+        SettingsAction::Cancel
+    } else {
+        action
     }
 }
 

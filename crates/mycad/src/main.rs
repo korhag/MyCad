@@ -3,6 +3,7 @@
 mod app;
 mod audit;
 mod preview;
+mod settings;
 mod theme;
 
 use std::env;

@@ -1,0 +1,34 @@
+has ---
+description: Keep CHANGELOG.md current for user-visible and geometry/behavior changes
+alwaysApply: true
+---
+
+# Changelog
+
+Maintain root `CHANGELOG.md` in [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) form, versions following [SemVer](https://semver.org/). Newest section first.
+
+## When to update
+
+In the **same change** as the code, add a bullet under `[Unreleased]` when the work:
+
+- Fixes rendering, import, tessellation, transforms, or viewport behavior
+- Adds or changes a user-facing command, UI, or `--import-only` output
+- Changes a public crate API or the workspace version in `Cargo.toml`
+
+Do **not** log formatting-only edits, comment-only edits, or plan/rule files.
+
+Do **not** bump `workspace.package.version` unless the user asked for a release. Unreleased work stays under `[Unreleased]`.
+
+## How to write entries
+
+- Start with a verb: `Fix`, `Add`, `Change`, `Remove`
+- Say **why it matters**, not the file list
+- Group under `### Added`, `### Changed`, `### Fixed`, or `### Removed`
+- Name DWG/entity types in caps (`LWPOLYLINE`, `INSERT`, bulge, OCS)
+
+```markdown
+### Fixed
+- Correct LWPOLYLINE bulge sign so positive bulge is CCW in world XY.
+```
+
+When the user asks to release, move `[Unreleased]` items into `## [X.Y.Z] - YYYY-MM-DD`, match `Cargo.toml`, and leave an empty `[Unreleased]` section on top.
