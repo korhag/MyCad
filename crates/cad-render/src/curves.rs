@@ -84,37 +84,92 @@ pub fn ellipse_points(
     pts
 }
 
-/// AutoCAD bulge is tan(included_angle / 4). Positive = CCW.
-pub fn bulge_arc(p1: Point2, p2: Point2, bulge: f64, segments: usize) -> Vec<Point2> {
+pub const POLYLINE_BULGE_SEGMENTS: usize = 16;
+
+// ------------------------------------------------------------
+// Type: BulgeArc
+// Purpose: Signed AutoCAD bulge circle: theta = 4*atan(bulge),
+//          positive bulge is CCW, sampled with the signed sweep.
+// ------------------------------------------------------------
+#[derive(Debug, Clone, Copy)]
+struct BulgeArc {
+    center: Point2,
+    radius: f64,
+    start_angle: f64,
+    sweep: f64,
+}
+
+fn bulge_circle(p1: Point2, p2: Point2, bulge: f64) -> Option<BulgeArc> {
     if bulge.abs() < 1e-12 {
-        return vec![p1, p2];
+        return None;
     }
     let chord = p1.distance(p2);
     if chord < 1e-15 {
-        return vec![p1];
+        return None;
     }
-    let included = 4.0 * bulge.atan();
-    let radius = chord / (2.0 * (included / 2.0).sin());
-    let mx = (p1.x + p2.x) * 0.5;
-    let my = (p1.y + p2.y) * 0.5;
-    let dx = (p2.x - p1.x) / chord;
-    let dy = (p2.y - p1.y) / chord;
-    let offset = (chord / 2.0) * (1.0 / bulge - bulge) / 2.0;
-    let cx = mx + dy * offset;
-    let cy = my - dx * offset;
-    let start = (p1.y - cy).atan2(p1.x - cx);
-    let end = (p2.y - cy).atan2(p2.x - cx);
-    arc_points(
-        Point3::new(cx, cy, 0.0),
-        radius.abs(),
-        start,
-        end,
-        bulge < 0.0,
-        Point3::new(0.0, 0.0, 1.0),
-        segments.max(8),
-    )
+    let bulge_sq = bulge * bulge;
+    let sweep = 4.0 * bulge.atan();
+    let radius = chord * (1.0 + bulge_sq) / (4.0 * bulge.abs());
+    let offset = chord * (1.0 - bulge_sq) / (4.0 * bulge);
+    let ux = (p2.x - p1.x) / chord;
+    let uy = (p2.y - p1.y) / chord;
+    let center = Point2::new(
+        (p1.x + p2.x) * 0.5 + (-uy) * offset,
+        (p1.y + p2.y) * 0.5 + ux * offset,
+    );
+    Some(BulgeArc {
+        center,
+        radius,
+        start_angle: (p1.y - center.y).atan2(p1.x - center.x),
+        sweep,
+    })
 }
 
+// ------------------------------------------------------------
+// Function: bulge_arc
+// Purpose: Sample a bulge-defined arc in the same 2D plane as the
+//          supplied vertices. First and last samples equal P1/P2.
+// ------------------------------------------------------------
+pub fn bulge_arc(p1: Point2, p2: Point2, bulge: f64, segments: usize) -> Vec<Point2> {
+    let Some(arc) = bulge_circle(p1, p2, bulge) else {
+        if p1.distance(p2) < 1e-15 {
+            return vec![p1];
+        }
+        return vec![p1, p2];
+    };
+    let n = segments.max(8);
+    let mut pts = Vec::with_capacity(n + 1);
+    for i in 0..=n {
+        let t = i as f64 / n as f64;
+        let angle = arc.start_angle + arc.sweep * t;
+        pts.push(Point2::new(
+            arc.center.x + arc.radius * angle.cos(),
+            arc.center.y + arc.radius * angle.sin(),
+        ));
+    }
+    if let Some(first) = pts.first_mut() {
+        *first = p1;
+    }
+    if let Some(last) = pts.last_mut() {
+        *last = p2;
+    }
+    pts
+}
+
+fn ocs_xy(point: Point3) -> Point2 {
+    Point2::new(point.x, point.y)
+}
+
+fn bulge_sample_to_wcs(sample: Point2, elevation: f64, extrusion: Point3) -> Point2 {
+    ocs_to_wcs(Point3::new(sample.x, sample.y, elevation), extrusion).xy()
+}
+
+// ------------------------------------------------------------
+// Function: polyline_points
+// Purpose: Tessellate LWPOLYLINE/POLYLINE vertices. Bulge arcs are
+//          constructed in OCS so negative-Z extrusion does not
+//          reverse handedness, then each sample is mapped to WCS.
+// ------------------------------------------------------------
 pub fn polyline_points(vertices: &[PolyVertex], closed: bool, extrusion: Point3) -> Vec<Point2> {
     if vertices.is_empty() {
         return Vec::new();
@@ -125,9 +180,10 @@ pub fn polyline_points(vertices: &[PolyVertex], closed: bool, extrusion: Point3)
     for i in 0..count {
         let a = vertices[i];
         let b = vertices[(i + 1) % n];
-        let pa = ocs_to_wcs(a.point, extrusion).xy();
-        let pb = ocs_to_wcs(b.point, extrusion).xy();
-        let mut seg = bulge_arc(pa, pb, a.bulge, 16);
+        let mut seg = bulge_arc(ocs_xy(a.point), ocs_xy(b.point), a.bulge, POLYLINE_BULGE_SEGMENTS);
+        for sample in &mut seg {
+            *sample = bulge_sample_to_wcs(*sample, a.point.z, extrusion);
+        }
         if !out.is_empty() && !seg.is_empty() {
             seg.remove(0);
         }
@@ -282,18 +338,176 @@ fn de_boor(
 mod tests {
     use super::*;
 
-    #[test]
-    fn bulge_zero_is_straight() {
-        let pts = bulge_arc(Point2::new(0.0, 0.0), Point2::new(10.0, 0.0), 0.0, 16);
-        assert_eq!(pts.len(), 2);
+    const EPS: f64 = 1e-9;
+
+    fn p(x: f64, y: f64) -> Point2 {
+        Point2::new(x, y)
+    }
+
+    fn assert_point(got: Point2, expected: Point2, label: &str) {
+        assert!(
+            (got.x - expected.x).abs() < EPS && (got.y - expected.y).abs() < EPS,
+            "{label}: got ({}, {}), expected ({}, {})",
+            got.x,
+            got.y,
+            expected.x,
+            expected.y
+        );
+    }
+
+    fn assert_near(got: f64, expected: f64, label: &str) {
+        assert!(
+            (got - expected).abs() < EPS,
+            "{label}: got {got}, expected {expected}"
+        );
+    }
+
+    fn sample_mid(pts: &[Point2]) -> Point2 {
+        pts[pts.len() / 2]
+    }
+
+    fn chord_vertices(a: Point2, b: Point2, bulge: f64) -> [PolyVertex; 2] {
+        [
+            PolyVertex {
+                point: Point3::from_xy(a.x, a.y),
+                bulge,
+            },
+            PolyVertex {
+                point: Point3::from_xy(b.x, b.y),
+                bulge: 0.0,
+            },
+        ]
     }
 
     #[test]
-    fn semicircle_bulge_is_one() {
-        let pts = bulge_arc(Point2::new(0.0, 0.0), Point2::new(2.0, 0.0), 1.0, 32);
-        assert!(pts.len() > 4);
-        let mid = &pts[pts.len() / 2];
-        assert!((mid.y - 1.0).abs() < 0.15);
+    fn bulge_zero_is_straight() {
+        let p1 = p(0.0, 0.0);
+        let p2 = p(2.0, 0.0);
+        let pts = bulge_arc(p1, p2, 0.0, 16);
+        assert_eq!(pts.len(), 2);
+        assert_point(pts[0], p1, "start");
+        assert_point(pts[1], p2, "end");
+        assert!(bulge_circle(p1, p2, 0.0).is_none());
+    }
+
+    #[test]
+    fn positive_unit_bulge_is_lower_semicircle() {
+        let p1 = p(0.0, 0.0);
+        let p2 = p(2.0, 0.0);
+        let arc = bulge_circle(p1, p2, 1.0).expect("arc");
+        assert_point(arc.center, p(1.0, 0.0), "center");
+        assert_near(arc.radius, 1.0, "radius");
+        assert_near(arc.sweep, std::f64::consts::PI, "sweep");
+        let pts = bulge_arc(p1, p2, 1.0, 32);
+        assert_point(pts[0], p1, "start");
+        assert_point(*pts.last().unwrap(), p2, "end");
+        assert_point(sample_mid(&pts), p(1.0, -1.0), "midpoint");
+        assert!(sample_mid(&pts).y < 0.0, "positive bulge stays below +X chord");
+    }
+
+    #[test]
+    fn negative_unit_bulge_is_upper_semicircle() {
+        let p1 = p(0.0, 0.0);
+        let p2 = p(2.0, 0.0);
+        let arc = bulge_circle(p1, p2, -1.0).expect("arc");
+        assert_point(arc.center, p(1.0, 0.0), "center");
+        assert_near(arc.radius, 1.0, "radius");
+        assert_near(arc.sweep, -std::f64::consts::PI, "sweep");
+        let pts = bulge_arc(p1, p2, -1.0, 32);
+        assert_point(pts[0], p1, "start");
+        assert_point(*pts.last().unwrap(), p2, "end");
+        assert_point(sample_mid(&pts), p(1.0, 1.0), "midpoint");
+        assert!(sample_mid(&pts).y > 0.0, "negative bulge stays above +X chord");
+    }
+
+    #[test]
+    fn plus_tan_22_5_is_ccw_quarter_arc() {
+        let p1 = p(0.0, 0.0);
+        let p2 = p(2.0, 0.0);
+        let bulge = (std::f64::consts::PI / 8.0).tan();
+        let arc = bulge_circle(p1, p2, bulge).expect("arc");
+        assert_near(arc.sweep, std::f64::consts::FRAC_PI_2, "sweep");
+        assert_near(arc.radius, std::f64::consts::SQRT_2, "radius");
+        assert_point(arc.center, p(1.0, 1.0), "center");
+        let pts = bulge_arc(p1, p2, bulge, 32);
+        assert_point(pts[0], p1, "start");
+        assert_point(*pts.last().unwrap(), p2, "end");
+        let mid = sample_mid(&pts);
+        assert_point(mid, p(1.0, 1.0 - std::f64::consts::SQRT_2), "midpoint");
+        assert!(mid.y < 0.0);
+    }
+
+    #[test]
+    fn minus_tan_22_5_is_cw_quarter_arc() {
+        let p1 = p(0.0, 0.0);
+        let p2 = p(2.0, 0.0);
+        let bulge = -((std::f64::consts::PI / 8.0).tan());
+        let arc = bulge_circle(p1, p2, bulge).expect("arc");
+        assert_near(arc.sweep, -std::f64::consts::FRAC_PI_2, "sweep");
+        assert_near(arc.radius, std::f64::consts::SQRT_2, "radius");
+        assert_point(arc.center, p(1.0, -1.0), "center");
+        let pts = bulge_arc(p1, p2, bulge, 32);
+        assert_point(pts[0], p1, "start");
+        assert_point(*pts.last().unwrap(), p2, "end");
+        let mid = sample_mid(&pts);
+        assert_point(mid, p(1.0, -1.0 + std::f64::consts::SQRT_2), "midpoint");
+        assert!(mid.y > 0.0);
+    }
+
+    #[test]
+    fn major_arc_bulge_greater_than_one_keeps_signed_sweep() {
+        let p1 = p(0.0, 0.0);
+        let p2 = p(2.0, 0.0);
+        let bulge = (3.0 * std::f64::consts::PI / 8.0).tan();
+        assert!(bulge > 1.0);
+        let arc = bulge_circle(p1, p2, bulge).expect("arc");
+        assert_near(arc.sweep, 3.0 * std::f64::consts::FRAC_PI_2, "sweep");
+        assert_near(arc.radius, std::f64::consts::SQRT_2, "radius");
+        assert_point(arc.center, p(1.0, -1.0), "center");
+        let pts = bulge_arc(p1, p2, bulge, 48);
+        assert_point(pts[0], p1, "start");
+        assert_point(*pts.last().unwrap(), p2, "end");
+        let mid = sample_mid(&pts);
+        assert_point(mid, p(1.0, -1.0 - std::f64::consts::SQRT_2), "midpoint");
+        assert!(mid.y < -1.0, "major CCW arc goes through the far lower side");
+    }
+
+    #[test]
+    fn reversed_endpoints_change_direction_not_only_shape() {
+        let p1 = p(2.0, 0.0);
+        let p2 = p(0.0, 0.0);
+        let pos = bulge_circle(p1, p2, 1.0).expect("pos");
+        let neg = bulge_circle(p1, p2, -1.0).expect("neg");
+        assert_point(pos.center, p(1.0, 0.0), "pos center");
+        assert_point(neg.center, p(1.0, 0.0), "neg center");
+        assert_near(pos.sweep, std::f64::consts::PI, "pos sweep");
+        assert_near(neg.sweep, -std::f64::consts::PI, "neg sweep");
+        let pos_mid = sample_mid(&bulge_arc(p1, p2, 1.0, 32));
+        let neg_mid = sample_mid(&bulge_arc(p1, p2, -1.0, 32));
+        assert_point(pos_mid, p(1.0, 1.0), "CCW from right to left is upper");
+        assert_point(neg_mid, p(1.0, -1.0), "CW from right to left is lower");
+        assert_ne!(pos_mid.y.signum(), neg_mid.y.signum());
+    }
+
+    #[test]
+    fn world_extrusion_polyline_matches_bulge_arc() {
+        let verts = chord_vertices(p(0.0, 0.0), p(2.0, 0.0), 1.0);
+        let pts = polyline_points(&verts, false, Point3::new(0.0, 0.0, 1.0));
+        assert_point(pts[0], p(0.0, 0.0), "start");
+        assert_point(*pts.last().unwrap(), p(2.0, 0.0), "end");
+        assert_point(sample_mid(&pts), p(1.0, -1.0), "midpoint");
+        assert_eq!(pts.len(), POLYLINE_BULGE_SEGMENTS.max(8) + 1);
+    }
+
+    #[test]
+    fn negative_z_ocs_preserves_bulge_handedness() {
+        let verts = chord_vertices(p(0.0, 0.0), p(2.0, 0.0), 1.0);
+        let pts = polyline_points(&verts, false, Point3::new(0.0, 0.0, -1.0));
+        assert_point(pts[0], p(0.0, 0.0), "start");
+        assert_point(*pts.last().unwrap(), p(-2.0, 0.0), "end X is mirrored");
+        let mid = sample_mid(&pts);
+        assert_point(mid, p(-1.0, -1.0), "Y side matches OCS, X is mirrored");
+        assert!(mid.y < 0.0);
     }
 
     #[test]
