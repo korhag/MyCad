@@ -63,10 +63,12 @@ pub enum Geometry {
         vertices: Vec<PolyVertex>,
         closed: bool,
         extrusion: Point3,
+        linetype_generation_continuous: bool,
     },
     Polyline {
         vertices: Vec<PolyVertex>,
         closed: bool,
+        linetype_generation_continuous: bool,
     },
     Spline {
         degree: u32,
@@ -105,6 +107,33 @@ pub enum Geometry {
         vertices: Vec<Point3>,
         closed: bool,
     },
+}
+
+impl Geometry {
+    // --------------------------------------------------------
+    // Method: type_name
+    // Purpose: Stable, user-facing name for inspectors and diagnostics.
+    // --------------------------------------------------------
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Self::Line { .. } => "Line",
+            Self::Point { .. } => "Point",
+            Self::Circle { .. } => "Circle",
+            Self::Arc { .. } => "Arc",
+            Self::Ellipse { .. } => "Ellipse",
+            Self::LwPolyline { .. } => "Polyline",
+            Self::Polyline { .. } => "Polyline",
+            Self::Spline { .. } => "Spline",
+            Self::Insert { .. } => "Block",
+            Self::Text(_) => "Text",
+            Self::MText(_) => "MText",
+            Self::Hatch(_) => "Hatch",
+            Self::Dimension { .. } => "Dimension",
+            Self::Solid { .. } => "Solid",
+            Self::Leader { .. } => "Leader",
+            Self::MLine { .. } => "MLine",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

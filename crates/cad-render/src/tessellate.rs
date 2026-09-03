@@ -9,7 +9,9 @@ use cad_core::{
 use crate::curves::{
     arc_points, bspline_points, circle_points, ellipse_points, polyline_points, CIRCLE_SEGMENTS,
 };
-use crate::stroke_font::{stroke_text, strip_mtext};
+use crate::dash::{generate_path_dashes, line_chain, polyline_path_segs, scaled_pattern, PathSeg};
+use crate::pick::EntityPick;
+use crate::stroke_font::{strip_mtext, stroke_text};
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -28,6 +30,7 @@ pub struct DisplayList {
     pub origin: Point2,
     pub line_vertices: Vec<GpuVertex>,
     pub triangle_vertices: Vec<GpuVertex>,
+    pub picks: Vec<EntityPick>,
 }
 
 impl DisplayList {
@@ -37,6 +40,89 @@ impl DisplayList {
 
     pub fn line_count(&self) -> usize {
         self.line_vertices.len() / 2
+    }
+
+    pub fn pick_for(&self, entity_index: usize) -> Option<&EntityPick> {
+        self.picks
+            .iter()
+            .find(|pick| pick.entity_index == entity_index)
+    }
+}
+
+struct TessSink<'a> {
+    list: &'a mut DisplayList,
+    pick: Option<&'a mut EntityPick>,
+}
+
+impl TessSink<'_> {
+    fn polyline(
+        &mut self,
+        pts: &[Point2],
+        closed: bool,
+        rgb: Rgb,
+        linetype: &LineType,
+        scale: f64,
+    ) {
+        self.path(
+            pts,
+            closed,
+            &line_chain(pts, closed),
+            true,
+            rgb,
+            linetype,
+            scale,
+        );
+    }
+
+    fn path(
+        &mut self,
+        pick_pts: &[Point2],
+        closed: bool,
+        segs: &[PathSeg],
+        plinegen: bool,
+        rgb: Rgb,
+        linetype: &LineType,
+        scale: f64,
+    ) {
+        if let Some(pick) = self.pick.as_mut() {
+            pick.add_stroke(pick_pts, closed);
+        }
+        if linetype.is_continuous() {
+            emit_solid_polyline(self.list, pick_pts, closed, rgb);
+            return;
+        }
+        let pattern = scaled_pattern(&linetype.dashes, scale);
+        for (a, b) in generate_path_dashes(segs, &pattern, plinegen, CIRCLE_SEGMENTS) {
+            push_line(self.list, a, b, rgb);
+        }
+    }
+
+    fn fan(&mut self, pts: &[Point2], rgb: Rgb) {
+        if let Some(pick) = self.pick.as_mut() {
+            pick.add_fill(pts);
+        }
+        emit_fan(self.list, pts, rgb);
+    }
+
+    fn text(
+        &mut self,
+        transform: Transform2,
+        rgb: Rgb,
+        insertion: Point3,
+        height: f64,
+        rotation: f64,
+        value: &str,
+    ) {
+        emit_text(
+            self.list,
+            self.pick.as_deref_mut(),
+            transform,
+            rgb,
+            insertion,
+            height,
+            rotation,
+            value,
+        );
     }
 }
 
@@ -51,17 +137,29 @@ pub fn tessellate_document(document: &Document) -> DisplayList {
         origin,
         line_vertices: Vec::with_capacity(64 * 1024),
         triangle_vertices: Vec::new(),
+        picks: Vec::with_capacity(document.model_space.len()),
     };
     let mut stack = Vec::new();
-    for entity in &document.model_space {
-        tessellate_entity(
-            document,
-            entity,
-            Transform2::identity(),
-            CadColor::Aci(7),
-            &mut stack,
-            &mut list,
-        );
+    for (entity_index, entity) in document.model_space.iter().enumerate() {
+        let mut pick = EntityPick::new(entity_index);
+        {
+            let mut sink = TessSink {
+                list: &mut list,
+                pick: Some(&mut pick),
+            };
+            tessellate_entity(
+                document,
+                entity,
+                Transform2::identity(),
+                CadColor::Aci(7),
+                "CONTINUOUS",
+                &mut stack,
+                &mut sink,
+            );
+        }
+        if !pick.is_empty() {
+            list.picks.push(pick);
+        }
     }
     list
 }
@@ -71,8 +169,9 @@ fn tessellate_entity(
     entity: &Entity,
     transform: Transform2,
     block_color: CadColor,
+    block_linetype: &str,
     stack: &mut Vec<String>,
-    list: &mut DisplayList,
+    sink: &mut TessSink<'_>,
 ) {
     if !entity.visible || !document.layer_is_visible(&entity.layer) {
         return;
@@ -82,13 +181,12 @@ fn tessellate_entity(
         .map(|l| l.color)
         .unwrap_or(CadColor::Aci(7));
     let rgb = entity.color.resolve(layer_color, block_color);
-    let linetype_name = resolve_linetype(document, entity);
+    let linetype_name = document.resolved_linetype_name(entity, block_linetype);
     let linetype = document
-        .linetypes
-        .get(&linetype_name)
+        .linetype(&linetype_name)
         .cloned()
-        .unwrap_or_else(|| LineType::builtin(&linetype_name));
-    let scale = entity.linetype_scale.max(1e-6);
+        .unwrap_or_else(|| LineType::continuous(&linetype_name));
+    let scale = document.effective_linetype_scale(entity);
 
     match &entity.geometry {
         Geometry::Insert {
@@ -114,6 +212,7 @@ fn tessellate_entity(
                 CadColor::ByLayer | CadColor::ByBlock => block_color,
                 other => other,
             };
+            let inherit_lt = document.resolved_linetype_name(entity, block_linetype);
             let cols = (*column_count).max(1);
             let rows = (*row_count).max(1);
             for col in 0..cols {
@@ -133,13 +232,20 @@ fn tessellate_entity(
                         .then(extra),
                     );
                     for child in &block.entities {
-                        tessellate_entity(document, child, nested, inherit, stack, list);
+                        tessellate_entity(
+                            document,
+                            child,
+                            nested,
+                            inherit,
+                            inherit_lt.as_str(),
+                            stack,
+                            sink,
+                        );
                     }
                 }
             }
             for attrib in attribs {
-                emit_text(
-                    list,
+                sink.text(
                     transform,
                     rgb,
                     attrib.insertion,
@@ -157,16 +263,27 @@ fn tessellate_entity(
             if let Some(block) = document.blocks.get(block_name) {
                 stack.push(block_name.clone());
                 for child in &block.entities {
-                    tessellate_entity(document, child, transform, block_color, stack, list);
+                    tessellate_entity(
+                        document,
+                        child,
+                        transform,
+                        block_color,
+                        block_linetype,
+                        stack,
+                        sink,
+                    );
                 }
                 stack.pop();
             }
         }
         Geometry::Line { start, end } => {
-            emit_polyline(
-                list,
-                &[transform.apply(start.xy()), transform.apply(end.xy())],
+            let a = transform.apply(start.xy());
+            let b = transform.apply(end.xy());
+            sink.path(
+                &[a, b],
                 false,
+                &[PathSeg::Line { a, b }],
+                true,
                 rgb,
                 &linetype,
                 scale,
@@ -175,23 +292,15 @@ fn tessellate_entity(
         Geometry::Point { position } => {
             let p = transform.apply(position.xy());
             let s = transform.scale_x().abs().max(0.1) * 0.5;
-            emit_polyline(
-                list,
-                &[
-                    Point2::new(p.x - s, p.y),
-                    Point2::new(p.x + s, p.y),
-                ],
+            sink.polyline(
+                &[Point2::new(p.x - s, p.y), Point2::new(p.x + s, p.y)],
                 false,
                 rgb,
                 &LineType::continuous("CONTINUOUS"),
                 1.0,
             );
-            emit_polyline(
-                list,
-                &[
-                    Point2::new(p.x, p.y - s),
-                    Point2::new(p.x, p.y + s),
-                ],
+            sink.polyline(
+                &[Point2::new(p.x, p.y - s), Point2::new(p.x, p.y + s)],
                 false,
                 rgb,
                 &LineType::continuous("CONTINUOUS"),
@@ -207,7 +316,15 @@ fn tessellate_entity(
                 .into_iter()
                 .map(|p| transform.apply(p))
                 .collect();
-            emit_polyline(list, &pts, true, rgb, &linetype, scale);
+            sink.path(
+                &pts,
+                true,
+                &circle_path_segs(&pts),
+                true,
+                rgb,
+                &linetype,
+                scale,
+            );
         }
         Geometry::Arc {
             center,
@@ -228,7 +345,15 @@ fn tessellate_entity(
             .into_iter()
             .map(|p| transform.apply(p))
             .collect();
-            emit_polyline(list, &pts, false, rgb, &linetype, scale);
+            sink.path(
+                &pts,
+                false,
+                &arc_path_segs(&pts),
+                true,
+                rgb,
+                &linetype,
+                scale,
+            );
         }
         Geometry::Ellipse {
             center,
@@ -250,25 +375,49 @@ fn tessellate_entity(
             .into_iter()
             .map(|p| transform.apply(p))
             .collect();
-            emit_polyline(list, &pts, false, rgb, &linetype, scale);
+            sink.polyline(&pts, false, rgb, &linetype, scale);
         }
         Geometry::LwPolyline {
             vertices,
             closed,
             extrusion,
+            linetype_generation_continuous,
         } => {
             let pts: Vec<Point2> = polyline_points(vertices, *closed, *extrusion)
                 .into_iter()
                 .map(|p| transform.apply(p))
                 .collect();
-            emit_polyline(list, &pts, *closed, rgb, &linetype, scale);
+            let segs = polyline_path_segs(vertices, *closed, *extrusion, transform);
+            sink.path(
+                &pts,
+                *closed,
+                &segs,
+                *linetype_generation_continuous,
+                rgb,
+                &linetype,
+                scale,
+            );
         }
-        Geometry::Polyline { vertices, closed } => {
-            let pts: Vec<Point2> = polyline_points(vertices, *closed, Point3::new(0.0, 0.0, 1.0))
+        Geometry::Polyline {
+            vertices,
+            closed,
+            linetype_generation_continuous,
+        } => {
+            let extrusion = Point3::new(0.0, 0.0, 1.0);
+            let pts: Vec<Point2> = polyline_points(vertices, *closed, extrusion)
                 .into_iter()
                 .map(|p| transform.apply(p))
                 .collect();
-            emit_polyline(list, &pts, *closed, rgb, &linetype, scale);
+            let segs = polyline_path_segs(vertices, *closed, extrusion, transform);
+            sink.path(
+                &pts,
+                *closed,
+                &segs,
+                *linetype_generation_continuous,
+                rgb,
+                &linetype,
+                scale,
+            );
         }
         Geometry::Spline {
             degree,
@@ -284,14 +433,13 @@ fn tessellate_entity(
                 fit_points.iter().map(|p| p.xy()).collect()
             };
             let pts: Vec<Point2> = sampled.into_iter().map(|p| transform.apply(p)).collect();
-            emit_polyline(list, &pts, *closed, rgb, &linetype, scale);
+            sink.polyline(&pts, *closed, rgb, &linetype, scale);
         }
         Geometry::Text(text) => {
             if text.is_attrib_def && !stack.is_empty() {
                 return;
             }
-            emit_text(
-                list,
+            sink.text(
                 transform,
                 rgb,
                 text.insertion,
@@ -304,20 +452,9 @@ fn tessellate_entity(
             let cleaned = strip_mtext(&text.value);
             let mut y_off = 0.0;
             for line in cleaned.lines() {
-                let insertion = Point3::new(
-                    text.insertion.x,
-                    text.insertion.y - y_off,
-                    text.insertion.z,
-                );
-                emit_text(
-                    list,
-                    transform,
-                    rgb,
-                    insertion,
-                    text.height,
-                    text.rotation,
-                    line,
-                );
+                let insertion =
+                    Point3::new(text.insertion.x, text.insertion.y - y_off, text.insertion.z);
+                sink.text(transform, rgb, insertion, text.height, text.rotation, line);
                 y_off += text.height * 1.6;
             }
         }
@@ -325,36 +462,44 @@ fn tessellate_entity(
             for path in &hatch.paths {
                 let pts = hatch_path_points(path);
                 let world: Vec<Point2> = pts.into_iter().map(|p| transform.apply(p)).collect();
-                emit_polyline(list, &world, true, rgb, &LineType::continuous("CONTINUOUS"), 1.0);
+                sink.polyline(&world, true, rgb, &LineType::continuous("CONTINUOUS"), 1.0);
                 if hatch.solid_fill && world.len() >= 3 {
-                    emit_fan(list, &world, rgb);
+                    sink.fan(&world, rgb);
                 }
             }
         }
         Geometry::Solid { corners, .. } => {
             let pts: Vec<Point2> = corners.iter().map(|c| transform.apply(c.xy())).collect();
-            emit_polyline(list, &pts, true, rgb, &LineType::continuous("CONTINUOUS"), 1.0);
-            emit_fan(list, &pts, rgb);
+            sink.polyline(&pts, true, rgb, &LineType::continuous("CONTINUOUS"), 1.0);
+            sink.fan(&pts, rgb);
         }
         Geometry::Leader { vertices } | Geometry::MLine { vertices, .. } => {
             let pts: Vec<Point2> = vertices.iter().map(|p| transform.apply(p.xy())).collect();
-            emit_polyline(list, &pts, false, rgb, &linetype, scale);
+            sink.polyline(&pts, false, rgb, &linetype, scale);
         }
     }
 }
 
-fn resolve_linetype(document: &Document, entity: &Entity) -> String {
-    let name = entity.linetype.to_ascii_uppercase();
-    if name == "BYLAYER" || name.is_empty() {
-        document
-            .layer(&entity.layer)
-            .map(|l| l.linetype.clone())
-            .unwrap_or_else(|| "CONTINUOUS".into())
-    } else if name == "BYBLOCK" {
-        "CONTINUOUS".into()
+fn circle_path_segs(pts: &[Point2]) -> Vec<PathSeg> {
+    let unique: Vec<Point2> = if pts.len() >= 2 && pts.first() == pts.last() {
+        pts[..pts.len() - 1].to_vec()
     } else {
-        entity.linetype.clone()
+        pts.to_vec()
+    };
+    PathSeg::full_circle_from_points(&unique)
+        .map(|seg| vec![seg])
+        .unwrap_or_else(|| line_chain(pts, true))
+}
+
+fn arc_path_segs(pts: &[Point2]) -> Vec<PathSeg> {
+    if pts.len() >= 3 {
+        if let Some(seg) =
+            PathSeg::from_three_arc_points(pts[0], pts[pts.len() / 2], *pts.last().unwrap())
+        {
+            return vec![seg];
+        }
     }
+    line_chain(pts, false)
 }
 
 fn hatch_path_points(path: &HatchPath) -> Vec<Point2> {
@@ -367,7 +512,11 @@ fn hatch_path_points(path: &HatchPath) -> Vec<Point2> {
             for edge in edges {
                 match edge {
                     HatchEdge::Line { start, end } => {
-                        if pts.last().map(|p: &Point2| p.distance(start.xy()) > 1e-9).unwrap_or(true) {
+                        if pts
+                            .last()
+                            .map(|p: &Point2| p.distance(start.xy()) > 1e-9)
+                            .unwrap_or(true)
+                        {
                             pts.push(start.xy());
                         }
                         pts.push(end.xy());
@@ -436,7 +585,11 @@ fn emit_hatch_pattern(
 ) {
     let mut hull = Vec::new();
     for path in paths {
-        hull.extend(hatch_path_points(path).into_iter().map(|p| transform.apply(p)));
+        hull.extend(
+            hatch_path_points(path)
+                .into_iter()
+                .map(|p| transform.apply(p)),
+        );
     }
     if hull.len() < 2 {
         return;
@@ -457,21 +610,27 @@ fn emit_hatch_pattern(
     let base = transform.apply(def.base.xy());
     let perp = Point2::new(-dir.y, dir.x);
     for i in -n..=n {
-        let origin = Point2::new(base.x + perp.x * step * i as f64, base.y + perp.y * step * i as f64);
+        let origin = Point2::new(
+            base.x + perp.x * step * i as f64,
+            base.y + perp.y * step * i as f64,
+        );
         let a = Point2::new(origin.x - dir.x * span, origin.y - dir.y * span);
         let b = Point2::new(origin.x + dir.x * span, origin.y + dir.y * span);
         if segment_hits_hull(a, b, &hull) {
-            emit_polyline(
-                list,
-                &[a, b],
-                false,
-                rgb,
-                &LineType {
-                    name: "HATCH".into(),
-                    dashes: def.dashes.clone(),
-                },
-                1.0,
-            );
+            let hatch_lt = LineType {
+                name: "HATCH".into(),
+                dashes: def.dashes.clone(),
+            };
+            if hatch_lt.is_continuous() {
+                emit_solid_polyline(list, &[a, b], false, rgb);
+            } else {
+                let pattern = scaled_pattern(&hatch_lt.dashes, 1.0);
+                for (p0, p1) in
+                    generate_path_dashes(&[PathSeg::Line { a, b }], &pattern, true, CIRCLE_SEGMENTS)
+                {
+                    push_line(list, p0, p1, rgb);
+                }
+            }
         }
     }
 }
@@ -500,8 +659,10 @@ fn point_in_polygon(p: Point2, poly: &[Point2]) -> bool {
     inside
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_text(
     list: &mut DisplayList,
+    mut pick: Option<&mut EntityPick>,
     transform: Transform2,
     rgb: Rgb,
     insertion: Point3,
@@ -513,18 +674,14 @@ fn emit_text(
     let h = height * transform.scale_y().abs().max(transform.scale_x().abs());
     let rot = rotation + transform.rotation_component();
     for [a, b] in stroke_text(origin, h.max(1e-6), rot, value) {
+        if let Some(pick) = pick.as_mut() {
+            pick.add_stroke(&[a, b], false);
+        }
         push_line(list, a, b, rgb);
     }
 }
 
-fn emit_polyline(
-    list: &mut DisplayList,
-    pts: &[Point2],
-    closed: bool,
-    rgb: Rgb,
-    linetype: &LineType,
-    scale: f64,
-) {
+fn emit_solid_polyline(list: &mut DisplayList, pts: &[Point2], closed: bool, rgb: Rgb) {
     if pts.len() < 2 {
         return;
     }
@@ -532,51 +689,7 @@ fn emit_polyline(
     for i in 0..n {
         let a = pts[i];
         let b = pts[(i + 1) % pts.len()];
-        if linetype.is_continuous() {
-            push_line(list, a, b, rgb);
-        } else {
-            dashed_segment(list, a, b, rgb, linetype, scale);
-        }
-    }
-}
-
-fn dashed_segment(
-    list: &mut DisplayList,
-    a: Point2,
-    b: Point2,
-    rgb: Rgb,
-    linetype: &LineType,
-    scale: f64,
-) {
-    let len = a.distance(b);
-    if len < 1e-12 {
-        return;
-    }
-    let dir = Point2::new((b.x - a.x) / len, (b.y - a.y) / len);
-    let pattern: Vec<f64> = linetype
-        .dashes
-        .iter()
-        .map(|d| d * scale)
-        .collect();
-    if pattern.is_empty() {
         push_line(list, a, b, rgb);
-        return;
-    }
-    let mut dist = 0.0;
-    let mut idx = 0;
-    let mut emitted = 0;
-    while dist < len && emitted < 64 {
-        let dash = pattern[idx % pattern.len()];
-        let seg_len = dash.abs().max(1e-6);
-        let next = (dist + seg_len).min(len);
-        if dash >= 0.0 {
-            let p0 = Point2::new(a.x + dir.x * dist, a.y + dir.y * dist);
-            let p1 = Point2::new(a.x + dir.x * next, a.y + dir.y * next);
-            push_line(list, p0, p1, rgb);
-            emitted += 1;
-        }
-        dist = next;
-        idx += 1;
     }
 }
 

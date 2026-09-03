@@ -1,0 +1,26 @@
+---
+description: All MyCad toolbars, palettes, and side panels must be dockable, snappable, resizable, and rearrangeable
+alwaysApply: true
+---
+
+# Dockable workspace chrome
+
+Every new toolbar, palette, inspector, status tool, or side panel is a dock tab in the existing `egui_dock` workspace (`crates/mycad/src/workspace.rs`). Do not introduce a fixed `SidePanel`, `TopBottomPanel` tool strip, or immovable window for new chrome. Menu bar and status bar may stay as app-level chrome; everything else docks.
+
+Users must be able to:
+
+- Drag a tab to another edge, split, or floating window (snap targets)
+- Resize splits
+- Collapse a leaf
+- Close a panel and restore it from **View** (`ensure_tab`)
+- Reset the arrangement (**View → Reset layout**)
+
+Persist layout through `AppSettings` dock JSON (import/export already includes it). Viewport is the only non-closeable tab. Add a `WorkspaceTab` variant, default placement, and View restore — do not fork a second layout system.
+
+```rust
+// BAD — new inspector locked to the left
+egui::SidePanel::left("layers").show(ctx, |ui| layers_ui(ui));
+
+// GOOD — same inspector as a dock tab the user can move
+WorkspaceTab::Layers  // split/float/collapse via DockArea
+```

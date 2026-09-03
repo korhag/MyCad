@@ -1,4 +1,4 @@
-//! Application chrome: menus, viewport interaction, diagnostics, loading.
+//! Application chrome: menus, viewport interaction, loading, workspace.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -7,21 +7,22 @@ use std::thread;
 use std::time::Instant;
 
 use cad_core::{Document, Point2};
-use cad_render::{tessellate_document, CadFrame, CadGpu, DisplayList};
+use cad_render::{tessellate_document, CadFrame, CadGpu, DisplayList, SelectBoxMode};
 use cad_viewport::Camera2;
 use dwg_import::ImportError;
-use eframe::egui::{self, PointerButton, Rect, Ui};
+use eframe::egui::{self, PointerButton, Rect, Stroke, Ui};
 
-use crate::settings::{
-    scroll_to_zoom_factor, sanitize_zoom_speed, AppSettings, DEFAULT_ZOOM_SPEED, ZOOM_SPEED_MAX,
-    ZOOM_SPEED_MIN,
-};
+use crate::input::InputAction;
+use crate::selection::{box_pick_entities, pick_entity, Selection};
+use crate::settings::{scroll_to_zoom_factor, AppSettings};
+use crate::settings_ui::{self, CaptureTarget, SettingsAction, SettingsTab};
 use crate::theme;
+use crate::workspace::{self, WorkspaceTab};
 
 enum LoadMsg {
     Success {
-        document: Document,
-        display: DisplayList,
+        document: Box<Document>,
+        display: Box<DisplayList>,
     },
     Failure {
         path: PathBuf,
@@ -29,25 +30,39 @@ enum LoadMsg {
     },
 }
 
+struct BoxSelectDrag {
+    button: PointerButton,
+    start: egui::Pos2,
+    current: egui::Pos2,
+    toggle: bool,
+    candidates: Vec<usize>,
+}
+
 // ------------------------------------------------------------
 // Type: MyCadApp
 // Purpose: Native GUI shell around the CAD document and wgpu viewport.
 // ------------------------------------------------------------
 pub struct MyCadApp {
-    camera: Camera2,
-    document: Option<Arc<Document>>,
-    display: Arc<DisplayList>,
+    pub(crate) camera: Camera2,
+    pub(crate) document: Option<Arc<Document>>,
+    pub(crate) display: Arc<DisplayList>,
     display_generation: u64,
     load_rx: Option<Receiver<LoadMsg>>,
-    loading_path: Option<PathBuf>,
+    pub(crate) loading_path: Option<PathBuf>,
     status: String,
-    error: Option<String>,
-    show_diagnostics: bool,
-    show_settings: bool,
-    settings: AppSettings,
-    settings_draft: AppSettings,
+    pub(crate) error: Option<String>,
+    pub(crate) settings: AppSettings,
+    pub(crate) settings_draft: AppSettings,
+    pub(crate) show_settings: bool,
+    pub(crate) settings_message: Option<String>,
+    pub(crate) imported_dock: bool,
+    pub(crate) capture: Option<CaptureTarget>,
+    pub(crate) settings_tab: SettingsTab,
+    pub(crate) dock_state: egui_dock::DockState<WorkspaceTab>,
+    pub(crate) selection: Selection,
     pending_open: Option<PathBuf>,
     last_pointer: Option<egui::Pos2>,
+    box_select: Option<BoxSelectDrag>,
 }
 
 impl MyCadApp {
@@ -55,10 +70,12 @@ impl MyCadApp {
         theme::apply(&cc.egui_ctx);
         if let Some(render_state) = &cc.wgpu_render_state {
             let mut renderer = render_state.renderer.write();
-            renderer
-                .callback_resources
-                .insert(CadGpu::new(&render_state.device, render_state.target_format));
+            renderer.callback_resources.insert(CadGpu::new(
+                &render_state.device,
+                render_state.target_format,
+            ));
         }
+        let settings = AppSettings::load(cc.storage);
         let mut app = Self {
             camera: Camera2::default(),
             document: None,
@@ -68,14 +85,20 @@ impl MyCadApp {
             loading_path: None,
             status: "Ready".to_string(),
             error: None,
-            show_diagnostics: true,
+            settings_draft: settings.clone(),
+            dock_state: settings.dock_state(),
+            settings,
             show_settings: false,
-            settings: AppSettings::load(cc.storage),
-            settings_draft: AppSettings::default(),
+            settings_message: None,
+            imported_dock: false,
+            capture: None,
+            settings_tab: SettingsTab::Viewport,
+            selection: Selection::default(),
             pending_open: initial_path,
             last_pointer: None,
+            box_select: None,
         };
-        app.settings_draft = app.settings.clone();
+        workspace::sanitize_dock_state(&mut app.dock_state);
         if let Some(path) = app.pending_open.take() {
             app.start_load(path);
         }
@@ -88,29 +111,29 @@ impl MyCadApp {
             return;
         }
         self.error = None;
+        self.selection.clear();
+        self.box_select = None;
         self.loading_path = Some(path.clone());
         self.status = format!("Loading {}…", file_name(&path));
         let (tx, rx) = mpsc::channel();
         self.load_rx = Some(rx);
         thread::Builder::new()
             .name("mycad-dwg-import".into())
-            .spawn(move || {
-                match dwg_import::import_dwg(&path) {
-                    Ok(mut document) => {
-                        let prepare = Instant::now();
-                        let display = tessellate_document(&document);
-                        document.diagnostics.render_prepare_time = prepare.elapsed();
-                        let _ = tx.send(LoadMsg::Success {
-                            document,
-                            display,
-                        });
-                    }
-                    Err(err) => {
-                        let _ = tx.send(LoadMsg::Failure {
-                            path,
-                            message: format_import_error(&err),
-                        });
-                    }
+            .spawn(move || match dwg_import::import_dwg(&path) {
+                Ok(mut document) => {
+                    let prepare = Instant::now();
+                    let display = tessellate_document(&document);
+                    document.diagnostics.render_prepare_time = prepare.elapsed();
+                    let _ = tx.send(LoadMsg::Success {
+                        document: Box::new(document),
+                        display: Box::new(display),
+                    });
+                }
+                Err(err) => {
+                    let _ = tx.send(LoadMsg::Failure {
+                        path,
+                        message: format_import_error(&err),
+                    });
                 }
             })
             .expect("import thread");
@@ -122,10 +145,18 @@ impl MyCadApp {
         };
         match rx.try_recv() {
             Ok(LoadMsg::Success { document, display }) => {
-                if let Some(extents) = document.diagnostics.extents.or_else(|| document.compute_extents())
+                let document = *document;
+                let display = *display;
+                if let Some(extents) = document
+                    .diagnostics
+                    .extents
+                    .or_else(|| document.compute_extents())
                 {
-                    self.camera
-                        .zoom_extents(extents, viewport.width() as f64, viewport.height() as f64);
+                    self.camera.zoom_extents(
+                        extents,
+                        viewport.width() as f64,
+                        viewport.height() as f64,
+                    );
                 }
                 self.status = format!(
                     "Loaded {}  •  {} entities  •  {} unsupported",
@@ -133,6 +164,8 @@ impl MyCadApp {
                     document.diagnostics.entity_total(),
                     document.diagnostics.unsupported_total()
                 );
+                self.selection.clear();
+                self.box_select = None;
                 self.document = Some(Arc::new(document));
                 self.display = Arc::new(display);
                 self.display_generation = self.display_generation.wrapping_add(1);
@@ -143,6 +176,8 @@ impl MyCadApp {
             Ok(LoadMsg::Failure { path, message }) => {
                 self.status = format!("Failed to open {}", file_name(&path));
                 self.error = Some(message);
+                self.selection.clear();
+                self.box_select = None;
                 self.loading_path = None;
                 self.load_rx = None;
             }
@@ -172,27 +207,125 @@ impl MyCadApp {
 
     fn open_settings(&mut self) {
         self.settings_draft = self.settings.clone();
+        self.settings_draft.set_dock_state(&self.dock_state);
+        self.settings_message = None;
+        self.imported_dock = false;
+        self.capture = None;
         self.show_settings = true;
     }
 
     fn apply_settings(&mut self, storage: Option<&mut (dyn eframe::Storage + 'static)>) {
         self.settings_draft.sanitize();
+        if self.imported_dock {
+            self.dock_state = self.settings_draft.dock_state();
+            workspace::sanitize_dock_state(&mut self.dock_state);
+        } else {
+            self.settings_draft.set_dock_state(&self.dock_state);
+        }
         self.settings = self.settings_draft.clone();
         if let Some(storage) = storage {
             self.settings.save(storage);
         }
+        self.imported_dock = false;
+        self.capture = None;
         self.show_settings = false;
     }
 
     fn cancel_settings(&mut self) {
         self.settings_draft = self.settings.clone();
+        self.imported_dock = false;
+        self.capture = None;
+        self.box_select = None;
+        self.settings_message = None;
         self.show_settings = false;
+    }
+
+    pub(crate) fn show_viewport(&mut self, ui: &mut Ui) {
+        let rect = ui.available_rect_before_wrap();
+        self.poll_load(rect);
+        ui.advance_cursor_after_rect(rect);
+        let response = ui.interact(
+            rect,
+            ui.id().with("cad-viewport"),
+            egui::Sense::click_and_drag(),
+        );
+        if self.capture.is_none() {
+            handle_viewport_input(self, ui, &response, rect);
+        }
+
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(10, 14, 12));
+        if self.document.is_none() && self.loading_path.is_none() {
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "File → Open   or   pass a DWG on the command line",
+                egui::FontId::proportional(16.0),
+                egui::Color32::from_rgb(140, 160, 140),
+            );
+        }
+
+        let aspect = (rect.width() as f64 / rect.height().max(1.0) as f64).max(1e-6);
+        painter.add(egui_wgpu::Callback::new_paint_callback(
+            rect,
+            CadFrame {
+                camera: self.camera,
+                origin: self.display.origin,
+                generation: self.display_generation,
+                display: Arc::clone(&self.display),
+                aspect,
+            },
+        ));
+        workspace::paint_selection_overlay(
+            &painter,
+            self.camera,
+            rect,
+            &self.display,
+            &self.selection,
+        );
+        if let Some(drag) = &self.box_select {
+            let colors = if self.show_settings {
+                &self.settings_draft.display
+            } else {
+                &self.settings.display
+            };
+            let start = cad_core::Point2::new(drag.start.x as f64, drag.start.y as f64);
+            let current = cad_core::Point2::new(drag.current.x as f64, drag.current.y as f64);
+            let color = match SelectBoxMode::from_screen_drag(start, current) {
+                SelectBoxMode::Window => colors.window_selection,
+                SelectBoxMode::Crossing => colors.crossing_selection,
+            };
+            workspace::paint_entity_highlights(
+                &painter,
+                self.camera,
+                rect,
+                &self.display,
+                &drag.candidates,
+                Stroke::new(2.0, color.to_color32()),
+                color.to_fill(),
+            );
+            workspace::paint_box_select_rect(
+                &painter,
+                drag.start,
+                drag.current,
+                color.to_color32(),
+                color.to_fill(),
+            );
+        }
+    }
+
+    fn zoom_extents(&mut self, width: f64, height: f64) {
+        if let Some(doc) = &self.document {
+            if let Some(extents) = doc.diagnostics.extents {
+                self.camera.zoom_extents(extents, width, height);
+            }
+        }
     }
 }
 
 impl eframe::App for MyCadApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        if self.load_rx.is_some() {
+        if self.load_rx.is_some() || self.capture.is_some() || self.box_select.is_some() {
             ctx.request_repaint();
         }
 
@@ -214,18 +347,21 @@ impl eframe::App for MyCadApp {
                 ui.menu_button("View", |ui| {
                     if ui.button("Zoom Extents").clicked() {
                         ui.close();
-                        if let Some(doc) = &self.document {
-                            if let Some(e) = doc.diagnostics.extents {
-                                let size = ctx.available_rect();
-                                self.camera.zoom_extents(
-                                    e,
-                                    size.width() as f64,
-                                    size.height() as f64,
-                                );
-                            }
-                        }
+                        let size = ctx.available_rect();
+                        self.zoom_extents(size.width() as f64, size.height() as f64);
                     }
-                    ui.checkbox(&mut self.show_diagnostics, "Diagnostics");
+                    if ui.button("Show Properties").clicked() {
+                        ui.close();
+                        workspace::ensure_tab(&mut self.dock_state, WorkspaceTab::Properties);
+                    }
+                    if ui.button("Show Diagnostics").clicked() {
+                        ui.close();
+                        workspace::ensure_tab(&mut self.dock_state, WorkspaceTab::Diagnostics);
+                    }
+                    if ui.button("Reset layout").clicked() {
+                        ui.close();
+                        self.dock_state = workspace::default_dock_state();
+                    }
                 });
                 ui.menu_button("Settings", |ui| {
                     if ui.button("Preferences…").clicked() {
@@ -234,6 +370,10 @@ impl eframe::App for MyCadApp {
                     }
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if !self.selection.is_empty() {
+                        ui.label(format!("{} selected", self.selection.len()));
+                        ui.separator();
+                    }
                     if self.loading_path.is_some() {
                         ui.spinner();
                         ui.label("Importing…");
@@ -261,50 +401,11 @@ impl eframe::App for MyCadApp {
             });
         });
 
-        if self.show_diagnostics {
-            egui::SidePanel::right("diagnostics")
-                .default_width(320.0)
-                .show(ctx, |ui| {
-                    diagnostics_panel(ui, self);
-                });
-        }
-
         egui::CentralPanel::default().show(ctx, |ui| {
-            let rect = ui.available_rect_before_wrap();
-            self.poll_load(rect);
-            let response = ui.interact(rect, ui.id().with("cad-viewport"), egui::Sense::click_and_drag());
-            handle_navigation(self, ui, &response, rect);
-
-            let painter = ui.painter_at(rect);
-            painter.rect_filled(
-                rect,
-                0.0,
-                egui::Color32::from_rgb(10, 14, 12),
-            );
-            if self.document.is_none() && self.loading_path.is_none() {
-                painter.text(
-                    rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "File → Open   or   pass a DWG on the command line",
-                    egui::FontId::proportional(16.0),
-                    egui::Color32::from_rgb(140, 160, 140),
-                );
-            }
-
-            let aspect = (rect.width() as f64 / rect.height().max(1.0) as f64).max(1e-6);
-            painter.add(egui_wgpu::Callback::new_paint_callback(
-                rect,
-                CadFrame {
-                    camera: self.camera,
-                    origin: self.display.origin,
-                    generation: self.display_generation,
-                    display: Arc::clone(&self.display),
-                    aspect,
-                },
-            ));
+            workspace::show_workspace(ui, self);
         });
 
-        match show_settings_window(ctx, self) {
+        match settings_ui::show(ctx, self) {
             SettingsAction::Apply => self.apply_settings(frame.storage_mut()),
             SettingsAction::Cancel => self.cancel_settings(),
             SettingsAction::None => {}
@@ -312,28 +413,93 @@ impl eframe::App for MyCadApp {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        self.settings.set_dock_state(&self.dock_state);
         self.settings.save(storage);
     }
 }
 
-fn handle_navigation(app: &mut MyCadApp, ui: &Ui, response: &egui::Response, rect: Rect) {
+fn handle_viewport_input(app: &mut MyCadApp, ui: &Ui, response: &egui::Response, rect: Rect) {
     let origin = Point2::new(rect.min.x as f64, rect.min.y as f64);
     let size = Point2::new(rect.width() as f64, rect.height() as f64);
+    let bindings = app.settings.bindings.clone();
+    let modifiers = ui.input(|i| i.modifiers);
+    let typing = ui.ctx().wants_keyboard_input();
 
-    if response.dragged_by(PointerButton::Middle) {
-        if let (Some(prev), Some(now)) = (app.last_pointer, ui.input(|i| i.pointer.latest_pos())) {
-            let delta = app.camera.pan_screen(
-                Point2::new(prev.x as f64, prev.y as f64),
-                Point2::new(now.x as f64, now.y as f64),
-                origin,
-                size,
-            );
-            app.camera.pan_world(delta);
+    if !typing && ui.input(|i| bindings.key_pressed(InputAction::SelectClear, i)) {
+        if app.box_select.take().is_none() {
+            app.selection.clear();
+        }
+    }
+    if !typing && ui.input(|i| bindings.key_pressed(InputAction::ZoomExtents, i)) {
+        app.zoom_extents(size.x, size.y);
+    }
+
+    let box_was_active = app.box_select.is_some();
+    update_box_select(app, ui, response, rect, origin, size, modifiers);
+    let box_active = box_was_active || app.box_select.is_some();
+
+    if !box_active {
+        for button in [
+            PointerButton::Primary,
+            PointerButton::Middle,
+            PointerButton::Secondary,
+        ] {
+            if response.double_clicked_by(button)
+                && bindings.double_clicked(InputAction::ZoomExtents, button, modifiers)
+            {
+                app.zoom_extents(size.x, size.y);
+                continue;
+            }
+            if !response.clicked_by(button) {
+                continue;
+            }
+            let world_hit = response.interact_pointer_pos().map(|pos| {
+                pick_entity(
+                    &app.display,
+                    &app.camera,
+                    Point2::new(pos.x as f64, pos.y as f64),
+                    origin,
+                    size,
+                )
+            });
+            if bindings.clicked(InputAction::SelectToggle, button, modifiers) {
+                if let Some(Some(index)) = world_hit {
+                    app.selection.toggle(index);
+                }
+            } else if bindings.clicked(InputAction::SelectReplace, button, modifiers) {
+                match world_hit {
+                    Some(Some(index)) => app.selection.replace(index),
+                    _ => app.selection.clear(),
+                }
+            }
+        }
+    }
+
+    if !box_active {
+        for button in [
+            PointerButton::Primary,
+            PointerButton::Middle,
+            PointerButton::Secondary,
+        ] {
+            if response.dragged_by(button) && bindings.dragged(InputAction::Pan, button, modifiers)
+            {
+                if let (Some(prev), Some(now)) =
+                    (app.last_pointer, ui.input(|i| i.pointer.latest_pos()))
+                {
+                    let delta = app.camera.pan_screen(
+                        Point2::new(prev.x as f64, prev.y as f64),
+                        Point2::new(now.x as f64, now.y as f64),
+                        origin,
+                        size,
+                    );
+                    app.camera.pan_world(delta);
+                }
+            }
         }
     }
     app.last_pointer = ui.input(|i| i.pointer.latest_pos());
 
-    if response.hovered() {
+    if !box_active && response.hovered() {
         let scroll = ui.input(|i| i.smooth_scroll_delta.y);
         if scroll.abs() > 0.0 {
             if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
@@ -346,152 +512,98 @@ fn handle_navigation(app: &mut MyCadApp, ui: &Ui, response: &egui::Response, rec
                 app.camera.zoom_at(world, factor);
             }
         }
-        if ui.input(|i| i.key_pressed(egui::Key::E) && i.modifiers.command) {
-            if let Some(doc) = &app.document {
-                if let Some(e) = doc.diagnostics.extents {
-                    app.camera.zoom_extents(e, size.x, size.y);
-                }
-            }
-        }
-    }
-
-    if response.double_clicked() {
-        if let Some(doc) = &app.document {
-            if let Some(e) = doc.diagnostics.extents {
-                app.camera.zoom_extents(e, size.x, size.y);
-            }
-        }
     }
 }
 
-enum SettingsAction {
-    None,
-    Apply,
-    Cancel,
+fn pointer_dragging_in(ui: &Ui, button: PointerButton, rect: Rect) -> bool {
+    ui.input(|i| {
+        let started_here = i
+            .pointer
+            .press_origin()
+            .map(|origin| rect.contains(origin))
+            .unwrap_or(false);
+        i.pointer.button_down(button) && i.pointer.is_decidedly_dragging() && started_here
+    })
 }
 
-fn show_settings_window(ctx: &egui::Context, app: &mut MyCadApp) -> SettingsAction {
-    if !app.show_settings {
-        return SettingsAction::None;
-    }
-    let mut open = true;
-    let mut action = SettingsAction::None;
-    egui::Window::new("Settings")
-        .open(&mut open)
-        .resizable(false)
-        .collapsible(false)
-        .default_width(360.0)
-        .show(ctx, |ui| {
-            ui.heading("Viewport");
-            ui.add_space(6.0);
-            ui.label("Zoom speed");
-            ui.horizontal(|ui| {
-                ui.add(
-                    egui::Slider::new(
-                        &mut app.settings_draft.zoom_speed,
-                        ZOOM_SPEED_MIN..=ZOOM_SPEED_MAX,
-                    )
-                    .logarithmic(true)
-                    .show_value(false),
-                );
-                ui.add(
-                    egui::DragValue::new(&mut app.settings_draft.zoom_speed)
-                        .speed(0.05)
-                        .range(ZOOM_SPEED_MIN..=ZOOM_SPEED_MAX)
-                        .suffix("×")
-                        .max_decimals(2),
-                );
+fn update_box_select(
+    app: &mut MyCadApp,
+    ui: &Ui,
+    response: &egui::Response,
+    rect: Rect,
+    origin: Point2,
+    size: Point2,
+    modifiers: egui::Modifiers,
+) {
+    let bindings = app.settings.bindings.clone();
+    let mut started_this_frame = false;
+    if app.box_select.is_none() {
+        for button in [
+            PointerButton::Primary,
+            PointerButton::Middle,
+            PointerButton::Secondary,
+        ] {
+            let dragging = response.drag_started_by(button)
+                || response.dragged_by(button)
+                || pointer_dragging_in(ui, button, rect);
+            if !dragging {
+                continue;
+            }
+            if bindings.dragged(InputAction::Pan, button, modifiers) {
+                continue;
+            }
+            let toggle =
+                bindings.selects_with_pointer(InputAction::SelectToggle, button, modifiers);
+            let replace =
+                bindings.selects_with_pointer(InputAction::SelectReplace, button, modifiers);
+            if !toggle && !replace {
+                continue;
+            }
+            let Some(start) = ui
+                .input(|i| i.pointer.press_origin())
+                .or(response.interact_pointer_pos())
+                .or(app.last_pointer)
+            else {
+                continue;
+            };
+            let current = ui
+                .input(|i| i.pointer.latest_pos())
+                .unwrap_or(start);
+            app.box_select = Some(BoxSelectDrag {
+                button,
+                start,
+                current,
+                toggle,
+                candidates: Vec::new(),
             });
-            app.settings_draft.zoom_speed = sanitize_zoom_speed(app.settings_draft.zoom_speed);
-            ui.weak("1.0× is the original smooth wheel zoom. Raise it to zoom faster without changing the curve. Apply saves and uses the value; Cancel leaves the current session unchanged.");
-            ui.add_space(8.0);
-            if ui
-                .add_enabled(
-                    (app.settings_draft.zoom_speed - DEFAULT_ZOOM_SPEED).abs() > 1e-9,
-                    egui::Button::new("Reset zoom speed"),
-                )
-                .clicked()
-            {
-                app.settings_draft.reset_zoom_speed();
-            }
-            ui.add_space(12.0);
-            ui.separator();
-            ui.horizontal(|ui| {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Apply").clicked() {
-                        action = SettingsAction::Apply;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        action = SettingsAction::Cancel;
-                    }
-                });
-            });
-        });
-    if !open {
-        SettingsAction::Cancel
-    } else {
-        action
+            started_this_frame = true;
+            break;
+        }
     }
-}
 
-fn diagnostics_panel(ui: &mut Ui, app: &MyCadApp) {
-    ui.heading("Diagnostics");
-    ui.separator();
-    let Some(doc) = &app.document else {
-        if let Some(path) = &app.loading_path {
-            ui.label(format!("Loading {}", file_name(path)));
-        } else {
-            ui.label("No drawing loaded.");
-        }
-        if let Some(err) = &app.error {
-            ui.add_space(8.0);
-            ui.colored_label(egui::Color32::from_rgb(220, 120, 90), err);
-        }
+    let Some(drag) = app.box_select.as_mut() else {
         return;
     };
-    let d = &doc.diagnostics;
-    ui.monospace(format!("DWG version: {}", d.dwg_version));
-    ui.monospace(format!("Layers: {}", d.layer_count));
-    ui.monospace(format!("Blocks: {}", d.block_count));
-    ui.monospace(format!("Objects: {}", d.object_count));
-    ui.monospace(format!("Imported entities: {}", d.entity_total()));
-    ui.monospace(format!("Unsupported entities: {}", d.unsupported_total()));
-    ui.monospace(format!("Import: {:.3}s", d.import_time.as_secs_f64()));
-    ui.monospace(format!(
-        "Render prepare: {:.3}s",
-        d.render_prepare_time.as_secs_f64()
-    ));
-    if let Some(e) = d.extents {
-        ui.monospace(format!(
-            "Extents: ({:.3}, {:.3}) – ({:.3}, {:.3})",
-            e.min.x, e.min.y, e.max.x, e.max.y
-        ));
-        ui.monospace(format!("Size: {:.3} × {:.3}", e.width(), e.height()));
-    }
-    ui.add_space(8.0);
-    ui.label("Entity counts");
-    egui::ScrollArea::vertical()
-        .id_salt("entity-counts")
-        .max_height(220.0)
-        .show(ui, |ui| {
-            for (name, count) in &d.entity_counts {
-                ui.monospace(format!("{name:>24}  {count}"));
-            }
-        });
-    ui.add_space(8.0);
-    ui.label("Unsupported (reported, not discarded silently)");
-    if d.unsupported_counts.is_empty() {
-        ui.weak("None");
-    } else {
-        for (name, count) in &d.unsupported_counts {
-            ui.monospace(format!("{name:>24}  {count}"));
+    if let Some(pos) = ui
+        .input(|i| i.pointer.latest_pos())
+        .or(response.interact_pointer_pos())
+    {
+        if pos != drag.current {
+            drag.current = pos;
         }
+        let start = Point2::new(drag.start.x as f64, drag.start.y as f64);
+        let current = Point2::new(drag.current.x as f64, drag.current.y as f64);
+        let (_mode, candidates) =
+            box_pick_entities(&app.display, &app.camera, start, current, origin, size);
+        drag.candidates = candidates;
     }
-    if !d.warnings.is_empty() {
-        ui.add_space(8.0);
-        ui.label("Warnings");
-        for w in &d.warnings {
-            ui.weak(w);
+
+    let button = drag.button;
+    let released = response.drag_stopped_by(button)
+        || ui.input(|i| i.pointer.button_released(button));
+    if released && !started_this_frame {
+        if let Some(drag) = app.box_select.take() {
+            app.selection.commit_box(&drag.candidates, drag.toggle);
         }
     }
 }

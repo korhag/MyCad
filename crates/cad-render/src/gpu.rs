@@ -118,7 +118,13 @@ impl CadGpu {
         }
     }
 
-    fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, list: &DisplayList, generation: u64) {
+    fn upload(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        list: &DisplayList,
+        generation: u64,
+    ) {
         if generation != self.uploaded_generation {
             self.line_buffer = upload_vertices(device, &list.line_vertices, "mycad.linevb");
             self.fill_buffer = upload_vertices(device, &list.triangle_vertices, "mycad.fillvb");
@@ -131,7 +137,11 @@ impl CadGpu {
     }
 }
 
-fn upload_vertices(device: &wgpu::Device, verts: &[GpuVertex], label: &str) -> Option<wgpu::Buffer> {
+fn upload_vertices(
+    device: &wgpu::Device,
+    verts: &[GpuVertex],
+    label: &str,
+) -> Option<wgpu::Buffer> {
     if verts.is_empty() {
         return None;
     }

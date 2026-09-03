@@ -37,6 +37,15 @@ impl CadColor {
         }
     }
 
+    pub fn display_name(self) -> String {
+        match self {
+            Self::ByLayer => "ByLayer".to_string(),
+            Self::ByBlock => "ByBlock".to_string(),
+            Self::Aci(i) => format!("ACI {i}"),
+            Self::Rgb { r, g, b } => format!("RGB {r},{g},{b}"),
+        }
+    }
+
     fn to_rgb_or_default(self) -> Rgb {
         match self {
             Self::Aci(i) => aci_rgb(i),

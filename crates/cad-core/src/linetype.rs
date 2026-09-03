@@ -1,5 +1,25 @@
 //! Basic AutoCAD linetype dash patterns.
 
+pub fn normalize_linetype_name(name: &str) -> String {
+    name.trim().to_ascii_uppercase()
+}
+
+pub fn is_bylayer_name(name: &str) -> bool {
+    let n = normalize_linetype_name(name);
+    n.is_empty() || n == "BYLAYER"
+}
+
+pub fn is_byblock_name(name: &str) -> bool {
+    normalize_linetype_name(name) == "BYBLOCK"
+}
+
+pub fn is_continuous_name(name: &str) -> bool {
+    matches!(
+        normalize_linetype_name(name).as_str(),
+        "CONTINUOUS" | "BYLAYER" | "BYBLOCK" | ""
+    )
+}
+
 // ------------------------------------------------------------
 // Type: LineType
 // Purpose: Named dash pattern in world units (positive = dash,

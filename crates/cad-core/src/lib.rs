@@ -19,5 +19,7 @@ pub use entity::{
 };
 pub use extents::Extents2;
 pub use geom::{ocs_to_wcs, Point2, Point3};
-pub use linetype::LineType;
+pub use linetype::{
+    is_byblock_name, is_bylayer_name, is_continuous_name, normalize_linetype_name, LineType,
+};
 pub use transform::Transform2;

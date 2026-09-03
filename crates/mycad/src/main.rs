@@ -2,9 +2,15 @@
 
 mod app;
 mod audit;
+mod diagnostics;
+mod input;
 mod preview;
+mod properties;
+mod selection;
 mod settings;
+mod settings_ui;
 mod theme;
+mod workspace;
 
 use std::env;
 use std::path::PathBuf;
@@ -13,7 +19,10 @@ use std::process::ExitCode;
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     let import_only = args.iter().any(|a| a == "--import-only");
-    let path = args.into_iter().find(|a| !a.starts_with("--")).map(PathBuf::from);
+    let path = args
+        .into_iter()
+        .find(|a| !a.starts_with("--"))
+        .map(PathBuf::from);
 
     if import_only {
         return run_import_only(path);
@@ -75,18 +84,17 @@ fn run_import_only(path: Option<PathBuf>) -> ExitCode {
             }
             let prepare = std::time::Instant::now();
             let display = cad_render::tessellate_document(&doc);
-            println!(
-                "render_prepare_s: {:.3}",
-                prepare.elapsed().as_secs_f64()
-            );
+            println!("render_prepare_s: {:.3}", prepare.elapsed().as_secs_f64());
             println!("line_segments: {}", display.line_count());
             println!("triangle_vertices: {}", display.triangle_vertices.len());
             println!("triangles: {}", display.triangle_vertices.len() / 3);
             audit::print_display_list_audit(&display);
             audit::print_geometry_audit(&doc);
+            audit::print_linetype_audit(&doc);
             if let Some(extents) = doc.diagnostics.extents {
                 let preview_path = std::path::Path::new("test-data").join("MyCad-preview.ppm");
-                if let Err(err) = preview::write_preview_ppm(&preview_path, &display, extents, 1600, 1000)
+                if let Err(err) =
+                    preview::write_preview_ppm(&preview_path, &display, extents, 1600, 1000)
                 {
                     eprintln!("preview write failed: {err}");
                 } else {

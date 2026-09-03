@@ -17,8 +17,10 @@ dwg-import.workspace = true
 eframe.workspace = true
 egui.workspace = true
 egui-wgpu.workspace = true
+egui_dock = { workspace = true }
 rfd.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 ron = "0.10"

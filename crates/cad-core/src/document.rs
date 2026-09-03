@@ -8,7 +8,7 @@ use crate::color::CadColor;
 use crate::entity::Entity;
 use crate::extents::Extents2;
 use crate::geom::{Point2, Point3};
-use crate::linetype::LineType;
+use crate::linetype::{is_byblock_name, is_bylayer_name, normalize_linetype_name, LineType};
 use crate::transform::Transform2;
 
 // ------------------------------------------------------------
@@ -81,7 +81,7 @@ impl ImportDiagnostics {
 // Purpose: Application CAD model. Future DXF import and editing
 //          talk to this type, never to LibreDWG structures.
 // ------------------------------------------------------------
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Document {
     pub source_path: Option<PathBuf>,
     pub layers: BTreeMap<String, Layer>,
@@ -89,6 +89,21 @@ pub struct Document {
     pub blocks: BTreeMap<String, BlockDefinition>,
     pub model_space: Vec<Entity>,
     pub diagnostics: ImportDiagnostics,
+    pub ltscale: f64,
+}
+
+impl Default for Document {
+    fn default() -> Self {
+        Self {
+            source_path: None,
+            layers: BTreeMap::new(),
+            linetypes: BTreeMap::new(),
+            blocks: BTreeMap::new(),
+            model_space: Vec::new(),
+            diagnostics: ImportDiagnostics::default(),
+            ltscale: 1.0,
+        }
+    }
 }
 
 impl Document {
@@ -108,6 +123,41 @@ impl Document {
         self.layer(name).map(|l| l.is_plottable()).unwrap_or(true)
     }
 
+    pub fn linetype(&self, name: &str) -> Option<&LineType> {
+        let key = normalize_linetype_name(name);
+        self.linetypes.get(&key).or_else(|| {
+            self.linetypes
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(&key))
+                .map(|(_, lt)| lt)
+        })
+    }
+
+    pub fn resolved_linetype_name(&self, entity: &Entity, block_linetype: &str) -> String {
+        let name = normalize_linetype_name(&entity.linetype);
+        if is_bylayer_name(&name) {
+            let layer_lt = self
+                .layer(&entity.layer)
+                .map(|l| normalize_linetype_name(&l.linetype))
+                .unwrap_or_else(|| "CONTINUOUS".into());
+            if is_bylayer_name(&layer_lt) {
+                "CONTINUOUS".into()
+            } else if is_byblock_name(&layer_lt) {
+                resolved_byblock(block_linetype)
+            } else {
+                layer_lt
+            }
+        } else if is_byblock_name(&name) {
+            resolved_byblock(block_linetype)
+        } else {
+            name
+        }
+    }
+
+    pub fn effective_linetype_scale(&self, entity: &Entity) -> f64 {
+        (self.ltscale * entity.linetype_scale).max(1e-6)
+    }
+
     pub fn compute_extents(&self) -> Option<Extents2> {
         let mut extents = Extents2::empty();
         let mut any = false;
@@ -121,6 +171,15 @@ impl Document {
             });
         }
         any.then_some(extents)
+    }
+}
+
+fn resolved_byblock(block_linetype: &str) -> String {
+    let inherited = normalize_linetype_name(block_linetype);
+    if inherited.is_empty() || is_byblock_name(&inherited) || is_bylayer_name(&inherited) {
+        "CONTINUOUS".into()
+    } else {
+        inherited
     }
 }
 
@@ -147,7 +206,10 @@ fn collect_entity_points(
             row_spacing,
             attribs,
         } => {
-            if block_stack.iter().any(|n| n.eq_ignore_ascii_case(block_name)) {
+            if block_stack
+                .iter()
+                .any(|n| n.eq_ignore_ascii_case(block_name))
+            {
                 return;
             }
             let Some(block) = document.blocks.get(block_name) else {
@@ -183,7 +245,10 @@ fn collect_entity_points(
         }
         crate::entity::Geometry::Dimension { block_name } => {
             if let Some(block) = document.blocks.get(block_name) {
-                if block_stack.iter().any(|n| n.eq_ignore_ascii_case(block_name)) {
+                if block_stack
+                    .iter()
+                    .any(|n| n.eq_ignore_ascii_case(block_name))
+                {
                     return;
                 }
                 block_stack.push(block_name.clone());
@@ -204,9 +269,7 @@ fn collect_entity_points(
             visit(Point2::new(c.x - r, c.y - r));
             visit(Point2::new(c.x + r, c.y + r));
         }
-        crate::entity::Geometry::Arc {
-            center, radius, ..
-        } => {
+        crate::entity::Geometry::Arc { center, radius, .. } => {
             let c = transform.apply(center.xy());
             let r = *radius * transform.scale_x().abs().max(transform.scale_y().abs());
             visit(Point2::new(c.x - r, c.y - r));
@@ -240,7 +303,8 @@ fn collect_entity_points(
                 visit(transform.apply(c.xy()));
             }
         }
-        crate::entity::Geometry::Leader { vertices } | crate::entity::Geometry::MLine { vertices, .. } => {
+        crate::entity::Geometry::Leader { vertices }
+        | crate::entity::Geometry::MLine { vertices, .. } => {
             for p in vertices {
                 visit(transform.apply(p.xy()));
             }
@@ -425,6 +489,7 @@ mod tests {
             ],
             closed: false,
             extrusion: Point3::new(0.0, 0.0, 1.0),
+            linetype_generation_continuous: false,
         }));
         let e = document.compute_extents().unwrap();
         assert_eq!(e.min, Point2::new(0.0, 0.0));
@@ -445,14 +510,16 @@ mod tests {
             },
         );
         document.model_space.push(line(0.0, 0.0, 10.0, 0.0));
-        document.model_space.push(Entity::new(Geometry::Text(crate::entity::TextData {
-            insertion: Point3::from_xy(8.0e7, 1.0e6),
-            height: 2.5,
-            rotation: 0.0,
-            value: "stray".into(),
-            extrusion: Point3::new(0.0, 0.0, 1.0),
-            is_attrib_def: false,
-        })));
+        document
+            .model_space
+            .push(Entity::new(Geometry::Text(crate::entity::TextData {
+                insertion: Point3::from_xy(8.0e7, 1.0e6),
+                height: 2.5,
+                rotation: 0.0,
+                value: "stray".into(),
+                extrusion: Point3::new(0.0, 0.0, 1.0),
+                is_attrib_def: false,
+            })));
         let e = document.compute_extents().unwrap();
         assert!((e.min.x - 0.0).abs() < 1e-9);
         assert!((e.max.x - 10.0).abs() < 1e-9);

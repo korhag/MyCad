@@ -6,16 +6,16 @@ use std::ffi::c_void;
 use std::path::Path;
 
 use cad_core::{
-    default_extrusion, ocs_to_wcs, BlockDefinition, CadColor, Document, Entity, Geometry, HatchData,
-    HatchEdge, HatchPath, HatchPatternLine, ImportDiagnostics, Layer, LineType, MTextData, Point3,
-    PolyVertex, TextData,
+    default_extrusion, normalize_linetype_name, ocs_to_wcs, BlockDefinition, CadColor, Document,
+    Entity, Geometry, HatchData, HatchEdge, HatchPath, HatchPatternLine, ImportDiagnostics, Layer,
+    LineType, MTextData, Point3, PolyVertex, TextData,
 };
 
 use crate::dynapi::{
-    get_array_field, get_common_field, get_field, get_header_field, get_utf8_field,
-    object_dxfname, object_fixedtype, read_raw_array, resolve_handle_name, Point2D, Point3D,
-    SplineControlPoint,
+    get_array_field, get_common_field, get_field, get_header_field, get_utf8_field, object_dxfname,
+    object_fixedtype, read_raw_array, resolve_handle_name, Point2D, Point3D, SplineControlPoint,
 };
+use crate::ltype::{linetype_from_flags, parse_ltype_dashes, parse_ltype_dashes_r11, LtypeDash};
 
 const LWPOLYLINE_CLOSED_BIT1: u16 = 1;
 const LWPOLYLINE_CLOSED_BIT512: u16 = 512;
@@ -47,12 +47,12 @@ pub unsafe fn convert_document(
         let fixedtype = object_fixedtype(obj);
         if fixedtype == libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_LAYER {
             let ptr = unsafe { libredwg_sys::uncad_object_object_ptr(obj) };
-            if let Some(layer) = convert_layer(ptr) {
+            if let Some(layer) = convert_layer(dwg, ptr) {
                 layers.insert(layer.name.clone(), layer);
             }
         } else if fixedtype == libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_LTYPE {
             let ptr = unsafe { libredwg_sys::uncad_object_object_ptr(obj) };
-            if let Some(lt) = convert_ltype(ptr) {
+            if let Some(lt) = convert_ltype(ptr, &mut diagnostics) {
                 linetypes.insert(lt.name.clone(), lt);
             }
         }
@@ -101,6 +101,10 @@ pub unsafe fn convert_document(
             .push(format!("HEADER EXTMAX {:.6},{:.6},{:.6}", p.x, p.y, p.z));
     }
 
+    let ltscale = get_header_field::<f64>(dwg, "LTSCALE")
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(1.0);
+
     let mut document = Document {
         source_path: Some(path.to_path_buf()),
         layers,
@@ -108,6 +112,7 @@ pub unsafe fn convert_document(
         blocks,
         model_space,
         diagnostics,
+        ltscale,
     };
     document.diagnostics.extents = document.compute_extents();
     if document
@@ -128,20 +133,19 @@ fn is_model_space(name: &str) -> bool {
     name.eq_ignore_ascii_case("*MODEL_SPACE")
 }
 
-fn convert_layer(object_ptr: *mut c_void) -> Option<Layer> {
+fn convert_layer(dwg: *mut libredwg_sys::Dwg_Data, object_ptr: *mut c_void) -> Option<Layer> {
     let name = get_utf8_field(object_ptr, "LAYER", "name")?;
     let color = get_field::<libredwg_sys::Dwg_Color>(object_ptr, "LAYER", "color");
     let aci = color.map(|c| resolve_layer_aci(c)).unwrap_or(7);
     let off = get_field::<u8>(object_ptr, "LAYER", "off").unwrap_or(0) != 0;
     let frozen = get_field::<u8>(object_ptr, "LAYER", "frozen").unwrap_or(0) != 0
-        || get_field::<u8>(object_ptr, "LAYER", "flag").map(|f| f & 1 != 0).unwrap_or(false);
+        || get_field::<u8>(object_ptr, "LAYER", "flag")
+            .map(|f| f & 1 != 0)
+            .unwrap_or(false);
     let linetype = get_field::<*mut libredwg_sys::Dwg_Object_Ref>(object_ptr, "LAYER", "ltype")
-        .and_then(|h| {
-            // Layer ltype handle name via object itself is awkward without dwg;
-            // fall back to CONTINUOUS. Name is filled later if possible.
-            let _ = h;
-            None
-        })
+        .and_then(|h| resolve_handle_name(dwg, h))
+        .map(|n| normalize_linetype_name(&n))
+        .filter(|n| !n.is_empty() && n != "BYLAYER" && n != "BYBLOCK")
         .unwrap_or_else(|| "CONTINUOUS".to_string());
     Some(Layer {
         name,
@@ -164,15 +168,25 @@ fn resolve_layer_aci(color: libredwg_sys::Dwg_Color) -> i16 {
     }
 }
 
-fn convert_ltype(object_ptr: *mut c_void) -> Option<LineType> {
-    let name = get_utf8_field(object_ptr, "LTYPE", "name")?;
-    let dashes: Vec<f64> = get_array_field::<u8, f64>(object_ptr, "LTYPE", "numdashes", "dashes");
-    let dashes = if dashes.is_empty() {
-        LineType::builtin(&name).dashes
+fn convert_ltype(object_ptr: *mut c_void, diagnostics: &mut ImportDiagnostics) -> Option<LineType> {
+    let raw_name = get_utf8_field(object_ptr, "LTYPE", "name")?;
+    let num = get_field::<u8>(object_ptr, "LTYPE", "numdashes").unwrap_or(0);
+    let ptr =
+        get_field::<*const LtypeDash>(object_ptr, "LTYPE", "dashes").unwrap_or(std::ptr::null());
+    let parsed = if !ptr.is_null() && num > 0 {
+        let slice = unsafe { std::slice::from_raw_parts(ptr, num as usize) };
+        let elements: Vec<(f64, u16)> = slice.iter().map(|d| (d.length, d.shape_flag)).collect();
+        parse_ltype_dashes(&raw_name, &elements)
     } else {
-        dashes
+        let r11 = get_field::<[f64; 12]>(object_ptr, "LTYPE", "dashes_r11").unwrap_or([0.0; 12]);
+        let pattern_len = get_field::<f64>(object_ptr, "LTYPE", "pattern_len");
+        parse_ltype_dashes_r11(&raw_name, &r11, pattern_len)
     };
-    Some(LineType { name, dashes })
+    diagnostics.warnings.extend(parsed.warnings);
+    Some(LineType {
+        name: parsed.name,
+        dashes: parsed.dashes,
+    })
 }
 
 fn block_record_name(block_header_object_ptr: *mut c_void) -> Option<String> {
@@ -259,9 +273,11 @@ unsafe fn convert_one(
         .and_then(|h| resolve_handle_name(dwg, h))
         .unwrap_or_else(|| "0".to_string());
     let color = entity_color(entity_ptr);
-    let linetype = get_common_field::<*mut libredwg_sys::Dwg_Object_Ref>(entity_ptr, "ltype")
-        .and_then(|h| resolve_handle_name(dwg, h))
-        .unwrap_or_else(|| "BYLAYER".to_string());
+    let linetype = linetype_from_flags(
+        get_common_field::<u8>(entity_ptr, "ltype_flags"),
+        get_common_field::<*mut libredwg_sys::Dwg_Object_Ref>(entity_ptr, "ltype")
+            .and_then(|h| resolve_handle_name(dwg, h)),
+    );
     let linetype_scale = get_common_field::<f64>(entity_ptr, "ltype_scale").unwrap_or(1.0);
     let invisible = get_common_field::<u16>(entity_ptr, "invisible").unwrap_or(0) != 0;
 
@@ -358,6 +374,7 @@ unsafe fn convert_geometry(
                     .collect(),
                 closed,
                 extrusion: extrusion_of(entity_ptr, "LWPOLYLINE"),
+                linetype_generation_continuous: flag & 0x80 != 0,
             }
         }
         libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_POLYLINE_2D => {
@@ -366,6 +383,7 @@ unsafe fn convert_geometry(
             Geometry::Polyline {
                 vertices,
                 closed: flag & 1 != 0,
+                linetype_generation_continuous: flag & 0x80 != 0,
             }
         }
         libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_POLYLINE_3D => {
@@ -374,6 +392,7 @@ unsafe fn convert_geometry(
             Geometry::Polyline {
                 vertices,
                 closed: flag & 1 != 0,
+                linetype_generation_continuous: false,
             }
         }
         libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_SPLINE => {
@@ -405,10 +424,7 @@ unsafe fn convert_geometry(
                 || get_field::<u8>(entity_ptr, "SPLINE", "weighted").unwrap_or(0) != 0;
             Geometry::Spline {
                 degree,
-                control_points: ctrl
-                    .iter()
-                    .map(|c| Point3::new(c.x, c.y, c.z))
-                    .collect(),
+                control_points: ctrl.iter().map(|c| Point3::new(c.x, c.y, c.z)).collect(),
                 fit_points: fit_points.iter().copied().map(pt3).collect(),
                 knots,
                 weights: if rational {
@@ -484,8 +500,8 @@ unsafe fn convert_geometry(
             is_attrib_def: true,
         }),
         libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_MTEXT => {
-            let x_axis = get_field::<Point3D>(entity_ptr, "MTEXT", "x_axis_dir")
-                .unwrap_or(Point3D {
+            let x_axis =
+                get_field::<Point3D>(entity_ptr, "MTEXT", "x_axis_dir").unwrap_or(Point3D {
                     x: 1.0,
                     y: 0.0,
                     z: 0.0,
@@ -527,9 +543,11 @@ unsafe fn convert_geometry(
         | libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_ARC_DIMENSION => {
             let dxfname = dimension_dxfname(fixedtype);
             Geometry::Dimension {
-                block_name: get_field::<*mut libredwg_sys::Dwg_Object_Ref>(entity_ptr, dxfname, "block")
-                    .and_then(resolve_block_name)
-                    .unwrap_or_default(),
+                block_name: get_field::<*mut libredwg_sys::Dwg_Object_Ref>(
+                    entity_ptr, dxfname, "block",
+                )
+                .and_then(resolve_block_name)
+                .unwrap_or_default(),
             }
         }
         libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_LEADER => Geometry::Leader {
@@ -650,10 +668,11 @@ fn convert_hatch_edge(seg: &libredwg_sys::Dwg_HATCH_PathSeg) -> Option<HatchEdge
             is_ccw: seg.is_ccw != 0,
         },
         4 => {
-            let control_points = unsafe { read_raw_array(seg.control_points, seg.num_control_points) }
-                .into_iter()
-                .map(|cp| Point3::from_xy(cp.point.x, cp.point.y))
-                .collect();
+            let control_points =
+                unsafe { read_raw_array(seg.control_points, seg.num_control_points) }
+                    .into_iter()
+                    .map(|cp| Point3::from_xy(cp.point.x, cp.point.y))
+                    .collect();
             HatchEdge::Spline { control_points }
         }
         _ => return None,
@@ -727,7 +746,9 @@ unsafe fn polyline_2d_vertices(
     let points_ptr = unsafe { libredwg_sys::dwg_object_polyline_2d_get_points(obj, &mut error) };
     let num_points = unsafe { libredwg_sys::dwg_object_polyline_2d_get_numpoints(obj, &mut error) };
     if !points_ptr.is_null() && num_points > 0 {
-        let slice = unsafe { std::slice::from_raw_parts(points_ptr.cast::<Point2D>(), num_points as usize) };
+        let slice = unsafe {
+            std::slice::from_raw_parts(points_ptr.cast::<Point2D>(), num_points as usize)
+        };
         verts = slice
             .iter()
             .map(|p| PolyVertex {
@@ -748,7 +769,8 @@ unsafe fn polyline_3d_vertices(obj: *mut libredwg_sys::Dwg_Object) -> Vec<PolyVe
     if points_ptr.is_null() || num_points == 0 {
         return Vec::new();
     }
-    let slice = unsafe { std::slice::from_raw_parts(points_ptr.cast::<Point3D>(), num_points as usize) };
+    let slice =
+        unsafe { std::slice::from_raw_parts(points_ptr.cast::<Point3D>(), num_points as usize) };
     let verts = slice
         .iter()
         .map(|p| PolyVertex {

@@ -13,6 +13,7 @@ use thiserror::Error;
 
 mod convert;
 mod dynapi;
+mod ltype;
 
 static LIBREDWG_LOCK: Mutex<()> = Mutex::new(());
 
@@ -59,9 +60,9 @@ pub fn import_dwg(path: impl AsRef<Path>) -> Result<Document, ImportError> {
         ..Default::default()
     };
     if error != 0 {
-        diagnostics
-            .warnings
-            .push(format!("LibreDWG returned non-zero status {error} (non-critical)"));
+        diagnostics.warnings.push(format!(
+            "LibreDWG returned non-zero status {error} (non-critical)"
+        ));
     }
 
     let mut document = unsafe { convert::convert_document(dwg.as_mut(), path, diagnostics) };

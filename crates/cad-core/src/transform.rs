@@ -171,16 +171,8 @@ mod tests {
 
     #[test]
     fn nested_transforms_compose() {
-        let inner = Transform2::insert(
-            Point3::from_xy(10.0, 0.0),
-            Point3::new(1.0, 1.0, 1.0),
-            0.0,
-        );
-        let outer = Transform2::insert(
-            Point3::from_xy(5.0, 5.0),
-            Point3::new(1.0, 1.0, 1.0),
-            0.0,
-        );
+        let inner = Transform2::insert(Point3::from_xy(10.0, 0.0), Point3::new(1.0, 1.0, 1.0), 0.0);
+        let outer = Transform2::insert(Point3::from_xy(5.0, 5.0), Point3::new(1.0, 1.0, 1.0), 0.0);
         let p = outer.then(inner).apply(Point2::new(1.0, 0.0));
         assert!((p.x - 16.0).abs() < 1e-12);
         assert!((p.y - 5.0).abs() < 1e-12);

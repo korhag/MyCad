@@ -32,6 +32,13 @@ impl Extents2 {
         any.then_some(e)
     }
 
+    pub fn from_corners(a: Point2, b: Point2) -> Self {
+        Self {
+            min: Point2::new(a.x.min(b.x), a.y.min(b.y)),
+            max: Point2::new(a.x.max(b.x), a.y.max(b.y)),
+        }
+    }
+
     pub fn include(&mut self, p: Point2) {
         if !p.is_finite() {
             return;
@@ -54,6 +61,40 @@ impl Extents2 {
             && self.max.y.is_finite()
             && self.max.x >= self.min.x
             && self.max.y >= self.min.y
+    }
+
+    pub fn contains(self, p: Point2) -> bool {
+        self.is_valid()
+            && p.x >= self.min.x
+            && p.x <= self.max.x
+            && p.y >= self.min.y
+            && p.y <= self.max.y
+    }
+
+    pub fn contains_extents(self, other: Self) -> bool {
+        self.is_valid()
+            && other.is_valid()
+            && other.min.x >= self.min.x
+            && other.max.x <= self.max.x
+            && other.min.y >= self.min.y
+            && other.max.y <= self.max.y
+    }
+
+    pub fn intersects(self, other: Self) -> bool {
+        self.is_valid()
+            && other.is_valid()
+            && self.min.x <= other.max.x
+            && self.max.x >= other.min.x
+            && self.min.y <= other.max.y
+            && self.max.y >= other.min.y
+    }
+
+    pub fn inflated(self, pad: f64) -> Self {
+        let pad = pad.max(0.0);
+        Self {
+            min: Point2::new(self.min.x - pad, self.min.y - pad),
+            max: Point2::new(self.max.x + pad, self.max.y + pad),
+        }
     }
 
     pub fn width(self) -> f64 {
@@ -126,5 +167,19 @@ mod tests {
         .unwrap();
         assert_eq!(e.min, Point2::new(1.0, 1.0));
         assert_eq!(e.max, Point2::new(1.0, 1.0));
+    }
+
+    #[test]
+    fn contains_extents_requires_full_inclusion() {
+        let outer = Extents2::from_corners(Point2::new(0.0, 0.0), Point2::new(10.0, 10.0));
+        let inner = Extents2::from_corners(Point2::new(1.0, 1.0), Point2::new(2.0, 2.0));
+        let overlapping = Extents2::from_corners(Point2::new(8.0, 8.0), Point2::new(12.0, 12.0));
+        assert!(outer.contains_extents(inner));
+        assert!(!outer.contains_extents(overlapping));
+        assert!(outer.intersects(overlapping));
+        assert!(!inner.intersects(Extents2::from_corners(
+            Point2::new(20.0, 20.0),
+            Point2::new(21.0, 21.0)
+        )));
     }
 }

@@ -117,7 +117,13 @@ impl<'a> AuditCtx<'a> {
         }
     }
 
-    fn consider_edge(&mut self, kind: &str, local_a: Point2, local_b: Point2, transform: Transform2) {
+    fn consider_edge(
+        &mut self,
+        kind: &str,
+        local_a: Point2,
+        local_b: Point2,
+        transform: Transform2,
+    ) {
         self.consider_point(kind, local_a, transform);
         self.consider_point(kind, local_b, transform);
         let world_a = transform.apply(local_a);
@@ -130,7 +136,11 @@ impl<'a> AuditCtx<'a> {
         let dy = (world_b.y - world_a.y).abs();
         if (8000.0..9200.0).contains(&length) && dx > 2000.0 && dy > 2000.0 {
             *self.x_kind.entry(kind.to_string()).or_insert(0) += 1;
-            let block_key = self.stack.last().cloned().unwrap_or_else(|| "*MODEL_SPACE".into());
+            let block_key = self
+                .stack
+                .last()
+                .cloned()
+                .unwrap_or_else(|| "*MODEL_SPACE".into());
             *self.x_block.entry(block_key).or_insert(0) += 1;
             if self.x_edges.len() < 12 {
                 self.x_edges.push(LongEdge {
@@ -148,7 +158,11 @@ impl<'a> AuditCtx<'a> {
         }
         if length > 10_000.0 {
             self.buckets[0] += 1;
-            let block_key = self.stack.last().cloned().unwrap_or_else(|| "*MODEL_SPACE".into());
+            let block_key = self
+                .stack
+                .last()
+                .cloned()
+                .unwrap_or_else(|| "*MODEL_SPACE".into());
             *self.mid_kind.entry(kind.to_string()).or_insert(0) += 1;
             *self.mid_block.entry(block_key).or_insert(0) += 1;
             if length < LONG_EDGE {
@@ -165,7 +179,9 @@ impl<'a> AuditCtx<'a> {
                 });
                 if self.mid_edges.len() > TOP_N * 8 {
                     self.mid_edges.sort_by(|a, b| {
-                        b.length.partial_cmp(&a.length).unwrap_or(std::cmp::Ordering::Equal)
+                        b.length
+                            .partial_cmp(&a.length)
+                            .unwrap_or(std::cmp::Ordering::Equal)
                     });
                     self.mid_edges.truncate(TOP_N * 4);
                 }
@@ -184,7 +200,11 @@ impl<'a> AuditCtx<'a> {
             return;
         }
         *self.kind_counts.entry(kind.to_string()).or_insert(0) += 1;
-        let block_key = self.stack.last().cloned().unwrap_or_else(|| "*MODEL_SPACE".into());
+        let block_key = self
+            .stack
+            .last()
+            .cloned()
+            .unwrap_or_else(|| "*MODEL_SPACE".into());
         *self.block_counts.entry(block_key).or_insert(0) += 1;
         self.long_edges.push(LongEdge {
             length,
@@ -198,8 +218,11 @@ impl<'a> AuditCtx<'a> {
             insert_note: self.insert_note_text(),
         });
         if self.long_edges.len() > TOP_N * 8 {
-            self.long_edges
-                .sort_by(|a, b| b.length.partial_cmp(&a.length).unwrap_or(std::cmp::Ordering::Equal));
+            self.long_edges.sort_by(|a, b| {
+                b.length
+                    .partial_cmp(&a.length)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
             self.long_edges.truncate(TOP_N * 4);
         }
     }
@@ -234,7 +257,11 @@ impl<'a> AuditCtx<'a> {
                 row_spacing,
                 ..
             } => {
-                if self.stack.iter().any(|n| n.eq_ignore_ascii_case(block_name)) {
+                if self
+                    .stack
+                    .iter()
+                    .any(|n| n.eq_ignore_ascii_case(block_name))
+                {
                     return;
                 }
                 let Some(block) = self.document.blocks.get(block_name) else {
@@ -269,11 +296,7 @@ impl<'a> AuditCtx<'a> {
                         );
                         let nested = transform.then(
                             Transform2::block_insert(
-                                *insertion,
-                                *scale,
-                                *rotation,
-                                *extrusion,
-                                base,
+                                *insertion, *scale, *rotation, *extrusion, base,
                             )
                             .then(extra),
                         );
@@ -286,7 +309,11 @@ impl<'a> AuditCtx<'a> {
                 self.stack.pop();
             }
             Geometry::Dimension { block_name } => {
-                if self.stack.iter().any(|n| n.eq_ignore_ascii_case(block_name)) {
+                if self
+                    .stack
+                    .iter()
+                    .any(|n| n.eq_ignore_ascii_case(block_name))
+                {
                     return;
                 }
                 if let Some(block) = self.document.blocks.get(block_name) {
@@ -354,12 +381,15 @@ impl<'a> AuditCtx<'a> {
                 vertices,
                 closed,
                 extrusion,
+                ..
             } => self.consider_polyline(
                 "LWPOLYLINE",
                 &polyline_points(vertices, *closed, *extrusion),
                 transform,
             ),
-            Geometry::Polyline { vertices, closed } => self.consider_polyline(
+            Geometry::Polyline {
+                vertices, closed, ..
+            } => self.consider_polyline(
                 "POLYLINE",
                 &polyline_points(vertices, *closed, Point3::new(0.0, 0.0, 1.0)),
                 transform,
@@ -398,10 +428,8 @@ impl<'a> AuditCtx<'a> {
             Geometry::MText(text) => {
                 let h = text.height * transform.scale_y().abs().max(transform.scale_x().abs());
                 if h > 500.0 {
-                    self.huge_text.push(format!(
-                        "mtext h={h:.3} stack={}",
-                        self.stack_text()
-                    ));
+                    self.huge_text
+                        .push(format!("mtext h={h:.3} stack={}", self.stack_text()));
                 }
                 self.consider_point("MTEXT", text.insertion.xy(), transform);
             }
@@ -413,23 +441,33 @@ impl<'a> AuditCtx<'a> {
             Geometry::Hatch(hatch) => {
                 for path in &hatch.paths {
                     match path {
-                        cad_core::HatchPath::Polyline { vertices, closed } => self.consider_polyline(
-                            "HATCH_POLY",
-                            &polyline_points(vertices, *closed, hatch.extrusion),
-                            transform,
-                        ),
+                        cad_core::HatchPath::Polyline { vertices, closed } => self
+                            .consider_polyline(
+                                "HATCH_POLY",
+                                &polyline_points(vertices, *closed, hatch.extrusion),
+                                transform,
+                            ),
                         cad_core::HatchPath::Edges(edges) => {
                             for edge in edges {
                                 match edge {
                                     cad_core::HatchEdge::Line { start, end } => {
-                                        self.consider_edge("HATCH_LINE", start.xy(), end.xy(), transform);
+                                        self.consider_edge(
+                                            "HATCH_LINE",
+                                            start.xy(),
+                                            end.xy(),
+                                            transform,
+                                        );
                                     }
                                     cad_core::HatchEdge::Ellipse {
                                         center,
                                         major_endpoint,
                                         ..
                                     } => {
-                                        self.consider_point("HATCH_ELLIPSE", center.xy(), transform);
+                                        self.consider_point(
+                                            "HATCH_ELLIPSE",
+                                            center.xy(),
+                                            transform,
+                                        );
                                         self.consider_point(
                                             "HATCH_ELLIPSE",
                                             major_endpoint.xy(),
@@ -443,11 +481,12 @@ impl<'a> AuditCtx<'a> {
                     }
                 }
             }
-            Geometry::Leader { vertices } | Geometry::MLine { vertices, .. } => self.consider_polyline(
-                "LEADER_OR_MLINE",
-                &vertices.iter().map(|p| p.xy()).collect::<Vec<_>>(),
-                transform,
-            ),
+            Geometry::Leader { vertices } | Geometry::MLine { vertices, .. } => self
+                .consider_polyline(
+                    "LEADER_OR_MLINE",
+                    &vertices.iter().map(|p| p.xy()).collect::<Vec<_>>(),
+                    transform,
+                ),
         }
     }
 }
@@ -476,8 +515,11 @@ pub fn print_geometry_audit(document: &Document) {
         ctx.walk(entity, Transform2::identity());
     }
 
-    ctx.long_edges
-        .sort_by(|a, b| b.length.partial_cmp(&a.length).unwrap_or(std::cmp::Ordering::Equal));
+    ctx.long_edges.sort_by(|a, b| {
+        b.length
+            .partial_cmp(&a.length)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     ctx.long_edges.truncate(TOP_N);
 
     println!("audit_long_edge_gt_10k {}", ctx.buckets[0]);
@@ -496,7 +538,10 @@ pub fn print_geometry_audit(document: &Document) {
     }
     println!("audit_blocks_nonzero_base {nonzero_base}");
     println!("audit_max_base_distance {max_base:.6}");
-    println!("audit_inserts_tiny_or_huge_scale {}", ctx.scale_samples.len());
+    println!(
+        "audit_inserts_tiny_or_huge_scale {}",
+        ctx.scale_samples.len()
+    );
     for sample in ctx.scale_samples.iter().take(15) {
         println!("  {sample}");
     }
@@ -509,8 +554,11 @@ pub fn print_geometry_audit(document: &Document) {
     for (name, count) in ctx.mid_block.iter().take(40) {
         println!("  {name} {count}");
     }
-    ctx.mid_edges
-        .sort_by(|a, b| b.length.partial_cmp(&a.length).unwrap_or(std::cmp::Ordering::Equal));
+    ctx.mid_edges.sort_by(|a, b| {
+        b.length
+            .partial_cmp(&a.length)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     println!("audit_top_10k_to_50k_edges");
     for (i, edge) in ctx.mid_edges.iter().take(15).enumerate() {
         println!(
@@ -519,8 +567,14 @@ pub fn print_geometry_audit(document: &Document) {
         );
         println!(
             "     local=({:.6},{:.6})-({:.6},{:.6}) world=({:.6},{:.6})-({:.6},{:.6})",
-            edge.local_a.x, edge.local_a.y, edge.local_b.x, edge.local_b.y,
-            edge.world_a.x, edge.world_a.y, edge.world_b.x, edge.world_b.y
+            edge.local_a.x,
+            edge.local_a.y,
+            edge.local_b.x,
+            edge.local_b.y,
+            edge.world_a.x,
+            edge.world_a.y,
+            edge.world_b.x,
+            edge.world_b.y
         );
         if !edge.insert_note.is_empty() {
             println!("     {}", edge.insert_note);
@@ -614,8 +668,14 @@ pub fn print_geometry_audit(document: &Document) {
         );
         println!(
             "     local=({:.6},{:.6})-({:.6},{:.6}) world=({:.6},{:.6})-({:.6},{:.6})",
-            edge.local_a.x, edge.local_a.y, edge.local_b.x, edge.local_b.y,
-            edge.world_a.x, edge.world_a.y, edge.world_b.x, edge.world_b.y
+            edge.local_a.x,
+            edge.local_a.y,
+            edge.local_b.x,
+            edge.local_b.y,
+            edge.world_a.x,
+            edge.world_a.y,
+            edge.world_b.x,
+            edge.world_b.y
         );
         if !edge.insert_note.is_empty() {
             println!("     {}", edge.insert_note);
@@ -645,7 +705,10 @@ fn dump_block_splines(document: &Document, name: &str) {
     };
     println!(
         "audit_block {name} base=({:.4},{:.4},{:.4}) entities={}",
-        block.base_pt.x, block.base_pt.y, block.base_pt.z, block.entities.len()
+        block.base_pt.x,
+        block.base_pt.y,
+        block.base_pt.z,
+        block.entities.len()
     );
     let mut n_spline = 0u64;
     for entity in &block.entities {
@@ -784,5 +847,121 @@ pub fn print_display_list_audit(display: &DisplayList) {
             "  #{i} area={area:.0} a=({:.1},{:.1}) b=({:.1},{:.1}) c=({:.1},{:.1}) rgb={:.2},{:.2},{:.2}",
             a.x, a.y, b.x, b.y, c.x, c.y, col[0], col[1], col[2]
         );
+    }
+}
+
+pub fn print_linetype_audit(document: &Document) {
+    println!("ltscale: {}", document.ltscale);
+    println!("linetype_defs: {}", document.linetypes.len());
+    for (name, lt) in &document.linetypes {
+        let dashes = lt
+            .dashes
+            .iter()
+            .map(|d| format!("{d}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        println!("  ltype {name} pattern=[{dashes}]");
+    }
+
+    let mut usage: BTreeMap<String, u64> = BTreeMap::new();
+    let mut samples: Vec<String> = Vec::new();
+    let mut stack = Vec::new();
+    for entity in &document.model_space {
+        collect_linetype_usage(
+            document,
+            entity,
+            "CONTINUOUS",
+            &mut stack,
+            &mut usage,
+            &mut samples,
+        );
+    }
+    println!("linetype_usage");
+    for (name, count) in &usage {
+        println!("  used {name} {count}");
+    }
+    println!("linetype_samples {}", samples.len());
+    for sample in samples.iter().take(8) {
+        println!("  {sample}");
+    }
+}
+
+fn collect_linetype_usage(
+    document: &Document,
+    entity: &Entity,
+    block_linetype: &str,
+    stack: &mut Vec<String>,
+    usage: &mut BTreeMap<String, u64>,
+    samples: &mut Vec<String>,
+) {
+    let resolved = document.resolved_linetype_name(entity, block_linetype);
+    *usage.entry(resolved.clone()).or_insert(0) += 1;
+    if samples.len() < 8 {
+        match &entity.geometry {
+            Geometry::Line { start, end } => {
+                let len = start.xy().distance(end.xy());
+                if len > 500.0
+                    && document
+                        .linetype(&resolved)
+                        .map(|lt| !lt.is_continuous())
+                        .unwrap_or(false)
+                {
+                    samples.push(format!(
+                        "LINE raw={} resolved={} layer={} ltscale={:.4} effective={:.4} len={:.1}",
+                        entity.linetype,
+                        resolved,
+                        entity.layer,
+                        entity.linetype_scale,
+                        document.effective_linetype_scale(entity),
+                        len
+                    ));
+                }
+            }
+            Geometry::LwPolyline {
+                vertices,
+                closed,
+                linetype_generation_continuous,
+                ..
+            }
+            | Geometry::Polyline {
+                vertices,
+                closed,
+                linetype_generation_continuous,
+            } => {
+                if document
+                    .linetype(&resolved)
+                    .map(|lt| !lt.is_continuous())
+                    .unwrap_or(false)
+                    && vertices.len() >= 2
+                {
+                    samples.push(format!(
+                        "POLYLINE raw={} resolved={} layer={} ltscale={:.4} effective={:.4} plinegen={} verts={} closed={}",
+                        entity.linetype,
+                        resolved,
+                        entity.layer,
+                        entity.linetype_scale,
+                        document.effective_linetype_scale(entity),
+                        linetype_generation_continuous,
+                        vertices.len(),
+                        closed
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Geometry::Insert { block_name, .. } = &entity.geometry {
+        if stack.iter().any(|n| n.eq_ignore_ascii_case(block_name)) {
+            return;
+        }
+        let Some(block) = document.blocks.get(block_name) else {
+            return;
+        };
+        let inherit = document.resolved_linetype_name(entity, block_linetype);
+        stack.push(block_name.clone());
+        for child in &block.entities {
+            collect_linetype_usage(document, child, &inherit, stack, usage, samples);
+        }
+        stack.pop();
     }
 }

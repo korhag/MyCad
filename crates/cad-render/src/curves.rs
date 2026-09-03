@@ -4,8 +4,21 @@ use cad_core::{ocs_to_wcs, Point2, Point3, PolyVertex};
 
 pub const CIRCLE_SEGMENTS: usize = 32;
 
-pub fn circle_points(center: Point3, radius: f64, extrusion: Point3, segments: usize) -> Vec<Point2> {
-    arc_points(center, radius, 0.0, std::f64::consts::TAU, true, extrusion, segments)
+pub fn circle_points(
+    center: Point3,
+    radius: f64,
+    extrusion: Point3,
+    segments: usize,
+) -> Vec<Point2> {
+    arc_points(
+        center,
+        radius,
+        0.0,
+        std::f64::consts::TAU,
+        true,
+        extrusion,
+        segments,
+    )
 }
 
 pub fn arc_points(
@@ -92,14 +105,14 @@ pub const POLYLINE_BULGE_SEGMENTS: usize = 16;
 //          positive bulge is CCW, sampled with the signed sweep.
 // ------------------------------------------------------------
 #[derive(Debug, Clone, Copy)]
-struct BulgeArc {
-    center: Point2,
-    radius: f64,
-    start_angle: f64,
-    sweep: f64,
+pub(crate) struct BulgeArc {
+    pub center: Point2,
+    pub radius: f64,
+    pub start_angle: f64,
+    pub sweep: f64,
 }
 
-fn bulge_circle(p1: Point2, p2: Point2, bulge: f64) -> Option<BulgeArc> {
+pub(crate) fn bulge_circle(p1: Point2, p2: Point2, bulge: f64) -> Option<BulgeArc> {
     if bulge.abs() < 1e-12 {
         return None;
     }
@@ -180,7 +193,12 @@ pub fn polyline_points(vertices: &[PolyVertex], closed: bool, extrusion: Point3)
     for i in 0..count {
         let a = vertices[i];
         let b = vertices[(i + 1) % n];
-        let mut seg = bulge_arc(ocs_xy(a.point), ocs_xy(b.point), a.bulge, POLYLINE_BULGE_SEGMENTS);
+        let mut seg = bulge_arc(
+            ocs_xy(a.point),
+            ocs_xy(b.point),
+            a.bulge,
+            POLYLINE_BULGE_SEGMENTS,
+        );
         for sample in &mut seg {
             *sample = bulge_sample_to_wcs(*sample, a.point.z, extrusion);
         }
@@ -282,13 +300,7 @@ fn clamped_uniform_knots(n_ctrl: usize, degree: usize) -> Vec<f64> {
     k
 }
 
-fn de_boor(
-    degree: usize,
-    control: &[Point3],
-    knots: &[f64],
-    weights: &[f64],
-    u: f64,
-) -> Point3 {
+fn de_boor(degree: usize, control: &[Point3], knots: &[f64], weights: &[f64], u: f64) -> Point3 {
     let n = control.len() - 1;
     let mut span = degree;
     while span < n && u >= knots[span + 1] {
@@ -402,7 +414,10 @@ mod tests {
         assert_point(pts[0], p1, "start");
         assert_point(*pts.last().unwrap(), p2, "end");
         assert_point(sample_mid(&pts), p(1.0, -1.0), "midpoint");
-        assert!(sample_mid(&pts).y < 0.0, "positive bulge stays below +X chord");
+        assert!(
+            sample_mid(&pts).y < 0.0,
+            "positive bulge stays below +X chord"
+        );
     }
 
     #[test]
@@ -417,7 +432,10 @@ mod tests {
         assert_point(pts[0], p1, "start");
         assert_point(*pts.last().unwrap(), p2, "end");
         assert_point(sample_mid(&pts), p(1.0, 1.0), "midpoint");
-        assert!(sample_mid(&pts).y > 0.0, "negative bulge stays above +X chord");
+        assert!(
+            sample_mid(&pts).y > 0.0,
+            "negative bulge stays above +X chord"
+        );
     }
 
     #[test]
@@ -469,7 +487,10 @@ mod tests {
         assert_point(*pts.last().unwrap(), p2, "end");
         let mid = sample_mid(&pts);
         assert_point(mid, p(1.0, -1.0 - std::f64::consts::SQRT_2), "midpoint");
-        assert!(mid.y < -1.0, "major CCW arc goes through the far lower side");
+        assert!(
+            mid.y < -1.0,
+            "major CCW arc goes through the far lower side"
+        );
     }
 
     #[test]
