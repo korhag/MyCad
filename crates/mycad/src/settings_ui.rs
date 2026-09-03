@@ -171,6 +171,33 @@ fn viewport_tab(ui: &mut egui::Ui, app: &mut MyCadApp) {
     {
         app.settings_draft.reset_zoom_speed();
     }
+    ui.add_space(16.0);
+    ui.separator();
+    ui.heading("Drafting");
+    ui.checkbox(
+        &mut app.settings_draft.drafting.ortho_enabled,
+        "ORTHO enabled (F8)",
+    );
+    ui.checkbox(
+        &mut app.settings_draft.drafting.osnap_enabled,
+        "Object snap enabled (F3)",
+    );
+    ui.add_space(6.0);
+    ui.label("Running object snaps");
+    ui.horizontal(|ui| {
+        ui.checkbox(
+            &mut app.settings_draft.drafting.running_snaps.endpoint,
+            "Endpoint",
+        );
+        ui.checkbox(
+            &mut app.settings_draft.drafting.running_snaps.midpoint,
+            "Midpoint",
+        );
+        ui.checkbox(
+            &mut app.settings_draft.drafting.running_snaps.center,
+            "Center",
+        );
+    });
 }
 
 fn display_tab(ui: &mut egui::Ui, app: &mut MyCadApp) {

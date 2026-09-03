@@ -4,11 +4,32 @@ use crate::color::CadColor;
 use crate::geom::Point3;
 
 // ------------------------------------------------------------
+// Type: EntityId
+// Purpose: Stable identity for a drawable entity. Indices into
+//          model_space are not durable across insert, erase, or undo.
+// ------------------------------------------------------------
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct EntityId(pub u64);
+
+impl EntityId {
+    pub const UNASSIGNED: Self = Self(0);
+
+    pub fn is_assigned(self) -> bool {
+        self.0 != 0
+    }
+
+    pub fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+// ------------------------------------------------------------
 // Type: Entity
 // Purpose: One drawable object in the native document model.
 // ------------------------------------------------------------
 #[derive(Debug, Clone)]
 pub struct Entity {
+    pub id: EntityId,
     pub layer: String,
     pub color: CadColor,
     pub linetype: String,
@@ -20,6 +41,7 @@ pub struct Entity {
 impl Entity {
     pub fn new(geometry: Geometry) -> Self {
         Self {
+            id: EntityId::UNASSIGNED,
             layer: "0".to_string(),
             color: CadColor::ByLayer,
             linetype: "BYLAYER".to_string(),

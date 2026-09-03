@@ -452,14 +452,14 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "cad-core"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "thiserror 2.0.20",
 ]
 
 [[package]]
 name = "cad-render"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "bytemuck",
  "cad-core",
@@ -470,7 +470,7 @@ dependencies = [
 
 [[package]]
 name = "cad-viewport"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "cad-core",
 ]
@@ -757,7 +757,7 @@ dependencies = [
 
 [[package]]
 name = "dwg-import"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "cad-core",
  "libc",
@@ -834,6 +834,15 @@ dependencies = [
  "serde",
  "smallvec",
  "unicode-segmentation",
+]
+
+[[package]]
+name = "egui-phosphor"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "80049258178b29a9807b15b5bcf3d60722a22a91d03bc9316935dec5ed5ed2e0"
+dependencies = [
+ "egui",
 ]
 
 [[package]]
@@ -1820,7 +1829,7 @@ dependencies = [
 
 [[package]]
 name = "mycad"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "cad-core",
  "cad-render",
@@ -1828,6 +1837,7 @@ dependencies = [
  "dwg-import",
  "eframe",
  "egui",
+ "egui-phosphor",
  "egui-wgpu",
  "egui_dock",
  "rfd",

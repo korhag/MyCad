@@ -1,6 +1,9 @@
 //! Basic visual system: dense retro engineering-workstation chrome.
 
 pub fn apply(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+    ctx.set_fonts(fonts);
     ctx.set_visuals(egui::Visuals {
         dark_mode: true,
         override_text_color: Some(egui::Color32::from_rgb(214, 220, 214)),

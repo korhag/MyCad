@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
 authors = ["MyCad"]
@@ -37,6 +37,7 @@ rfd = "0.15"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 egui_dock = { version = "0.17", features = ["serde"] }
+egui-phosphor = "0.10"
 thiserror = "2"
 
 # MSVC 14.41 ICEs on vendored LibreDWG decode.c at /O2 (C1001, 0xC0000005).

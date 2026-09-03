@@ -5,9 +5,34 @@ All notable changes to MyCad are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project versions with [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Workspace version is `0.2.0` (`Cargo.toml`).
+Workspace version is `0.3.0` (`Cargo.toml`).
 
 ## [Unreleased]
+
+## [0.3.0] - 2026-09-03
+
+### Added
+
+- Add an interactive LINE command with first/next-point prompts, live preview, repeated segments, Enter or right-click to finish, Esc to cancel, and one undoable transaction per invocation.
+- Add persistent ORTHO (F8) and OSNAP (F3) drafting controls to the status bar, including coordinates and Shift temporary ORTHO reversal while a command requests a point.
+- Add semantic Endpoint, Midpoint, and Center object snaps with fixed-screen-aperture markers and nested INSERT transforms, avoiding false snaps from tessellated curve samples.
+- Add a dockable Home icon ribbon above the viewport with History, Draw, Modify, Measure, and current-layer controls. LINE and Distance start with one click; later drawing, modify, and measurement tools stay visible but disabled until their releases.
+- Add a one-time dock-layout migration that places Home above the viewport for layouts saved before the toolbar existed, without reopening Home after the user closes it.
+- Add Undo/Redo (Ctrl+Z / Ctrl+Y) so accepted LINE segments can be reversed as a single command.
+- Add a Distance measurement command that reports length, ΔX, ΔY, and angle without modifying the drawing, using imported $INSUNITS when available.
+- Add stable `EntityId` values, current-layer creation defaults from DWG `$CLAYER`, and `$INSUNITS` import so new geometry inherits ByLayer properties and measurements can name millimetres or inches.
+- Add a dirty indicator in the window title and status bar, with discard confirmation on Open or Quit. Editing stays in memory and never overwrites the source DWG.
+
+### Changed
+
+- Change LINE commits to append tessellation, object snaps, extents, and GPU vertices for the new segment so drawing stays interactive on large DWGs. Undo, redo, and file load still rebuild the full display.
+- Shrink the Home ribbon to the icon row so the dock strip is only as tall as the tools, leaving the rest of the window for the viewport.
+
+## [0.2.1] - 2026-09-03
+
+### Fixed
+
+- Ignore dock splitter drags in the viewport so resizing Properties or Diagnostics no longer draws or commits a selection box.
 
 ## [0.2.0] - 2026-09-03
 

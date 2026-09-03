@@ -2,7 +2,11 @@
 
 mod app;
 mod audit;
+mod commands;
 mod diagnostics;
+mod drafting;
+mod history;
+mod home;
 mod input;
 mod preview;
 mod properties;

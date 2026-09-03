@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::color::CadColor;
-use crate::entity::Entity;
+use crate::entity::{Entity, EntityId, Geometry};
 use crate::extents::Extents2;
 use crate::geom::{Point2, Point3};
 use crate::linetype::{is_byblock_name, is_bylayer_name, normalize_linetype_name, LineType};
@@ -77,6 +77,97 @@ impl ImportDiagnostics {
 }
 
 // ------------------------------------------------------------
+// Enum: DrawingUnits
+// Purpose: AutoCAD $INSUNITS codes used when reporting measurements.
+// ------------------------------------------------------------
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrawingUnits {
+    Unspecified,
+    Inches,
+    Feet,
+    Miles,
+    Millimeters,
+    Centimeters,
+    Meters,
+    Kilometers,
+    Microinches,
+    Mils,
+    Yards,
+    Angstroms,
+    Nanometers,
+    Microns,
+    Decimeters,
+    Decameters,
+    Hectometers,
+    Gigameters,
+    AstronomicalUnits,
+    LightYears,
+    Parsecs,
+    Other(u16),
+}
+
+impl Default for DrawingUnits {
+    fn default() -> Self {
+        Self::Unspecified
+    }
+}
+
+impl DrawingUnits {
+    pub fn from_insunits(code: u16) -> Self {
+        match code {
+            0 => Self::Unspecified,
+            1 => Self::Inches,
+            2 => Self::Feet,
+            3 => Self::Miles,
+            4 => Self::Millimeters,
+            5 => Self::Centimeters,
+            6 => Self::Meters,
+            7 => Self::Kilometers,
+            8 => Self::Microinches,
+            9 => Self::Mils,
+            10 => Self::Yards,
+            11 => Self::Angstroms,
+            12 => Self::Nanometers,
+            13 => Self::Microns,
+            14 => Self::Decimeters,
+            15 => Self::Decameters,
+            16 => Self::Hectometers,
+            17 => Self::Gigameters,
+            18 => Self::AstronomicalUnits,
+            19 => Self::LightYears,
+            20 => Self::Parsecs,
+            other => Self::Other(other),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unspecified | Self::Other(_) => "drawing units",
+            Self::Inches => "in",
+            Self::Feet => "ft",
+            Self::Miles => "mi",
+            Self::Millimeters => "mm",
+            Self::Centimeters => "cm",
+            Self::Meters => "m",
+            Self::Kilometers => "km",
+            Self::Microinches => "µin",
+            Self::Mils => "mil",
+            Self::Yards => "yd",
+            Self::Angstroms => "Å",
+            Self::Nanometers => "nm",
+            Self::Microns => "µm",
+            Self::Decimeters => "dm",
+            Self::Decameters => "dam",
+            Self::Hectometers => "hm",
+            Self::Gigameters => "Gm",
+            Self::AstronomicalUnits => "au",
+            Self::LightYears => "ly",
+            Self::Parsecs => "pc",
+        }
+    }
+}
+
+// ------------------------------------------------------------
 // Type: Document
 // Purpose: Application CAD model. Future DXF import and editing
 //          talk to this type, never to LibreDWG structures.
@@ -90,11 +181,14 @@ pub struct Document {
     pub model_space: Vec<Entity>,
     pub diagnostics: ImportDiagnostics,
     pub ltscale: f64,
+    pub current_layer: String,
+    pub units: DrawingUnits,
+    next_entity_id: u64,
 }
 
 impl Default for Document {
     fn default() -> Self {
-        Self {
+        let mut document = Self {
             source_path: None,
             layers: BTreeMap::new(),
             linetypes: BTreeMap::new(),
@@ -102,7 +196,12 @@ impl Default for Document {
             model_space: Vec::new(),
             diagnostics: ImportDiagnostics::default(),
             ltscale: 1.0,
-        }
+            current_layer: "0".into(),
+            units: DrawingUnits::Unspecified,
+            next_entity_id: 1,
+        };
+        document.ensure_layer_zero();
+        document
     }
 }
 
@@ -113,6 +212,126 @@ impl Document {
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "(untitled)".to_string())
+    }
+
+    pub fn ensure_layer_zero(&mut self) {
+        self.layers.entry("0".into()).or_insert_with(|| Layer {
+            name: "0".into(),
+            visible: true,
+            frozen: false,
+            color: CadColor::Aci(7),
+            linetype: "CONTINUOUS".into(),
+        });
+    }
+
+    pub fn allocate_id(&mut self) -> EntityId {
+        let id = EntityId(self.next_entity_id);
+        self.next_entity_id = self.next_entity_id.saturating_add(1).max(1);
+        id
+    }
+
+    pub fn assign_missing_ids(&mut self) {
+        let mut next = self.next_entity_id.max(1);
+        for entity in self.model_space.iter_mut().chain(
+            self.blocks
+                .values_mut()
+                .flat_map(|block| block.entities.iter_mut()),
+        ) {
+            if entity.id.is_assigned() {
+                next = next.max(entity.id.raw() + 1);
+            } else {
+                entity.id = EntityId(next);
+                next += 1;
+            }
+        }
+        self.next_entity_id = next;
+    }
+
+    pub fn new_entity(&self, geometry: Geometry) -> Entity {
+        let mut entity = Entity::new(geometry);
+        entity.layer = self.current_layer.clone();
+        entity.color = CadColor::ByLayer;
+        entity.linetype = "BYLAYER".into();
+        entity
+    }
+
+    pub fn insert_model_entity(&mut self, index: usize, mut entity: Entity) -> Entity {
+        if entity.id.is_assigned() {
+            self.next_entity_id = self.next_entity_id.max(entity.id.raw() + 1);
+        } else {
+            entity.id = self.allocate_id();
+        }
+        let index = index.min(self.model_space.len());
+        self.model_space.insert(index, entity.clone());
+        entity
+    }
+
+    pub fn add_entity(&mut self, entity: Entity) -> Entity {
+        let index = self.model_space.len();
+        self.insert_model_entity(index, entity)
+    }
+
+    pub fn remove_model_entity(&mut self, id: EntityId) -> Option<(usize, Entity)> {
+        let index = self.model_space.iter().position(|entity| entity.id == id)?;
+        let entity = self.model_space.remove(index);
+        Some((index, entity))
+    }
+
+    pub fn replace_model_entity(&mut self, id: EntityId, mut entity: Entity) -> Option<Entity> {
+        let index = self
+            .model_space
+            .iter()
+            .position(|existing| existing.id == id)?;
+        if !entity.id.is_assigned() {
+            entity.id = id;
+        }
+        Some(std::mem::replace(&mut self.model_space[index], entity))
+    }
+
+    pub fn entity_by_id(&self, id: EntityId) -> Option<&Entity> {
+        self.model_space.iter().find(|entity| entity.id == id)
+    }
+
+    pub fn entity_index(&self, id: EntityId) -> Option<usize> {
+        self.model_space.iter().position(|entity| entity.id == id)
+    }
+
+    pub fn layer_can_be_current(&self, name: &str) -> bool {
+        self.layers.get(name).is_some_and(|layer| !layer.frozen)
+    }
+
+    pub fn set_current_layer(&mut self, name: &str) -> bool {
+        if self.layer_can_be_current(name) {
+            self.current_layer = name.to_string();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn apply_current_layer(&mut self, requested: Option<&str>) {
+        self.ensure_layer_zero();
+        if let Some(name) = requested.filter(|name| !name.is_empty()) {
+            if self.set_current_layer(name) {
+                return;
+            }
+        }
+        if self.set_current_layer("0") {
+            return;
+        }
+        if let Some(name) = self
+            .layers
+            .values()
+            .find(|layer| !layer.frozen)
+            .map(|layer| layer.name.clone())
+        {
+            self.current_layer = name;
+            return;
+        }
+        if let Some(layer) = self.layers.get_mut("0") {
+            layer.frozen = false;
+        }
+        self.current_layer = "0".into();
     }
 
     pub fn layer(&self, name: &str) -> Option<&Layer> {
@@ -523,5 +742,75 @@ mod tests {
         let e = document.compute_extents().unwrap();
         assert!((e.min.x - 0.0).abs() < 1e-9);
         assert!((e.max.x - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn added_entities_receive_stable_unique_ids() {
+        let mut document = Document::default();
+        let a = document.add_entity(line(0.0, 0.0, 1.0, 0.0));
+        let b = document.add_entity(line(1.0, 0.0, 2.0, 0.0));
+        assert!(a.id.is_assigned());
+        assert!(b.id.is_assigned());
+        assert_ne!(a.id, b.id);
+        document.remove_model_entity(a.id);
+        assert_eq!(
+            document.entity_by_id(b.id).map(|entity| entity.id),
+            Some(b.id)
+        );
+        let restored = document.insert_model_entity(0, a.clone());
+        assert_eq!(restored.id, a.id);
+        assert_eq!(document.model_space[0].id, a.id);
+        assert_eq!(document.model_space[1].id, b.id);
+    }
+
+    #[test]
+    fn frozen_layer_cannot_become_current() {
+        let mut document = Document::default();
+        document.layers.insert(
+            "FROZEN".into(),
+            Layer {
+                name: "FROZEN".into(),
+                visible: true,
+                frozen: true,
+                color: CadColor::Aci(1),
+                linetype: "CONTINUOUS".into(),
+            },
+        );
+        assert!(!document.set_current_layer("FROZEN"));
+        assert_eq!(document.current_layer, "0");
+        document.apply_current_layer(Some("FROZEN"));
+        assert_eq!(document.current_layer, "0");
+        assert!(document.set_current_layer("0"));
+    }
+
+    #[test]
+    fn new_entity_inherits_current_layer() {
+        let mut document = Document::default();
+        document.layers.insert(
+            "WALL".into(),
+            Layer {
+                name: "WALL".into(),
+                visible: true,
+                frozen: false,
+                color: CadColor::Aci(1),
+                linetype: "CONTINUOUS".into(),
+            },
+        );
+        assert!(document.set_current_layer("WALL"));
+        let entity = document.new_entity(Geometry::Line {
+            start: Point3::from_xy(0.0, 0.0),
+            end: Point3::from_xy(1.0, 0.0),
+        });
+        assert_eq!(entity.layer, "WALL");
+        assert_eq!(entity.color, CadColor::ByLayer);
+        assert_eq!(entity.linetype, "BYLAYER");
+    }
+
+    #[test]
+    fn insunits_maps_to_drawing_units() {
+        assert_eq!(DrawingUnits::from_insunits(0).label(), "drawing units");
+        assert_eq!(DrawingUnits::from_insunits(4).label(), "mm");
+        assert_eq!(DrawingUnits::from_insunits(1).label(), "in");
+        assert_eq!(DrawingUnits::from_insunits(99).label(), "drawing units");
     }
 }

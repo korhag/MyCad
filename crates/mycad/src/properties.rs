@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use cad_core::{CadColor, Document, Entity, Geometry, Point3, PolyVertex};
+use cad_core::{line_length, polyline_length, CadColor, Document, Entity, Geometry, Point3};
 use eframe::egui::{self, RichText, Ui};
 
 use crate::app::MyCadApp;
@@ -10,11 +10,11 @@ use crate::app::MyCadApp;
 pub fn show(ui: &mut Ui, app: &MyCadApp) {
     ui.heading("Properties");
     ui.separator();
-    let Some(document) = app.document.as_deref() else {
+    let Some(document) = app.document.as_ref() else {
         ui.weak("Open a drawing, then click an entity.");
         return;
     };
-    let selection = app.selection.indices();
+    let selection = app.selection.ids();
     if selection.is_empty() {
         ui.weak("Click a line, circle, polyline, or block.");
         ui.add_space(8.0);
@@ -22,15 +22,15 @@ pub fn show(ui: &mut Ui, app: &MyCadApp) {
         return;
     }
     if selection.len() == 1 {
-        if let Some(entity) = document.model_space.get(selection[0]) {
-            show_single(ui, document, entity, selection[0]);
+        if let Some(entity) = document.entity_by_id(selection[0]) {
+            show_single(ui, document, entity);
             return;
         }
     }
     show_multiple(ui, document, selection);
 }
 
-fn show_single(ui: &mut Ui, document: &Document, entity: &Entity, index: usize) {
+fn show_single(ui: &mut Ui, document: &Document, entity: &Entity) {
     ui.label(RichText::new(entity.geometry.type_name()).strong());
     ui.add_space(4.0);
     ui.label(RichText::new("Common").small().weak());
@@ -38,12 +38,13 @@ fn show_single(ui: &mut Ui, document: &Document, entity: &Entity, index: usize) 
         .num_columns(2)
         .spacing([12.0, 4.0])
         .show(ui, |ui| {
-            kv(ui, "Index", format!("#{index}"));
+            kv(ui, "Id", format!("#{}", entity.id.raw()));
             kv(ui, "Layer", entity.layer.clone());
             kv(ui, "Color", color_label(document, entity));
             kv(ui, "Linetype", entity.linetype.clone());
             kv(ui, "Linetype scale", format_num(entity.linetype_scale));
             kv(ui, "Drawing LTSCALE", format_num(document.ltscale));
+            kv(ui, "Units", document.units.label().to_string());
             kv(
                 ui,
                 "Effective LT scale",
@@ -61,10 +62,10 @@ fn show_single(ui: &mut Ui, document: &Document, entity: &Entity, index: usize) 
         });
 }
 
-fn show_multiple(ui: &mut Ui, document: &Document, indices: &[usize]) {
-    let entities: Vec<&Entity> = indices
+fn show_multiple(ui: &mut Ui, document: &Document, ids: &[cad_core::EntityId]) {
+    let entities: Vec<&Entity> = ids
         .iter()
-        .filter_map(|i| document.model_space.get(*i))
+        .filter_map(|id| document.entity_by_id(*id))
         .collect();
     ui.label(RichText::new(format!("{} selected", entities.len())).strong());
     ui.add_space(6.0);
@@ -113,7 +114,7 @@ fn geometry_rows(ui: &mut Ui, geometry: &Geometry) {
         Geometry::Line { start, end } => {
             kv(ui, "Start", point_label(*start));
             kv(ui, "End", point_label(*end));
-            kv(ui, "Length", format_num(start.xy().distance(end.xy())));
+            kv(ui, "Length", format_num(line_length(start.xy(), end.xy())));
         }
         Geometry::Circle { center, radius, .. } => {
             kv(ui, "Center", point_label(*center));
@@ -299,37 +300,5 @@ where
         first
     } else {
         "Mixed".into()
-    }
-}
-
-fn polyline_length(vertices: &[PolyVertex], closed: bool) -> f64 {
-    if vertices.len() < 2 {
-        return 0.0;
-    }
-    let n = if closed {
-        vertices.len()
-    } else {
-        vertices.len() - 1
-    };
-    let mut total = 0.0;
-    for i in 0..n {
-        let a = vertices[i];
-        let b = vertices[(i + 1) % vertices.len()];
-        total += segment_length(a, b);
-    }
-    total
-}
-
-fn segment_length(a: PolyVertex, b: PolyVertex) -> f64 {
-    let chord = a.point.xy().distance(b.point.xy());
-    if a.bulge.abs() < 1e-12 {
-        return chord;
-    }
-    let theta = 4.0 * a.bulge.atan();
-    if theta.abs() < 1e-12 {
-        chord
-    } else {
-        let radius = chord / (2.0 * (theta * 0.5).sin().abs().max(1e-12));
-        (radius * theta).abs()
     }
 }

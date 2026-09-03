@@ -7,8 +7,8 @@ use std::path::Path;
 
 use cad_core::{
     default_extrusion, normalize_linetype_name, ocs_to_wcs, BlockDefinition, CadColor, Document,
-    Entity, Geometry, HatchData, HatchEdge, HatchPath, HatchPatternLine, ImportDiagnostics, Layer,
-    LineType, MTextData, Point3, PolyVertex, TextData,
+    DrawingUnits, Entity, EntityId, Geometry, HatchData, HatchEdge, HatchPath, HatchPatternLine,
+    ImportDiagnostics, Layer, LineType, MTextData, Point3, PolyVertex, TextData,
 };
 
 use crate::dynapi::{
@@ -104,16 +104,25 @@ pub unsafe fn convert_document(
     let ltscale = get_header_field::<f64>(dwg, "LTSCALE")
         .filter(|v| v.is_finite() && *v > 0.0)
         .unwrap_or(1.0);
+    let units = get_header_field::<u16>(dwg, "INSUNITS")
+        .map(DrawingUnits::from_insunits)
+        .unwrap_or(DrawingUnits::Unspecified);
+    let clayer = get_header_field::<*mut libredwg_sys::Dwg_Object_Ref>(dwg, "CLAYER")
+        .and_then(|handle| resolve_handle_name(dwg, handle))
+        .filter(|name| !name.is_empty());
 
-    let mut document = Document {
-        source_path: Some(path.to_path_buf()),
-        layers,
-        linetypes,
-        blocks,
-        model_space,
-        diagnostics,
-        ltscale,
-    };
+    let mut document = Document::default();
+    document.source_path = Some(path.to_path_buf());
+    document.layers = layers;
+    document.linetypes = linetypes;
+    document.blocks = blocks;
+    document.model_space = model_space;
+    document.diagnostics = diagnostics;
+    document.ltscale = ltscale;
+    document.units = units;
+    document.ensure_layer_zero();
+    document.apply_current_layer(clayer.as_deref());
+    document.assign_missing_ids();
     document.diagnostics.extents = document.compute_extents();
     if document
         .model_space
@@ -290,6 +299,7 @@ unsafe fn convert_one(
     };
 
     Some(Entity {
+        id: EntityId::UNASSIGNED,
         layer,
         color,
         linetype,
@@ -791,5 +801,26 @@ mod tests {
         assert!(is_model_space("*Model_Space"));
         assert!(is_model_space("*MODEL_SPACE"));
         assert!(!is_model_space("*Paper_Space"));
+    }
+
+    #[test]
+    fn missing_clayer_falls_back_to_layer_zero() {
+        let mut document = Document::default();
+        document.layers.insert(
+            "FROZEN".into(),
+            Layer {
+                name: "FROZEN".into(),
+                visible: true,
+                frozen: true,
+                color: CadColor::Aci(1),
+                linetype: "CONTINUOUS".into(),
+            },
+        );
+        document.apply_current_layer(Some("FROZEN"));
+        assert_eq!(document.current_layer, "0");
+        document.apply_current_layer(Some("missing"));
+        assert_eq!(document.current_layer, "0");
+        document.apply_current_layer(None);
+        assert_eq!(document.current_layer, "0");
     }
 }

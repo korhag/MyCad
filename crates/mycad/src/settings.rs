@@ -2,13 +2,15 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::drafting::DraftingPreferences;
 use crate::input::InputMap;
 use crate::workspace::{
-    decode_dock_layout, default_dock_state, encode_dock_layout, sanitize_dock_state, WorkspaceTab,
+    decode_dock_layout, default_dock_state, encode_dock_layout, migrate_home_tab,
+    sanitize_dock_state, WorkspaceTab,
 };
 
 pub const STORAGE_KEY: &str = "mycad_settings";
-pub const SETTINGS_SCHEMA_VERSION: u32 = 1;
+pub const SETTINGS_SCHEMA_VERSION: u32 = 3;
 pub const DEFAULT_ZOOM_SPEED: f64 = 1.0;
 pub const ZOOM_SPEED_MIN: f64 = 0.25;
 pub const ZOOM_SPEED_MAX: f64 = 10.0;
@@ -109,6 +111,9 @@ pub struct AppSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dock_layout: Option<serde_json::Value>,
     pub display: DisplaySettings,
+    pub drafting: DraftingPreferences,
+    #[serde(default)]
+    pub home_layout_migrated: bool,
 }
 
 impl Default for AppSettings {
@@ -118,6 +123,8 @@ impl Default for AppSettings {
             bindings: InputMap::standard(),
             dock_layout: Some(encode_dock_layout(&default_dock_state())),
             display: DisplaySettings::default(),
+            drafting: DraftingPreferences::default(),
+            home_layout_migrated: false,
         }
     }
 }
@@ -140,7 +147,8 @@ impl AppSettings {
     pub fn sanitize(&mut self) {
         self.zoom_speed = sanitize_zoom_speed(self.zoom_speed);
         self.bindings.sanitize();
-        let state = decode_dock_layout(self.dock_layout.as_ref());
+        let mut state = decode_dock_layout(self.dock_layout.as_ref());
+        self.home_layout_migrated = migrate_home_tab(&mut state, self.home_layout_migrated);
         self.dock_layout = Some(encode_dock_layout(&state));
     }
 
@@ -256,8 +264,21 @@ mod tests {
                 .as_deref(),
             Some("space")
         );
-        assert!(json.contains("\"schema_version\": 1"));
+        assert!(json.contains("\"schema_version\": 3"));
         assert!(!json.to_lowercase().contains(".dwg"));
+    }
+
+    #[test]
+    fn json_round_trip_preserves_drafting_switches() {
+        let mut settings = AppSettings::default();
+        settings.drafting.ortho_enabled = true;
+        settings.drafting.osnap_enabled = false;
+        settings.drafting.running_snaps.midpoint = false;
+        let json = settings.to_portable_json().expect("encode");
+        let decoded = AppSettings::from_portable_json(&json).expect("decode");
+        assert!(decoded.drafting.ortho_enabled);
+        assert!(!decoded.drafting.osnap_enabled);
+        assert!(!decoded.drafting.running_snaps.midpoint);
     }
 
     #[test]
@@ -309,6 +330,7 @@ mod tests {
             .collect();
         assert!(tabs.contains(&WorkspaceTab::Viewport));
         assert!(tabs.contains(&WorkspaceTab::Properties));
+        assert!(tabs.contains(&WorkspaceTab::Home));
     }
 
     #[test]
@@ -392,5 +414,38 @@ mod tests {
     fn old_json_without_display_still_loads() {
         let decoded = AppSettings::from_portable_json("{\"zoom_speed\":2.5}").expect("legacy");
         assert_eq!(decoded.display, DisplaySettings::default());
+    }
+
+    #[test]
+    fn old_layout_without_home_is_migrated_once() {
+        let old = egui_dock::DockState::new(vec![WorkspaceTab::Viewport]);
+        let mut settings = AppSettings {
+            dock_layout: Some(encode_dock_layout(&old)),
+            home_layout_migrated: false,
+            ..AppSettings::default()
+        };
+        settings.dock_layout = Some(encode_dock_layout(&old));
+        settings.home_layout_migrated = false;
+        settings.sanitize();
+        assert!(settings.home_layout_migrated);
+        assert!(settings
+            .dock_state()
+            .find_tab(&WorkspaceTab::Home)
+            .is_some());
+
+        let mut closed = settings.dock_state();
+        if let Some(tab) = closed.find_tab(&WorkspaceTab::Home) {
+            closed.remove_tab(tab);
+        }
+        settings.set_dock_state(&closed);
+        settings.sanitize();
+        assert!(
+            settings
+                .dock_state()
+                .find_tab(&WorkspaceTab::Home)
+                .is_none(),
+            "users can still close Home after the one-time migration"
+        );
+        assert!(settings.home_layout_migrated);
     }
 }

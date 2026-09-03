@@ -44,6 +44,7 @@ cargo run -p mycad -- "test-data/KD-1413-260825 Assir Poultry Internal Logistics
 - **Left-click** an entity to select it (line, circle, polyline, block insert, and other drawable types). Nested block geometry selects the parent block.
 - **Ctrl+click** or **Shift+click** adds or removes entities from the selection.
 - Click empty space or press **Esc** to clear the selection.
+- The **Home** ribbon (above the viewport by default) starts LINE and Distance with one click. Drag its tab to another edge, float it, collapse it, or restore it from **View → Show Home**. Layouts saved before Home gain the ribbon once on upgrade.
 - The **Properties** panel (left by default) shows a compact read-only inspector for the current selection. Drag its tab to another edge, float it in a window, resize the split, or collapse the leaf. **View → Show Properties** brings it back; **View → Reset layout** restores the default arrangement.
 - Mouse wheel zooms around the cursor; middle-mouse drag pans.
 - Double-click the viewport or **Ctrl+E** / **Cmd+E** for Zoom Extents.
@@ -66,3 +67,5 @@ cargo run -p mycad -- --import-only "test-data/KD-1413-260825 Assir Poultry Inte
 ## License
 
 GPL-3.0-or-later (required by LibreDWG).
+
+Toolbar icons are [Phosphor Icons](https://phosphoricons.com/) (MIT), bundled in the application binary through `egui-phosphor`.

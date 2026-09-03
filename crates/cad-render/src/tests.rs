@@ -4,8 +4,8 @@ use crate::{
 };
 use cad_core::Point2;
 use cad_core::{
-    BlockDefinition, CadColor, Document, Entity, Extents2, Geometry, Layer, Point3, PolyVertex,
-    Transform2,
+    BlockDefinition, CadColor, Document, Entity, EntityId, Extents2, Geometry, Layer, Point3,
+    PolyVertex, Transform2,
 };
 use cad_viewport::Camera2;
 
@@ -33,7 +33,7 @@ fn vp() -> (Point2, Point2) {
     (Point2::new(0.0, 0.0), Point2::new(800.0, 600.0))
 }
 
-fn pick_world(document: &Document, world: Point2) -> Option<usize> {
+fn pick_world(document: &Document, world: Point2) -> Option<EntityId> {
     let list = tessellate_document(document);
     let camera = camera_looking_at(world, 100.0);
     let (origin, size) = vp();
@@ -59,7 +59,7 @@ fn tessellates_line_into_two_vertices() {
     let list = tessellate_document(&document);
     assert_eq!(list.line_count(), 1);
     assert_eq!(list.picks.len(), 1);
-    assert_eq!(list.picks[0].entity_index, 0);
+    assert_eq!(list.picks[0].entity_id, EntityId(0));
 }
 
 #[test]
@@ -70,7 +70,10 @@ fn picks_a_line_near_its_midpoint() {
         start: Point3::from_xy(0.0, 0.0),
         end: Point3::from_xy(10.0, 0.0),
     }));
-    assert_eq!(pick_world(&document, Point2::new(5.0, 0.0)), Some(0));
+    assert_eq!(
+        pick_world(&document, Point2::new(5.0, 0.0)),
+        Some(EntityId(0))
+    );
     assert_eq!(pick_world(&document, Point2::new(50.0, 50.0)), None);
 }
 
@@ -83,7 +86,10 @@ fn picks_a_circle_on_the_circumference_not_the_center() {
         radius: 10.0,
         extrusion: Point3::new(0.0, 0.0, 1.0),
     }));
-    assert_eq!(pick_world(&document, Point2::new(10.0, 0.0)), Some(0));
+    assert_eq!(
+        pick_world(&document, Point2::new(10.0, 0.0)),
+        Some(EntityId(0))
+    );
     assert_eq!(pick_world(&document, Point2::new(0.0, 0.0)), None);
 }
 
@@ -110,8 +116,14 @@ fn picks_a_polyline_along_a_segment() {
         extrusion: Point3::new(0.0, 0.0, 1.0),
         linetype_generation_continuous: false,
     }));
-    assert_eq!(pick_world(&document, Point2::new(4.0, 0.0)), Some(0));
-    assert_eq!(pick_world(&document, Point2::new(8.0, 3.0)), Some(0));
+    assert_eq!(
+        pick_world(&document, Point2::new(4.0, 0.0)),
+        Some(EntityId(0))
+    );
+    assert_eq!(
+        pick_world(&document, Point2::new(8.0, 3.0)),
+        Some(EntityId(0))
+    );
     assert_eq!(pick_world(&document, Point2::new(4.0, 6.0)), None);
 }
 
@@ -128,7 +140,10 @@ fn picks_filled_solid_from_its_interior() {
         ],
         extrusion: Point3::new(0.0, 0.0, 1.0),
     }));
-    assert_eq!(pick_world(&document, Point2::new(5.0, 5.0)), Some(0));
+    assert_eq!(
+        pick_world(&document, Point2::new(5.0, 5.0)),
+        Some(EntityId(0))
+    );
     assert_eq!(pick_world(&document, Point2::new(40.0, 40.0)), None);
 }
 
@@ -144,8 +159,14 @@ fn overlapping_strokes_prefer_the_closer_entity() {
         start: Point3::from_xy(0.0, 1.0),
         end: Point3::from_xy(20.0, 1.0),
     }));
-    assert_eq!(pick_world(&document, Point2::new(10.0, 0.9)), Some(1));
-    assert_eq!(pick_world(&document, Point2::new(10.0, 0.1)), Some(0));
+    assert_eq!(
+        pick_world(&document, Point2::new(10.0, 0.9)),
+        Some(EntityId(1))
+    );
+    assert_eq!(
+        pick_world(&document, Point2::new(10.0, 0.1)),
+        Some(EntityId(0))
+    );
 }
 
 #[test]
@@ -160,7 +181,10 @@ fn overlapping_equal_distance_uses_later_draw_order() {
         start: Point3::from_xy(0.0, 0.0),
         end: Point3::from_xy(20.0, 0.0),
     }));
-    assert_eq!(pick_world(&document, Point2::new(10.0, 0.0)), Some(1));
+    assert_eq!(
+        pick_world(&document, Point2::new(10.0, 0.0)),
+        Some(EntityId(1))
+    );
 }
 
 #[test]
@@ -190,7 +214,10 @@ fn nested_block_picks_the_parent_insert() {
         column_spacing: 0.0,
         row_spacing: 0.0,
     }));
-    assert_eq!(pick_world(&document, Point2::new(110.0, 50.0)), Some(0));
+    assert_eq!(
+        pick_world(&document, Point2::new(110.0, 50.0)),
+        Some(EntityId(0))
+    );
     assert_eq!(pick_world(&document, Point2::new(0.0, 0.0)), None);
 }
 
@@ -211,7 +238,10 @@ fn stroke_on_a_fill_wins_within_the_aperture() {
         start: Point3::from_xy(0.0, 10.0),
         end: Point3::from_xy(20.0, 10.0),
     }));
-    assert_eq!(pick_world(&document, Point2::new(10.0, 10.0)), Some(1));
+    assert_eq!(
+        pick_world(&document, Point2::new(10.0, 10.0)),
+        Some(EntityId(1))
+    );
 }
 
 fn dashed() -> cad_core::LineType {
@@ -342,8 +372,14 @@ fn dashed_polyline_remains_pickable_in_gaps() {
         extrusion: Point3::new(0.0, 0.0, 1.0),
         linetype_generation_continuous: true,
     }));
-    assert_eq!(pick_world(&document, Point2::new(4.0, 0.0)), Some(0));
-    assert_eq!(pick_world(&document, Point2::new(8.0, 3.0)), Some(0));
+    assert_eq!(
+        pick_world(&document, Point2::new(4.0, 0.0)),
+        Some(EntityId(0))
+    );
+    assert_eq!(
+        pick_world(&document, Point2::new(8.0, 3.0)),
+        Some(EntityId(0))
+    );
 }
 
 #[test]
@@ -503,7 +539,9 @@ fn insert_transform(insertion: Point3, scale: Point3, rotation: f64) -> Transfor
 
 fn assert_selected_insert_matches(document: &Document, transform: Transform2) {
     let list = tessellate_document(document);
-    let pick = list.pick_for(0).expect("parent INSERT should be pickable");
+    let pick = list
+        .pick_for(EntityId(0))
+        .expect("parent INSERT should be pickable");
     let pick_edges: Vec<_> = pick.stroke_edges().collect();
     let gpu_edges = world_line_pairs(&list);
     let expected = expected_world_pairs(transform);
@@ -605,11 +643,11 @@ fn window_selects_only_fully_contained_entities() {
     let region = Extents2::from_corners(Point2::new(0.0, 0.0), Point2::new(10.0, 10.0));
     assert_eq!(
         box_select(&list.picks, region, SelectBoxMode::Window),
-        vec![0]
+        vec![EntityId(0)]
     );
     assert_eq!(
         box_select(&list.picks, region, SelectBoxMode::Crossing),
-        vec![0, 1]
+        vec![EntityId(0), EntityId(1)]
     );
 }
 
@@ -621,7 +659,7 @@ fn crossing_hits_a_segment_through_the_box() {
     assert!(box_select(&list.picks, region, SelectBoxMode::Window).is_empty());
     assert_eq!(
         box_select(&list.picks, region, SelectBoxMode::Crossing),
-        vec![0]
+        vec![EntityId(0)]
     );
 }
 
@@ -643,7 +681,7 @@ fn crossing_selects_a_fill_that_contains_the_box() {
     assert!(box_select(&list.picks, inside, SelectBoxMode::Window).is_empty());
     assert_eq!(
         box_select(&list.picks, inside, SelectBoxMode::Crossing),
-        vec![0]
+        vec![EntityId(0)]
     );
 }
 
@@ -680,12 +718,12 @@ fn crossing_ignores_empty_gaps_inside_a_block() {
     let around_child = Extents2::from_corners(Point2::new(-1.0, -1.0), Point2::new(11.0, 1.0));
     assert_eq!(
         box_select(&list.picks, around_child, SelectBoxMode::Crossing),
-        vec![0]
+        vec![EntityId(0)]
     );
     assert!(box_select(&list.picks, around_child, SelectBoxMode::Window).is_empty());
 }
 
-fn indexed_select(list: &DisplayList, region: Extents2, mode: SelectBoxMode) -> Vec<usize> {
+fn indexed_select(list: &DisplayList, region: Extents2, mode: SelectBoxMode) -> Vec<EntityId> {
     let mut out = Vec::new();
     list.box_select_into(region, mode, &mut out);
     out
@@ -714,8 +752,14 @@ fn indexed_box_select_matches_brute_window_and_crossing() {
     let region = Extents2::from_corners(Point2::new(0.0, 0.0), Point2::new(10.0, 10.0));
     assert_index_matches_brute(&list, region, SelectBoxMode::Window);
     assert_index_matches_brute(&list, region, SelectBoxMode::Crossing);
-    assert_eq!(list.pick_for(0).map(|pick| pick.entity_index), Some(0));
-    assert_eq!(list.pick_for(1).map(|pick| pick.entity_index), Some(1));
+    assert_eq!(
+        list.pick_for(EntityId(0)).map(|pick| pick.entity_id),
+        Some(EntityId(0))
+    );
+    assert_eq!(
+        list.pick_for(EntityId(1)).map(|pick| pick.entity_id),
+        Some(EntityId(1))
+    );
 }
 
 #[test]
@@ -805,7 +849,10 @@ fn spatial_index_prunes_a_local_query() {
     );
     assert_index_matches_brute(&list, region, SelectBoxMode::Window);
     assert_index_matches_brute(&list, region, SelectBoxMode::Crossing);
-    assert_eq!(indexed_select(&list, region, SelectBoxMode::Window), vec![0]);
+    assert_eq!(
+        indexed_select(&list, region, SelectBoxMode::Window),
+        vec![EntityId(0)]
+    );
 }
 
 #[test]
@@ -832,15 +879,17 @@ fn overlay_batches_merge_adjacent_ranges_not_edge_count() {
         linetype_generation_continuous: false,
     }));
     let list = tessellate_document(&document);
-    let adjacent = list.overlay_batches(&[0, 1]);
+    let adjacent = list.overlay_batches(&[EntityId(0), EntityId(1)]);
     assert_eq!(adjacent.lines.len(), 1);
     assert!(adjacent.fills.is_empty());
-    let skipped = list.overlay_batches(&[0, 2]);
+    let skipped = list.overlay_batches(&[EntityId(0), EntityId(2)]);
     assert_eq!(skipped.lines.len(), 2);
-    let dense = list.overlay_batches(&[3]);
+    let dense = list.overlay_batches(&[EntityId(3)]);
     assert_eq!(dense.range_count(), 1);
     assert!(
-        list.draw_range_for(3).unwrap().line_end - list.draw_range_for(3).unwrap().line_start > 4,
+        list.draw_range_for(EntityId(3)).unwrap().line_end
+            - list.draw_range_for(EntityId(3)).unwrap().line_start
+            > 4,
         "dense polyline should emit many vertices in one range"
     );
 }
@@ -848,12 +897,12 @@ fn overlay_batches_merge_adjacent_ranges_not_edge_count() {
 #[test]
 fn adaptive_primitive_index_is_memory_bounded() {
     use crate::pick::{EntityPick, COMPLEX_PRIMITIVE_COUNT};
-    let mut simple = EntityPick::new(0);
+    let mut simple = EntityPick::new(EntityId(0));
     simple.add_stroke(&[Point2::new(0.0, 0.0), Point2::new(1.0, 0.0)], false);
     simple.finalize();
     assert!(!simple.has_primitive_index());
 
-    let mut complex = EntityPick::new(1);
+    let mut complex = EntityPick::new(EntityId(1));
     for i in 0..COMPLEX_PRIMITIVE_COUNT {
         let x = i as f64 * 10.0;
         complex.add_stroke(&[Point2::new(x, 0.0), Point2::new(x + 1.0, 0.0)], false);
@@ -865,4 +914,98 @@ fn adaptive_primitive_index_is_memory_bounded() {
         "primitive grid should not store a dense full-drawing map ({})",
         complex.primitive_index_refs()
     );
+}
+
+fn pick_from_list(list: &DisplayList, world: Point2) -> Option<EntityId> {
+    let camera = camera_looking_at(world, 100.0);
+    let (origin, size) = vp();
+    let screen = camera.world_to_screen(world, origin, size);
+    hit_test(
+        &list.picks,
+        &camera,
+        screen,
+        origin,
+        size,
+        DEFAULT_PICK_TOLERANCE_PX,
+    )
+}
+
+fn world_line_segments(list: &DisplayList) -> Vec<[Point2; 2]> {
+    list.line_vertices
+        .chunks_exact(2)
+        .map(|pair| {
+            [
+                Point2::new(
+                    pair[0].position[0] as f64 + list.origin.x,
+                    pair[0].position[1] as f64 + list.origin.y,
+                ),
+                Point2::new(
+                    pair[1].position[0] as f64 + list.origin.x,
+                    pair[1].position[1] as f64 + list.origin.y,
+                ),
+            ]
+        })
+        .collect()
+}
+
+fn segments_match(left: &[[Point2; 2]], right: &[[Point2; 2]]) {
+    assert_eq!(left.len(), right.len());
+    for (a, b) in left.iter().zip(right) {
+        for (p, q) in a.iter().zip(b) {
+            assert!(
+                (p.x - q.x).abs() < 1e-4 && (p.y - q.y).abs() < 1e-4,
+                "world vertices differ: {p:?} vs {q:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn append_line_matches_full_rebuild_for_pick_and_vertices() {
+    let mut document = Document::default();
+    layer0(&mut document);
+    let first = document.new_entity(Geometry::Line {
+        start: Point3::from_xy(0.0, 0.0),
+        end: Point3::from_xy(10.0, 0.0),
+    });
+    let first = document.add_entity(first);
+    document.diagnostics.extents = document.compute_extents();
+    let mut list = tessellate_document(&document);
+    let origin = list.origin;
+    let line_start = list.line_vertices.len() as u32;
+
+    let second = document.new_entity(Geometry::Line {
+        start: Point3::from_xy(10.0, 0.0),
+        end: Point3::from_xy(10.0, 4.0),
+    });
+    let second = document.add_entity(second);
+    if let Some(extents) = document.diagnostics.extents.as_mut() {
+        extents.include(Point2::new(10.0, 0.0));
+        extents.include(Point2::new(10.0, 4.0));
+    }
+
+    let appended = list
+        .append_entity(&document, &second)
+        .expect("new LINE should tessellate");
+    assert_eq!(appended.line_start, line_start);
+    assert_eq!(list.origin, origin);
+    assert_eq!(list.picks.len(), 2);
+
+    let rebuilt = tessellate_document(&document);
+    segments_match(&world_line_segments(&list), &world_line_segments(&rebuilt));
+    let pick = list.pick_for(second.id).expect("appended pick");
+    let rebuilt_pick = rebuilt.pick_for(second.id).expect("rebuilt pick");
+    assert_eq!(pick.bounds, rebuilt_pick.bounds);
+    assert_eq!(pick_from_list(&list, Point2::new(5.0, 0.0)), Some(first.id));
+    assert_eq!(
+        pick_from_list(&list, Point2::new(10.0, 2.0)),
+        Some(second.id)
+    );
+
+    let region = Extents2::from_corners(Point2::new(9.5, 1.5), Point2::new(10.5, 2.5));
+    let brute = box_select(&list.picks, region, SelectBoxMode::Crossing);
+    let mut indexed = Vec::new();
+    list.box_select_into(region, SelectBoxMode::Crossing, &mut indexed);
+    assert_eq!(brute, indexed);
+    assert!(indexed.contains(&second.id));
 }

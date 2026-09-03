@@ -1,9 +1,11 @@
 //! Walk a cad-core document into GPU-ready line and triangle batches.
 //! Geometry is sampled in f64, then stored relative to a document origin as f32.
 
+use std::collections::HashMap;
+
 use cad_core::{
-    CadColor, Document, Entity, Extents2, Geometry, HatchEdge, HatchPath, LineType, Point2, Point3,
-    Rgb, Transform2,
+    CadColor, Document, Entity, EntityId, Extents2, Geometry, HatchEdge, HatchPath, LineType,
+    Point2, Point3, Rgb, Transform2,
 };
 
 use crate::curves::{
@@ -30,6 +32,17 @@ pub struct EntityDrawRange {
     pub line_end: u32,
     pub fill_start: u32,
     pub fill_end: u32,
+}
+
+// ------------------------------------------------------------
+// Type: AppendedGeometry
+// Purpose: Vertex counts before an incremental entity was appended,
+//          so the GPU can upload only the new tail.
+// ------------------------------------------------------------
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppendedGeometry {
+    pub line_start: u32,
+    pub fill_start: u32,
 }
 
 // ------------------------------------------------------------
@@ -64,7 +77,7 @@ pub struct DisplayList {
     pub triangle_vertices: Vec<GpuVertex>,
     pub picks: Vec<EntityPick>,
     pub draw_ranges: Vec<EntityDrawRange>,
-    pick_of: Vec<Option<u32>>,
+    pick_of: HashMap<EntityId, u32>,
     spatial: SpatialIndex,
 }
 
@@ -77,13 +90,13 @@ impl DisplayList {
         self.line_vertices.len() / 2
     }
 
-    pub fn pick_for(&self, entity_index: usize) -> Option<&EntityPick> {
-        let slot = (*self.pick_of.get(entity_index)?)?;
+    pub fn pick_for(&self, entity_id: EntityId) -> Option<&EntityPick> {
+        let slot = *self.pick_of.get(&entity_id)?;
         self.picks.get(slot as usize)
     }
 
-    pub fn draw_range_for(&self, entity_index: usize) -> Option<EntityDrawRange> {
-        let slot = (*self.pick_of.get(entity_index)?)?;
+    pub fn draw_range_for(&self, entity_id: EntityId) -> Option<EntityDrawRange> {
+        let slot = *self.pick_of.get(&entity_id)?;
         self.draw_ranges.get(slot as usize).copied()
     }
 
@@ -91,20 +104,47 @@ impl DisplayList {
         &self.spatial
     }
 
-    pub fn box_select_into(&self, region: Extents2, mode: SelectBoxMode, out: &mut Vec<usize>) {
+    pub fn box_select_into(&self, region: Extents2, mode: SelectBoxMode, out: &mut Vec<EntityId>) {
         box_select_into(&self.picks, Some(&self.spatial), region, mode, out);
     }
 
-    pub fn overlay_batches(&self, indices: &[usize]) -> OverlayBatches {
-        overlay_batches(self, indices)
+    pub fn overlay_batches(&self, ids: &[EntityId]) -> OverlayBatches {
+        overlay_batches(self, ids)
+    }
+
+    pub fn append_entity(
+        &mut self,
+        document: &Document,
+        entity: &Entity,
+    ) -> Option<AppendedGeometry> {
+        let entity_index = document
+            .model_space
+            .iter()
+            .position(|existing| existing.id == entity.id)
+            .unwrap_or(document.model_space.len().saturating_sub(1));
+        let mut stack = Vec::new();
+        let appended = emit_top_level_entity(document, entity, entity_index, self, &mut stack)?;
+        let slot = (self.picks.len() - 1) as u32;
+        let bounds = self.picks[slot as usize].bounds;
+        if self.spatial.is_empty() {
+            self.spatial = SpatialIndex::build(
+                self.picks
+                    .iter()
+                    .enumerate()
+                    .map(|(index, pick)| (index as u32, pick.bounds)),
+            );
+        } else {
+            self.spatial.insert(slot, bounds);
+        }
+        Some(appended)
     }
 }
 
-pub fn overlay_batches(display: &DisplayList, indices: &[usize]) -> OverlayBatches {
-    let mut lines = Vec::with_capacity(indices.len());
-    let mut fills = Vec::with_capacity(indices.len());
-    for &entity_index in indices {
-        let Some(range) = display.draw_range_for(entity_index) else {
+pub fn overlay_batches(display: &DisplayList, ids: &[EntityId]) -> OverlayBatches {
+    let mut lines = Vec::with_capacity(ids.len());
+    let mut fills = Vec::with_capacity(ids.len());
+    for &entity_id in ids {
+        let Some(range) = display.draw_range_for(entity_id) else {
             continue;
         };
         if range.line_end > range.line_start {
@@ -226,43 +266,12 @@ pub fn tessellate_document(document: &Document) -> DisplayList {
         triangle_vertices: Vec::new(),
         picks: Vec::with_capacity(document.model_space.len()),
         draw_ranges: Vec::with_capacity(document.model_space.len()),
-        pick_of: vec![None; document.model_space.len()],
+        pick_of: HashMap::with_capacity(document.model_space.len()),
         spatial: SpatialIndex::empty(),
     };
     let mut stack = Vec::new();
     for (entity_index, entity) in document.model_space.iter().enumerate() {
-        let line_start = list.line_vertices.len() as u32;
-        let fill_start = list.triangle_vertices.len() as u32;
-        let mut pick = EntityPick::new(entity_index);
-        {
-            let mut sink = TessSink {
-                list: &mut list,
-                pick: Some(&mut pick),
-            };
-            tessellate_entity(
-                document,
-                entity,
-                Transform2::identity(),
-                CadColor::Aci(7),
-                "CONTINUOUS",
-                &mut stack,
-                &mut sink,
-            );
-        }
-        if !pick.is_empty() {
-            pick.finalize();
-            if entity_index >= list.pick_of.len() {
-                list.pick_of.resize(entity_index + 1, None);
-            }
-            list.pick_of[entity_index] = Some(list.picks.len() as u32);
-            list.picks.push(pick);
-            list.draw_ranges.push(EntityDrawRange {
-                line_start,
-                line_end: list.line_vertices.len() as u32,
-                fill_start,
-                fill_end: list.triangle_vertices.len() as u32,
-            });
-        }
+        emit_top_level_entity(document, entity, entity_index, &mut list, &mut stack);
     }
     list.spatial = SpatialIndex::build(
         list.picks
@@ -271,6 +280,54 @@ pub fn tessellate_document(document: &Document) -> DisplayList {
             .map(|(slot, pick)| (slot as u32, pick.bounds)),
     );
     list
+}
+
+fn emit_top_level_entity(
+    document: &Document,
+    entity: &Entity,
+    entity_index: usize,
+    list: &mut DisplayList,
+    stack: &mut Vec<String>,
+) -> Option<AppendedGeometry> {
+    let entity_id = if entity.id.is_assigned() {
+        entity.id
+    } else {
+        EntityId(entity_index as u64)
+    };
+    let line_start = list.line_vertices.len() as u32;
+    let fill_start = list.triangle_vertices.len() as u32;
+    let mut pick = EntityPick::new(entity_id);
+    {
+        let mut sink = TessSink {
+            list,
+            pick: Some(&mut pick),
+        };
+        tessellate_entity(
+            document,
+            entity,
+            Transform2::identity(),
+            CadColor::Aci(7),
+            "CONTINUOUS",
+            stack,
+            &mut sink,
+        );
+    }
+    if pick.is_empty() {
+        return None;
+    }
+    pick.finalize();
+    list.pick_of.insert(entity_id, list.picks.len() as u32);
+    list.picks.push(pick);
+    list.draw_ranges.push(EntityDrawRange {
+        line_start,
+        line_end: list.line_vertices.len() as u32,
+        fill_start,
+        fill_end: list.triangle_vertices.len() as u32,
+    });
+    Some(AppendedGeometry {
+        line_start,
+        fill_start,
+    })
 }
 
 fn tessellate_entity(

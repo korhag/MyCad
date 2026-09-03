@@ -27,6 +27,24 @@ fn reference_dwg_imports_without_panic() {
         "import produced no entity accounting"
     );
     assert!(doc.ltscale > 0.0 && doc.ltscale.is_finite());
+    assert!(
+        doc.layers.contains_key(&doc.current_layer),
+        "current layer should exist in the layer table"
+    );
+    assert!(
+        !doc.layers
+            .get(&doc.current_layer)
+            .expect("current layer")
+            .frozen,
+        "current layer must not be frozen"
+    );
+    assert!(
+        doc.model_space
+            .iter()
+            .chain(doc.blocks.values().flat_map(|block| block.entities.iter()))
+            .all(|entity| entity.id.is_assigned()),
+        "imported entities should receive stable IDs"
+    );
     assert!(!doc.linetypes.is_empty(), "expected LTYPE table entries");
     let has = |name: &str| doc.linetypes.keys().any(|k| k.eq_ignore_ascii_case(name));
     assert!(has("CONTINUOUS"), "missing CONTINUOUS linetype");

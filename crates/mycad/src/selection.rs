@@ -2,74 +2,74 @@
 
 use std::collections::HashSet;
 
-use cad_core::{Extents2, Point2};
+use cad_core::{Document, EntityId, Extents2, Point2};
 use cad_render::{hit_test, DisplayList, SelectBoxMode, DEFAULT_PICK_TOLERANCE_PX};
 use cad_viewport::Camera2;
 
 // ------------------------------------------------------------
 // Type: Selection
-// Purpose: Ordered set of top-level model-space entity indices.
+// Purpose: Ordered set of top-level model-space entity IDs.
 // ------------------------------------------------------------
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Selection {
-    indices: Vec<usize>,
-    members: HashSet<usize>,
+    ids: Vec<EntityId>,
+    members: HashSet<EntityId>,
 }
 
 impl Selection {
     pub fn clear(&mut self) {
-        self.indices.clear();
+        self.ids.clear();
         self.members.clear();
     }
 
     pub fn is_empty(&self) -> bool {
-        self.indices.is_empty()
+        self.ids.is_empty()
     }
 
     pub fn len(&self) -> usize {
-        self.indices.len()
+        self.ids.len()
     }
 
-    pub fn indices(&self) -> &[usize] {
-        &self.indices
+    pub fn ids(&self) -> &[EntityId] {
+        &self.ids
     }
 
     #[allow(dead_code)]
-    pub fn contains(&self, index: usize) -> bool {
-        self.members.contains(&index)
+    pub fn contains(&self, id: EntityId) -> bool {
+        self.members.contains(&id)
     }
 
-    pub fn replace(&mut self, index: usize) {
-        self.indices.clear();
+    pub fn replace(&mut self, id: EntityId) {
+        self.ids.clear();
         self.members.clear();
-        self.indices.push(index);
-        self.members.insert(index);
+        self.ids.push(id);
+        self.members.insert(id);
     }
 
-    pub fn toggle(&mut self, index: usize) {
-        if self.members.remove(&index) {
-            self.indices.retain(|existing| *existing != index);
+    pub fn toggle(&mut self, id: EntityId) {
+        if self.members.remove(&id) {
+            self.ids.retain(|existing| *existing != id);
         } else {
-            self.members.insert(index);
-            self.indices.push(index);
+            self.members.insert(id);
+            self.ids.push(id);
         }
     }
 
-    pub fn replace_all(&mut self, indices: impl IntoIterator<Item = usize>) {
-        self.indices.clear();
+    pub fn replace_all(&mut self, ids: impl IntoIterator<Item = EntityId>) {
+        self.ids.clear();
         self.members.clear();
-        for index in indices {
-            if self.members.insert(index) {
-                self.indices.push(index);
+        for id in ids {
+            if self.members.insert(id) {
+                self.ids.push(id);
             }
         }
     }
 
-    pub fn toggle_all(&mut self, indices: impl IntoIterator<Item = usize>) {
+    pub fn toggle_all(&mut self, ids: impl IntoIterator<Item = EntityId>) {
         let mut odd = HashSet::new();
-        for index in indices {
-            if !odd.remove(&index) {
-                odd.insert(index);
+        for id in ids {
+            if !odd.remove(&id) {
+                odd.insert(id);
             }
         }
         if odd.is_empty() {
@@ -77,25 +77,25 @@ impl Selection {
         }
         let mut add = Vec::new();
         let mut remove = HashSet::new();
-        for index in odd {
-            if self.members.contains(&index) {
-                remove.insert(index);
+        for id in odd {
+            if self.members.contains(&id) {
+                remove.insert(id);
             } else {
-                add.push(index);
+                add.push(id);
             }
         }
         if !remove.is_empty() {
-            self.indices.retain(|index| !remove.contains(index));
-            self.members.retain(|index| !remove.contains(index));
+            self.ids.retain(|id| !remove.contains(id));
+            self.members.retain(|id| !remove.contains(id));
         }
-        for index in add {
-            if self.members.insert(index) {
-                self.indices.push(index);
+        for id in add {
+            if self.members.insert(id) {
+                self.ids.push(id);
             }
         }
     }
 
-    pub fn commit_box(&mut self, candidates: &[usize], toggle: bool) {
+    pub fn commit_box(&mut self, candidates: &[EntityId], toggle: bool) {
         if toggle {
             self.toggle_all(candidates.iter().copied());
         } else {
@@ -103,10 +103,23 @@ impl Selection {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn retain_valid(&mut self, entity_count: usize) {
-        self.indices.retain(|index| *index < entity_count);
-        self.members.retain(|index| *index < entity_count);
+    pub fn retain_valid(&mut self, document: &Document) {
+        self.ids.retain(|id| document.entity_by_id(*id).is_some());
+        self.members
+            .retain(|id| document.entity_by_id(*id).is_some());
+    }
+
+    pub fn shared_layer(&self, document: &Document) -> Option<String> {
+        let mut layer = None;
+        for id in &self.ids {
+            let entity_layer = document.entity_by_id(*id)?.layer.clone();
+            match &layer {
+                None => layer = Some(entity_layer),
+                Some(existing) if existing != &entity_layer => return None,
+                Some(_) => {}
+            }
+        }
+        layer
     }
 }
 
@@ -120,7 +133,7 @@ pub fn pick_entity(
     screen: Point2,
     viewport_origin: Point2,
     viewport_size: Point2,
-) -> Option<usize> {
+) -> Option<EntityId> {
     hit_test(
         &display.picks,
         camera,
@@ -139,7 +152,7 @@ pub fn box_pick_entities(
     current: Point2,
     viewport_origin: Point2,
     viewport_size: Point2,
-) -> (SelectBoxMode, Vec<usize>) {
+) -> (SelectBoxMode, Vec<EntityId>) {
     let mut out = Vec::new();
     let mode = box_pick_entities_into(
         display,
@@ -160,7 +173,7 @@ pub fn box_pick_entities_into(
     current: Point2,
     viewport_origin: Point2,
     viewport_size: Point2,
-    out: &mut Vec<usize>,
+    out: &mut Vec<EntityId>,
 ) -> SelectBoxMode {
     let mode = SelectBoxMode::from_screen_drag(start, current);
     let a = camera.screen_to_world(start, viewport_origin, viewport_size);
@@ -173,79 +186,94 @@ pub fn box_pick_entities_into(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cad_core::{Entity, Geometry, Point3};
+
+    fn id(n: u64) -> EntityId {
+        EntityId(n)
+    }
 
     #[test]
     fn replace_clears_previous_selection() {
         let mut selection = Selection::default();
-        selection.replace(2);
-        selection.replace(5);
-        assert_eq!(selection.indices(), &[5]);
+        selection.replace(id(2));
+        selection.replace(id(5));
+        assert_eq!(selection.ids(), &[id(5)]);
     }
 
     #[test]
     fn toggle_adds_and_removes() {
         let mut selection = Selection::default();
-        selection.toggle(1);
-        selection.toggle(3);
-        selection.toggle(1);
-        assert_eq!(selection.indices(), &[3]);
+        selection.toggle(id(1));
+        selection.toggle(id(3));
+        selection.toggle(id(1));
+        assert_eq!(selection.ids(), &[id(3)]);
     }
 
     #[test]
     fn clear_empties_selection() {
         let mut selection = Selection::default();
-        selection.replace(0);
+        selection.replace(id(0));
         selection.clear();
         assert!(selection.is_empty());
     }
 
     #[test]
-    fn retain_valid_drops_stale_indices() {
+    fn retain_valid_drops_removed_ids() {
+        let mut document = Document::default();
+        let first = document.add_entity(Entity::new(Geometry::Line {
+            start: Point3::from_xy(0.0, 0.0),
+            end: Point3::from_xy(1.0, 0.0),
+        }));
+        let second = document.add_entity(Entity::new(Geometry::Line {
+            start: Point3::from_xy(1.0, 0.0),
+            end: Point3::from_xy(2.0, 0.0),
+        }));
         let mut selection = Selection::default();
-        selection.toggle(0);
-        selection.toggle(4);
-        selection.retain_valid(2);
-        assert_eq!(selection.indices(), &[0]);
+        selection.toggle(first.id);
+        selection.toggle(second.id);
+        document.remove_model_entity(second.id);
+        selection.retain_valid(&document);
+        assert_eq!(selection.ids(), &[first.id]);
     }
 
     #[test]
     fn replace_all_replaces_and_dedupes() {
         let mut selection = Selection::default();
-        selection.replace(9);
-        selection.replace_all([1, 2, 1]);
-        assert_eq!(selection.indices(), &[1, 2]);
-        assert!(selection.contains(1));
-        assert!(!selection.contains(9));
+        selection.replace(id(9));
+        selection.replace_all([id(1), id(2), id(1)]);
+        assert_eq!(selection.ids(), &[id(1), id(2)]);
+        assert!(selection.contains(id(1)));
+        assert!(!selection.contains(id(9)));
     }
 
     #[test]
     fn toggle_all_adds_and_removes_candidates() {
         let mut selection = Selection::default();
-        selection.replace_all([1, 2]);
-        selection.toggle_all([2, 3]);
-        assert_eq!(selection.indices(), &[1, 3]);
+        selection.replace_all([id(1), id(2)]);
+        selection.toggle_all([id(2), id(3)]);
+        assert_eq!(selection.ids(), &[id(1), id(3)]);
     }
 
     #[test]
     fn commit_box_replace_and_toggle() {
         let mut selection = Selection::default();
-        selection.replace(4);
-        selection.commit_box(&[1, 2], false);
-        assert_eq!(selection.indices(), &[1, 2]);
-        selection.commit_box(&[2, 5], true);
-        assert_eq!(selection.indices(), &[1, 5]);
+        selection.replace(id(4));
+        selection.commit_box(&[id(1), id(2)], false);
+        assert_eq!(selection.ids(), &[id(1), id(2)]);
+        selection.commit_box(&[id(2), id(5)], true);
+        assert_eq!(selection.ids(), &[id(1), id(5)]);
     }
 
     #[test]
     fn bulk_commit_stays_near_linear() {
         let mut selection = Selection::default();
-        let many: Vec<usize> = (0..20_000).collect();
+        let many: Vec<EntityId> = (1..20_001).map(EntityId).collect();
         selection.replace_all(many.iter().copied());
         assert_eq!(selection.len(), 20_000);
-        selection.toggle_all(0..10_000);
+        selection.toggle_all((1..10_001).map(EntityId));
         assert_eq!(selection.len(), 10_000);
-        assert_eq!(selection.indices()[0], 10_000);
-        assert!(selection.contains(19_999));
-        assert!(!selection.contains(0));
+        assert_eq!(selection.ids()[0], id(10_001));
+        assert!(selection.contains(id(20_000)));
+        assert!(!selection.contains(id(1)));
     }
 }

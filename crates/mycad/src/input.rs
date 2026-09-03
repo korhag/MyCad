@@ -738,10 +738,6 @@ mod tests {
         map.sanitize();
         let none = mods(false, false, false, false);
         assert!(map.dragged(InputAction::Pan, PointerButton::Primary, none));
-        assert!(!map.dragged(
-            InputAction::SelectReplace,
-            PointerButton::Primary,
-            none
-        ));
+        assert!(!map.dragged(InputAction::SelectReplace, PointerButton::Primary, none));
     }
 }

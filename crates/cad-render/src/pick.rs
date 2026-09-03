@@ -1,6 +1,6 @@
 //! Screen-space picking against tessellated world-space primitives.
 
-use cad_core::{Extents2, Point2};
+use cad_core::{EntityId, Extents2, Point2};
 use cad_viewport::Camera2;
 
 pub const DEFAULT_PICK_TOLERANCE_PX: f64 = 6.0;
@@ -34,16 +34,16 @@ pub struct PickPrimitive {
 // ------------------------------------------------------------
 #[derive(Debug, Clone)]
 pub struct EntityPick {
-    pub entity_index: usize,
+    pub entity_id: EntityId,
     pub bounds: Extents2,
     pub primitives: Vec<PickPrimitive>,
     primitive_index: Option<SpatialIndex>,
 }
 
 impl EntityPick {
-    pub fn new(entity_index: usize) -> Self {
+    pub fn new(entity_id: EntityId) -> Self {
         Self {
-            entity_index,
+            entity_id,
             bounds: Extents2::empty(),
             primitives: Vec::new(),
             primitive_index: None,
@@ -241,7 +241,14 @@ impl SpatialIndex {
         self.cells.iter().map(Vec::len).sum()
     }
 
-    fn insert(&mut self, id: u32, extents: Extents2) {
+    pub fn insert(&mut self, id: u32, extents: Extents2) {
+        if !extents.is_valid() {
+            return;
+        }
+        if self.cells.is_empty() {
+            *self = Self::build([(id, extents)]);
+            return;
+        }
         let (x0, x1, y0, y1) = self.cell_range(extents);
         for y in y0..=y1 {
             for x in x0..=x1 {
@@ -262,14 +269,18 @@ impl SpatialIndex {
         if !value.is_finite() {
             return 0;
         }
-        value.floor().clamp(0.0, (self.cols.saturating_sub(1)) as f64) as usize
+        value
+            .floor()
+            .clamp(0.0, (self.cols.saturating_sub(1)) as f64) as usize
     }
 
     fn clamp_row(&self, value: f64) -> usize {
         if !value.is_finite() {
             return 0;
         }
-        value.floor().clamp(0.0, (self.rows.saturating_sub(1)) as f64) as usize
+        value
+            .floor()
+            .clamp(0.0, (self.rows.saturating_sub(1)) as f64) as usize
     }
 }
 
@@ -278,7 +289,7 @@ impl SpatialIndex {
 // Purpose: Return every top-level entity that matches a window or
 //          crossing box in world coordinates.
 // ------------------------------------------------------------
-pub fn box_select(picks: &[EntityPick], region: Extents2, mode: SelectBoxMode) -> Vec<usize> {
+pub fn box_select(picks: &[EntityPick], region: Extents2, mode: SelectBoxMode) -> Vec<EntityId> {
     let mut out = Vec::new();
     box_select_into(picks, None, region, mode, &mut out);
     out
@@ -289,7 +300,7 @@ pub fn box_select_into(
     spatial: Option<&SpatialIndex>,
     region: Extents2,
     mode: SelectBoxMode,
-    out: &mut Vec<usize>,
+    out: &mut Vec<EntityId>,
 ) {
     out.clear();
     if !region.is_valid() || region.width() < 1e-15 || region.height() < 1e-15 {
@@ -304,13 +315,13 @@ pub fn box_select_into(
                 continue;
             };
             if pick_matches(pick, region, mode, &mut scratch) {
-                out.push(pick.entity_index);
+                out.push(pick.entity_id);
             }
         }
     } else {
         for pick in picks {
             if pick_matches(pick, region, mode, &mut scratch) {
-                out.push(pick.entity_index);
+                out.push(pick.entity_id);
             }
         }
     }
@@ -442,12 +453,12 @@ pub fn hit_test(
     viewport_origin: Point2,
     viewport_size: Point2,
     tolerance_px: f64,
-) -> Option<usize> {
+) -> Option<EntityId> {
     let tolerance_px = tolerance_px.max(0.5);
     let mut best_stroke: Option<Hit> = None;
     let mut best_fill: Option<Hit> = None;
 
-    for pick in picks.iter().rev() {
+    for (draw_order, pick) in picks.iter().enumerate() {
         if pick.is_empty() {
             continue;
         }
@@ -472,7 +483,7 @@ pub fn hit_test(
                         viewport_size,
                     ) {
                         if dist <= tolerance_px {
-                            consider_hit(&mut best_stroke, pick.entity_index, dist);
+                            consider_hit(&mut best_stroke, pick.entity_id, draw_order, dist);
                         }
                     }
                 }
@@ -484,35 +495,38 @@ pub fn hit_test(
                         viewport_origin,
                         viewport_size,
                     ) {
-                        consider_hit(&mut best_fill, pick.entity_index, 0.0);
+                        consider_hit(&mut best_fill, pick.entity_id, draw_order, 0.0);
                     }
                 }
             }
         }
     }
 
-    best_stroke.or(best_fill).map(|hit| hit.entity_index)
+    best_stroke.or(best_fill).map(|hit| hit.entity_id)
 }
 
 struct Hit {
-    entity_index: usize,
+    entity_id: EntityId,
+    draw_order: usize,
     distance: f64,
 }
 
-fn consider_hit(slot: &mut Option<Hit>, entity_index: usize, distance: f64) {
+fn consider_hit(slot: &mut Option<Hit>, entity_id: EntityId, draw_order: usize, distance: f64) {
     match slot {
         Some(existing) if existing.distance + 1e-6 < distance => {}
         Some(existing) if (existing.distance - distance).abs() <= 1e-6 => {
-            if entity_index > existing.entity_index {
+            if draw_order > existing.draw_order {
                 *existing = Hit {
-                    entity_index,
+                    entity_id,
+                    draw_order,
                     distance,
                 };
             }
         }
         _ => {
             *slot = Some(Hit {
-                entity_index,
+                entity_id,
+                draw_order,
                 distance,
             });
         }
@@ -636,7 +650,7 @@ mod tests {
 
     #[test]
     fn separate_primitives_do_not_grow_a_connector_edge() {
-        let mut pick = EntityPick::new(0);
+        let mut pick = EntityPick::new(EntityId(0));
         pick.add_stroke(&[p(0.0, 0.0), p(10.0, 0.0)], false);
         pick.add_stroke(&[p(100.0, 100.0), p(110.0, 100.0)], false);
         pick.add_stroke(&[p(-200.0, 50.0), p(-190.0, 50.0)], false);
@@ -674,5 +688,25 @@ mod tests {
             SelectBoxMode::from_screen_drag(p(80.0, 10.0), p(10.0, 40.0)),
             SelectBoxMode::Crossing
         );
+    }
+
+    #[test]
+    fn insert_adds_bounds_to_an_existing_grid() {
+        let mut index =
+            SpatialIndex::build([(0, Extents2::from_corners(p(0.0, 0.0), p(10.0, 10.0)))]);
+        index.insert(1, Extents2::from_corners(p(8.0, 8.0), p(9.0, 9.0)));
+        let mut slots = Vec::new();
+        index.gather(Extents2::from_corners(p(7.5, 7.5), p(9.5, 9.5)), &mut slots);
+        assert!(slots.contains(&0));
+        assert!(slots.contains(&1));
+    }
+
+    #[test]
+    fn insert_builds_a_grid_when_the_index_is_empty() {
+        let mut index = SpatialIndex::empty();
+        index.insert(3, Extents2::from_corners(p(1.0, 1.0), p(2.0, 2.0)));
+        let mut slots = Vec::new();
+        index.gather(Extents2::from_corners(p(0.5, 0.5), p(2.5, 2.5)), &mut slots);
+        assert_eq!(slots, vec![3]);
     }
 }
