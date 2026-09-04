@@ -5,9 +5,16 @@ All notable changes to MyCad are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project versions with [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Workspace version is `0.16.0` (`Cargo.toml`).
+Workspace version is `0.17.0` (`Cargo.toml`).
 
 ## [Unreleased]
+
+## [0.17.0] - 2026-09-04
+
+### Changed
+
+- Clicking another Draw, Modify, or Measure tool now cancels the current command (same cleanup as Esc) and starts the new one in one click. Clicking the already-active tool stays a no-op, and Esc still returns to Idle.
+- Ignore the local `test-data/` directory so large PDFs and preview images stay off GitHub.
 
 ## [0.16.0] - 2026-09-04
 

@@ -45,7 +45,6 @@ pub fn show(ui: &mut Ui, app: &mut MyCadApp) {
 
 fn home_groups(app: &MyCadApp) -> Vec<RibbonGroup> {
     let kind = app.command_kind();
-    let idle = kind.is_idle();
     let line_active = kind == CommandKind::Line;
     let polyline_active = kind == CommandKind::Polyline;
     let circle_active = kind == CommandKind::Circle;
@@ -99,7 +98,7 @@ fn home_groups(app: &MyCadApp) -> Vec<RibbonGroup> {
                     LINE_SEGMENT,
                     "L",
                     0,
-                    idle || line_active,
+                    true,
                     line_active,
                 ),
                 command(
@@ -109,7 +108,7 @@ fn home_groups(app: &MyCadApp) -> Vec<RibbonGroup> {
                     LINE_SEGMENTS,
                     "P",
                     1,
-                    idle || polyline_active,
+                    true,
                     polyline_active,
                 ),
                 command(
@@ -119,7 +118,7 @@ fn home_groups(app: &MyCadApp) -> Vec<RibbonGroup> {
                     CIRCLE,
                     "C",
                     2,
-                    idle || circle_active,
+                    true,
                     circle_active,
                 ),
                 command(
@@ -129,7 +128,7 @@ fn home_groups(app: &MyCadApp) -> Vec<RibbonGroup> {
                     PATH,
                     "A",
                     3,
-                    idle || arc_active,
+                    true,
                     arc_active,
                 ),
                 command(
@@ -139,7 +138,7 @@ fn home_groups(app: &MyCadApp) -> Vec<RibbonGroup> {
                     RECTANGLE,
                     "R",
                     4,
-                    idle || rectangle_active,
+                    true,
                     rectangle_active,
                 ),
             ],
@@ -155,7 +154,7 @@ fn home_groups(app: &MyCadApp) -> Vec<RibbonGroup> {
                     ARROWS_OUT_CARDINAL,
                     "Move",
                     0,
-                    idle || move_active,
+                    true,
                     move_active,
                 ),
                 command(
@@ -165,7 +164,7 @@ fn home_groups(app: &MyCadApp) -> Vec<RibbonGroup> {
                     COPY,
                     "Copy",
                     1,
-                    idle || copy_active,
+                    true,
                     copy_active,
                 ),
                 command(
@@ -175,7 +174,7 @@ fn home_groups(app: &MyCadApp) -> Vec<RibbonGroup> {
                     ARROWS_CLOCKWISE,
                     "Rotate",
                     2,
-                    idle || rotate_active,
+                    true,
                     rotate_active,
                 ),
                 command(
@@ -185,7 +184,7 @@ fn home_groups(app: &MyCadApp) -> Vec<RibbonGroup> {
                     FLIP_HORIZONTAL,
                     "Mirror",
                     3,
-                    idle || mirror_active,
+                    true,
                     mirror_active,
                 ),
                 command(
@@ -195,7 +194,7 @@ fn home_groups(app: &MyCadApp) -> Vec<RibbonGroup> {
                     ARROWS_OUT,
                     "Scale",
                     4,
-                    idle || scale_active,
+                    true,
                     scale_active,
                 ),
                 command(
@@ -205,7 +204,7 @@ fn home_groups(app: &MyCadApp) -> Vec<RibbonGroup> {
                     ERASER,
                     "Delete",
                     5,
-                    idle || erase_active,
+                    true,
                     erase_active,
                 ),
             ],
@@ -221,7 +220,7 @@ fn home_groups(app: &MyCadApp) -> Vec<RibbonGroup> {
                     RULER,
                     "DI",
                     0,
-                    idle || distance_active,
+                    true,
                     distance_active,
                 ),
                 command(
@@ -231,7 +230,7 @@ fn home_groups(app: &MyCadApp) -> Vec<RibbonGroup> {
                     ANGLE,
                     "Angle",
                     1,
-                    idle || angle_active,
+                    true,
                     angle_active,
                 ),
                 command(
@@ -241,7 +240,7 @@ fn home_groups(app: &MyCadApp) -> Vec<RibbonGroup> {
                     CIRCLE,
                     "Radius",
                     2,
-                    idle || radius_active,
+                    true,
                     radius_active,
                 ),
                 command(
@@ -251,7 +250,7 @@ fn home_groups(app: &MyCadApp) -> Vec<RibbonGroup> {
                     POLYGON,
                     "Area",
                     3,
-                    idle || area_active,
+                    true,
                     area_active,
                 ),
             ],
@@ -477,6 +476,41 @@ mod tests {
             !matches_priority("Save", "Save", 0),
             "Save belongs on the menu-bar quick-access control"
         );
+    }
+
+    #[test]
+    fn draw_modify_measure_stay_clickable_while_another_command_is_active() {
+        let mut app = crate::app::MyCadApp::for_test();
+        app.start_line_command();
+        let groups = home_groups(&app);
+        let mut saw_line = false;
+        let mut saw_circle = false;
+        for group in &groups {
+            if matches!(group.id, "draw" | "modify" | "measure") {
+                for command in &group.commands {
+                    assert!(
+                        command.enabled,
+                        "{} should stay clickable while LINE is active",
+                        command.label
+                    );
+                }
+            }
+        }
+        for group in &groups {
+            for command in &group.commands {
+                if command.id == CMD_LINE {
+                    saw_line = true;
+                    assert!(command.active);
+                    assert!(command.enabled);
+                }
+                if command.id == CMD_CIRCLE {
+                    saw_circle = true;
+                    assert!(!command.active);
+                    assert!(command.enabled);
+                }
+            }
+        }
+        assert!(saw_line && saw_circle);
     }
 
     #[test]

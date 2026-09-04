@@ -3,17 +3,16 @@
 
 use std::collections::HashMap;
 
-use cad_core::{
-    CadColor, Document, Entity, EntityId, Extents2, Geometry, HatchEdge, HatchPath, LineType,
-    Point2, Point3, Rgb, Transform2,
-};
-
-use crate::curves::{
+use cad_core::curves::{
     arc_points, bspline_points, circle_points, ellipse_points, polyline_points, CIRCLE_SEGMENTS,
 };
+use cad_core::{
+    strip_mtext, stroke_text, CadColor, Document, Entity, EntityId, Extents2, Geometry, HatchEdge,
+    HatchPath, LineType, Point2, Point3, Rgb, Transform2,
+};
+
 use crate::dash::{generate_path_dashes, line_chain, polyline_path_segs, scaled_pattern, PathSeg};
 use crate::pick::{box_select_into, EntityPick, SelectBoxMode, SpatialIndex};
-use crate::stroke_font::{strip_mtext, stroke_text};
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]

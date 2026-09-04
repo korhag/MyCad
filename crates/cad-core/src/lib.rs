@@ -5,6 +5,7 @@
 
 pub mod color;
 pub mod compare;
+pub mod curves;
 pub mod document;
 pub mod entity;
 pub mod entity_transform;
@@ -15,10 +16,15 @@ pub mod linetype;
 pub mod measure;
 pub mod measure_index;
 pub mod snap;
+pub mod stroke_font;
 pub mod transform;
 
 pub use color::{aci_rgb, CadColor, Rgb};
 pub use compare::{compare_documents, CompareTol, Mismatch};
+pub use curves::{
+    arc_points, bspline_points, bulge_arc, circle_points, ellipse_points, polyline_points,
+    CIRCLE_SEGMENTS, POLYLINE_BULGE_SEGMENTS,
+};
 pub use document::{BlockDefinition, Document, DrawingUnits, ImportDiagnostics, Layer};
 pub use entity::{
     default_extrusion, Entity, EntityId, Geometry, HatchData, HatchEdge, HatchPath,
@@ -48,4 +54,5 @@ pub use measure_index::{
     MeasurePrimitive, MeasureRole, MEASURE_APERTURE_PX,
 };
 pub use snap::{SnapFeature, SnapIndex, SnapKind};
+pub use stroke_font::{measure_width, strip_mtext, stroke_text};
 pub use transform::Transform2;

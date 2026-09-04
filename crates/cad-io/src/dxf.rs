@@ -18,6 +18,7 @@ use cad_core::{
 
 use crate::error::ExportError;
 use crate::options::{DxfAcadVersion, DxfExportOptions, SaveReport};
+use crate::r2000::{encode_dxf_r2000, mtext_group_chunks};
 
 const WORLD: Point3 = Point3 {
     x: 0.0,
@@ -36,6 +37,11 @@ pub fn write_dxf(
 ) -> Result<SaveReport, ExportError> {
     let mut writer = DxfWriter::new(document, options.version);
     writer.write_document();
+    if writer.nonfinite {
+        return Err(ExportError::Invalid(
+            "DXF cannot store non-finite coordinates or scales",
+        ));
+    }
     crate::atomic::write_atomic(path, writer.out.as_bytes())
         .map_err(|source| ExportError::io(path, source))?;
     Ok(writer.report)
@@ -49,6 +55,7 @@ struct DxfWriter<'a> {
     report: SaveReport,
     block_stack: Vec<String>,
     block_records: BTreeMap<String, String>,
+    nonfinite: bool,
 }
 
 impl<'a> DxfWriter<'a> {
@@ -64,6 +71,7 @@ impl<'a> DxfWriter<'a> {
             report: SaveReport::default(),
             block_stack: Vec::new(),
             block_records: BTreeMap::new(),
+            nonfinite: false,
         }
     }
 
@@ -73,7 +81,11 @@ impl<'a> DxfWriter<'a> {
     }
 
     fn pair_f(&mut self, code: i16, value: f64) {
-        self.pair(code, format_dxf_f64(value));
+        if !value.is_finite() {
+            self.nonfinite = true;
+            self.warn("non-finite coordinate or scale was not written as a number");
+        }
+        self.pair(code, format_dxf_r2000_f64(value));
     }
 
     fn pair_i(&mut self, code: i16, value: i32) {
@@ -719,7 +731,6 @@ impl<'a> DxfWriter<'a> {
 
     fn write_hatch(&mut self, entity: &Entity, hatch: &HatchData) {
         self.begin_entity("HATCH", entity);
-        self.pair(100, "AcDbHatch");
         self.pair_f(10, 0.0);
         self.pair_f(20, 0.0);
         self.pair_f(30, hatch.elevation);
@@ -978,35 +989,22 @@ fn acad_class(kind: &str) -> &'static str {
 
 fn sanitize_name(name: &str) -> String {
     let trimmed = name.trim();
-    if trimmed.is_empty() {
+    let cleaned = if trimmed.is_empty() {
         "0".into()
     } else {
         trimmed.replace(['\n', '\r'], "_")
-    }
+    };
+    encode_dxf_r2000(&cleaned)
 }
 
 fn sanitize_text(value: &str) -> String {
-    value.replace('\r', "").replace('\n', "\\P")
+    encode_dxf_r2000(&value.replace('\r', "").replace('\n', "\\P"))
 }
 
 fn write_mtext_chunks(value: &str, mut write: impl FnMut(i16, &str)) {
     let text = sanitize_text(value);
-    if text.len() <= 250 {
-        write(1, &text);
-        return;
-    }
-    let bytes = text.as_bytes();
-    let mut start = 0;
-    let mut first = true;
-    while start < bytes.len() {
-        let mut end = (start + 250).min(bytes.len());
-        while end < bytes.len() && !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        let chunk = &text[start..end];
-        write(if first { 1 } else { 3 }, chunk);
-        first = false;
-        start = end;
+    for (code, chunk) in mtext_group_chunks(&text) {
+        write(code, chunk);
     }
 }
 
@@ -1042,7 +1040,7 @@ fn autocad_julian_date() -> f64 {
     2_451_545.0
 }
 
-fn format_dxf_f64(value: f64) -> String {
+fn format_dxf_r2000_f64(value: f64) -> String {
     if !value.is_finite() {
         "0.0".into()
     } else if value.fract().abs() < 1e-12 {
@@ -1310,5 +1308,102 @@ mod tests {
         assert!(!entities.contains(" 72\n"));
         assert!(entities.contains(" 11\n0.0\n 21\n1.0\n"));
         assert!(!entities.contains(" 50\n90"));
+    }
+
+    #[test]
+    fn r2000_encodes_turkish_text_and_layer_names() {
+        let mut document = Document::default();
+        document.layers.insert(
+            "Şase".into(),
+            cad_core::Layer {
+                name: "Şase".into(),
+                visible: true,
+                frozen: false,
+                color: CadColor::Aci(1),
+                linetype: "CONTINUOUS".into(),
+            },
+        );
+        let mut text = Entity::new(Geometry::Text(TextData {
+            insertion: Point3::from_xy(0.0, 0.0),
+            height: 2.5,
+            rotation: 0.0,
+            value: "Ölçü Çıkış İstanbul ğşıİ".into(),
+            extrusion: Point3::new(0.0, 0.0, 1.0),
+            is_attrib_def: false,
+        }));
+        text.layer = "Şase".into();
+        document.add_entity(text);
+        let (_, dxf) = write_to_string(&document);
+        assert!(dxf.is_ascii(), "R2000 DXF must be ASCII plus \\U+ escapes");
+        assert!(dxf.contains("\\U+00D6"));
+        assert!(dxf.contains("\\U+015E"));
+        assert!(dxf.contains("\\U+0131"));
+        assert!(!dxf.contains("Ölçü"));
+    }
+
+    #[test]
+    fn long_mtext_writes_group_3_then_group_1() {
+        let mut document = Document::default();
+        let value = format!("{}İstanbul", "A".repeat(500));
+        document.add_entity(Entity::new(Geometry::MText(MTextData {
+            insertion: Point3::from_xy(0.0, 0.0),
+            height: 2.5,
+            rotation: 0.0,
+            width: 80.0,
+            value,
+            extrusion: Point3::new(0.0, 0.0, 1.0),
+        })));
+        let (_, dxf) = write_to_string(&document);
+        let entities = entities_section(&dxf);
+        let first_3 = entities.find("\n  3\n").expect("group 3");
+        let last_1 = entities.rfind("\n  1\n").expect("group 1");
+        assert!(first_3 < last_1, "group 3 chunks must precede the last group 1");
+        assert!(dxf.contains("\\U+0130"));
+        let group_3_count = entities.matches("\n  3\n").count();
+        assert!(group_3_count >= 2);
+    }
+
+    #[test]
+    fn non_finite_coordinate_fails_the_save() {
+        let mut document = Document::default();
+        document.add_entity(Entity::new(Geometry::Line {
+            start: Point3::from_xy(f64::NAN, 0.0),
+            end: Point3::from_xy(1.0, 0.0),
+        }));
+        let path = temp_path("nan.dxf");
+        let err = write_dxf(&document, &path, &DxfExportOptions::default()).unwrap_err();
+        let _ = fs::remove_file(&path);
+        assert!(err.to_string().contains("non-finite"));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn hatch_writes_acdbhatch_once() {
+        let mut document = Document::default();
+        document.add_entity(Entity::new(Geometry::Hatch(HatchData {
+            extrusion: Point3::new(0.0, 0.0, 1.0),
+            elevation: 0.0,
+            solid_fill: true,
+            paths: vec![HatchPath::Polyline {
+                vertices: vec![
+                    PolyVertex {
+                        point: Point3::from_xy(0.0, 0.0),
+                        bulge: 0.0,
+                    },
+                    PolyVertex {
+                        point: Point3::from_xy(1.0, 0.0),
+                        bulge: 0.0,
+                    },
+                    PolyVertex {
+                        point: Point3::from_xy(1.0, 1.0),
+                        bulge: 0.0,
+                    },
+                ],
+                closed: true,
+            }],
+            pattern_lines: Vec::new(),
+        })));
+        let (_, text) = write_to_string(&document);
+        assert_eq!(text.matches("AcDbHatch").count(), 1);
     }
 }

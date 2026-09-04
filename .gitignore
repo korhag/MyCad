@@ -23,12 +23,8 @@
 .env.*
 !.env.example
 
-# CAD drawings and generated previews (tens of MB; keep only source in git)
-test-data/*.dwg
-test-data/*.dxf
-test-data/*.ppm
-test-data/MyCad-preview.*
-test-data/_*.png
+# Local CAD drawings, PDFs, and generated previews (too large for GitHub)
+/test-data/
 
 # Editors / OS
 .idea/

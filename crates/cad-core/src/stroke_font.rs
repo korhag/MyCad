@@ -1,6 +1,6 @@
 //! Compact stroke font for TEXT / MTEXT (ASCII). Coordinates are 0..1.
 
-use cad_core::Point2;
+use crate::geom::Point2;
 
 pub fn measure_width(text: &str, height: f64) -> f64 {
     text.chars().count() as f64 * height * 0.8

@@ -3,9 +3,9 @@
 //! Dash placement is computed on mathematical path distance. Tessellation
 //! chords are a display approximation and never restart the pattern.
 
+use cad_core::curves::CIRCLE_SEGMENTS;
+use cad_core::measure::bulge_circle;
 use cad_core::Point2;
-
-use crate::curves::{bulge_circle, CIRCLE_SEGMENTS};
 
 const PATH_EPS: f64 = 1e-12;
 

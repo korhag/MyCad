@@ -144,8 +144,17 @@ impl MyCadApp {
             ));
         }
         let settings = AppSettings::load(cc.storage);
+        let mut app = Self::from_settings(settings, initial_path);
+        workspace::sanitize_dock_state(&mut app.dock_state);
+        if let Some(path) = app.pending_open.take() {
+            app.start_load(path);
+        }
+        app
+    }
+
+    fn from_settings(settings: AppSettings, initial_path: Option<PathBuf>) -> Self {
         let drafting_preferences = settings.drafting;
-        let mut app = Self {
+        Self {
             camera: Camera2::default(),
             document: None,
             display: Arc::new(DisplayList::default()),
@@ -185,11 +194,13 @@ impl MyCadApp {
             last_pointer: None,
             box_select: None,
             command_snaps: Vec::new(),
-        };
-        workspace::sanitize_dock_state(&mut app.dock_state);
-        if let Some(path) = app.pending_open.take() {
-            app.start_load(path);
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        let mut app = Self::from_settings(AppSettings::default(), None);
+        workspace::sanitize_dock_state(&mut app.dock_state);
         app
     }
 
@@ -517,10 +528,6 @@ impl MyCadApp {
         self.show_settings = false;
     }
 
-    pub(crate) fn command_is_active(&self) -> bool {
-        self.command.is_active()
-    }
-
     pub(crate) fn command_kind(&self) -> CommandKind {
         self.command.kind()
     }
@@ -594,27 +601,23 @@ impl MyCadApp {
     }
 
     pub(crate) fn start_erase_command(&mut self) {
-        if self.command.is_active() {
-            return;
-        }
-        if self.selection.is_empty() {
-            self.start_kind(CommandKind::Erase);
-            return;
-        }
-        self.erase_selected();
+        self.start_kind(CommandKind::Erase);
     }
 
+    // Clicking a different CAD tool cancels the current interaction with
+    // the same cleanup as Esc, then starts the new tool immediately.
     fn start_kind(&mut self, kind: CommandKind) {
-        if self.command.kind() == kind || self.command.is_active() {
+        if kind == CommandKind::Idle || self.command.kind() == kind {
             return;
+        }
+        if self.command.is_active() {
+            self.cancel_command();
         }
         self.box_select = None;
         self.context_menu = None;
         self.measurement = None;
         if kind.is_measure() {
             self.finish_active_transaction();
-        } else if kind == CommandKind::Idle {
-            return;
         } else {
             self.history.commit_open();
             self.history.begin();
@@ -723,6 +726,8 @@ impl MyCadApp {
         self.command.finish();
         self.dynamic_input.set_layout(DynamicLayout::Hidden);
         self.drafting.clear_acquisition();
+        self.command_snaps.clear();
+        self.box_select = None;
         self.status = status.into();
     }
 
@@ -1949,92 +1954,68 @@ impl eframe::App for MyCadApp {
                     }
                 });
                 ui.menu_button("Draw", |ui| {
-                    let idle = !self.command_is_active();
-                    if ui
-                        .add_enabled(idle, egui::Button::new("Line    L"))
-                        .clicked()
-                    {
+                    if ui.button("Line    L").clicked() {
                         ui.close();
                         self.start_line_command();
                     }
-                    if ui
-                        .add_enabled(idle, egui::Button::new("Polyline    P"))
-                        .clicked()
-                    {
+                    if ui.button("Polyline    P").clicked() {
                         ui.close();
                         self.start_polyline_command();
                     }
-                    if ui
-                        .add_enabled(idle, egui::Button::new("Circle    C"))
-                        .clicked()
-                    {
+                    if ui.button("Circle    C").clicked() {
                         ui.close();
                         self.start_circle_command();
                     }
-                    if ui
-                        .add_enabled(idle, egui::Button::new("Arc    A"))
-                        .clicked()
-                    {
+                    if ui.button("Arc    A").clicked() {
                         ui.close();
                         self.start_arc_command();
                     }
-                    if ui
-                        .add_enabled(idle, egui::Button::new("Rectangle    R"))
-                        .clicked()
-                    {
+                    if ui.button("Rectangle    R").clicked() {
                         ui.close();
                         self.start_rectangle_command();
                     }
                 });
                 ui.menu_button("Modify", |ui| {
-                    let idle = !self.command_is_active();
-                    if ui.add_enabled(idle, egui::Button::new("Move")).clicked() {
+                    if ui.button("Move").clicked() {
                         ui.close();
                         self.start_move_command();
                     }
-                    if ui.add_enabled(idle, egui::Button::new("Copy")).clicked() {
+                    if ui.button("Copy").clicked() {
                         ui.close();
                         self.start_copy_command();
                     }
-                    if ui.add_enabled(idle, egui::Button::new("Rotate")).clicked() {
+                    if ui.button("Rotate").clicked() {
                         ui.close();
                         self.start_rotate_command();
                     }
-                    if ui.add_enabled(idle, egui::Button::new("Mirror")).clicked() {
+                    if ui.button("Mirror").clicked() {
                         ui.close();
                         self.start_mirror_command();
                     }
-                    if ui.add_enabled(idle, egui::Button::new("Scale")).clicked() {
+                    if ui.button("Scale").clicked() {
                         ui.close();
                         self.start_scale_command();
                     }
                     ui.separator();
-                    if ui
-                        .add_enabled(idle, egui::Button::new("Erase    Del"))
-                        .clicked()
-                    {
+                    if ui.button("Erase    Del").clicked() {
                         ui.close();
                         self.start_erase_command();
                     }
                 });
                 ui.menu_button("Measure", |ui| {
-                    let idle = !self.command_is_active();
-                    if ui
-                        .add_enabled(idle, egui::Button::new("Distance    D"))
-                        .clicked()
-                    {
+                    if ui.button("Distance    D").clicked() {
                         ui.close();
                         self.start_distance_command();
                     }
-                    if ui.add_enabled(idle, egui::Button::new("Angle")).clicked() {
+                    if ui.button("Angle").clicked() {
                         ui.close();
                         self.start_angle_command();
                     }
-                    if ui.add_enabled(idle, egui::Button::new("Radius")).clicked() {
+                    if ui.button("Radius").clicked() {
                         ui.close();
                         self.start_radius_command();
                     }
-                    if ui.add_enabled(idle, egui::Button::new("Area")).clicked() {
+                    if ui.button("Area").clicked() {
                         ui.close();
                         self.start_area_command();
                     }
@@ -2807,5 +2788,171 @@ mod save_as_tests {
             lossy_save_message(14),
             "This drawing contains 14 entities that MyCad cannot fully preserve. Saving as DWG/DXF may change or remove unsupported content."
         );
+    }
+}
+
+#[cfg(test)]
+mod command_switch_tests {
+    use super::*;
+
+    fn model_count(app: &MyCadApp) -> usize {
+        app.document
+            .as_ref()
+            .map(|document| document.model_space.len())
+            .unwrap_or(0)
+    }
+
+    fn assert_no_stale_interaction(app: &MyCadApp) {
+        assert!(
+            app.command.preview(Some(Point2::new(25.0, 17.0))).is_none(),
+            "rubber-band preview should not survive a tool switch"
+        );
+        assert!(
+            !app.dynamic_input.is_active(),
+            "dynamic input should reset with the new command"
+        );
+        assert!(app.drafting.acquired_snap.is_none());
+        assert!(app.drafting.command_base_point.is_none());
+        assert!(app.command_snaps.is_empty());
+        assert!(app.measurement.is_none());
+        assert!(app.box_select.is_none());
+    }
+
+    #[test]
+    fn idle_starts_line() {
+        let mut app = MyCadApp::for_test();
+        assert!(!app.command.is_active());
+        app.start_line_command();
+        assert_eq!(app.command.kind(), CommandKind::Line);
+        assert!(app.command.is_active());
+        assert_no_stale_interaction(&app);
+    }
+
+    #[test]
+    fn line_switches_to_circle_without_escape() {
+        let mut app = MyCadApp::for_test();
+        app.start_line_command();
+        app.start_circle_command();
+        assert_eq!(app.command.kind(), CommandKind::Circle);
+        assert_no_stale_interaction(&app);
+    }
+
+    #[test]
+    fn unfinished_circle_is_discarded_when_switching_to_rectangle() {
+        let mut app = MyCadApp::for_test();
+        app.start_circle_command();
+        app.accept_command_point(Point2::new(0.0, 0.0));
+        assert!(app.dynamic_input.is_active());
+        assert!(app
+            .command
+            .preview(Some(Point2::new(4.0, 0.0)))
+            .is_some());
+        app.start_rectangle_command();
+        assert_eq!(app.command.kind(), CommandKind::Rectangle);
+        assert_eq!(model_count(&app), 0);
+        assert_no_stale_interaction(&app);
+    }
+
+    #[test]
+    fn unfinished_rectangle_is_discarded_when_switching_to_arc() {
+        let mut app = MyCadApp::for_test();
+        app.start_rectangle_command();
+        app.accept_command_point(Point2::new(1.0, 1.0));
+        assert!(app.dynamic_input.is_active());
+        app.start_arc_command();
+        assert_eq!(app.command.kind(), CommandKind::Arc);
+        assert_eq!(model_count(&app), 0);
+        assert_no_stale_interaction(&app);
+    }
+
+    #[test]
+    fn committed_line_geometry_survives_a_switch_to_distance() {
+        let mut app = MyCadApp::for_test();
+        app.start_line_command();
+        app.accept_command_point(Point2::new(0.0, 0.0));
+        app.accept_command_point(Point2::new(10.0, 0.0));
+        assert_eq!(model_count(&app), 1);
+        app.command.write_snap_features(&mut app.command_snaps);
+        assert!(!app.command_snaps.is_empty());
+        app.start_distance_command();
+        assert_eq!(app.command.kind(), CommandKind::Distance);
+        assert_eq!(model_count(&app), 1);
+        assert!(app.can_undo());
+        assert_no_stale_interaction(&app);
+    }
+
+    #[test]
+    fn distance_switches_to_line() {
+        let mut app = MyCadApp::for_test();
+        app.start_distance_command();
+        app.accept_command_point(Point2::new(0.0, 0.0));
+        app.start_line_command();
+        assert_eq!(app.command.kind(), CommandKind::Line);
+        assert_eq!(model_count(&app), 0);
+        assert_no_stale_interaction(&app);
+    }
+
+    #[test]
+    fn move_switches_to_copy() {
+        let mut app = MyCadApp::for_test();
+        app.start_move_command();
+        assert_eq!(app.command.kind(), CommandKind::Move);
+        app.start_copy_command();
+        assert_eq!(app.command.kind(), CommandKind::Copy);
+        assert_no_stale_interaction(&app);
+    }
+
+    #[test]
+    fn context_menu_copy_switches_from_move() {
+        let mut app = MyCadApp::for_test();
+        app.start_move_command();
+        app.apply_context_action(ContextAction::Copy, 800.0, 600.0);
+        assert_eq!(app.command.kind(), CommandKind::Copy);
+        assert_no_stale_interaction(&app);
+    }
+
+    #[test]
+    fn clicking_the_active_tool_does_not_restart_it() {
+        let mut app = MyCadApp::for_test();
+        app.start_line_command();
+        app.accept_command_point(Point2::new(3.0, 4.0));
+        assert_eq!(app.command.base_point(), Some(Point2::new(3.0, 4.0)));
+        assert!(app.dynamic_input.is_active());
+        app.start_line_command();
+        assert_eq!(app.command.kind(), CommandKind::Line);
+        assert_eq!(app.command.base_point(), Some(Point2::new(3.0, 4.0)));
+        assert!(app.dynamic_input.is_active());
+        assert_eq!(model_count(&app), 0);
+    }
+
+    #[test]
+    fn escape_still_returns_to_idle() {
+        let mut app = MyCadApp::for_test();
+        app.start_line_command();
+        app.accept_command_point(Point2::new(1.0, 1.0));
+        app.cancel_command();
+        assert!(app.command.is_idle());
+        assert!(!app.command.is_active());
+        assert_no_stale_interaction(&app);
+        assert_eq!(app.status, "Command canceled");
+    }
+
+    #[test]
+    fn one_click_tool_chain_matches_cad_ux() {
+        let mut app = MyCadApp::for_test();
+        let chain = [
+            CommandKind::Line,
+            CommandKind::Circle,
+            CommandKind::Arc,
+            CommandKind::Polyline,
+            CommandKind::Rectangle,
+            CommandKind::Distance,
+            CommandKind::Move,
+        ];
+        for kind in chain {
+            app.start_kind(kind);
+            assert_eq!(app.command.kind(), kind);
+            assert_no_stale_interaction(&app);
+        }
     }
 }

@@ -4,8 +4,9 @@
 use std::path::Path;
 
 use cad_core::{
-    CadColor, Document, Entity, Extents2, Geometry, HatchEdge, HatchPath, Point2, Point3,
-    PolyVertex, Rgb, Transform2,
+    arc_points, bspline_points, circle_points, default_extrusion, ellipse_points, polyline_points,
+    stroke_text, strip_mtext, CadColor, Document, Entity, Extents2, Geometry, HatchEdge,
+    HatchPath, Point2, Point3, Rgb, Transform2, CIRCLE_SEGMENTS,
 };
 
 use crate::error::ExportError;
@@ -111,6 +112,17 @@ fn set_stroke_color(out: &mut String, style: PdfPlotStyle, rgb: Rgb) {
     out.push_str(&format!("{r:.4} {g:.4} {b:.4} RG\n"));
 }
 
+fn set_fill_color(out: &mut String, style: PdfPlotStyle, rgb: Rgb) {
+    let (r, g, b) = plot_stroke_rgb(style, rgb);
+    out.push_str(&format!("{r:.4} {g:.4} {b:.4} rg\n"));
+}
+
+#[derive(Clone, Copy)]
+enum Paint {
+    Stroke,
+    FillStroke,
+}
+
 fn entity_rgb(document: &Document, entity: &Entity, block_color: CadColor) -> Rgb {
     let layer_color = document
         .layer(&entity.layer)
@@ -134,11 +146,7 @@ fn emit_entity(
     }
     match &entity.geometry {
         Geometry::Line { start, end } => {
-            set_stroke_color(
-                out,
-                options.style,
-                entity_rgb(document, entity, block_color),
-            );
+            color_stroke(out, document, entity, block_color, options);
             stroke_polyline(
                 &mapper,
                 out,
@@ -148,28 +156,36 @@ fn emit_entity(
             1
         }
         Geometry::Point { position } => {
-            set_stroke_color(
-                out,
-                options.style,
-                entity_rgb(document, entity, block_color),
-            );
-            let p = transform.apply3(*position);
-            let (x, y) = mapper.map(p.xy());
-            out.push_str(&format!("{x:.4} {y:.4} m {x:.4} {y:.4} l S\n"));
-            1
-        }
-        Geometry::Circle { center, radius, .. } => {
-            set_stroke_color(
-                out,
-                options.style,
-                entity_rgb(document, entity, block_color),
-            );
-            stroke_circle(
+            color_stroke(out, document, entity, block_color, options);
+            let p = transform.apply(position.xy());
+            let s = 0.5_f64.max(transform.scale_x().abs().max(transform.scale_y().abs()) * 0.4);
+            paint_path(
                 &mapper,
                 out,
-                transform.apply3(*center).xy(),
-                radius.abs() * transform.scale_x(),
+                &[Point2::new(p.x - s, p.y), Point2::new(p.x + s, p.y)],
+                false,
+                Paint::Stroke,
             );
+            paint_path(
+                &mapper,
+                out,
+                &[Point2::new(p.x, p.y - s), Point2::new(p.x, p.y + s)],
+                false,
+                Paint::Stroke,
+            );
+            1
+        }
+        Geometry::Circle {
+            center,
+            radius,
+            extrusion,
+        } => {
+            color_stroke(out, document, entity, block_color, options);
+            let pts: Vec<Point2> = circle_points(*center, *radius, *extrusion, CIRCLE_SEGMENTS)
+                .into_iter()
+                .map(|p| transform.apply(p))
+                .collect();
+            paint_path(&mapper, out, &pts, true, Paint::Stroke);
             1
         }
         Geometry::Arc {
@@ -177,110 +193,135 @@ fn emit_entity(
             radius,
             start_angle,
             end_angle,
-            ..
+            extrusion,
         } => {
-            set_stroke_color(
-                out,
-                options.style,
-                entity_rgb(document, entity, block_color),
-            );
-            stroke_arc(
-                &mapper,
-                out,
-                transform.apply3(*center).xy(),
-                radius.abs() * transform.scale_x(),
-                *start_angle + transform.rotation_component(),
-                *end_angle + transform.rotation_component(),
-            );
+            color_stroke(out, document, entity, block_color, options);
+            let pts: Vec<Point2> = arc_points(
+                *center,
+                *radius,
+                *start_angle,
+                *end_angle,
+                true,
+                *extrusion,
+                CIRCLE_SEGMENTS,
+            )
+            .into_iter()
+            .map(|p| transform.apply(p))
+            .collect();
+            paint_path(&mapper, out, &pts, false, Paint::Stroke);
             1
         }
         Geometry::LwPolyline {
-            vertices, closed, ..
+            vertices,
+            closed,
+            extrusion,
+            ..
+        } => {
+            color_stroke(out, document, entity, block_color, options);
+            let pts: Vec<Point2> = polyline_points(vertices, *closed, *extrusion)
+                .into_iter()
+                .map(|p| transform.apply(p))
+                .collect();
+            paint_path(&mapper, out, &pts, *closed, Paint::Stroke);
+            1
         }
-        | Geometry::Polyline {
+        Geometry::Polyline {
             vertices, closed, ..
         } => {
-            set_stroke_color(
-                out,
-                options.style,
-                entity_rgb(document, entity, block_color),
-            );
-            let points: Vec<Point3> = vertices
-                .iter()
-                .map(|vertex| transform.apply3(vertex.point))
+            color_stroke(out, document, entity, block_color, options);
+            let pts: Vec<Point2> = polyline_points(vertices, *closed, default_extrusion())
+                .into_iter()
+                .map(|p| transform.apply(p))
                 .collect();
-            stroke_bulged(&mapper, out, vertices, &points, *closed, transform);
+            paint_path(&mapper, out, &pts, *closed, Paint::Stroke);
             1
         }
         Geometry::Ellipse {
             center,
             major_axis,
             axis_ratio,
-            ..
+            start_param,
+            end_param,
+            extrusion,
         } => {
-            set_stroke_color(
-                out,
-                options.style,
-                entity_rgb(document, entity, block_color),
-            );
-            let center = transform.apply3(*center).xy();
-            let axis = transform.apply_vector(major_axis.xy());
-            stroke_ellipse(&mapper, out, center, axis, *axis_ratio);
+            color_stroke(out, document, entity, block_color, options);
+            let pts: Vec<Point2> = ellipse_points(
+                *center,
+                *major_axis,
+                *axis_ratio,
+                *start_param,
+                *end_param,
+                *extrusion,
+                CIRCLE_SEGMENTS,
+            )
+            .into_iter()
+            .map(|p| transform.apply(p))
+            .collect();
+            let closed = (*end_param - *start_param).abs() >= std::f64::consts::TAU - 1e-6;
+            paint_path(&mapper, out, &pts, closed, Paint::Stroke);
             1
         }
-        Geometry::Spline { control_points, .. } => {
-            set_stroke_color(
-                out,
-                options.style,
-                entity_rgb(document, entity, block_color),
-            );
-            let points: Vec<Point3> = control_points
-                .iter()
-                .map(|p| transform.apply3(*p))
-                .collect();
-            stroke_polyline(&mapper, out, &points, false);
+        Geometry::Spline {
+            degree,
+            control_points,
+            fit_points,
+            knots,
+            weights,
+            closed,
+        } => {
+            color_stroke(out, document, entity, block_color, options);
+            let sampled = if control_points.len() >= 2 {
+                bspline_points(*degree, control_points, knots, weights, 24)
+            } else {
+                fit_points.iter().map(|p| p.xy()).collect()
+            };
+            let pts: Vec<Point2> = sampled.into_iter().map(|p| transform.apply(p)).collect();
+            paint_path(&mapper, out, &pts, *closed, Paint::Stroke);
             1
         }
         Geometry::Solid { corners, .. } => {
-            set_stroke_color(
-                out,
-                options.style,
-                entity_rgb(document, entity, block_color),
-            );
-            let points: Vec<Point3> = corners.iter().map(|p| transform.apply3(*p)).collect();
-            stroke_polyline(&mapper, out, &points, true);
+            color_fill(out, document, entity, block_color, options);
+            let pts: Vec<Point2> = corners.iter().map(|c| transform.apply(c.xy())).collect();
+            paint_path(&mapper, out, &pts, true, Paint::FillStroke);
             1
         }
         Geometry::Leader { vertices } | Geometry::MLine { vertices, .. } => {
-            set_stroke_color(
-                out,
-                options.style,
-                entity_rgb(document, entity, block_color),
-            );
-            let points: Vec<Point3> = vertices.iter().map(|p| transform.apply3(*p)).collect();
-            stroke_polyline(&mapper, out, &points, false);
+            color_stroke(out, document, entity, block_color, options);
+            let pts: Vec<Point2> = vertices.iter().map(|p| transform.apply(p.xy())).collect();
+            paint_path(&mapper, out, &pts, false, Paint::Stroke);
             1
         }
         Geometry::Text(data) => {
-            set_stroke_color(
+            color_stroke(out, document, entity, block_color, options);
+            emit_text(
+                &mapper,
                 out,
-                options.style,
-                entity_rgb(document, entity, block_color),
+                transform,
+                data.insertion,
+                data.height,
+                data.rotation,
+                &data.value,
             );
-            let p = transform.apply3(data.insertion);
-            let (x, y) = mapper.map(p.xy());
-            out.push_str(&format!("{x:.4} {y:.4} m {x:.4} {y:.4} l S\n"));
             1
         }
         Geometry::MText(data) => {
-            set_stroke_color(
-                out,
-                options.style,
-                entity_rgb(document, entity, block_color),
-            );
-            let p = transform.apply3(data.insertion);
-            let (x, y) = mapper.map(p.xy());
-            out.push_str(&format!("{x:.4} {y:.4} m {x:.4} {y:.4} l S\n"));
+            color_stroke(out, document, entity, block_color, options);
+            let cleaned = strip_mtext(&data.value);
+            let mut y_off = 0.0;
+            for line in cleaned.lines() {
+                let insertion =
+                    Point3::new(data.insertion.x, data.insertion.y - y_off, data.insertion.z);
+                emit_text(
+                    &mapper,
+                    out,
+                    transform,
+                    insertion,
+                    data.height,
+                    data.rotation,
+                    line,
+                );
+                y_off += data.height * 1.6;
+            }
             1
         }
         Geometry::Insert {
@@ -339,13 +380,22 @@ fn emit_entity(
             written
         }
         Geometry::Hatch(hatch) => {
-            set_stroke_color(
-                out,
-                options.style,
-                entity_rgb(document, entity, block_color),
-            );
+            let rgb = entity_rgb(document, entity, block_color);
+            set_stroke_color(out, options.style, rgb);
+            if hatch.solid_fill {
+                set_fill_color(out, options.style, rgb);
+            }
             for path in &hatch.paths {
-                stroke_hatch_path(&mapper, out, path, transform);
+                let pts = hatch_path_points(path)
+                    .into_iter()
+                    .map(|p| transform.apply(p))
+                    .collect::<Vec<_>>();
+                let paint = if hatch.solid_fill {
+                    Paint::FillStroke
+                } else {
+                    Paint::Stroke
+                };
+                paint_path(&mapper, out, &pts, true, paint);
             }
             1
         }
@@ -379,138 +429,151 @@ fn emit_entity(
     }
 }
 
-fn stroke_hatch_path(mapper: &PageMap, out: &mut String, path: &HatchPath, transform: Transform2) {
+fn color_stroke(
+    out: &mut String,
+    document: &Document,
+    entity: &Entity,
+    block_color: CadColor,
+    options: PdfExportOptions,
+) {
+    set_stroke_color(out, options.style, entity_rgb(document, entity, block_color));
+}
+
+fn color_fill(
+    out: &mut String,
+    document: &Document,
+    entity: &Entity,
+    block_color: CadColor,
+    options: PdfExportOptions,
+) {
+    let rgb = entity_rgb(document, entity, block_color);
+    set_stroke_color(out, options.style, rgb);
+    set_fill_color(out, options.style, rgb);
+}
+
+fn emit_text(
+    mapper: &PageMap,
+    out: &mut String,
+    transform: Transform2,
+    insertion: Point3,
+    height: f64,
+    rotation: f64,
+    value: &str,
+) {
+    for [a, b] in stroke_text(insertion.xy(), height.max(1e-6), rotation, value) {
+        paint_path(
+            mapper,
+            out,
+            &[transform.apply(a), transform.apply(b)],
+            false,
+            Paint::Stroke,
+        );
+    }
+}
+
+fn hatch_path_points(path: &HatchPath) -> Vec<Point2> {
     match path {
         HatchPath::Polyline { vertices, closed } => {
-            let points: Vec<Point3> = vertices
-                .iter()
-                .map(|vertex| transform.apply3(vertex.point))
-                .collect();
-            stroke_bulged(mapper, out, vertices, &points, *closed, transform);
+            polyline_points(vertices, *closed, default_extrusion())
         }
         HatchPath::Edges(edges) => {
+            let mut pts = Vec::new();
             for edge in edges {
                 match edge {
-                    HatchEdge::Line { start, end } => stroke_polyline(
-                        mapper,
-                        out,
-                        &[transform.apply3(*start), transform.apply3(*end)],
-                        false,
-                    ),
+                    HatchEdge::Line { start, end } => {
+                        if pts
+                            .last()
+                            .map(|p: &Point2| p.distance(start.xy()) > 1e-9)
+                            .unwrap_or(true)
+                        {
+                            pts.push(start.xy());
+                        }
+                        pts.push(end.xy());
+                    }
                     HatchEdge::Arc {
                         center,
                         radius,
                         start_angle,
                         end_angle,
-                        ..
-                    } => stroke_arc(
-                        mapper,
-                        out,
-                        transform.apply3(*center).xy(),
-                        radius.abs() * transform.scale_x(),
-                        *start_angle + transform.rotation_component(),
-                        *end_angle + transform.rotation_component(),
-                    ),
+                        is_ccw,
+                    } => {
+                        let mut arc = arc_points(
+                            *center,
+                            *radius,
+                            *start_angle,
+                            *end_angle,
+                            *is_ccw,
+                            default_extrusion(),
+                            CIRCLE_SEGMENTS,
+                        );
+                        if !pts.is_empty() && !arc.is_empty() {
+                            arc.remove(0);
+                        }
+                        pts.extend(arc);
+                    }
                     HatchEdge::Ellipse {
                         center,
                         major_endpoint,
                         axis_ratio,
-                        ..
+                        start_angle,
+                        end_angle,
+                        is_ccw,
                     } => {
-                        let center = transform.apply3(*center).xy();
-                        let axis = transform.apply_vector(major_endpoint.xy());
-                        stroke_ellipse(mapper, out, center, axis, *axis_ratio);
+                        let (start_param, end_param) = if *is_ccw {
+                            (*start_angle, *end_angle)
+                        } else {
+                            (*end_angle, *start_angle)
+                        };
+                        let mut ellipse = ellipse_points(
+                            *center,
+                            *major_endpoint,
+                            *axis_ratio,
+                            start_param,
+                            end_param,
+                            default_extrusion(),
+                            CIRCLE_SEGMENTS,
+                        );
+                        if !pts.is_empty() && !ellipse.is_empty() {
+                            ellipse.remove(0);
+                        }
+                        pts.extend(ellipse);
                     }
                     HatchEdge::Spline { control_points } => {
-                        let points: Vec<Point3> = control_points
-                            .iter()
-                            .map(|p| transform.apply3(*p))
-                            .collect();
-                        stroke_polyline(mapper, out, &points, false);
+                        let mut spline = bspline_points(3, control_points, &[], &[], 24);
+                        if !pts.is_empty() && !spline.is_empty() {
+                            spline.remove(0);
+                        }
+                        pts.extend(spline);
                     }
                 }
             }
+            pts
         }
     }
 }
 
-fn stroke_polyline(mapper: &PageMap, out: &mut String, points: &[Point3], closed: bool) {
+fn paint_path(mapper: &PageMap, out: &mut String, points: &[Point2], closed: bool, paint: Paint) {
     let Some(first) = points.first() else {
         return;
     };
-    let (x, y) = mapper.map(first.xy());
+    let (x, y) = mapper.map(*first);
     out.push_str(&format!("{x:.4} {y:.4} m\n"));
     for point in points.iter().skip(1) {
-        let (x, y) = mapper.map(point.xy());
+        let (x, y) = mapper.map(*point);
         out.push_str(&format!("{x:.4} {y:.4} l\n"));
     }
     if closed {
         out.push_str("h\n");
     }
-    out.push_str("S\n");
+    match paint {
+        Paint::Stroke => out.push_str("S\n"),
+        Paint::FillStroke => out.push_str("B\n"),
+    }
 }
 
-fn stroke_bulged(
-    mapper: &PageMap,
-    out: &mut String,
-    vertices: &[PolyVertex],
-    points: &[Point3],
-    closed: bool,
-    _transform: Transform2,
-) {
-    if vertices.iter().all(|v| v.bulge.abs() <= 1e-12) {
-        stroke_polyline(mapper, out, points, closed);
-        return;
-    }
-    stroke_polyline(mapper, out, points, closed);
-}
-
-fn stroke_circle(mapper: &PageMap, out: &mut String, center: Point2, radius: f64) {
-    stroke_arc(mapper, out, center, radius, 0.0, std::f64::consts::TAU);
-}
-
-fn stroke_arc(
-    mapper: &PageMap,
-    out: &mut String,
-    center: Point2,
-    radius: f64,
-    start: f64,
-    end: f64,
-) {
-    let mut sweep = end - start;
-    if sweep <= 1e-12 {
-        sweep += std::f64::consts::TAU;
-    }
-    let steps = ((sweep.abs() / (std::f64::consts::FRAC_PI_8)).ceil() as usize).clamp(4, 64);
-    for i in 0..=steps {
-        let t = start + sweep * (i as f64 / steps as f64);
-        let p = Point2::new(center.x + radius * t.cos(), center.y + radius * t.sin());
-        let (x, y) = mapper.map(p);
-        if i == 0 {
-            out.push_str(&format!("{x:.4} {y:.4} m\n"));
-        } else {
-            out.push_str(&format!("{x:.4} {y:.4} l\n"));
-        }
-    }
-    out.push_str("S\n");
-}
-
-fn stroke_ellipse(mapper: &PageMap, out: &mut String, center: Point2, major: Point2, ratio: f64) {
-    let steps = 48;
-    for i in 0..=steps {
-        let t = std::f64::consts::TAU * (i as f64 / steps as f64);
-        let p = Point2::new(
-            center.x + major.x * t.cos() - major.y * ratio * t.sin(),
-            center.y + major.y * t.cos() + major.x * ratio * t.sin(),
-        );
-        let (x, y) = mapper.map(p);
-        if i == 0 {
-            out.push_str(&format!("{x:.4} {y:.4} m\n"));
-        } else {
-            out.push_str(&format!("{x:.4} {y:.4} l\n"));
-        }
-    }
-    out.push_str("h S\n");
+fn stroke_polyline(mapper: &PageMap, out: &mut String, points: &[Point3], closed: bool) {
+    let pts: Vec<Point2> = points.iter().map(|p| p.xy()).collect();
+    paint_path(mapper, out, &pts, closed, Paint::Stroke);
 }
 
 fn assemble_pdf(width: f64, height: f64, content: &str) -> Vec<u8> {

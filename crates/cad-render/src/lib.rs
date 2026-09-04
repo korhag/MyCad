@@ -1,12 +1,11 @@
 //! CAD viewport rendering: tessellation (CPU) plus wgpu (GPU).
 
-pub mod curves;
 pub mod dash;
 pub mod gpu;
 pub mod pick;
-pub mod stroke_font;
 pub mod tessellate;
 
+pub use cad_core::{curves, stroke_font};
 pub use gpu::{plan_gpu_upload, CadFrame, CadGpu, GpuUpload, GpuUploadPlan};
 pub use pick::{
     box_select, box_select_into, hit_test, stroke_edges, EntityPick, PickKind, PickPrimitive,

@@ -1,6 +1,8 @@
-//! Curve sampling used by tessellation. All math stays in f64 world units.
+//! Curve sampling shared by viewport tessellation and vector PDF export.
 
-use cad_core::{ocs_to_wcs, Point2, Point3, PolyVertex};
+use crate::geom::{ocs_to_wcs, Point2, Point3};
+use crate::entity::PolyVertex;
+use crate::measure::bulge_circle;
 
 pub const CIRCLE_SEGMENTS: usize = 32;
 
@@ -98,45 +100,6 @@ pub fn ellipse_points(
 }
 
 pub const POLYLINE_BULGE_SEGMENTS: usize = 16;
-
-// ------------------------------------------------------------
-// Type: BulgeArc
-// Purpose: Signed AutoCAD bulge circle: theta = 4*atan(bulge),
-//          positive bulge is CCW, sampled with the signed sweep.
-// ------------------------------------------------------------
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct BulgeArc {
-    pub center: Point2,
-    pub radius: f64,
-    pub start_angle: f64,
-    pub sweep: f64,
-}
-
-pub(crate) fn bulge_circle(p1: Point2, p2: Point2, bulge: f64) -> Option<BulgeArc> {
-    if bulge.abs() < 1e-12 {
-        return None;
-    }
-    let chord = p1.distance(p2);
-    if chord < 1e-15 {
-        return None;
-    }
-    let bulge_sq = bulge * bulge;
-    let sweep = 4.0 * bulge.atan();
-    let radius = chord * (1.0 + bulge_sq) / (4.0 * bulge.abs());
-    let offset = chord * (1.0 - bulge_sq) / (4.0 * bulge);
-    let ux = (p2.x - p1.x) / chord;
-    let uy = (p2.y - p1.y) / chord;
-    let center = Point2::new(
-        (p1.x + p2.x) * 0.5 + (-uy) * offset,
-        (p1.y + p2.y) * 0.5 + ux * offset,
-    );
-    Some(BulgeArc {
-        center,
-        radius,
-        start_angle: (p1.y - center.y).atan2(p1.x - center.x),
-        sweep,
-    })
-}
 
 // ------------------------------------------------------------
 // Function: bulge_arc

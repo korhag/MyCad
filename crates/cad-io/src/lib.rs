@@ -9,6 +9,7 @@ mod dxf;
 mod error;
 mod options;
 mod pdf;
+mod r2000;
 
 pub use atomic::{
     replace_atomic, sibling_temp_in_dir, sibling_temp_path, sibling_temp_with_extension,
@@ -20,3 +21,4 @@ pub use options::{
     PdfPaperSize, PdfPlotStyle, SaveReport, PDF_MARGIN_MM,
 };
 pub use pdf::export_pdf;
+pub use r2000::{decode_dxf_r2000, encode_dxf_r2000};
