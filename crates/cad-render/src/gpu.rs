@@ -37,17 +37,32 @@ pub struct CadGpu {
     scene: UniformSlot,
     selection: UniformSlot,
     preview: UniformSlot,
-    line_buffer: Option<wgpu::Buffer>,
-    fill_buffer: Option<wgpu::Buffer>,
+    line_chunks: Vec<VertexChunk>,
+    fill_chunks: Vec<VertexChunk>,
     line_count: u32,
     fill_count: u32,
     line_capacity: u32,
     fill_capacity: u32,
+    max_line_vertices: u32,
+    max_fill_vertices: u32,
     uploaded_generation: u64,
+}
+
+struct VertexChunk {
+    buffer: wgpu::Buffer,
+    capacity: u32,
 }
 
 const MIN_VERTEX_CAPACITY: u32 = 1024;
 const VERTEX_STRIDE: u64 = std::mem::size_of::<GpuVertex>() as u64;
+const DEFAULT_MAX_BUFFER_SIZE: u64 = 256 * 1024 * 1024;
+
+fn device_max_buffer_size(device: &wgpu::Device) -> u64 {
+    match device.limits().max_buffer_size {
+        0 => DEFAULT_MAX_BUFFER_SIZE,
+        size => size,
+    }
+}
 
 // ------------------------------------------------------------
 // Type: GpuUpload
@@ -112,12 +127,35 @@ pub fn plan_gpu_upload(
     }
 }
 
-fn next_vertex_capacity(needed: u32) -> u32 {
+fn max_vertices_for_buffer(max_buffer_size: u64, align: u32) -> u32 {
+    let align = align.max(1);
+    let n = (max_buffer_size / VERTEX_STRIDE).min(u64::from(u32::MAX)) as u32;
+    (n / align) * align
+}
+
+fn next_vertex_capacity(needed: u32, max_per_buffer: u32) -> u32 {
     if needed == 0 {
-        0
-    } else {
-        needed.max(MIN_VERTEX_CAPACITY).next_power_of_two()
+        return 0;
     }
+    let max_per_buffer = max_per_buffer.max(1);
+    let capped = needed.min(max_per_buffer);
+    let grown = capped.max(MIN_VERTEX_CAPACITY).next_power_of_two();
+    grown.min(max_per_buffer).max(capped)
+}
+
+fn chunk_capacities(needed: u32, max_per_buffer: u32) -> Vec<u32> {
+    if needed == 0 {
+        return Vec::new();
+    }
+    let max_per_buffer = max_per_buffer.max(1);
+    let mut remaining = needed;
+    let mut caps = Vec::new();
+    while remaining > 0 {
+        let take = remaining.min(max_per_buffer);
+        caps.push(next_vertex_capacity(take, max_per_buffer));
+        remaining -= take;
+    }
+    caps
 }
 
 impl CadGpu {
@@ -185,12 +223,14 @@ impl CadGpu {
             selection: UniformSlot::new(device, &bind_group_layout, "mycad.selection"),
             preview: UniformSlot::new(device, &bind_group_layout, "mycad.preview"),
             bind_group_layout,
-            line_buffer: None,
-            fill_buffer: None,
+            line_chunks: Vec::new(),
+            fill_chunks: Vec::new(),
             line_count: 0,
             fill_count: 0,
             line_capacity: 0,
             fill_capacity: 0,
+            max_line_vertices: max_vertices_for_buffer(device_max_buffer_size(device), 2),
+            max_fill_vertices: max_vertices_for_buffer(device_max_buffer_size(device), 3),
             uploaded_generation: 0,
         }
     }
@@ -222,15 +262,10 @@ impl CadGpu {
                 line_start,
                 fill_start,
             } => {
+                write_vertex_tail(queue, &self.line_chunks, line_start, &list.line_vertices);
                 write_vertex_tail(
                     queue,
-                    self.line_buffer.as_ref(),
-                    line_start,
-                    &list.line_vertices,
-                );
-                write_vertex_tail(
-                    queue,
-                    self.fill_buffer.as_ref(),
+                    &self.fill_chunks,
                     fill_start,
                     &list.triangle_vertices,
                 );
@@ -242,14 +277,14 @@ impl CadGpu {
                 if matches!(plan, GpuUploadPlan::GrowAndFull) {
                     self.grow_buffers(device, new_line_count, new_fill_count);
                 }
-                write_vertex_range(queue, self.line_buffer.as_ref(), 0, &list.line_vertices);
-                write_vertex_range(queue, self.fill_buffer.as_ref(), 0, &list.triangle_vertices);
+                write_vertex_range(queue, &self.line_chunks, 0, &list.line_vertices);
+                write_vertex_range(queue, &self.fill_chunks, 0, &list.triangle_vertices);
                 if new_line_count == 0 {
-                    self.line_buffer = None;
+                    self.line_chunks.clear();
                     self.line_capacity = 0;
                 }
                 if new_fill_count == 0 {
-                    self.fill_buffer = None;
+                    self.fill_chunks.clear();
                     self.fill_capacity = 0;
                 }
                 self.line_count = new_line_count;
@@ -261,14 +296,16 @@ impl CadGpu {
     }
 
     fn grow_buffers(&mut self, device: &wgpu::Device, line_count: u32, fill_count: u32) {
-        let line_capacity = next_vertex_capacity(line_count);
-        let fill_capacity = next_vertex_capacity(fill_count);
+        let line_caps = chunk_capacities(line_count, self.max_line_vertices);
+        let fill_caps = chunk_capacities(fill_count, self.max_fill_vertices);
+        let line_capacity = line_caps.iter().copied().sum();
+        let fill_capacity = fill_caps.iter().copied().sum();
         if line_capacity > self.line_capacity {
-            self.line_buffer = create_vertex_buffer(device, line_capacity, "mycad.linevb");
+            self.line_chunks = create_vertex_chunks(device, &line_caps, "mycad.linevb");
             self.line_capacity = line_capacity;
         }
         if fill_capacity > self.fill_capacity {
-            self.fill_buffer = create_vertex_buffer(device, fill_capacity, "mycad.fillvb");
+            self.fill_chunks = create_vertex_chunks(device, &fill_caps, "mycad.fillvb");
             self.fill_capacity = fill_capacity;
         }
     }
@@ -313,6 +350,23 @@ impl UniformSlot {
     }
 }
 
+fn create_vertex_chunks(device: &wgpu::Device, caps: &[u32], label: &str) -> Vec<VertexChunk> {
+    caps.iter()
+        .enumerate()
+        .filter_map(|(index, &capacity)| {
+            let name = if index == 0 {
+                label.to_string()
+            } else {
+                format!("{label}.{index}")
+            };
+            Some(VertexChunk {
+                buffer: create_vertex_buffer(device, capacity, &name)?,
+                capacity,
+            })
+        })
+        .collect()
+}
+
 fn create_vertex_buffer(device: &wgpu::Device, capacity: u32, label: &str) -> Option<wgpu::Buffer> {
     if capacity == 0 {
         return None;
@@ -327,31 +381,42 @@ fn create_vertex_buffer(device: &wgpu::Device, capacity: u32, label: &str) -> Op
 
 fn write_vertex_tail(
     queue: &wgpu::Queue,
-    buffer: Option<&wgpu::Buffer>,
+    chunks: &[VertexChunk],
     start: u32,
     verts: &[GpuVertex],
 ) {
-    write_vertex_range(queue, buffer, start, verts);
+    write_vertex_range(queue, chunks, start, verts);
 }
 
 fn write_vertex_range(
     queue: &wgpu::Queue,
-    buffer: Option<&wgpu::Buffer>,
+    chunks: &[VertexChunk],
     start: u32,
     verts: &[GpuVertex],
 ) {
-    let Some(buffer) = buffer else {
-        return;
-    };
-    let start = start as usize;
-    if start >= verts.len() {
+    let mut offset = start as usize;
+    if offset >= verts.len() {
         return;
     }
-    queue.write_buffer(
-        buffer,
-        VERTEX_STRIDE * start as u64,
-        bytemuck::cast_slice(&verts[start..]),
-    );
+    let mut remaining = &verts[offset..];
+    for chunk in chunks {
+        let cap = chunk.capacity as usize;
+        if offset >= cap {
+            offset -= cap;
+            continue;
+        }
+        let take = remaining.len().min(cap - offset);
+        queue.write_buffer(
+            &chunk.buffer,
+            VERTEX_STRIDE * offset as u64,
+            bytemuck::cast_slice(&remaining[..take]),
+        );
+        remaining = &remaining[take..];
+        offset = 0;
+        if remaining.is_empty() {
+            return;
+        }
+    }
 }
 
 fn make_pipeline(
@@ -471,25 +536,39 @@ impl egui_wgpu::CallbackTrait for CadFrame {
 }
 
 fn draw_scene(gpu: &CadGpu, render_pass: &mut wgpu::RenderPass<'static>) {
-    let has_fill = gpu.fill_buffer.is_some() && gpu.fill_count >= 3;
-    let has_lines = gpu.line_buffer.is_some() && gpu.line_count >= 2;
+    let has_fill = !gpu.fill_chunks.is_empty() && gpu.fill_count >= 3;
+    let has_lines = !gpu.line_chunks.is_empty() && gpu.line_count >= 2;
     if !has_fill && !has_lines {
         return;
     }
     render_pass.set_bind_group(0, &gpu.scene.bind_group, &[]);
     if has_fill {
-        if let Some(buf) = gpu.fill_buffer.as_ref() {
-            render_pass.set_pipeline(&gpu.fill_pipeline);
-            render_pass.set_vertex_buffer(0, buf.slice(..));
-            render_pass.draw(0..gpu.fill_count, 0..1);
-        }
+        render_pass.set_pipeline(&gpu.fill_pipeline);
+        draw_chunks(render_pass, &gpu.fill_chunks, gpu.fill_count, 3);
     }
     if has_lines {
-        if let Some(buf) = gpu.line_buffer.as_ref() {
-            render_pass.set_pipeline(&gpu.line_pipeline);
-            render_pass.set_vertex_buffer(0, buf.slice(..));
-            render_pass.draw(0..gpu.line_count, 0..1);
+        render_pass.set_pipeline(&gpu.line_pipeline);
+        draw_chunks(render_pass, &gpu.line_chunks, gpu.line_count, 2);
+    }
+}
+
+fn draw_chunks(
+    render_pass: &mut wgpu::RenderPass<'static>,
+    chunks: &[VertexChunk],
+    count: u32,
+    min_verts: u32,
+) {
+    let mut remaining = count;
+    for chunk in chunks {
+        if remaining == 0 {
+            break;
         }
+        let n = remaining.min(chunk.capacity);
+        if n >= min_verts {
+            render_pass.set_vertex_buffer(0, chunk.buffer.slice(..));
+            render_pass.draw(0..n, 0..1);
+        }
+        remaining -= n;
     }
 }
 
@@ -503,33 +582,49 @@ fn draw_overlay(
         return;
     }
     render_pass.set_bind_group(0, bind_group, &[]);
-    if let Some(buf) = gpu.fill_buffer.as_ref() {
-        if !overlay.fills.is_empty() {
-            render_pass.set_pipeline(&gpu.fill_pipeline);
-            render_pass.set_vertex_buffer(0, buf.slice(..));
-            for range in &overlay.fills {
-                if range.end.saturating_sub(range.start) >= 3 {
-                    render_pass.draw(range.start..range.end, 0..1);
-                }
-            }
+    if !overlay.fills.is_empty() && !gpu.fill_chunks.is_empty() {
+        render_pass.set_pipeline(&gpu.fill_pipeline);
+        for range in &overlay.fills {
+            draw_global_range(render_pass, &gpu.fill_chunks, range.start, range.end, 3);
         }
     }
-    if let Some(buf) = gpu.line_buffer.as_ref() {
-        if !overlay.lines.is_empty() {
-            render_pass.set_pipeline(&gpu.line_pipeline);
-            render_pass.set_vertex_buffer(0, buf.slice(..));
-            for range in &overlay.lines {
-                if range.end.saturating_sub(range.start) >= 2 {
-                    render_pass.draw(range.start..range.end, 0..1);
-                }
-            }
+    if !overlay.lines.is_empty() && !gpu.line_chunks.is_empty() {
+        render_pass.set_pipeline(&gpu.line_pipeline);
+        for range in &overlay.lines {
+            draw_global_range(render_pass, &gpu.line_chunks, range.start, range.end, 2);
+        }
+    }
+}
+
+fn draw_global_range(
+    render_pass: &mut wgpu::RenderPass<'static>,
+    chunks: &[VertexChunk],
+    start: u32,
+    end: u32,
+    min_verts: u32,
+) {
+    let mut base = 0u32;
+    for chunk in chunks {
+        let chunk_end = base.saturating_add(chunk.capacity);
+        let lo = start.max(base);
+        let hi = end.min(chunk_end);
+        if hi.saturating_sub(lo) >= min_verts {
+            render_pass.set_vertex_buffer(0, chunk.buffer.slice(..));
+            render_pass.draw(lo - base..hi - base, 0..1);
+        }
+        base = chunk_end;
+        if base >= end {
+            break;
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{plan_gpu_upload, GpuUpload, GpuUploadPlan};
+    use super::{
+        chunk_capacities, max_vertices_for_buffer, next_vertex_capacity, plan_gpu_upload,
+        GpuUpload, GpuUploadPlan, DEFAULT_MAX_BUFFER_SIZE, VERTEX_STRIDE,
+    };
     use cad_core::Transform2;
 
     #[test]
@@ -631,6 +726,40 @@ mod tests {
         assert_eq!(
             plan_gpu_upload(8, 9, 50, 6, 1024, 64, 40, 3, GpuUpload::Full),
             GpuUploadPlan::Full
+        );
+    }
+
+    #[test]
+    fn capacity_does_not_round_up_past_the_gpu_buffer_limit() {
+        let max_verts = max_vertices_for_buffer(DEFAULT_MAX_BUFFER_SIZE, 2);
+        let just_over_power_of_two = (1u32 << 23) + 2;
+        let capacity = next_vertex_capacity(just_over_power_of_two, max_verts);
+        assert!(capacity >= just_over_power_of_two);
+        assert!(u64::from(capacity) * VERTEX_STRIDE <= DEFAULT_MAX_BUFFER_SIZE);
+        assert!(
+            u64::from(capacity.next_power_of_two()) * VERTEX_STRIDE > DEFAULT_MAX_BUFFER_SIZE,
+            "this case is the one that used to allocate 384 MiB"
+        );
+    }
+
+    #[test]
+    fn oversized_meshes_split_into_gpu_sized_chunks() {
+        let max_verts = max_vertices_for_buffer(DEFAULT_MAX_BUFFER_SIZE, 2);
+        let needed = max_verts.saturating_mul(2).saturating_add(4);
+        let caps = chunk_capacities(needed, max_verts);
+        assert!(caps.len() >= 3);
+        assert!(caps.iter().all(|&cap| cap <= max_verts));
+        assert!(caps
+            .iter()
+            .all(|&cap| u64::from(cap) * VERTEX_STRIDE <= DEFAULT_MAX_BUFFER_SIZE));
+        assert!(caps.iter().copied().sum::<u32>() >= needed);
+    }
+
+    #[test]
+    fn small_uploads_still_use_power_of_two_capacity() {
+        assert_eq!(
+            next_vertex_capacity(2000, max_vertices_for_buffer(DEFAULT_MAX_BUFFER_SIZE, 2)),
+            2048
         );
     }
 }

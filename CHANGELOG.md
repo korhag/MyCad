@@ -5,9 +5,15 @@ All notable changes to MyCad are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project versions with [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Workspace version is `0.17.0` (`Cargo.toml`).
+Workspace version is `0.17.1` (`Cargo.toml`).
 
 ## [Unreleased]
+
+## [0.17.1] - 2026-09-04
+
+### Fixed
+
+- Open large DWGs without crashing when linework exceeds one GPU vertex buffer. Capacity no longer rounds up past the device limit (the previous 384 MiB `mycad.linevb` allocation), and bigger meshes split across multiple buffers.
 
 ## [0.17.0] - 2026-09-04
 
