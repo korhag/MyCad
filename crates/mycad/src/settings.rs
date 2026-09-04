@@ -6,11 +6,11 @@ use crate::drafting::DraftingPreferences;
 use crate::input::InputMap;
 use crate::workspace::{
     decode_dock_layout, default_dock_state, encode_dock_layout, migrate_home_tab,
-    sanitize_dock_state, WorkspaceTab,
+    recover_home_split_once, sanitize_dock_state, WorkspaceTab,
 };
 
 pub const STORAGE_KEY: &str = "mycad_settings";
-pub const SETTINGS_SCHEMA_VERSION: u32 = 3;
+pub const SETTINGS_SCHEMA_VERSION: u32 = 4;
 pub const DEFAULT_ZOOM_SPEED: f64 = 1.0;
 pub const ZOOM_SPEED_MIN: f64 = 0.25;
 pub const ZOOM_SPEED_MAX: f64 = 10.0;
@@ -114,6 +114,8 @@ pub struct AppSettings {
     pub drafting: DraftingPreferences,
     #[serde(default)]
     pub home_layout_migrated: bool,
+    #[serde(default)]
+    pub responsive_ribbon_recovered: bool,
 }
 
 impl Default for AppSettings {
@@ -125,6 +127,7 @@ impl Default for AppSettings {
             display: DisplaySettings::default(),
             drafting: DraftingPreferences::default(),
             home_layout_migrated: false,
+            responsive_ribbon_recovered: false,
         }
     }
 }
@@ -149,6 +152,8 @@ impl AppSettings {
         self.bindings.sanitize();
         let mut state = decode_dock_layout(self.dock_layout.as_ref());
         self.home_layout_migrated = migrate_home_tab(&mut state, self.home_layout_migrated);
+        self.responsive_ribbon_recovered =
+            recover_home_split_once(&mut state, self.responsive_ribbon_recovered);
         self.dock_layout = Some(encode_dock_layout(&state));
     }
 
@@ -264,7 +269,7 @@ mod tests {
                 .as_deref(),
             Some("space")
         );
-        assert!(json.contains("\"schema_version\": 3"));
+        assert!(json.contains("\"schema_version\": 4"));
         assert!(!json.to_lowercase().contains(".dwg"));
     }
 

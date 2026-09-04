@@ -1,6 +1,6 @@
 //! Persistent dockable workspace: Home, Properties, Viewport, Diagnostics.
 
-use eframe::egui::{self, Color32, Margin, Pos2, Rect, Stroke, StrokeKind, Ui};
+use eframe::egui::{self, Color32, Pos2, Rect, Stroke, StrokeKind, Ui};
 use egui_dock::{DockArea, DockState, Node, NodeIndex, Split, Style, TabViewer};
 use serde::{Deserialize, Serialize};
 
@@ -87,6 +87,43 @@ pub fn migrate_home_tab(state: &mut DockState<WorkspaceTab>, already_migrated: b
     true
 }
 
+pub fn recover_home_split_once(
+    state: &mut DockState<WorkspaceTab>,
+    already_recovered: bool,
+) -> bool {
+    if already_recovered {
+        return true;
+    }
+    let Some((surface, home, _)) = state.find_tab(&WorkspaceTab::Home) else {
+        return true;
+    };
+    let Some(parent) = home.parent() else {
+        return true;
+    };
+    let is_home_leaf = state[surface][home]
+        .tabs()
+        .is_some_and(|tabs| tabs.len() == 1 && tabs[0] == WorkspaceTab::Home);
+    let Node::Vertical(split) = &state[surface][parent] else {
+        return true;
+    };
+    let home_is_top = parent.left() == home;
+    let home_is_bottom = parent.right() == home;
+    if is_home_leaf
+        && (home_is_top || home_is_bottom)
+        && ((home_is_top && split.fraction > 0.28) || (home_is_bottom && split.fraction < 0.72))
+    {
+        let fraction = if home_is_top {
+            HOME_SPLIT_FRACTION
+        } else {
+            1.0 - HOME_SPLIT_FRACTION
+        };
+        if let Node::Vertical(split) = &mut state[surface][parent] {
+            split.fraction = fraction;
+        }
+    }
+    true
+}
+
 pub fn ensure_tab(state: &mut DockState<WorkspaceTab>, tab: WorkspaceTab) {
     if state.find_tab(&tab).is_none() {
         state.push_to_focused_leaf(tab);
@@ -143,7 +180,6 @@ fn replace_null_numbers(value: &mut serde_json::Value) {
 pub fn show_workspace(ui: &mut Ui, app: &mut MyCadApp) {
     let mut dock_state = std::mem::replace(&mut app.dock_state, default_dock_state());
     let style = Style::from_egui(ui.style().as_ref());
-    let tab_bar_height = style.tab_bar.height;
     {
         let mut viewer = WorkspaceViewer { app };
         DockArea::new(&mut dock_state)
@@ -152,90 +188,7 @@ pub fn show_workspace(ui: &mut Ui, app: &mut MyCadApp) {
             .show_leaf_collapse_buttons(true)
             .show_inside(ui, &mut viewer);
     }
-    fit_home_strip(&mut dock_state, tab_bar_height);
     app.dock_state = dock_state;
-}
-
-pub fn home_leaf_height(tab_bar_height: f32) -> f32 {
-    tab_bar_height + f32::from(home::RIBBON_BODY_MARGIN) * 2.0 + home::RIBBON_BODY_HEIGHT
-}
-
-fn fit_home_strip(state: &mut DockState<WorkspaceTab>, tab_bar_height: f32) {
-    let Some((surface, mut node, _)) = state.find_tab(&WorkspaceTab::Home) else {
-        return;
-    };
-    if state[surface][node].is_collapsed() {
-        return;
-    }
-    let desired = home_leaf_height(tab_bar_height);
-    while let Some(parent) = node.parent() {
-        let home_is_top = parent.left() == node;
-        let home_is_bottom = parent.right() == node;
-        match &state[surface][parent] {
-            Node::Horizontal(_) => {
-                node = parent;
-                continue;
-            }
-            Node::Vertical(_) if home_is_top || home_is_bottom => {
-                if !subtree_is_home_only(state, surface, node) {
-                    return;
-                }
-            }
-            _ => return,
-        }
-        let Node::Vertical(split) = &mut state[surface][parent] else {
-            return;
-        };
-        let parent_h = split.rect.height();
-        if !parent_h.is_finite() || parent_h < 32.0 {
-            return;
-        }
-        let current = if home_is_top {
-            parent_h * split.fraction
-        } else {
-            parent_h * (1.0 - split.fraction)
-        };
-        if current > parent_h * 0.28 {
-            return;
-        }
-        let fraction = (desired / parent_h).clamp(0.02, 0.25);
-        split.fraction = if home_is_top {
-            fraction
-        } else {
-            1.0 - fraction
-        };
-        return;
-    }
-}
-
-fn subtree_is_home_only(
-    state: &DockState<WorkspaceTab>,
-    surface: egui_dock::SurfaceIndex,
-    node: NodeIndex,
-) -> bool {
-    let mut tabs = Vec::new();
-    collect_tabs(state, surface, node, &mut tabs);
-    !tabs.is_empty() && tabs.iter().all(|tab| *tab == WorkspaceTab::Home)
-}
-
-fn collect_tabs(
-    state: &DockState<WorkspaceTab>,
-    surface: egui_dock::SurfaceIndex,
-    node: NodeIndex,
-    out: &mut Vec<WorkspaceTab>,
-) {
-    match &state[surface][node] {
-        Node::Leaf(_) => {
-            if let Some(tabs) = state[surface][node].tabs() {
-                out.extend(tabs.iter().copied());
-            }
-        }
-        Node::Horizontal(_) | Node::Vertical(_) => {
-            collect_tabs(state, surface, node.left(), out);
-            collect_tabs(state, surface, node.right(), out);
-        }
-        Node::Empty => {}
-    }
 }
 
 // ------------------------------------------------------------
@@ -277,19 +230,6 @@ impl TabViewer for WorkspaceViewer<'_> {
             WorkspaceTab::Home => [true, false],
             _ => [true, true],
         }
-    }
-
-    fn tab_style_override(
-        &self,
-        tab: &Self::Tab,
-        global_style: &egui_dock::TabStyle,
-    ) -> Option<egui_dock::TabStyle> {
-        if !matches!(tab, WorkspaceTab::Home) {
-            return None;
-        }
-        let mut style = global_style.clone();
-        style.tab_body.inner_margin = Margin::symmetric(4, home::RIBBON_BODY_MARGIN);
-        Some(style)
     }
 }
 
@@ -358,42 +298,48 @@ mod layout_tests {
         );
         let (v_surface, viewport, _) = state.find_tab(&WorkspaceTab::Viewport).expect("Viewport");
         assert_eq!(surface, v_surface);
-        assert!(
-            !subtree_is_home_only(&state, surface, viewport),
-            "Viewport tree should stay below Home"
-        );
+        assert_ne!(node, viewport);
     }
 
     #[test]
-    fn fit_home_strip_sizes_an_oversized_top_split_to_the_icon_row() {
+    fn home_split_is_not_rewritten_after_layout_creation() {
         let mut state = default_dock_state();
         let (surface, node) = state
             .find_tab(&WorkspaceTab::Home)
             .map(|(surface, node, _)| (surface, node))
             .expect("Home");
         let parent = node.parent().expect("Home should sit in a split");
-        {
-            let Node::Vertical(split) = &mut state[surface][parent] else {
-                panic!("Home should be in a vertical strip");
-            };
-            split.rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(1200.0, 800.0));
-            split.fraction = 0.12;
-        }
-        fit_home_strip(&mut state, 24.0);
-        let Node::Vertical(split) = &state[surface][parent] else {
-            panic!("Home should stay in a vertical strip");
-        };
-        let leaf_h = if parent.left() == node {
-            800.0 * split.fraction
-        } else {
-            800.0 * (1.0 - split.fraction)
-        };
-        let expected = home_leaf_height(24.0);
         assert!(
-            (leaf_h - expected).abs() < 2.0,
-            "Home leaf {leaf_h} should match icon row {expected}"
+            matches!(state[surface][parent], Node::Vertical(_)),
+            "Home should be above the viewport"
         );
-        assert!(leaf_h < 800.0 * 0.12);
+        let Node::Vertical(split) = &mut state[surface][parent] else {
+            unreachable!();
+        };
+        split.fraction = 0.42;
+        assert_eq!(split.fraction, 0.42);
+    }
+
+    #[test]
+    fn oversized_home_split_is_recovered_only_once() {
+        let mut state = default_dock_state();
+        let (surface, home, _) = state.find_tab(&WorkspaceTab::Home).expect("Home");
+        let parent = home.parent().expect("Home split");
+        let Node::Vertical(split) = &mut state[surface][parent] else {
+            panic!("Home should be above viewport");
+        };
+        split.fraction = 0.6;
+        assert!(recover_home_split_once(&mut state, false));
+        let Node::Vertical(split) = &mut state[surface][parent] else {
+            unreachable!();
+        };
+        assert_eq!(split.fraction, HOME_SPLIT_FRACTION);
+        split.fraction = 0.6;
+        assert!(recover_home_split_once(&mut state, true));
+        let Node::Vertical(split) = &state[surface][parent] else {
+            unreachable!();
+        };
+        assert_eq!(split.fraction, 0.6);
     }
 
     #[test]

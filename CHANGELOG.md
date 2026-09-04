@@ -27,6 +27,8 @@ Workspace version is `0.3.0` (`Cargo.toml`).
 
 - Change LINE commits to append tessellation, object snaps, extents, and GPU vertices for the new segment so drawing stays interactive on large DWGs. Undo, redo, and file load still rebuild the full display.
 - Shrink the Home ribbon to the icon row so the dock strip is only as tall as the tools, leaving the rest of the window for the viewport.
+- Make the Home ribbon vertically resizable, scaling its icon tiles with the available height and switching to compact text menus when space is limited.
+- Fix blank Home ribbons after resizing by using one stable dock-body height for responsive layout and recovering oversized saved splits once.
 
 ## [0.2.1] - 2026-09-03
 
