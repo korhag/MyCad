@@ -1,8 +1,6 @@
 //! Transient inspection overlay shared by Distance, Angle, Radius, and Area.
 
-use cad_core::{
-    bulge_circle, DrawingUnits, MeasurementResult, Point2, PolyVertex,
-};
+use cad_core::{bulge_circle, DrawingUnits, MeasurementResult, Point2, PolyVertex};
 use cad_viewport::Camera2;
 use eframe::egui::{
     self, Align2, Area, Color32, FontId, Frame, Id, Order, Pos2, Rect, Shape, Stroke, Vec2,
@@ -154,11 +152,17 @@ pub fn live_cursor_label(painter: &egui::Painter, rect: Rect, cursor: Pos2, text
 fn paint_marker(painter: &egui::Painter, center: Pos2) {
     let r = MARKER_PX;
     painter.line_segment(
-        [Pos2::new(center.x - r, center.y), Pos2::new(center.x + r, center.y)],
+        [
+            Pos2::new(center.x - r, center.y),
+            Pos2::new(center.x + r, center.y),
+        ],
         Stroke::new(STROKE_PX, ACCENT),
     );
     painter.line_segment(
-        [Pos2::new(center.x, center.y - r), Pos2::new(center.x, center.y + r)],
+        [
+            Pos2::new(center.x, center.y - r),
+            Pos2::new(center.x, center.y + r),
+        ],
         Stroke::new(STROKE_PX, ACCENT),
     );
 }
@@ -168,8 +172,14 @@ fn paint_label(painter: &egui::Painter, viewport: Rect, pos: Pos2, text: &str) {
     let galley = painter.layout_no_wrap(text.to_string(), font, Color32::from_rgb(250, 236, 200));
     let size = galley.size() + Vec2::new(10.0, 6.0);
     let mut min = pos - Vec2::new(size.x * 0.5, size.y * 0.5);
-    min.x = min.x.clamp(viewport.min.x + 4.0, (viewport.max.x - size.x - 4.0).max(viewport.min.x + 4.0));
-    min.y = min.y.clamp(viewport.min.y + 4.0, (viewport.max.y - size.y - 4.0).max(viewport.min.y + 4.0));
+    min.x = min.x.clamp(
+        viewport.min.x + 4.0,
+        (viewport.max.x - size.x - 4.0).max(viewport.min.x + 4.0),
+    );
+    min.y = min.y.clamp(
+        viewport.min.y + 4.0,
+        (viewport.max.y - size.y - 4.0).max(viewport.min.y + 4.0),
+    );
     let rect = Rect::from_min_size(min, size);
     painter.rect_filled(rect, 3.0, Color32::from_rgba_unmultiplied(12, 16, 14, 200));
     painter.galley(rect.center() - galley.size() * 0.5, galley, Color32::WHITE);

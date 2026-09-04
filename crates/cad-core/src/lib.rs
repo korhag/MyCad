@@ -4,10 +4,12 @@
 //! editing can share the same types.
 
 pub mod color;
+pub mod compare;
 pub mod document;
 pub mod entity;
 pub mod entity_transform;
 pub mod extents;
+pub mod fixtures;
 pub mod geom;
 pub mod linetype;
 pub mod measure;
@@ -16,6 +18,7 @@ pub mod snap;
 pub mod transform;
 
 pub use color::{aci_rgb, CadColor, Rgb};
+pub use compare::{compare_documents, CompareTol, Mismatch};
 pub use document::{BlockDefinition, Document, DrawingUnits, ImportDiagnostics, Layer};
 pub use entity::{
     default_extrusion, Entity, EntityId, Geometry, HatchData, HatchEdge, HatchPath,
@@ -25,6 +28,8 @@ pub use entity_transform::{
     reference_radius, transform_entity, transform_geometry, validate_entities, EntityTransform,
     TransformError,
 };
+pub use extents::Extents2;
+pub use fixtures::primitives_document;
 pub use geom::{
     arc_from_three_points, ocs_to_wcs, ArcFromPointsError, Point2, Point3, ThreePointArc,
     GEOM_TOLERANCE,

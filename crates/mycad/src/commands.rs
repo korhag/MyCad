@@ -33,10 +33,6 @@ impl ModifyKind {
         }
     }
 
-    pub fn label(self) -> &'static str {
-        self.command_kind().label()
-    }
-
     pub fn creates_copies(self) -> bool {
         matches!(self, Self::Copy | Self::Mirror)
     }
@@ -117,7 +113,10 @@ impl CommandKind {
     }
 
     pub fn is_measure(self) -> bool {
-        matches!(self, Self::Distance | Self::Angle | Self::Radius | Self::Area)
+        matches!(
+            self,
+            Self::Distance | Self::Angle | Self::Radius | Self::Area
+        )
     }
 
     pub fn is_modify(self) -> bool {
@@ -155,7 +154,6 @@ pub enum CommandOutput {
         transform: EntityTransform,
         copies: bool,
     },
-    Erase,
     Rejected(&'static str),
 }
 
@@ -221,7 +219,10 @@ pub struct DistanceState {
 #[derive(Debug, Clone, PartialEq)]
 pub enum AngleState {
     Prompt,
-    FirstSegment { start: Point2, end: Point2 },
+    FirstSegment {
+        start: Point2,
+        end: Point2,
+    },
     ThreePoint {
         vertex: Option<Point2>,
         ray: Option<Point2>,
@@ -274,6 +275,10 @@ impl CommandState {
 
     pub fn is_active(&self) -> bool {
         self.kind().is_active()
+    }
+
+    pub fn is_idle(&self) -> bool {
+        self.kind().is_idle()
     }
 
     pub fn is_selecting_objects(&self) -> bool {
@@ -353,7 +358,7 @@ impl CommandState {
     }
 
     pub fn start_modify(&mut self, kind: ModifyKind, selected: Vec<EntityId>) {
-        let phase = if selected.is_empty() {
+        let phase = if kind == ModifyKind::Erase || selected.is_empty() {
             ModifyPhase::Selecting
         } else {
             ModifyPhase::BasePoint
@@ -473,6 +478,7 @@ impl CommandState {
                 kind: ModifyKind::Erase,
                 phase: ModifyPhase::Selecting,
                 targets,
+                ..
             }) => !targets.is_empty(),
             Self::Modify(ModifyState {
                 phase: ModifyPhase::Selecting,
@@ -508,7 +514,9 @@ impl CommandState {
             Self::Rectangle(state) => state.first.is_some(),
             Self::Distance(state) => state.first.is_some(),
             Self::Angle(AngleState::FirstSegment { .. }) => true,
-            Self::Angle(AngleState::ThreePoint { vertex, ray }) => vertex.is_some() || ray.is_some(),
+            Self::Angle(AngleState::ThreePoint { vertex, ray }) => {
+                vertex.is_some() || ray.is_some()
+            }
             Self::Area(AreaState::Points { .. }) => true,
             Self::Modify(state) => state.phase != ModifyPhase::Selecting,
             _ => false,
@@ -662,10 +670,7 @@ impl CommandState {
                 *state = AngleState::FirstSegment { start, end };
                 CommandOutput::None
             }
-            AngleState::FirstSegment {
-                start: a0,
-                end: a1,
-            } => {
+            AngleState::FirstSegment { start: a0, end: a1 } => {
                 let (a0, a1) = (*a0, *a1);
                 match cad_core::AngleMeasurement::from_segments(a0, a1, start, end) {
                     Some(angle) => {
@@ -702,7 +707,9 @@ impl CommandState {
         CommandOutput::None
     }
 
-    pub fn finish_measurement(&mut self) -> Option<Result<MeasurementResult, cad_core::MeasureError>> {
+    pub fn finish_measurement(
+        &mut self,
+    ) -> Option<Result<MeasurementResult, cad_core::MeasureError>> {
         match self {
             Self::Area(AreaState::Points { vertices }) if vertices.len() >= 3 => {
                 match cad_core::AreaMeasurement::from_points(vertices) {
@@ -830,15 +837,11 @@ impl CommandState {
             }
             Self::Angle(AngleState::ThreePoint { .. }) => "ANGLE — Specify the second ray",
             Self::Radius => "RADIUS — Select a Circle or Arc",
-            Self::Area(AreaState::Prompt) => {
-                "AREA — Select a closed object or specify first point"
-            }
+            Self::Area(AreaState::Prompt) => "AREA — Select a closed object or specify first point",
             Self::Area(AreaState::Points { vertices }) if vertices.len() < 3 => {
                 "AREA — Specify next boundary point"
             }
-            Self::Area(AreaState::Points { .. }) => {
-                "AREA — Specify next point, or Enter to finish"
-            }
+            Self::Area(AreaState::Points { .. }) => "AREA — Specify next point, or Enter to finish",
             Self::Modify(state) => modify_prompt(state),
         }
     }
@@ -953,9 +956,8 @@ fn accept_modify_point(
         }
         ModifyPhase::ScaleFactor => {
             let base = state.base.expect("base point");
-            let factor = typed_factor.unwrap_or_else(|| {
-                base.distance(point) / state.reference_radius.max(1.0)
-            });
+            let factor = typed_factor
+                .unwrap_or_else(|| base.distance(point) / state.reference_radius.max(1.0));
             CommandOutput::Modify {
                 transform: EntityTransform::UniformScale { base, factor },
                 copies: false,
@@ -1004,7 +1006,9 @@ fn modify_prompt(state: &ModifyState) -> &'static str {
         (ModifyKind::Copy, _) => "COPY — Specify destination point",
         (ModifyKind::Rotate, ModifyPhase::BasePoint) => "ROTATE — Specify base point",
         (ModifyKind::Rotate, _) => "ROTATE — Specify rotation angle",
-        (ModifyKind::Mirror, ModifyPhase::BasePoint) => "MIRROR — Specify first point of mirror line",
+        (ModifyKind::Mirror, ModifyPhase::BasePoint) => {
+            "MIRROR — Specify first point of mirror line"
+        }
         (ModifyKind::Mirror, _) => "MIRROR — Specify second point of mirror line",
         (ModifyKind::Scale, ModifyPhase::BasePoint) => "SCALE — Specify base point",
         (ModifyKind::Scale, _) => "SCALE — Specify scale factor",
@@ -1542,10 +1546,7 @@ mod tests {
         let first = Point2::new(0.0, 0.0);
         command.accept_point(first);
         command.accept_point(Point2::new(5.0, 0.0));
-        assert!(matches!(
-            command.accept_point(first),
-            CommandOutput::None
-        ));
+        assert!(matches!(command.accept_point(first), CommandOutput::None));
         assert_eq!(command.kind(), CommandKind::Polyline);
         match command.finish_geometry() {
             Some(Geometry::LwPolyline {
@@ -1578,5 +1579,109 @@ mod tests {
             other => panic!("expected closed polyline, got {other:?}"),
         }
         assert_eq!(command.kind(), CommandKind::Polyline);
+    }
+
+    #[test]
+    fn modify_selection_first_asks_for_base_point() {
+        let mut command = CommandState::Idle;
+        command.start_modify(ModifyKind::Move, vec![EntityId(3)]);
+        assert!(!command.is_selecting_objects());
+        assert!(command.requests_point());
+        assert_eq!(command.modify_targets(), &[EntityId(3)]);
+        assert!(matches!(
+            command.accept_modify_point(Point2::new(1.0, 1.0), None, None),
+            CommandOutput::None
+        ));
+        let CommandOutput::Modify {
+            transform: EntityTransform::Translate { dx, dy },
+            copies,
+        } = command.accept_modify_point(Point2::new(4.0, 5.0), None, None)
+        else {
+            panic!("expected move");
+        };
+        assert!((dx - 3.0).abs() < 1e-12);
+        assert!((dy - 4.0).abs() < 1e-12);
+        assert!(!copies);
+        assert_eq!(command.kind(), CommandKind::Move);
+    }
+
+    #[test]
+    fn modify_command_first_enters_selection_phase() {
+        let mut command = CommandState::Idle;
+        command.start_modify(ModifyKind::Copy, Vec::new());
+        assert!(command.is_selecting_objects());
+        assert!(!command.requests_point());
+        command.confirm_modify_selection(vec![EntityId(1), EntityId(2)], 10.0);
+        assert!(!command.is_selecting_objects());
+        assert!(command.requests_point());
+    }
+
+    #[test]
+    fn copy_and_mirror_request_copies() {
+        let mut command = CommandState::Idle;
+        command.start_modify(ModifyKind::Copy, vec![EntityId(1)]);
+        command.accept_modify_point(Point2::new(0.0, 0.0), None, None);
+        let CommandOutput::Modify { copies, .. } =
+            command.accept_modify_point(Point2::new(1.0, 0.0), None, None)
+        else {
+            panic!("copy");
+        };
+        assert!(copies);
+        command.start_modify(ModifyKind::Mirror, vec![EntityId(1)]);
+        command.accept_modify_point(Point2::new(0.0, 0.0), None, None);
+        let CommandOutput::Modify { copies, .. } =
+            command.accept_modify_point(Point2::new(0.0, 1.0), None, None)
+        else {
+            panic!("mirror");
+        };
+        assert!(copies);
+    }
+
+    #[test]
+    fn esc_style_modify_cancel_returns_idle() {
+        let mut command = CommandState::Idle;
+        command.start_modify(ModifyKind::Rotate, vec![EntityId(8)]);
+        command.cancel();
+        assert_eq!(command, CommandState::Idle);
+    }
+
+    #[test]
+    fn erase_stays_in_selection_phase_even_with_preselection() {
+        let mut command = CommandState::Idle;
+        command.start_modify(ModifyKind::Erase, vec![EntityId(4)]);
+        assert!(command.is_selecting_objects());
+        assert!(!command.requests_point());
+    }
+
+    #[test]
+    fn rotate_uses_signed_typed_angle() {
+        let mut command = CommandState::Idle;
+        command.start_modify(ModifyKind::Rotate, vec![EntityId(1)]);
+        command.accept_modify_point(Point2::new(0.0, 0.0), None, None);
+        let CommandOutput::Modify {
+            transform: EntityTransform::Rotate { radians, .. },
+            copies,
+        } = command.accept_modify_point(Point2::new(10.0, 0.0), Some(-90.0), None)
+        else {
+            panic!("rotate");
+        };
+        assert!((radians + std::f64::consts::FRAC_PI_2).abs() < 1e-12);
+        assert!(!copies);
+    }
+
+    #[test]
+    fn scale_prefers_typed_factor_over_cursor() {
+        let mut command = CommandState::Idle;
+        command.start_modify(ModifyKind::Scale, vec![EntityId(1)]);
+        command.accept_modify_point(Point2::new(0.0, 0.0), None, None);
+        let CommandOutput::Modify {
+            transform: EntityTransform::UniformScale { factor, .. },
+            copies,
+        } = command.accept_modify_point(Point2::new(100.0, 0.0), None, Some(2.5))
+        else {
+            panic!("scale");
+        };
+        assert!((factor - 2.5).abs() < 1e-12);
+        assert!(!copies);
     }
 }

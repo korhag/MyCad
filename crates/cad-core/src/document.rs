@@ -140,6 +140,33 @@ impl DrawingUnits {
         }
     }
 
+    pub fn to_insunits(self) -> u16 {
+        match self {
+            Self::Unspecified => 0,
+            Self::Inches => 1,
+            Self::Feet => 2,
+            Self::Miles => 3,
+            Self::Millimeters => 4,
+            Self::Centimeters => 5,
+            Self::Meters => 6,
+            Self::Kilometers => 7,
+            Self::Microinches => 8,
+            Self::Mils => 9,
+            Self::Yards => 10,
+            Self::Angstroms => 11,
+            Self::Nanometers => 12,
+            Self::Microns => 13,
+            Self::Decimeters => 14,
+            Self::Decameters => 15,
+            Self::Hectometers => 16,
+            Self::Gigameters => 17,
+            Self::AstronomicalUnits => 18,
+            Self::LightYears => 19,
+            Self::Parsecs => 20,
+            Self::Other(code) => code,
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Unspecified | Self::Other(_) => "drawing units",
@@ -345,8 +372,12 @@ impl Document {
         self.layers.get(name).or_else(|| self.layers.get("0"))
     }
 
-    pub fn layer_is_visible(&self, name: &str) -> bool {
+    pub fn layer_is_plottable(&self, name: &str) -> bool {
         self.layer(name).map(|l| l.is_plottable()).unwrap_or(true)
+    }
+
+    pub fn layer_is_visible(&self, name: &str) -> bool {
+        self.layer_is_plottable(name)
     }
 
     pub fn linetype(&self, name: &str) -> Option<&LineType> {
@@ -841,6 +872,8 @@ mod tests {
         assert_eq!(DrawingUnits::from_insunits(4).label(), "mm");
         assert_eq!(DrawingUnits::from_insunits(1).label(), "in");
         assert_eq!(DrawingUnits::from_insunits(99).label(), "drawing units");
+        assert_eq!(DrawingUnits::Millimeters.to_insunits(), 4);
+        assert_eq!(DrawingUnits::from_insunits(4).to_insunits(), 4);
     }
 
     #[test]

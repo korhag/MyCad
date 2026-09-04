@@ -18,16 +18,18 @@ pub enum InputAction {
     Pan,
     ZoomExtents,
     ContextMenu,
+    EraseSelection,
 }
 
 impl InputAction {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::SelectReplace,
         Self::SelectToggle,
         Self::SelectClear,
         Self::Pan,
         Self::ZoomExtents,
         Self::ContextMenu,
+        Self::EraseSelection,
     ];
 
     pub fn label(self) -> &'static str {
@@ -38,6 +40,7 @@ impl InputAction {
             Self::Pan => "Pan",
             Self::ZoomExtents => "Zoom extents",
             Self::ContextMenu => "Context menu",
+            Self::EraseSelection => "Erase selection",
         }
     }
 
@@ -46,12 +49,21 @@ impl InputAction {
             Self::SelectReplace | Self::SelectToggle | Self::SelectClear => "Selection",
             Self::Pan | Self::ZoomExtents => "View",
             Self::ContextMenu => "Viewport",
+            Self::EraseSelection => "Modify",
         }
     }
 
     pub fn prefers_drag(self) -> bool {
         matches!(self, Self::Pan)
     }
+}
+
+pub fn erase_hotkey_allowed(
+    command_active: bool,
+    dynamic_input_active: bool,
+    wants_keyboard: bool,
+) -> bool {
+    !command_active && !dynamic_input_active && !wants_keyboard
 }
 
 // ------------------------------------------------------------
@@ -311,6 +323,8 @@ pub struct InputMap {
     pub zoom_extents: Vec<Binding>,
     #[serde(default)]
     pub context_menu: Vec<Binding>,
+    #[serde(default)]
+    pub erase_selection: Vec<Binding>,
 }
 
 impl Default for InputMap {
@@ -339,6 +353,7 @@ impl InputMap {
                 Binding::key("e").with_command(),
             ],
             context_menu: vec![Binding::click(MouseButtonKind::Right)],
+            erase_selection: vec![Binding::key("delete")],
         }
     }
 
@@ -350,6 +365,7 @@ impl InputMap {
             InputAction::Pan => &self.pan,
             InputAction::ZoomExtents => &self.zoom_extents,
             InputAction::ContextMenu => &self.context_menu,
+            InputAction::EraseSelection => &self.erase_selection,
         }
     }
 
@@ -361,6 +377,7 @@ impl InputMap {
             InputAction::Pan => &mut self.pan,
             InputAction::ZoomExtents => &mut self.zoom_extents,
             InputAction::ContextMenu => &mut self.context_menu,
+            InputAction::EraseSelection => &mut self.erase_selection,
         }
     }
 
@@ -723,10 +740,17 @@ mod tests {
             pan: Vec::new(),
             zoom_extents: Vec::new(),
             context_menu: Vec::new(),
+            erase_selection: Vec::new(),
         };
         map.sanitize();
         assert!(!map.bindings_for(InputAction::SelectReplace).is_empty());
         assert!(!map.bindings_for(InputAction::SelectClear).is_empty());
+        assert_eq!(
+            map.bindings_for(InputAction::EraseSelection)[0]
+                .key
+                .as_deref(),
+            Some("delete")
+        );
     }
 
     #[test]
@@ -738,6 +762,7 @@ mod tests {
             pan: vec![Binding::drag(MouseButtonKind::Middle)],
             zoom_extents: vec![Binding::double_click(MouseButtonKind::Left)],
             context_menu: vec![Binding::click(MouseButtonKind::Right)],
+            erase_selection: Vec::new(),
         };
         map.sanitize();
         let none = mods(false, false, false, false);
@@ -756,10 +781,25 @@ mod tests {
             pan: vec![Binding::drag(MouseButtonKind::Left)],
             zoom_extents: vec![Binding::double_click(MouseButtonKind::Left)],
             context_menu: vec![Binding::click(MouseButtonKind::Right)],
+            erase_selection: Vec::new(),
         };
         map.sanitize();
         let none = mods(false, false, false, false);
         assert!(map.dragged(InputAction::Pan, PointerButton::Primary, none));
         assert!(!map.dragged(InputAction::SelectReplace, PointerButton::Primary, none));
+    }
+
+    #[test]
+    fn delete_hotkey_is_ignored_while_text_or_a_command_owns_focus() {
+        assert!(erase_hotkey_allowed(false, false, false));
+        assert!(!erase_hotkey_allowed(true, false, false));
+        assert!(!erase_hotkey_allowed(false, true, false));
+        assert!(!erase_hotkey_allowed(false, false, true));
+        assert_eq!(
+            InputMap::standard().bindings_for(InputAction::EraseSelection)[0]
+                .key
+                .as_deref(),
+            Some("delete")
+        );
     }
 }

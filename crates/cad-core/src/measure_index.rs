@@ -2,8 +2,8 @@
 
 use crate::entity::PolyVertex;
 use crate::measure::{
-    angle_on_arc, bulge_circle, point_bulge_distance, point_in_closed_polyline,
-    point_on_circle, point_segment_distance, MeasureError,
+    angle_on_arc, bulge_circle, point_bulge_distance, point_in_closed_polyline, point_on_circle,
+    point_segment_distance, MeasureError,
 };
 use crate::{
     ocs_to_wcs, Document, Entity, EntityId, Extents2, Geometry, Point2, Point3, Transform2,
@@ -294,7 +294,10 @@ fn matches_role(geom: &MeasureGeom, role: MeasureRole) -> bool {
             matches!(geom, MeasureGeom::Circle { .. } | MeasureGeom::Arc { .. })
         }
         MeasureRole::Closed => {
-            matches!(geom, MeasureGeom::ClosedLoop { .. } | MeasureGeom::Circle { .. })
+            matches!(
+                geom,
+                MeasureGeom::ClosedLoop { .. } | MeasureGeom::Circle { .. }
+            )
         }
     }
 }

@@ -1,0 +1,10 @@
+[package]
+name = "cad-io"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native DXF and PDF save/export for cad-core documents"
+
+[dependencies]
+cad-core.workspace = true
+thiserror.workspace = true

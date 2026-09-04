@@ -88,6 +88,10 @@ pub unsafe fn convert_document(
         );
     }
 
+    unsafe {
+        fill_named_blocks_from_sequences(dwg, &mut blocks, &mut diagnostics);
+    }
+
     diagnostics.layer_count = layers.len();
     diagnostics.block_count = blocks.len();
     if let Some(p) = get_header_field::<Point3D>(dwg, "EXTMIN") {
@@ -140,6 +144,89 @@ pub unsafe fn convert_document(
 
 fn is_model_space(name: &str) -> bool {
     name.eq_ignore_ascii_case("*MODEL_SPACE")
+}
+
+fn is_paper_space(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    upper == "*PAPER_SPACE" || upper.starts_with("*PAPER_SPACE")
+}
+
+unsafe fn fill_named_blocks_from_sequences(
+    dwg: *mut libredwg_sys::Dwg_Data,
+    blocks: &mut BTreeMap<String, BlockDefinition>,
+    diagnostics: &mut ImportDiagnostics,
+) {
+    let num_objects = unsafe { libredwg_sys::dwg_get_num_objects(dwg) };
+    let mut current_name: Option<String> = None;
+    let mut collected = Vec::new();
+    let mut base_pt = Point3::default();
+    for i in 0..num_objects {
+        let obj = unsafe { libredwg_sys::dwg_get_object(dwg, i) };
+        if obj.is_null() {
+            continue;
+        }
+        let fixedtype = object_fixedtype(obj);
+        if fixedtype == libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_BLOCK {
+            collected.clear();
+            let entity_ptr = unsafe { libredwg_sys::uncad_object_entity_ptr(obj) };
+            current_name = get_utf8_field(entity_ptr, "BLOCK", "name");
+            base_pt = pt_field(entity_ptr, "BLOCK", "base_pt").unwrap_or_default();
+        } else if fixedtype == libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_ENDBLK {
+            if let Some(name) = current_name.take() {
+                if !is_model_space(&name) && !is_paper_space(&name) {
+                    match blocks.get_mut(&name) {
+                        Some(block) if block.entities.is_empty() => {
+                            block.entities = std::mem::take(&mut collected);
+                        }
+                        Some(_) => collected.clear(),
+                        None => {
+                            let key = find_block_key(blocks, &name).unwrap_or_else(|| name.clone());
+                            if let Some(block) = blocks.get_mut(&key) {
+                                if block.entities.is_empty() {
+                                    block.entities = std::mem::take(&mut collected);
+                                } else {
+                                    collected.clear();
+                                }
+                            } else {
+                                blocks.insert(
+                                    name.clone(),
+                                    BlockDefinition {
+                                        name,
+                                        base_pt,
+                                        entities: std::mem::take(&mut collected),
+                                    },
+                                );
+                            }
+                        }
+                    }
+                } else {
+                    collected.clear();
+                }
+            }
+        } else if current_name
+            .as_deref()
+            .is_some_and(|name| !is_model_space(name) && !is_paper_space(name))
+        {
+            let name = current_name.as_deref().unwrap();
+            let needs_fill = blocks
+                .get(name)
+                .or_else(|| find_block_key(blocks, name).and_then(|key| blocks.get(&key)))
+                .map(|block| block.entities.is_empty())
+                .unwrap_or(true);
+            if needs_fill {
+                if let Some(entity) = unsafe { convert_one(dwg, obj, diagnostics) } {
+                    collected.push(entity);
+                }
+            }
+        }
+    }
+}
+
+fn find_block_key(blocks: &BTreeMap<String, BlockDefinition>, name: &str) -> Option<String> {
+    blocks
+        .keys()
+        .find(|key| key.eq_ignore_ascii_case(name))
+        .cloned()
 }
 
 fn convert_layer(dwg: *mut libredwg_sys::Dwg_Data, object_ptr: *mut c_void) -> Option<Layer> {
@@ -313,6 +400,9 @@ fn entity_color(entity_ptr: *mut c_void) -> CadColor {
     let Some(color) = get_common_field::<libredwg_sys::Dwg_Color>(entity_ptr, "color") else {
         return CadColor::ByLayer;
     };
+    if (1..=255).contains(&color.index) {
+        return CadColor::from_aci_index(color.index);
+    }
     if color.method == libredwg_sys::DWG_COLOR_METHOD_DWG_COLOR_METHOD_TRUECOLOR {
         let rgb = color.rgb & 0x00ff_ffff;
         return CadColor::Rgb {
@@ -463,6 +553,11 @@ unsafe fn convert_geometry(
             let block_name =
                 get_field::<*mut libredwg_sys::Dwg_Object_Ref>(entity_ptr, dxf, "block_header")
                     .and_then(resolve_block_name)
+                    .filter(|name| !name.is_empty())
+                    .or_else(|| {
+                        get_utf8_field(entity_ptr, dxf, "block_name")
+                            .filter(|name| !name.is_empty())
+                    })
                     .unwrap_or_default();
             let mut attribs = Vec::new();
             let mut sub = unsafe { libredwg_sys::get_first_owned_subentity(obj) };
@@ -482,12 +577,16 @@ unsafe fn convert_geometry(
                 rotation: get_field::<f64>(entity_ptr, dxf, "rotation").unwrap_or(0.0),
                 extrusion: extrusion_of(entity_ptr, dxf),
                 attribs,
-                column_count: get_field::<u16>(entity_ptr, dxf, "num_cols")
-                    .or_else(|| get_field::<u32>(entity_ptr, dxf, "num_cols").map(|n| n as u16))
-                    .unwrap_or(1) as u32,
-                row_count: get_field::<u16>(entity_ptr, dxf, "num_rows")
-                    .or_else(|| get_field::<u32>(entity_ptr, dxf, "num_rows").map(|n| n as u16))
-                    .unwrap_or(1) as u32,
+                column_count: insert_array_count(
+                    get_field::<u16>(entity_ptr, dxf, "num_cols")
+                        .map(|n| n as u32)
+                        .or_else(|| get_field::<u32>(entity_ptr, dxf, "num_cols")),
+                ),
+                row_count: insert_array_count(
+                    get_field::<u16>(entity_ptr, dxf, "num_rows")
+                        .map(|n| n as u32)
+                        .or_else(|| get_field::<u32>(entity_ptr, dxf, "num_rows")),
+                ),
                 column_spacing: get_field::<f64>(entity_ptr, dxf, "col_spacing").unwrap_or(0.0),
                 row_spacing: get_field::<f64>(entity_ptr, dxf, "row_spacing").unwrap_or(0.0),
             }
@@ -711,6 +810,10 @@ fn dimension_dxfname(fixedtype: libredwg_sys::DWG_OBJECT_TYPE) -> &'static str {
         libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_ARC_DIMENSION => "ARC_DIMENSION",
         _ => "DIMENSION_LINEAR",
     }
+}
+
+fn insert_array_count(value: Option<u32>) -> u32 {
+    value.filter(|count| *count > 0).unwrap_or(1)
 }
 
 fn extrusion_of(entity_ptr: *mut c_void, dxfname: &str) -> Point3 {

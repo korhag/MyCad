@@ -5,9 +5,114 @@ All notable changes to MyCad are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project versions with [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Workspace version is `0.6.1` (`Cargo.toml`).
+Workspace version is `0.16.0` (`Cargo.toml`).
 
 ## [Unreleased]
+
+## [0.16.0] - 2026-09-04
+
+### Added
+
+- Save (Ctrl+S) now overwrites a DWG that MyCAD already wrote (`*-MyCad.dwg`, or the file chosen in this session). Imported third-party DWGs still open Save As so a production drawing is not replaced until fidelity coverage is broader.
+- Extend DXF/DWG round-trip fixtures with POINT, POLYLINE, negative LWPOLYLINE bulge, non-zero Z, entity linetype scale, and `$INSUNITS` inches so interchange is checked beyond millimetre LINE/ARC/CIRCLE drawings.
+
+### Changed
+
+- Label unsaved-changes as **Don't Save**, and name Save As filters **DXF Drawing** and **DWG Drawing - AutoCAD 2000**.
+- Report LibreDWG DWG write failures with the target path so `Save failed:` status text names the file.
+
+## [0.15.0] - 2026-09-04
+
+### Added
+
+- Add a compact Save icon on the menu-bar quick-access strip (tooltip **Save** / **Ctrl+S**) so the Home ribbon stays a drawing toolbar. File still carries Open, Save, Save As, and Export PDF.
+
+### Changed
+
+- Report successful saves in the status bar as `Saved Plant.dxf`, `Saved Plant.dwg`, or `Exported Plant.pdf` without a dialog. A DWG with interchange fallbacks reports `DWG saved with 3 compatibility warnings`. Failures use `Save failed: …`.
+
+## [0.14.0] - 2026-09-04
+
+### Added
+
+- Add round-trip tests that write a primitive-filled document to DXF, import it again, convert that DXF to DWG through LibreDWG, and compare coordinates, angles, radius, bulge, block transforms, entity counts, layers, linetypes, and extents instead of only checking that a file exists.
+- Add `dwg_import::import_dxf` so DXF interchange uses the same process-wide LibreDWG lock and native convert path as DWG import.
+- Add PDF export checks for a valid file, requested page size, non-zero vector operators, geometry inside the printable region, and omitted hidden or frozen layers.
+
+### Fixed
+
+- Write MTEXT rotation as the DXF 11 x-axis vector and omit group 72 so LibreDWG does not treat flow direction as a column count (`DWG_ERR_INVALIDDWG`).
+- Write `$TDCREATE` / `$TDUCREATE` / `$TDUPDATE` / `$TDUUPDATE` as a real Julian day so LibreDWG's R2000 decoder does not call `strftime` on a zero calendar date and abort with `STATUS_STACK_BUFFER_OVERRUN` when the existing DWG importer reads a file we just encoded.
+- Write named-block BLOCK_RECORD rows (not `*MODEL_SPACE`) so INSERT group 2 resolves to a block name, start DXF handles at `0x100` so written entities do not collide with LibreDWG's reserved `*MODEL_SPACE` handle (`0x1F`) and truncate the ENTITIES section, and keep ACI palette indexes when LibreDWG also fills a matching truecolor.
+- Restore named INSERT definitions from BLOCK/ENDBLK sequences when LibreDWG does not create BLOCK_HEADER owned lists, fall back to the INSERT `block_name` text field, and keep SPLINE after other model-space types so a spline read error cannot drop TEXT, HATCH, and LEADER.
+- Treat INSERT column/row counts of zero as 1×1 so a missing DXF array size does not look like an empty block array.
+
+## [0.13.0] - 2026-09-04
+
+### Added
+
+- Add a vector PDF plot dialog (A4–A0, portrait/landscape, extents, fit to page, color or monochrome, 5/10/15 mm margins) that writes CAD geometry to the page. Hidden and frozen layers are omitted because only `layer.is_plottable()` content is plotted; the viewport, grid, selection, and OSNAP markers are not captured.
+
+## [0.12.0] - 2026-09-04
+
+### Changed
+
+- Keep Ctrl+S from overwriting an imported DWG. Save opens a Save As dialog with a `*-MyCad.dwg` copy name so the original production file stays intact until DWG round-trip coverage is mature.
+- Warn before any DXF or DWG save when `unsupported_total()` is greater than zero, and offer **Save a Copy** or **Cancel** instead of silently dropping layouts, proxies, XREFs, and other content the native model does not store.
+
+## [0.11.0] - 2026-09-04
+
+### Added
+
+- Add File → Save As **DWG AutoCAD 2000**, written as Document → temporary DXF → LibreDWG `dxf_read_file` / `dwg_write_file` → temporary DWG → atomic replace. Save (Ctrl+S) overwrites an opened or previously saved DWG in place the same way.
+
+### Changed
+
+- Keep the DXF writer as the only Document → CAD mapping. DWG save reuses that interchange file instead of a second entity serializer. AutoCAD 2004 and later DWG versions stay out of the UI until round-trip validation exists.
+
+## [0.10.0] - 2026-09-04
+
+### Added
+
+- Add File → Save (Ctrl+S) and File → Save As (Ctrl+Shift+S) for DXF, plus File → Export → PDF. New drawings and opened DWG files use Save As; a previously saved DXF overwrites in place and clears the dirty star.
+- Write DXF and PDF through a same-directory temp file that replaces the target only after a complete flush, so a crash or serializer error cannot truncate the previous drawing.
+
+### Changed
+
+- Treat PDF as export only: it does not change `document.source_path` or call `history.mark_clean()`.
+- Replace the unsaved-changes warning that MyCad cannot write DWG with Save / Don't save / Cancel, and bind File → Open to Ctrl+O.
+
+## [0.9.0] - 2026-09-04
+
+### Added
+
+- Add File → Save As DXF to write the native document as AutoCAD 2000 (`AC1015`) through `cad-io`, including HEADER, LTYPE, LAYER, BLOCKS, and ENTITIES.
+- Preserve coordinates, Z, layer, ByLayer/ByBlock/ACI/TrueColor, linetype, entity linetype scale, visibility, bulges, closed polylines, arcs, ellipses, splines, block insert/scale/rotation, TEXT/MTEXT, `$INSUNITS`, and `$LTSCALE` on DXF save.
+
+### Changed
+
+- Export DIMENSION as the visible anonymous-block geometry with a SaveReport warning instead of skipping it or inventing a DIMENSION entity. MLINE, INSERT attributes, ATTDEF, HATCH spline edges, and varying-Z LWPOLYLINE follow the same explode-and-warn fallback so geometry is never silently discarded.
+
+## [0.8.0] - 2026-09-04
+
+### Added
+
+- Add a `cad-io` crate that writes native DXF and PDF from `cad-core::Document`, keeping serialization out of the app, ribbon, and renderer.
+- Add `dwg-import::convert_dxf_to_dwg` so DXF-to-DWG conversion uses the existing LibreDWG process-wide mutex instead of a second FFI path.
+
+## [0.7.0] - 2026-09-04
+
+### Added
+
+- Add Move, Copy, Rotate, Mirror, Scale, and Erase as one shared modification command with selection-first and command-first workflows.
+- Add exact planar transforms in cad-core for LINE, POLYLINE, CIRCLE, ARC, POINT, ELLIPSE, SPLINE, SOLID, LEADER, MLINE, TEXT, MTEXT, and top-level INSERT instances, including live GPU preview without retessellating the drawing.
+- Add a compact context-sensitive right-click menu with Repeat of the last completed command, one Modify submenu, and command-specific Confirm/Undo/Cancel actions.
+- Add Delete-key erase while idle, using the existing rebindable input map and leaving numeric dynamic-input editing untouched.
+
+### Changed
+
+- Enable the Home Modify ribbon buttons and add a top-level Modify menu that dispatch to the same command handlers as the right-click menu.
+- Keep Hatch, Dimension, and non-world OCS geometry out of Move/Copy/Rotate/Mirror/Scale by aborting the whole selection with a short type list instead of approximating.
 
 ## [0.6.1] - 2026-09-04
 

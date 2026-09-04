@@ -1,4 +1,6 @@
 //! Dockable Home toolbar backed by the adaptive ribbon engine.
+//!
+//! Save is a compact quick-access control on the menu bar, not a Home group.
 
 use cad_core::CadColor;
 use eframe::egui::{Color32, Ui};
@@ -23,6 +25,12 @@ const CMD_DISTANCE: &str = "distance";
 const CMD_ANGLE: &str = "angle";
 const CMD_RADIUS: &str = "radius";
 const CMD_AREA: &str = "area";
+const CMD_MOVE: &str = "move";
+const CMD_COPY: &str = "copy";
+const CMD_ROTATE: &str = "rotate";
+const CMD_MIRROR: &str = "mirror";
+const CMD_SCALE: &str = "scale";
+const CMD_ERASE: &str = "erase";
 
 pub fn show(ui: &mut Ui, app: &mut MyCadApp) {
     let available = ui.available_size();
@@ -47,6 +55,12 @@ fn home_groups(app: &MyCadApp) -> Vec<RibbonGroup> {
     let angle_active = kind == CommandKind::Angle;
     let radius_active = kind == CommandKind::Radius;
     let area_active = kind == CommandKind::Area;
+    let move_active = kind == CommandKind::Move;
+    let copy_active = kind == CommandKind::Copy;
+    let rotate_active = kind == CommandKind::Rotate;
+    let mirror_active = kind == CommandKind::Mirror;
+    let scale_active = kind == CommandKind::Scale;
+    let erase_active = kind == CommandKind::Erase;
     vec![
         RibbonGroup {
             id: "history",
@@ -134,12 +148,66 @@ fn home_groups(app: &MyCadApp) -> Vec<RibbonGroup> {
             id: "modify",
             name: "Modify",
             commands: vec![
-                later(ARROWS_OUT_CARDINAL, "Move", "Move", "v0.5.0", 0),
-                later(COPY, "Copy", "Copy", "v0.5.0", 1),
-                later(ARROWS_CLOCKWISE, "Rotate", "Rotate", "v0.5.0", 2),
-                later(FLIP_HORIZONTAL, "Mirror", "Mirror", "v0.5.0", 3),
-                later(ARROWS_OUT, "Scale", "Scale", "v0.5.0", 4),
-                later(ERASER, "Erase", "Erase", "v0.5.0", 5),
+                command(
+                    CMD_MOVE,
+                    "Move",
+                    "Move",
+                    ARROWS_OUT_CARDINAL,
+                    "Move",
+                    0,
+                    idle || move_active,
+                    move_active,
+                ),
+                command(
+                    CMD_COPY,
+                    "Copy",
+                    "Copy",
+                    COPY,
+                    "Copy",
+                    1,
+                    idle || copy_active,
+                    copy_active,
+                ),
+                command(
+                    CMD_ROTATE,
+                    "Rotate",
+                    "Rotate",
+                    ARROWS_CLOCKWISE,
+                    "Rotate",
+                    2,
+                    idle || rotate_active,
+                    rotate_active,
+                ),
+                command(
+                    CMD_MIRROR,
+                    "Mirror",
+                    "Mirror",
+                    FLIP_HORIZONTAL,
+                    "Mirror",
+                    3,
+                    idle || mirror_active,
+                    mirror_active,
+                ),
+                command(
+                    CMD_SCALE,
+                    "Scale",
+                    "Scale",
+                    ARROWS_OUT,
+                    "Scale",
+                    4,
+                    idle || scale_active,
+                    scale_active,
+                ),
+                command(
+                    CMD_ERASE,
+                    "Erase",
+                    "Erase",
+                    ERASER,
+                    "Delete",
+                    5,
+                    idle || erase_active,
+                    erase_active,
+                ),
             ],
         },
         RibbonGroup {
@@ -214,6 +282,7 @@ fn command(
     }
 }
 
+#[cfg(test)]
 fn later(
     icon: &'static str,
     label: &'static str,
@@ -233,6 +302,7 @@ fn later(
     }
 }
 
+#[cfg(test)]
 fn later_tooltip(release: &'static str) -> &'static str {
     match release {
         "v0.4.0" => "Coming in v0.4.0",
@@ -298,6 +368,12 @@ fn dispatch(app: &mut MyCadApp, action: RibbonAction) {
         RibbonAction::Command(CMD_ANGLE) => app.start_angle_command(),
         RibbonAction::Command(CMD_RADIUS) => app.start_radius_command(),
         RibbonAction::Command(CMD_AREA) => app.start_area_command(),
+        RibbonAction::Command(CMD_MOVE) => app.start_move_command(),
+        RibbonAction::Command(CMD_COPY) => app.start_copy_command(),
+        RibbonAction::Command(CMD_ROTATE) => app.start_rotate_command(),
+        RibbonAction::Command(CMD_MIRROR) => app.start_mirror_command(),
+        RibbonAction::Command(CMD_SCALE) => app.start_scale_command(),
+        RibbonAction::Command(CMD_ERASE) => app.start_erase_command(),
         RibbonAction::Command(_) => {}
         RibbonAction::SetLayer(name) => app.set_current_layer(&name),
         RibbonAction::SetSelectedLayerCurrent => app.set_selected_layer_current(),
@@ -350,7 +426,16 @@ mod tests {
             "Modify" => RibbonGroup {
                 id: "modify",
                 name: "Modify",
-                commands: vec![later(ARROWS_OUT_CARDINAL, "Move", "Move", "v0.5.0", 0)],
+                commands: vec![command(
+                    CMD_MOVE,
+                    "Move",
+                    "Move",
+                    ARROWS_OUT_CARDINAL,
+                    "Move",
+                    0,
+                    idle,
+                    false,
+                )],
             },
             "Measure" => RibbonGroup {
                 id: "measure",
@@ -384,6 +469,14 @@ mod tests {
         assert!(compact.show_icons);
         assert!(compact.icon_text_gap > 0.0);
         assert_eq!(compact.rows, 1);
+    }
+
+    #[test]
+    fn home_does_not_grow_a_save_group() {
+        assert!(
+            !matches_priority("Save", "Save", 0),
+            "Save belongs on the menu-bar quick-access control"
+        );
     }
 
     #[test]

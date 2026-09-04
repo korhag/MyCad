@@ -198,6 +198,35 @@ pub fn paint_overlay(
     }
 }
 
+pub fn paint_world_axis(
+    painter: &egui::Painter,
+    rect: Rect,
+    camera: Camera2,
+    start: Point2,
+    end: Point2,
+) {
+    let dir = Point2::new(end.x - start.x, end.y - start.y);
+    let length = (dir.x * dir.x + dir.y * dir.y).sqrt();
+    if length <= cad_core::GEOM_TOLERANCE {
+        return;
+    }
+    let origin = Point2::new(rect.min.x as f64, rect.min.y as f64);
+    let size = Point2::new(rect.width() as f64, rect.height() as f64);
+    let to_screen = |point: Point2| {
+        let point = camera.world_to_screen(point, origin, size);
+        Pos2::new(point.x as f32, point.y as f32)
+    };
+    let span = camera.view_height.max(1.0) * 8.0;
+    let ux = dir.x / length;
+    let uy = dir.y / length;
+    let a = Point2::new(start.x - ux * span, start.y - uy * span);
+    let b = Point2::new(start.x + ux * span, start.y + uy * span);
+    painter.line_segment(
+        [to_screen(a), to_screen(b)],
+        Stroke::new(1.0, Color32::from_rgb(90, 140, 150)),
+    );
+}
+
 fn paint_preview(
     painter: &egui::Painter,
     to_screen: &impl Fn(Point2) -> Pos2,
@@ -402,7 +431,10 @@ mod tests {
             &extra,
         );
         assert_eq!(resolved, extra[0].point);
-        assert_eq!(drafting.acquired_snap.map(|feature| feature.kind), Some(SnapKind::Endpoint));
+        assert_eq!(
+            drafting.acquired_snap.map(|feature| feature.kind),
+            Some(SnapKind::Endpoint)
+        );
     }
 
     #[test]

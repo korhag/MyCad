@@ -3,10 +3,11 @@ name = "dwg-import"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "LibreDWG-backed DWG import, converting into cad-core documents"
+description = "LibreDWG-backed DWG/DXF import and DXF-interchange DWG save"
 
 [dependencies]
 cad-core.workspace = true
+cad-io.workspace = true
 libredwg-sys.workspace = true
 libc.workspace = true
 thiserror.workspace = true

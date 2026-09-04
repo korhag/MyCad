@@ -714,4 +714,12 @@ mod tests {
         assert!(clamped.x >= viewport.min.x);
         assert!(clamped.y >= viewport.min.y);
     }
+
+    #[test]
+    fn factor_layout_owns_keyboard_so_delete_hotkey_stays_gated() {
+        let mut input = DynamicInput::default();
+        input.set_layout(DynamicLayout::Factor);
+        assert!(input.is_active());
+        assert_eq!(input.layout(), DynamicLayout::Factor);
+    }
 }

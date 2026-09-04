@@ -1,4 +1,5 @@
-//! LibreDWG DWG importer. Converts into cad-core and then frees the C graph.
+//! LibreDWG DWG/DXF import and DXF-interchange DWG save. Converts into cad-core
+//! and then frees the C graph.
 
 use std::ffi::CString;
 use std::fs::File;
@@ -13,7 +14,12 @@ use thiserror::Error;
 
 mod convert;
 mod dynapi;
+mod export;
 mod ltype;
+
+pub use export::{
+    convert_dxf_to_dwg, write_dwg, write_dwg_as, DwgOutputVersion, DwgWriteError, ExportError,
+};
 
 static LIBREDWG_LOCK: Mutex<()> = Mutex::new(());
 
@@ -27,16 +33,35 @@ pub enum ImportError {
     Io(#[from] std::io::Error),
 }
 
+enum CadReadKind {
+    Dwg,
+    Dxf,
+}
+
 // ------------------------------------------------------------
 // Function: import_dwg
 // Purpose: Read a DWG via LibreDWG and return an isolated CAD document.
 // ------------------------------------------------------------
 pub fn import_dwg(path: impl AsRef<Path>) -> Result<Document, ImportError> {
-    let path = path.as_ref();
+    import_cad_file(path.as_ref(), CadReadKind::Dwg)
+}
+
+// ------------------------------------------------------------
+// Function: import_dxf
+// Purpose: Read a DXF via LibreDWG using the same lock and convert path.
+// ------------------------------------------------------------
+pub fn import_dxf(path: impl AsRef<Path>) -> Result<Document, ImportError> {
+    import_cad_file(path.as_ref(), CadReadKind::Dxf)
+}
+
+fn import_cad_file(path: &Path, kind: CadReadKind) -> Result<Document, ImportError> {
     let path_str = path.to_str().ok_or(ImportError::InvalidPath)?;
     let c_path = CString::new(path_str).map_err(|_| ImportError::InvalidPath)?;
     let started = Instant::now();
-    let magic = read_dwg_magic(path).unwrap_or_default();
+    let magic = match kind {
+        CadReadKind::Dwg => read_dwg_magic(path).unwrap_or_default(),
+        CadReadKind::Dxf => String::new(),
+    };
 
     let _guard = LIBREDWG_LOCK
         .lock()
@@ -44,7 +69,12 @@ pub fn import_dwg(path: impl AsRef<Path>) -> Result<Document, ImportError> {
 
     let mut dwg: Box<libredwg_sys::Dwg_Data> =
         Box::new(unsafe { MaybeUninit::zeroed().assume_init() });
-    let error = unsafe { libredwg_sys::dwg_read_file(c_path.as_ptr(), dwg.as_mut()) };
+    let error = unsafe {
+        match kind {
+            CadReadKind::Dwg => libredwg_sys::dwg_read_file(c_path.as_ptr(), dwg.as_mut()),
+            CadReadKind::Dxf => libredwg_sys::dxf_read_file(c_path.as_ptr(), dwg.as_mut()),
+        }
+    };
     #[allow(clippy::unnecessary_cast)]
     if error >= libredwg_sys::DWG_ERROR_DWG_ERR_CLASSESNOTFOUND as i32 {
         unsafe { libredwg_sys::dwg_free(dwg.as_mut()) };
@@ -52,10 +82,10 @@ pub fn import_dwg(path: impl AsRef<Path>) -> Result<Document, ImportError> {
     }
 
     let mut diagnostics = ImportDiagnostics {
-        dwg_version: if magic.is_empty() {
-            "unknown".into()
-        } else {
-            format!("{magic} ({})", ac_magic_label(&magic))
+        dwg_version: match kind {
+            CadReadKind::Dwg if magic.is_empty() => "unknown".into(),
+            CadReadKind::Dwg => format!("{magic} ({})", ac_magic_label(&magic)),
+            CadReadKind::Dxf => "DXF".into(),
         },
         ..Default::default()
     };

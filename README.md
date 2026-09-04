@@ -14,7 +14,8 @@ LibreDWG is used only inside `dwg-import`. The rest of the application talks to
 | `cad-core` | Native document/entity model (f64 world coordinates) |
 | `cad-viewport` | Camera, Zoom Extents, cursor-centered zoom, pan |
 | `cad-render` | Tessellation + wgpu viewport renderer |
-| `dwg-import` | LibreDWG FFI → `cad-core::Document` |
+| `cad-io` | Native DXF write and PDF export from `cad-core::Document` |
+| `dwg-import` | LibreDWG FFI → `cad-core::Document`; DXF import and DXF-interchange DWG save |
 | `mycad` | egui chrome (menus, selection, properties, settings) |
 
 ## Linux build
@@ -41,7 +42,10 @@ cargo run -p mycad -- "test-data/KD-1413-260825 Assir Poultry Internal Logistics
 
 ## Usage
 
-- **File → Open** to pick a DWG.
+- **File → Open** (`Ctrl+O`) to pick a DWG.
+- **File → Save** (`Ctrl+S`) overwrites a previously saved DXF in place. An opened DWG always goes through Save As with a `*-MyCad.dwg` copy name so the original file is not overwritten. A compact Save icon on the menu bar (tooltip **Save** / **Ctrl+S**) runs the same command. Successful saves report in the status bar (`Saved Plant.dxf`, `Saved Plant.dwg`, or `DWG saved with 3 compatibility warnings`) without a dialog.
+- **File → Save As…** (`Ctrl+Shift+S`) writes AutoCAD 2000 DXF or **DWG AutoCAD 2000**. DWG save goes through the DXF writer, then LibreDWG. If the drawing has unsupported entities, MyCad asks to **Save a Copy** first.
+- **File → Export → PDF…** opens a plot dialog, then writes a vector PDF of plottable model-space geometry (not a viewport screenshot). Paper A4–A0, portrait or landscape, extents, fit to page, color or monochrome, and 5/10/15 mm margins. The drawing path and dirty state are unchanged. A finished export reports `Exported Plant.pdf` in the status bar.
 - Pass a path on the command line for repeatable testing.
 - **Left-click** an entity to select it (line, circle, polyline, block insert, and other drawable types). Nested block geometry selects the parent block.
 - **Ctrl+click** or **Shift+click** adds or removes entities from the selection.

@@ -169,7 +169,14 @@ pub fn transform_geometry(
             start_angle,
             end_angle,
             extrusion,
-        } => transform_arc(*center, *radius, *start_angle, *end_angle, *extrusion, matrix),
+        } => transform_arc(
+            *center,
+            *radius,
+            *start_angle,
+            *end_angle,
+            *extrusion,
+            matrix,
+        ),
         Geometry::Ellipse {
             center,
             major_axis,
@@ -247,7 +254,10 @@ pub fn transform_geometry(
                 scale: new_scale,
                 rotation: new_rotation,
                 extrusion: *extrusion,
-                attribs: attribs.iter().map(|text| transform_text(text, matrix)).collect(),
+                attribs: attribs
+                    .iter()
+                    .map(|text| transform_text(text, matrix))
+                    .collect(),
                 column_count: *column_count,
                 row_count: *row_count,
                 column_spacing: *column_spacing * matrix.scale_x(),
@@ -279,10 +289,7 @@ pub fn transform_geometry(
     })
 }
 
-pub fn reference_radius<'a>(
-    entities: impl IntoIterator<Item = &'a Entity>,
-    base: Point2,
-) -> f64 {
+pub fn reference_radius<'a>(entities: impl IntoIterator<Item = &'a Entity>, base: Point2) -> f64 {
     let mut farthest = 0.0_f64;
     for entity in entities {
         for point in representative_points(&entity.geometry) {
@@ -405,7 +412,11 @@ fn decompose_insert(combined: Transform2, scale_z: f64) -> (Point2, Point3, f64)
     if combined.reverses_orientation() {
         sy = -sy;
     }
-    (insertion, Point3::new(sx, sy, scale_z), combined.rotation_component())
+    (
+        insertion,
+        Point3::new(sx, sy, scale_z),
+        combined.rotation_component(),
+    )
 }
 
 fn apply_vector3(matrix: Transform2, v: Point3) -> Point3 {
@@ -429,7 +440,10 @@ fn representative_points(geometry: &Geometry) -> Vec<Point2> {
         }
         Geometry::Ellipse {
             center, major_axis, ..
-        } => vec![center.xy(), Point2::new(center.x + major_axis.x, center.y + major_axis.y)],
+        } => vec![
+            center.xy(),
+            Point2::new(center.x + major_axis.x, center.y + major_axis.y),
+        ],
         Geometry::LwPolyline { vertices, .. } | Geometry::Polyline { vertices, .. } => {
             vertices.iter().map(|v| v.point.xy()).collect()
         }
@@ -524,9 +538,7 @@ mod tests {
         )
         .expect("scale");
         match scaled.geometry {
-            Geometry::Circle {
-                center, radius, ..
-            } => {
+            Geometry::Circle { center, radius, .. } => {
                 assert!((center.x - 12.0).abs() < 1e-12);
                 assert!((radius - 6.0).abs() < 1e-12);
             }
@@ -679,11 +691,8 @@ mod tests {
             column_spacing: 0.0,
             row_spacing: 0.0,
         });
-        let moved = transform_entity(
-            &entity,
-            EntityTransform::Translate { dx: 5.0, dy: -1.0 },
-        )
-        .expect("move insert");
+        let moved = transform_entity(&entity, EntityTransform::Translate { dx: 5.0, dy: -1.0 })
+            .expect("move insert");
         match moved.geometry {
             Geometry::Insert {
                 block_name,
@@ -716,10 +725,7 @@ mod tests {
             block_name: "*D1".into(),
         });
         let err = validate_entities([&ok, &hatch, &dimension]).unwrap_err();
-        assert_eq!(
-            err,
-            TransformError::Unsupported(vec!["Hatch", "Dimension"])
-        );
+        assert_eq!(err, TransformError::Unsupported(vec!["Hatch", "Dimension"]));
         assert_eq!(err.to_string(), "Cannot transform Hatch, Dimension");
     }
 
@@ -791,11 +797,8 @@ mod tests {
         source.color = CadColor::Aci(3);
         source.linetype = "DASHED".into();
         source.linetype_scale = 2.0;
-        let copy = transform_entity(
-            &source,
-            EntityTransform::Translate { dx: 10.0, dy: 0.0 },
-        )
-        .expect("copy");
+        let copy = transform_entity(&source, EntityTransform::Translate { dx: 10.0, dy: 0.0 })
+            .expect("copy");
         assert_eq!(copy.id, source.id);
         assert_eq!(copy.layer, "A-WALL");
         assert_eq!(copy.color, CadColor::Aci(3));
@@ -830,5 +833,53 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn insert_transform_does_not_mutate_block_definition() {
+        use crate::document::{BlockDefinition, Document};
+        let mut document = Document::default();
+        document.blocks.insert(
+            "DOOR".into(),
+            BlockDefinition {
+                name: "DOOR".into(),
+                base_pt: Point3::from_xy(0.0, 0.0),
+                entities: vec![line(0.0, 0.0, 1.0, 0.0)],
+            },
+        );
+        let insert = document.add_entity(Entity::new(Geometry::Insert {
+            block_name: "DOOR".into(),
+            insertion: Point3::from_xy(10.0, 4.0),
+            scale: Point3::new(1.0, 1.0, 1.0),
+            rotation: 0.0,
+            extrusion: default_extrusion(),
+            attribs: Vec::new(),
+            column_count: 1,
+            row_count: 1,
+            column_spacing: 0.0,
+            row_spacing: 0.0,
+        }));
+        let moved = transform_entity(&insert, EntityTransform::Translate { dx: 5.0, dy: 0.0 })
+            .expect("move insert");
+        let _ = document.replace_model_entity(insert.id, moved);
+        let def = document.blocks.get("DOOR").expect("block");
+        match &def.entities[0].geometry {
+            Geometry::Line { start, end } => {
+                assert!((start.x).abs() < 1e-12);
+                assert!((end.x - 1.0).abs() < 1e-12);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_world_ocs_geometry_is_unsupported() {
+        let entity = Entity::new(Geometry::Circle {
+            center: Point3::from_xy(0.0, 0.0),
+            radius: 1.0,
+            extrusion: Point3::new(1.0, 0.0, 0.0),
+        });
+        let err = validate_entities([&entity]).unwrap_err();
+        assert!(matches!(err, TransformError::Unsupported(_)));
     }
 }

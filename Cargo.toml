@@ -4,12 +4,13 @@ members = [
     "crates/cad-core",
     "crates/cad-viewport",
     "crates/cad-render",
+    "crates/cad-io",
     "crates/dwg-import",
     "crates/mycad",
 ]
 
 [workspace.package]
-version = "0.6.1"
+version = "0.16.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
 authors = ["MyCad"]
@@ -19,6 +20,7 @@ rust-version = "1.80"
 cad-core = { path = "crates/cad-core" }
 cad-viewport = { path = "crates/cad-viewport" }
 cad-render = { path = "crates/cad-render" }
+cad-io = { path = "crates/cad-io" }
 dwg-import = { path = "crates/dwg-import" }
 
 bytemuck = { version = "1.22", features = ["derive"] }

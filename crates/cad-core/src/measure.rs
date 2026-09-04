@@ -94,9 +94,16 @@ impl AngleMeasurement {
             return None;
         }
         let vertex = infinite_line_intersection(a0, a1, b0, b1).unwrap_or_else(|| {
-            Point2::new((a0.x + a1.x + b0.x + b1.x) * 0.25, (a0.y + a1.y + b0.y + b1.y) * 0.25)
+            Point2::new(
+                (a0.x + a1.x + b0.x + b1.x) * 0.25,
+                (a0.y + a1.y + b0.y + b1.y) * 0.25,
+            )
         });
-        Self::from_directions(vertex, vertex + Point2::new(da.x / la, da.y / la), vertex + Point2::new(db.x / lb, db.y / lb))
+        Self::from_directions(
+            vertex,
+            vertex + Point2::new(da.x / la, da.y / la),
+            vertex + Point2::new(db.x / lb, db.y / lb),
+        )
     }
 }
 
@@ -115,7 +122,10 @@ pub struct RadiusMeasurement {
 
 impl RadiusMeasurement {
     pub fn circle(center: Point2, radius: f64, toward: Point2) -> Option<Self> {
-        if !center.is_finite() || !toward.is_finite() || !radius.is_finite() || radius <= GEOM_TOLERANCE
+        if !center.is_finite()
+            || !toward.is_finite()
+            || !radius.is_finite()
+            || radius <= GEOM_TOLERANCE
         {
             return None;
         }
@@ -128,7 +138,13 @@ impl RadiusMeasurement {
         })
     }
 
-    pub fn arc(center: Point2, radius: f64, start_angle: f64, end_angle: f64, toward: Point2) -> Option<Self> {
+    pub fn arc(
+        center: Point2,
+        radius: f64,
+        start_angle: f64,
+        end_angle: f64,
+        toward: Point2,
+    ) -> Option<Self> {
         let circle = Self::circle(center, radius, toward)?;
         let sweep = ccw_sweep(start_angle, end_angle);
         if !sweep.is_finite() {
@@ -281,7 +297,8 @@ impl MeasurementResult {
             }
             Self::Radius(m) => {
                 let primary = format!("R {}", format_length(m.radius, units));
-                let mut details = vec![format!("Diameter {}", format_length(m.radius * 2.0, units))];
+                let mut details =
+                    vec![format!("Diameter {}", format_length(m.radius * 2.0, units))];
                 if let Some(length) = m.arc_length {
                     details.push(format!("Arc length {}", format_length(length, units)));
                 }
@@ -316,7 +333,9 @@ impl MeasurementResult {
             Self::Distance(m) => m.distance.is_finite() && m.distance > GEOM_TOLERANCE,
             Self::Angle(m) => m.angle.is_finite() && m.vertex.is_finite(),
             Self::Radius(m) => m.radius.is_finite() && m.radius > GEOM_TOLERANCE,
-            Self::Area(m) => m.area.is_finite() && m.area > GEOM_TOLERANCE && m.perimeter.is_finite(),
+            Self::Area(m) => {
+                m.area.is_finite() && m.area > GEOM_TOLERANCE && m.perimeter.is_finite()
+            }
         }
     }
 }
@@ -403,7 +422,12 @@ pub fn format_angle_deg(radians: f64) -> String {
     format!("{deg:.2}°")
 }
 
-pub fn infinite_line_intersection(a0: Point2, a1: Point2, b0: Point2, b1: Point2) -> Option<Point2> {
+pub fn infinite_line_intersection(
+    a0: Point2,
+    a1: Point2,
+    b0: Point2,
+    b1: Point2,
+) -> Option<Point2> {
     let da = a1 - a0;
     let db = b1 - b0;
     let denom = da.x * db.y - da.y * db.x;
@@ -761,7 +785,10 @@ mod tests {
     fn formatting_uses_insunits_without_magnitude_conversion() {
         let text = format_length(125.0, DrawingUnits::Millimeters);
         assert_eq!(text, "125.0000 mm");
-        assert_eq!(format_area(100.0, DrawingUnits::Millimeters), "100.0000 mm²");
+        assert_eq!(
+            format_area(100.0, DrawingUnits::Millimeters),
+            "100.0000 mm²"
+        );
         assert_eq!(format_area(2.5, DrawingUnits::Inches), "2.5000 in²");
         assert_eq!(format_number(-0.0, 4), "0.0000");
         assert_eq!(format_angle_deg(-0.0), "0.00°");

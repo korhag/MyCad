@@ -452,14 +452,22 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "cad-core"
-version = "0.6.1"
+version = "0.16.0"
 dependencies = [
  "thiserror 2.0.20",
 ]
 
 [[package]]
+name = "cad-io"
+version = "0.16.0"
+dependencies = [
+ "cad-core",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "cad-render"
-version = "0.6.1"
+version = "0.16.0"
 dependencies = [
  "bytemuck",
  "cad-core",
@@ -470,7 +478,7 @@ dependencies = [
 
 [[package]]
 name = "cad-viewport"
-version = "0.6.1"
+version = "0.16.0"
 dependencies = [
  "cad-core",
 ]
@@ -757,9 +765,10 @@ dependencies = [
 
 [[package]]
 name = "dwg-import"
-version = "0.6.1"
+version = "0.16.0"
 dependencies = [
  "cad-core",
+ "cad-io",
  "libc",
  "libredwg-sys",
  "thiserror 2.0.20",
@@ -1829,9 +1838,10 @@ dependencies = [
 
 [[package]]
 name = "mycad"
-version = "0.6.1"
+version = "0.16.0"
 dependencies = [
  "cad-core",
+ "cad-io",
  "cad-render",
  "cad-viewport",
  "dwg-import",

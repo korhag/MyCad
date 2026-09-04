@@ -287,11 +287,7 @@ mod tests {
 
     #[test]
     fn try_inverse_roundtrips_and_uniform_scale_detects_mirroring() {
-        let t = Transform2::insert(
-            Point3::from_xy(10.0, -4.0),
-            Point3::new(2.0, 3.0, 1.0),
-            0.4,
-        );
+        let t = Transform2::insert(Point3::from_xy(10.0, -4.0), Point3::new(2.0, 3.0, 1.0), 0.4);
         let inv = t.try_inverse().expect("invertible");
         let p = Point2::new(7.0, 1.5);
         let back = inv.apply(t.apply(p));
@@ -303,16 +299,16 @@ mod tests {
 
     #[test]
     fn then_applies_the_inner_transform_first() {
-        let translated = Transform2::translate(10.0, 0.0)
+        let rotate_then_translate = Transform2::translate(10.0, 0.0)
             .then(Transform2::rotate(std::f64::consts::FRAC_PI_2))
             .apply(Point2::new(1.0, 0.0));
-        assert!(translated.x.abs() < 1e-12);
-        assert!((translated.y - 1.0).abs() < 1e-12);
-        let rotated_then_moved = Transform2::rotate(std::f64::consts::FRAC_PI_2)
+        assert!((rotate_then_translate.x - 10.0).abs() < 1e-12);
+        assert!((rotate_then_translate.y - 1.0).abs() < 1e-12);
+        let translate_then_rotate = Transform2::rotate(std::f64::consts::FRAC_PI_2)
             .then(Transform2::translate(10.0, 0.0))
             .apply(Point2::new(1.0, 0.0));
-        assert!((rotated_then_moved.x + 10.0).abs() < 1e-12);
-        assert!((rotated_then_moved.y - 1.0).abs() < 1e-12);
+        assert!(translate_then_rotate.x.abs() < 1e-12);
+        assert!((translate_then_rotate.y - 11.0).abs() < 1e-12);
     }
 
     #[test]

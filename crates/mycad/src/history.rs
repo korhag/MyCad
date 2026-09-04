@@ -281,4 +281,98 @@ mod tests {
         history.redo(&mut document);
         assert!(history.is_dirty());
     }
+
+    #[test]
+    fn grouped_replaces_undo_as_one_transaction() {
+        use cad_core::{transform_entity, EntityTransform};
+        let mut document = Document::default();
+        let mut history = History::default();
+        let first = document.add_entity(line(0.0, 0.0, 1.0, 0.0));
+        let second = document.add_entity(line(2.0, 0.0, 3.0, 0.0));
+        history.begin();
+        let xf = EntityTransform::Translate { dx: 5.0, dy: 0.0 };
+        for entity in [first.clone(), second.clone()] {
+            let after = transform_entity(&entity, xf).expect("move");
+            let index = document.entity_index(entity.id).unwrap();
+            let _ = document.replace_model_entity(entity.id, after.clone());
+            history.record(Edit::Replace {
+                index,
+                before: entity,
+                after,
+            });
+        }
+        history.commit_open();
+        history.undo(&mut document);
+        assert_eq!(document.model_space.len(), 2);
+        match &document.model_space[0].geometry {
+            Geometry::Line { start, .. } => assert!((start.x).abs() < 1e-12),
+            other => panic!("{other:?}"),
+        }
+        history.redo(&mut document);
+        match &document.model_space[0].geometry {
+            Geometry::Line { start, .. } => assert!((start.x - 5.0).abs() < 1e-12),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(document.model_space[0].id, first.id);
+        assert_eq!(document.model_space[1].id, second.id);
+    }
+
+    #[test]
+    fn erase_undo_restores_ids_and_order() {
+        let mut document = Document::default();
+        let mut history = History::default();
+        let first = document.add_entity(line(0.0, 0.0, 1.0, 0.0));
+        let second = document.add_entity(line(2.0, 0.0, 3.0, 0.0));
+        history.begin();
+        history.record(Edit::Remove {
+            index: 1,
+            entity: second.clone(),
+        });
+        history.record(Edit::Remove {
+            index: 0,
+            entity: first.clone(),
+        });
+        Edit::Remove {
+            index: 1,
+            entity: second.clone(),
+        }
+        .apply(&mut document);
+        Edit::Remove {
+            index: 0,
+            entity: first.clone(),
+        }
+        .apply(&mut document);
+        history.commit_open();
+        assert!(document.model_space.is_empty());
+        history.undo(&mut document);
+        assert_eq!(document.model_space.len(), 2);
+        assert_eq!(document.model_space[0].id, first.id);
+        assert_eq!(document.model_space[1].id, second.id);
+        history.redo(&mut document);
+        assert!(document.model_space.is_empty());
+    }
+
+    #[test]
+    fn copy_inserts_keep_new_ids_on_undo_redo() {
+        let mut document = Document::default();
+        let mut history = History::default();
+        let source = document.add_entity(line(0.0, 0.0, 1.0, 0.0));
+        history.begin();
+        let mut copy = source.clone();
+        copy.id = cad_core::EntityId::UNASSIGNED;
+        let copy = document.add_entity(copy);
+        history.record(Edit::Insert {
+            index: 1,
+            entity: copy.clone(),
+        });
+        history.commit_open();
+        assert_ne!(copy.id, source.id);
+        assert_eq!(copy.layer, source.layer);
+        history.undo(&mut document);
+        assert_eq!(document.model_space.len(), 1);
+        assert_eq!(document.model_space[0].id, source.id);
+        history.redo(&mut document);
+        assert_eq!(document.model_space.len(), 2);
+        assert_eq!(document.model_space[1].id, copy.id);
+    }
 }

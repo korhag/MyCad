@@ -7,24 +7,31 @@ use std::thread;
 use std::time::Instant;
 
 use cad_core::{
-    Document, Entity, EntityTransform, Geometry, MeasureIndex, MeasureRole, MeasurementResult,
-    Point2, SnapFeature, SnapIndex, Transform2, TransformError, GEOM_TOLERANCE, reference_radius,
-    transform_entity, validate_entities,
+    reference_radius, transform_entity, validate_entities, Document, Entity, EntityTransform,
+    Geometry, MeasureIndex, MeasureRole, MeasurementResult, Point2, SnapFeature, SnapIndex,
+    Transform2, TransformError, GEOM_TOLERANCE,
+};
+use cad_io::{
+    export_pdf, write_dxf, CadFileFormat, DxfExportOptions, PdfExportOptions, PdfOrientation,
+    PdfPaperSize, PdfPlotStyle, SaveReport, PDF_MARGIN_MM,
 };
 use cad_render::{
     tessellate_document, CadFrame, CadGpu, DisplayList, GpuUpload, OverlayBatches, SelectBoxMode,
 };
 use cad_viewport::Camera2;
-use dwg_import::ImportError;
+use dwg_import::{write_dwg, DwgWriteError, ExportError as DwgExportError, ImportError};
 use eframe::egui::{self, PointerButton, Rect, Ui};
+use egui_phosphor::regular::FLOPPY_DISK;
 
-use crate::commands::{AngleState, AreaState, CommandKind, CommandOutput, CommandState, ModifyKind};
+use crate::commands::{
+    AngleState, AreaState, CommandKind, CommandOutput, CommandState, ModifyKind,
+};
 use crate::context_menu::{self, ContextAction, ContextKind, MenuResult, ViewportMenu};
 use crate::drafting::DraftingState;
 use crate::dynamic_input::{DynamicInput, DynamicKeyResult, DynamicLayout, LiveValues};
 use crate::history::{Edit, History};
-use crate::measurement::{self, CardAction, MeasurementOverlay};
 use crate::input::InputAction;
+use crate::measurement::{self, CardAction, MeasurementOverlay};
 use crate::selection::{box_pick_entities_into, pick_entity, Selection};
 use crate::settings::{scroll_to_zoom_factor, AppSettings, RgbColor};
 use crate::settings_ui::{self, CaptureTarget, SettingsAction, SettingsTab};
@@ -32,6 +39,7 @@ use crate::theme;
 use crate::workspace::{self, WorkspaceTab};
 
 const SELECTION_OVERLAY_COLOR: [f32; 4] = [255.0 / 255.0, 196.0 / 255.0, 72.0 / 255.0, 1.0];
+const SAVE_TOOLTIP: &str = "Save\nCtrl+S";
 
 enum LoadMsg {
     Success {
@@ -73,6 +81,9 @@ struct KeyChord {
     escape: bool,
     undo: bool,
     redo: bool,
+    open: bool,
+    save: bool,
+    save_as: bool,
 }
 
 // ------------------------------------------------------------
@@ -113,6 +124,10 @@ pub struct MyCadApp {
     input_consumed_escape: bool,
     pending_open: Option<PathBuf>,
     pending_discard: Option<PendingDiscard>,
+    pending_lossy_save: bool,
+    /// True after MyCAD wrote `document.source_path` this session.
+    source_written_by_mycad: bool,
+    pdf_plot: Option<PdfExportOptions>,
     last_pointer: Option<egui::Pos2>,
     box_select: Option<BoxSelectDrag>,
     command_snaps: Vec<SnapFeature>,
@@ -164,6 +179,9 @@ impl MyCadApp {
             input_consumed_escape: false,
             pending_open: initial_path,
             pending_discard: None,
+            pending_lossy_save: false,
+            source_written_by_mycad: false,
+            pdf_plot: None,
             last_pointer: None,
             box_select: None,
             command_snaps: Vec::new(),
@@ -263,6 +281,7 @@ impl MyCadApp {
                 self.measurement = None;
                 self.drafting.clear_acquisition();
                 self.history.clear();
+                self.source_written_by_mycad = false;
                 self.document = Some(document);
                 self.display = Arc::new(display);
                 self.snaps = Arc::new(*snaps);
@@ -303,6 +322,153 @@ impl MyCadApp {
             return;
         }
         self.open_dialog_now();
+    }
+
+    fn save_drawing(&mut self) -> bool {
+        if self.document.is_none() {
+            self.status = "No drawing is open".into();
+            return false;
+        }
+        if self.request_lossy_save_warning() {
+            return false;
+        }
+        if let Some(path) = self
+            .document
+            .as_ref()
+            .and_then(|document| in_place_cad_path(document, self.source_written_by_mycad))
+            .map(Path::to_path_buf)
+        {
+            self.write_cad_to(&path)
+        } else {
+            self.save_as_drawing_now()
+        }
+    }
+
+    fn save_as_drawing(&mut self) -> bool {
+        if self.document.is_none() {
+            self.status = "No drawing is open".into();
+            return false;
+        }
+        if self.request_lossy_save_warning() {
+            return false;
+        }
+        self.save_as_drawing_now()
+    }
+
+    fn request_lossy_save_warning(&mut self) -> bool {
+        if !self.document.as_ref().is_some_and(needs_lossy_save_warning) {
+            return false;
+        }
+        self.pending_lossy_save = true;
+        true
+    }
+
+    fn save_as_drawing_now(&mut self) -> bool {
+        let Some(document) = self.document.as_ref() else {
+            self.status = "No drawing is open".into();
+            return false;
+        };
+        let prefer_dwg = document
+            .source_path
+            .as_deref()
+            .is_some_and(|path| CadFileFormat::from_path(path) == Some(CadFileFormat::Dwg));
+        let mut dialog = rfd::FileDialog::new();
+        if prefer_dwg {
+            dialog = dialog
+                .add_filter("DWG Drawing - AutoCAD 2000", &["dwg", "DWG"])
+                .add_filter("DXF Drawing", &["dxf", "DXF"]);
+        } else {
+            dialog = dialog
+                .add_filter("DXF Drawing", &["dxf", "DXF"])
+                .add_filter("DWG Drawing - AutoCAD 2000", &["dwg", "DWG"]);
+        }
+        dialog = dialog.add_filter("All files", &["*"]);
+        dialog = dialog.set_file_name(suggested_save_name(document, prefer_dwg));
+        let Some(path) = dialog.save_file() else {
+            return false;
+        };
+        self.write_cad_to(&with_save_extension(path, prefer_dwg))
+    }
+
+    fn write_cad_to(&mut self, path: &Path) -> bool {
+        match CadFileFormat::from_path(path) {
+            Some(CadFileFormat::Dwg) => self.write_dwg_to(path),
+            _ => self.write_dxf_to(path),
+        }
+    }
+
+    fn write_dxf_to(&mut self, path: &Path) -> bool {
+        let Some(document) = self.document.as_ref() else {
+            self.status = "No drawing is open".into();
+            return false;
+        };
+        match write_dxf(document, path, &DxfExportOptions::default()) {
+            Ok(report) => self.finish_cad_save(path, report),
+            Err(err) => {
+                self.status = format_save_failed(&err);
+                self.error = None;
+                false
+            }
+        }
+    }
+
+    fn write_dwg_to(&mut self, path: &Path) -> bool {
+        let Some(document) = self.document.as_ref() else {
+            self.status = "No drawing is open".into();
+            return false;
+        };
+        match write_dwg(document, path) {
+            Ok(report) => self.finish_cad_save(path, report),
+            Err(err) => {
+                self.status = format_save_failed(format_dwg_write_error(&err));
+                self.error = None;
+                false
+            }
+        }
+    }
+
+    fn finish_cad_save(&mut self, path: &Path, report: SaveReport) -> bool {
+        if let Some(document) = self.document.as_mut() {
+            document.source_path = Some(path.to_path_buf());
+        }
+        self.source_written_by_mycad = true;
+        self.history.mark_clean();
+        self.error = None;
+        self.status = format_save_status(path, &report);
+        true
+    }
+
+    fn export_pdf_dialog(&mut self) {
+        if self.document.is_none() {
+            self.status = "No drawing is open".into();
+            return;
+        }
+        self.pdf_plot = Some(PdfExportOptions::default());
+    }
+
+    fn write_pdf_export(&mut self, options: PdfExportOptions) {
+        let Some(document) = self.document.as_ref() else {
+            self.status = "No drawing is open".into();
+            return;
+        };
+        let mut dialog = rfd::FileDialog::new()
+            .add_filter("PDF documents", &["pdf", "PDF"])
+            .add_filter("All files", &["*"]);
+        dialog = dialog.set_file_name(suggested_pdf_name(document));
+        let Some(path) = dialog.save_file() else {
+            return;
+        };
+        let path = with_pdf_extension(path);
+        match export_pdf(document, &path, &options) {
+            Ok(report) => {
+                self.error = None;
+                self.status = format_pdf_export_status(&path, &report);
+            }
+            Err(err) => {
+                self.status = format_save_failed(&err);
+                self.error = None;
+            }
+        }
     }
 
     fn open_dialog_now(&mut self) {
@@ -467,8 +633,7 @@ impl MyCadApp {
             | CommandKind::Copy
             | CommandKind::Rotate
             | CommandKind::Mirror
-            | CommandKind::Scale
-            | CommandKind::Erase => {
+            | CommandKind::Scale => {
                 let selected = self.selection.ids().to_vec();
                 let modify = kind.modify_kind().expect("modify kind");
                 if !selected.is_empty() {
@@ -479,9 +644,16 @@ impl MyCadApp {
                     }
                 }
                 self.command.start_modify(modify, selected.clone());
-                if !selected.is_empty() && modify != ModifyKind::Erase {
+                if !selected.is_empty() {
                     self.set_modify_reference_radius();
                 }
+            }
+            CommandKind::Erase => {
+                if !self.selection.is_empty() {
+                    self.erase_selected();
+                    return;
+                }
+                self.command.start_modify(ModifyKind::Erase, Vec::new());
             }
             CommandKind::Idle => {}
         }
@@ -522,7 +694,12 @@ impl MyCadApp {
             return;
         }
         if let Some(geometry) = self.command.finish_geometry() {
+            let kind = self.command.kind();
             self.commit_geometry(geometry);
+            self.remember_completed(kind);
+        }
+        if self.command.kind().is_modify() {
+            return;
         }
         self.idle_after_command("Ready");
     }
@@ -531,7 +708,9 @@ impl MyCadApp {
         let Some(geometry) = self.command.close_geometry() else {
             return;
         };
+        let kind = self.command.kind();
         self.commit_geometry(geometry);
+        self.remember_completed(kind);
         self.idle_after_command("Ready");
     }
 
@@ -563,6 +742,9 @@ impl MyCadApp {
                 let _ = self.command.undo_last();
             }
             CommandKind::Area => {
+                let _ = self.command.undo_last();
+            }
+            kind if kind.is_modify() => {
                 let _ = self.command.undo_last();
             }
             _ => {}
@@ -615,7 +797,6 @@ impl MyCadApp {
             CommandOutput::Modify { transform, copies } => {
                 self.commit_modify(transform, copies);
             }
-            CommandOutput::Erase => self.erase_selected(),
             CommandOutput::Rejected(message) => {
                 self.status = message.into();
             }
@@ -762,7 +943,10 @@ impl MyCadApp {
     }
 
     fn validate_modify_selection(&self, ids: &[cad_core::EntityId]) -> Result<(), TransformError> {
-        let document = self.document.as_ref().ok_or(TransformError::Invalid("No drawing is open"))?;
+        let document = self
+            .document
+            .as_ref()
+            .ok_or(TransformError::Invalid("No drawing is open"))?;
         let entities: Vec<_> = ids
             .iter()
             .filter_map(|id| document.entity_by_id(*id))
@@ -837,6 +1021,11 @@ impl MyCadApp {
             .iter()
             .filter_map(|id| document.entity_by_id(*id).cloned())
             .collect();
+        if originals.is_empty() || originals.len() != targets.len() {
+            self.cancel_command();
+            self.status = "Select objects first".into();
+            return;
+        }
         if let Err(err) = validate_entities(&originals) {
             self.cancel_command();
             self.status = err.to_string();
@@ -936,24 +1125,9 @@ impl MyCadApp {
                 return;
             };
             for (index, entity) in removals {
-                if document.remove_model_entity(entity.id).is_some() {
-                    if let Some(count) = document
-                        .diagnostics
-                        .entity_counts
-                        .get_mut(entity.geometry.type_name())
-                    {
-                        *count = count.saturating_sub(1);
-                        if *count == 0 {
-                            document
-                                .diagnostics
-                                .entity_counts
-                                .remove(entity.geometry.type_name());
-                        }
-                    }
-                    document.diagnostics.object_count =
-                        document.diagnostics.object_count.saturating_sub(1);
-                    self.history.record(Edit::Remove { index, entity });
-                }
+                let edit = Edit::Remove { index, entity };
+                edit.apply(document);
+                self.history.record(edit);
             }
         }
         self.remember_completed(CommandKind::Erase);
@@ -966,15 +1140,13 @@ impl MyCadApp {
         self.status = "Erase complete".into();
     }
 
-    fn last_started_modify(&self) -> CommandKind {
-        self.command.kind()
-    }
-
     fn complete_measurement(&mut self, result: MeasurementResult) {
+        let kind = self.command.kind();
         self.measurement = Some(MeasurementOverlay::final_result(result));
         self.command.finish();
         self.dynamic_input.set_layout(DynamicLayout::Hidden);
         self.drafting.clear_acquisition();
+        self.remember_completed(kind);
         self.status = self.command.prompt().into();
     }
 
@@ -1006,13 +1178,12 @@ impl MyCadApp {
                         .map_err(cad_core::MeasureError::message)
                 })
             }
-            CommandKind::Area if ids.len() == 1 => {
-                area_from_entity(document.entity_by_id(ids[0])).map(|result| {
+            CommandKind::Area if ids.len() == 1 => area_from_entity(document.entity_by_id(ids[0]))
+                .map(|result| {
                     result
                         .map(MeasurementResult::Area)
                         .map_err(cad_core::MeasureError::message)
-                })
-            }
+                }),
             _ => None,
         }
     }
@@ -1020,7 +1191,10 @@ impl MyCadApp {
     fn accept_measure_click(&mut self, point: Point2) {
         let aperture = measurement::world_aperture(&self.camera, self.viewport_height);
         let kind = self.command.kind();
-        let angle_three = matches!(self.command, CommandState::Angle(AngleState::ThreePoint { .. }));
+        let angle_three = matches!(
+            self.command,
+            CommandState::Angle(AngleState::ThreePoint { .. })
+        );
         let area_points = matches!(self.command, CommandState::Area(AreaState::Points { .. }));
         match kind {
             CommandKind::Distance => self.accept_command_point(point),
@@ -1090,6 +1264,7 @@ impl MyCadApp {
             }
             CommandOutput::Measurement(result) => self.complete_measurement(result),
             CommandOutput::Rejected(message) => self.status = message.into(),
+            CommandOutput::Modify { transform, copies } => self.commit_modify(transform, copies),
             CommandOutput::None => {
                 self.sync_dynamic_layout();
                 self.dynamic_input.reset_values();
@@ -1168,6 +1343,7 @@ impl MyCadApp {
         let selection_overlay = self.display.overlay_batches(self.selection.ids());
         let mut preview_overlay = OverlayBatches::default();
         let mut preview_color = RgbColor::WINDOW.to_gpu();
+        let mut preview_model = Transform2::identity_mat4();
         let mut box_rect = None;
         if let Some(drag) = &self.box_select {
             let colors = if self.show_settings {
@@ -1184,6 +1360,16 @@ impl MyCadApp {
             preview_overlay = self.display.overlay_batches(&drag.candidates);
             preview_color = color.to_gpu();
             box_rect = Some((drag.start, drag.current, color));
+        } else if let Some(world) = self.command.preview_transform(
+            self.drafting.current_point,
+            self.dynamic_input.typed_angle_deg(),
+            self.dynamic_input.typed_factor(),
+        ) {
+            if let Ok(matrix) = world.to_matrix() {
+                preview_overlay = self.display.overlay_batches(self.command.modify_targets());
+                preview_color = [0.55, 0.95, 0.85, 1.0];
+                preview_model = matrix.to_local_origin(self.display.origin).to_mat4();
+            }
         }
         painter.add(egui_wgpu::Callback::new_paint_callback(
             rect,
@@ -1198,6 +1384,7 @@ impl MyCadApp {
                 selection_color: SELECTION_OVERLAY_COLOR,
                 preview: preview_overlay,
                 preview_color,
+                preview_model,
             },
         ));
         if let Some((start, current, color)) = box_rect {
@@ -1236,6 +1423,12 @@ impl MyCadApp {
             start_marker,
             close_hint,
         );
+        if let Some([start, end]) = self
+            .command
+            .preview_mirror_axis(self.drafting.current_point)
+        {
+            crate::drafting::paint_world_axis(&painter, rect, self.camera, start, end);
+        }
         let units = self
             .document
             .as_ref()
@@ -1252,8 +1445,17 @@ impl MyCadApp {
             measurement::paint(&painter, rect, self.camera, overlay, units);
         }
         if let Some(cursor) = self.last_pointer.filter(|pos| rect.contains(*pos)) {
-            let live =
+            let mut live =
                 LiveValues::from_points(self.command.base_point(), self.drafting.current_point);
+            if let Some(EntityTransform::UniformScale { factor, .. }) =
+                self.command.preview_transform(
+                    self.drafting.current_point,
+                    self.dynamic_input.typed_angle_deg(),
+                    self.dynamic_input.typed_factor(),
+                )
+            {
+                live = live.with_factor(factor);
+            }
             self.dynamic_input.paint(&painter, rect, cursor, live);
         }
     }
@@ -1325,12 +1527,15 @@ impl MyCadApp {
         let result = context_menu::show(
             ctx,
             &mut menu,
-            self.command.can_finish(),
+            self.command.can_finish()
+                || (self.command.is_selecting_objects() && !self.selection.is_empty()),
             self.command.can_close(),
             self.command.can_undo_last(),
             self.command.can_back(),
             can_set_layer,
             self.last_command.is_some() && !self.command.is_active(),
+            self.selection.len(),
+            self.last_command,
         );
         match result {
             MenuResult::StayOpen => self.context_menu = Some(menu),
@@ -1360,10 +1565,134 @@ impl MyCadApp {
                 }
             }
             ContextAction::ZoomExtents => self.zoom_extents(width, height),
+            ContextAction::Move => self.start_move_command(),
+            ContextAction::Copy => self.start_copy_command(),
+            ContextAction::Rotate => self.start_rotate_command(),
+            ContextAction::Mirror => self.start_mirror_command(),
+            ContextAction::Scale => self.start_scale_command(),
+            ContextAction::Erase => self.start_erase_command(),
+        }
+    }
+
+    fn show_pdf_plot_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut options) = self.pdf_plot else {
+            return;
+        };
+        let mut export = false;
+        let mut cancel = false;
+        egui::Window::new("Export PDF")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label("Paper");
+                egui::ComboBox::from_id_salt("pdf-paper")
+                    .selected_text(options.paper.label())
+                    .show_ui(ui, |ui| {
+                        for paper in PdfPaperSize::ALL {
+                            ui.selectable_value(&mut options.paper, paper, paper.label());
+                        }
+                    });
+                ui.add_space(6.0);
+                ui.label("Orientation");
+                ui.horizontal(|ui| {
+                    ui.selectable_value(
+                        &mut options.orientation,
+                        PdfOrientation::Portrait,
+                        "Portrait",
+                    );
+                    ui.selectable_value(
+                        &mut options.orientation,
+                        PdfOrientation::Landscape,
+                        "Landscape",
+                    );
+                });
+                ui.add_space(6.0);
+                ui.label("Plot area");
+                ui.label("Extents");
+                ui.add_space(6.0);
+                ui.label("Scale");
+                ui.label("Fit to page");
+                ui.add_space(6.0);
+                ui.label("Style");
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut options.style, PdfPlotStyle::Color, "Color");
+                    ui.selectable_value(&mut options.style, PdfPlotStyle::Monochrome, "Monochrome");
+                });
+                ui.add_space(6.0);
+                ui.label("Margins");
+                ui.horizontal(|ui| {
+                    for millimetres in PDF_MARGIN_MM {
+                        ui.selectable_value(
+                            &mut options.margin_mm,
+                            millimetres,
+                            format!("{millimetres:.0} mm"),
+                        );
+                    }
+                });
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Export…").clicked() {
+                        export = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+                if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+                    cancel = true;
+                }
+            });
+        self.pdf_plot = Some(options);
+        if cancel {
+            self.pdf_plot = None;
+        } else if export {
+            self.pdf_plot = None;
+            self.write_pdf_export(options);
+        }
+    }
+
+    fn show_lossy_save_dialog(&mut self, ctx: &egui::Context) {
+        if !self.pending_lossy_save {
+            return;
+        }
+        let count = self
+            .document
+            .as_ref()
+            .map(|document| document.diagnostics.unsupported_total())
+            .unwrap_or(0);
+        let mut save_copy = false;
+        let mut cancel = false;
+        egui::Window::new("Unsupported content")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(lossy_save_message(count));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Save a Copy").clicked() {
+                        save_copy = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if cancel {
+            self.pending_lossy_save = false;
+        } else if save_copy {
+            self.pending_lossy_save = false;
+            if self.save_as_drawing_now() && self.pending_discard.is_some() {
+                self.continue_pending_discard(ctx);
+            }
         }
     }
 
     fn show_discard_dialog(&mut self, ctx: &egui::Context) {
+        if self.pending_lossy_save {
+            return;
+        }
         let Some(pending) = self.pending_discard.as_ref() else {
             return;
         };
@@ -1371,19 +1700,28 @@ impl MyCadApp {
             PendingDiscard::Quit => "Quit without saving?",
             PendingDiscard::OpenDialog | PendingDiscard::Open(_) => "Discard unsaved changes?",
         };
-        let mut confirm = false;
+        let file_label = self
+            .document
+            .as_ref()
+            .map(|document| document.file_name())
+            .unwrap_or_else(|| "(untitled)".into());
+        let mut save = false;
+        let mut discard = false;
         let mut cancel = false;
         egui::Window::new("Unsaved changes")
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                ui.label("MyCad cannot write DWG files yet. In-memory edits will be lost.");
+                ui.label(format!("Save changes to {file_label}?"));
                 ui.label(title);
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Discard").clicked() {
-                        confirm = true;
+                    if ui.button("Save").clicked() {
+                        save = true;
+                    }
+                    if ui.button("Don't Save").clicked() {
+                        discard = true;
                     }
                     if ui.button("Cancel").clicked() {
                         cancel = true;
@@ -1392,17 +1730,25 @@ impl MyCadApp {
             });
         if cancel {
             self.pending_discard = None;
-        } else if confirm {
-            let pending = self.pending_discard.take();
-            self.history.clear();
-            match pending {
-                Some(PendingDiscard::OpenDialog) => self.open_dialog_now(),
-                Some(PendingDiscard::Open(path)) => self.start_load_now(path),
-                Some(PendingDiscard::Quit) => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-                None => {}
+        } else if save {
+            if self.save_drawing() {
+                self.continue_pending_discard(ctx);
             }
+        } else if discard {
+            self.history.clear();
+            self.continue_pending_discard(ctx);
+        }
+    }
+
+    fn continue_pending_discard(&mut self, ctx: &egui::Context) {
+        let pending = self.pending_discard.take();
+        match pending {
+            Some(PendingDiscard::OpenDialog) => self.open_dialog_now(),
+            Some(PendingDiscard::Open(path)) => self.start_load_now(path),
+            Some(PendingDiscard::Quit) => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            None => {}
         }
     }
 }
@@ -1418,6 +1764,8 @@ impl eframe::App for MyCadApp {
         if self.capture.is_none()
             && !self.show_settings
             && self.pending_discard.is_none()
+            && !self.pending_lossy_save
+            && self.pdf_plot.is_none()
             && !ctx.wants_keyboard_input()
         {
             let keys = ctx.input(|input| {
@@ -1438,6 +1786,9 @@ impl eframe::App for MyCadApp {
                     redo: ctrl
                         && (input.key_pressed(egui::Key::Y)
                             || (input.modifiers.shift && input.key_pressed(egui::Key::Z))),
+                    open: ctrl && !input.modifiers.shift && input.key_pressed(egui::Key::O),
+                    save: ctrl && !input.modifiers.shift && input.key_pressed(egui::Key::S),
+                    save_as: ctrl && input.modifiers.shift && input.key_pressed(egui::Key::S),
                 }
             });
             if keys.f3 {
@@ -1446,10 +1797,27 @@ impl eframe::App for MyCadApp {
             if keys.f8 {
                 self.toggle_ortho();
             }
+            if crate::input::erase_hotkey_allowed(
+                self.command.is_active(),
+                self.dynamic_input.is_active(),
+                false,
+            ) && ctx.input(|input| {
+                self.settings
+                    .bindings
+                    .key_pressed(InputAction::EraseSelection, input)
+            }) {
+                self.erase_selected();
+            }
             if keys.undo {
                 self.undo();
             } else if keys.redo {
                 self.redo();
+            } else if keys.open {
+                self.open_dialog();
+            } else if keys.save {
+                let _ = self.save_drawing();
+            } else if keys.save_as {
+                let _ = self.save_as_drawing();
             } else if keys.escape && self.context_menu.take().is_some() {
                 self.input_consumed_escape = true;
             } else if keys.escape && self.command.is_active() {
@@ -1463,7 +1831,7 @@ impl eframe::App for MyCadApp {
                 let finish_empty = matches!(
                     self.command.kind(),
                     CommandKind::Line | CommandKind::Polyline
-                );
+                ) || self.command.is_selecting_objects();
                 let numeric =
                     ctx.input_mut(|input| self.dynamic_input.consume(input, live, finish_empty));
                 match numeric {
@@ -1520,12 +1888,41 @@ impl eframe::App for MyCadApp {
             ui.add_space(2.0);
             ui.horizontal(|ui| {
                 ui.heading("MyCad");
+                let has_drawing = self.document.is_some();
+                if save_quick_access_button(ui, has_drawing).clicked() {
+                    let _ = self.save_drawing();
+                }
                 ui.separator();
                 ui.menu_button("File", |ui| {
-                    if ui.button("Open…").clicked() {
+                    if ui.button("Open…    Ctrl+O").clicked() {
                         ui.close();
                         self.open_dialog();
                     }
+                    if ui
+                        .add_enabled(has_drawing, egui::Button::new("Save    Ctrl+S"))
+                        .clicked()
+                    {
+                        ui.close();
+                        let _ = self.save_drawing();
+                    }
+                    if ui
+                        .add_enabled(has_drawing, egui::Button::new("Save As…    Ctrl+Shift+S"))
+                        .clicked()
+                    {
+                        ui.close();
+                        let _ = self.save_as_drawing();
+                    }
+                    ui.separator();
+                    ui.menu_button("Export", |ui| {
+                        if ui
+                            .add_enabled(has_drawing, egui::Button::new("PDF…"))
+                            .clicked()
+                        {
+                            ui.close();
+                            self.export_pdf_dialog();
+                        }
+                    });
+                    ui.separator();
                     if ui.button("Quit").clicked() {
                         ui.close();
                         if self.is_dirty() {
@@ -1589,6 +1986,37 @@ impl eframe::App for MyCadApp {
                         self.start_rectangle_command();
                     }
                 });
+                ui.menu_button("Modify", |ui| {
+                    let idle = !self.command_is_active();
+                    if ui.add_enabled(idle, egui::Button::new("Move")).clicked() {
+                        ui.close();
+                        self.start_move_command();
+                    }
+                    if ui.add_enabled(idle, egui::Button::new("Copy")).clicked() {
+                        ui.close();
+                        self.start_copy_command();
+                    }
+                    if ui.add_enabled(idle, egui::Button::new("Rotate")).clicked() {
+                        ui.close();
+                        self.start_rotate_command();
+                    }
+                    if ui.add_enabled(idle, egui::Button::new("Mirror")).clicked() {
+                        ui.close();
+                        self.start_mirror_command();
+                    }
+                    if ui.add_enabled(idle, egui::Button::new("Scale")).clicked() {
+                        ui.close();
+                        self.start_scale_command();
+                    }
+                    ui.separator();
+                    if ui
+                        .add_enabled(idle, egui::Button::new("Erase    Del"))
+                        .clicked()
+                    {
+                        ui.close();
+                        self.start_erase_command();
+                    }
+                });
                 ui.menu_button("Measure", |ui| {
                     let idle = !self.command_is_active();
                     if ui
@@ -1598,24 +2026,15 @@ impl eframe::App for MyCadApp {
                         ui.close();
                         self.start_distance_command();
                     }
-                    if ui
-                        .add_enabled(idle, egui::Button::new("Angle"))
-                        .clicked()
-                    {
+                    if ui.add_enabled(idle, egui::Button::new("Angle")).clicked() {
                         ui.close();
                         self.start_angle_command();
                     }
-                    if ui
-                        .add_enabled(idle, egui::Button::new("Radius"))
-                        .clicked()
-                    {
+                    if ui.add_enabled(idle, egui::Button::new("Radius")).clicked() {
                         ui.close();
                         self.start_radius_command();
                     }
-                    if ui
-                        .add_enabled(idle, egui::Button::new("Area"))
-                        .clicked()
-                    {
+                    if ui.add_enabled(idle, egui::Button::new("Area")).clicked() {
                         ui.close();
                         self.start_area_command();
                     }
@@ -1668,11 +2087,7 @@ impl eframe::App for MyCadApp {
             ui.horizontal(|ui| {
                 ui.monospace(self.status_file_label());
                 ui.separator();
-                ui.label(self.command.prompt()).on_hover_text(
-                    self.last_command
-                        .map(|kind| format!("{} — {}", kind.label(), self.status))
-                        .unwrap_or_else(|| self.status.clone()),
-                );
+                ui.label(&self.status).on_hover_text(self.command.prompt());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
                         .selectable_label(self.drafting.preferences.osnap_enabled, "OSNAP  F3")
@@ -1706,6 +2121,8 @@ impl eframe::App for MyCadApp {
 
         self.show_viewport_menu(ctx);
 
+        self.show_pdf_plot_dialog(ctx);
+        self.show_lossy_save_dialog(ctx);
         self.show_discard_dialog(ctx);
 
         match settings_ui::show(ctx, self) {
@@ -2006,6 +2423,117 @@ fn file_name(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
+fn suggested_save_name(document: &Document, prefer_dwg: bool) -> String {
+    if prefer_dwg {
+        drawing_copy_name(document, "dwg")
+    } else {
+        drawing_stem_name(document, "dxf")
+    }
+}
+
+fn suggested_pdf_name(document: &Document) -> String {
+    drawing_stem_name(document, "pdf")
+}
+
+fn drawing_stem(document: &Document) -> String {
+    let name = document.file_name();
+    Path::new(&name)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| *stem != "(untitled)")
+        .unwrap_or("drawing")
+        .to_string()
+}
+
+fn drawing_stem_name(document: &Document, extension: &str) -> String {
+    format!("{}.{extension}", drawing_stem(document))
+}
+
+fn drawing_copy_name(document: &Document, extension: &str) -> String {
+    let stem = drawing_stem(document);
+    let stem = if stem.ends_with("-MyCad") {
+        stem
+    } else {
+        format!("{stem}-MyCad")
+    };
+    format!("{stem}.{extension}")
+}
+
+fn with_save_extension(path: PathBuf, prefer_dwg: bool) -> PathBuf {
+    match CadFileFormat::from_path(&path) {
+        Some(_) => path,
+        None => with_extension(path, if prefer_dwg { "dwg" } else { "dxf" }),
+    }
+}
+
+fn with_pdf_extension(path: PathBuf) -> PathBuf {
+    with_extension(path, "pdf")
+}
+
+fn with_extension(path: PathBuf, extension: &str) -> PathBuf {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some(ext) if ext.eq_ignore_ascii_case(extension) => path,
+        _ => path.with_extension(extension),
+    }
+}
+
+fn in_place_cad_path(document: &Document, written_by_mycad: bool) -> Option<&Path> {
+    let path = document.source_path.as_deref()?;
+    match CadFileFormat::from_path(path) {
+        Some(CadFileFormat::Dxf) => Some(path),
+        Some(CadFileFormat::Dwg) if written_by_mycad || is_mycad_saved_dwg(path) => Some(path),
+        _ => None,
+    }
+}
+
+fn is_mycad_saved_dwg(path: &Path) -> bool {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| stem.ends_with("-MyCad"))
+}
+
+fn needs_lossy_save_warning(document: &Document) -> bool {
+    document.diagnostics.unsupported_total() > 0
+}
+
+fn lossy_save_message(count: u64) -> String {
+    let noun = if count == 1 { "entity" } else { "entities" };
+    format!(
+        "This drawing contains {count} {noun} that MyCad cannot fully preserve. Saving as DWG/DXF may change or remove unsupported content."
+    )
+}
+
+fn format_save_status(path: &Path, report: &SaveReport) -> String {
+    let name = file_name(path);
+    if CadFileFormat::from_path(path) == Some(CadFileFormat::Dwg) && !report.warnings.is_empty() {
+        let count = report.warnings.len();
+        let noun = if count == 1 { "warning" } else { "warnings" };
+        format!("DWG saved with {count} compatibility {noun}")
+    } else {
+        format!("Saved {name}")
+    }
+}
+
+fn format_pdf_export_status(path: &Path, _report: &SaveReport) -> String {
+    format!("Exported {}", file_name(path))
+}
+
+fn format_save_failed(err: impl std::fmt::Display) -> String {
+    format!("Save failed: {err}")
+}
+
+fn save_quick_access_button(ui: &mut egui::Ui, enabled: bool) -> egui::Response {
+    let icon = egui::RichText::new(FLOPPY_DISK).size(16.0);
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(icon)
+            .frame(false)
+            .min_size(egui::vec2(22.0, 18.0)),
+    )
+    .on_hover_text(SAVE_TOOLTIP)
+    .on_disabled_hover_text(SAVE_TOOLTIP)
+}
+
 fn format_import_error(err: &ImportError) -> String {
     match err {
         ImportError::Critical(code) => format!(
@@ -2013,6 +2541,24 @@ fn format_import_error(err: &ImportError) -> String {
         ),
         ImportError::InvalidPath => "The file path is not valid UTF-8.".into(),
         ImportError::Io(e) => format!("Could not open file: {e}"),
+    }
+}
+
+fn format_dwg_write_error(err: &DwgWriteError) -> String {
+    match err {
+        DwgWriteError::Dxf(err) => err.to_string(),
+        DwgWriteError::Convert(DwgExportError::Critical { path, code }) => {
+            format!(
+                "LibreDWG could not write {} (critical error {code}).",
+                file_name(path)
+            )
+        }
+        DwgWriteError::Convert(DwgExportError::InvalidPath) => {
+            "The file path is not valid UTF-8.".into()
+        }
+        DwgWriteError::Convert(DwgExportError::Io(err)) | DwgWriteError::Io(err) => {
+            format!("Could not write file: {err}")
+        }
     }
 }
 
@@ -2074,5 +2620,192 @@ fn area_from_entity(
             vertices, closed, ..
         } => Some(cad_core::AreaMeasurement::from_polyline(vertices, *closed)),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod save_as_tests {
+    use super::*;
+
+    #[test]
+    fn dwg_source_suggests_a_mycad_copy_name() {
+        let mut document = Document::default();
+        document.source_path = Some(PathBuf::from("plant.dwg"));
+        assert_eq!(suggested_save_name(&document, true), "plant-MyCad.dwg");
+        assert_eq!(suggested_save_name(&document, false), "plant.dxf");
+    }
+
+    #[test]
+    fn existing_mycad_suffix_is_not_repeated() {
+        let mut document = Document::default();
+        document.source_path = Some(PathBuf::from("plant-MyCad.dwg"));
+        assert_eq!(suggested_save_name(&document, true), "plant-MyCad.dwg");
+    }
+
+    #[test]
+    fn untitled_drawing_uses_a_generic_dxf_name() {
+        let document = Document::default();
+        assert_eq!(suggested_save_name(&document, false), "drawing.dxf");
+        assert_eq!(suggested_save_name(&document, true), "drawing-MyCad.dwg");
+    }
+
+    #[test]
+    fn save_extension_follows_chosen_format() {
+        assert_eq!(
+            with_save_extension(PathBuf::from("out.dwg"), false),
+            PathBuf::from("out.dwg")
+        );
+        assert_eq!(
+            with_save_extension(PathBuf::from("out.DXF"), true),
+            PathBuf::from("out.DXF")
+        );
+        assert_eq!(
+            with_save_extension(PathBuf::from("out"), false),
+            PathBuf::from("out.dxf")
+        );
+        assert_eq!(
+            with_save_extension(PathBuf::from("out"), true),
+            PathBuf::from("out.dwg")
+        );
+    }
+
+    #[test]
+    fn dwg_source_cannot_save_in_place() {
+        let mut document = Document::default();
+        document.source_path = Some(PathBuf::from("plant.dwg"));
+        assert!(in_place_cad_path(&document, false).is_none());
+    }
+
+    #[test]
+    fn mycad_dwg_copy_can_save_in_place() {
+        let mut document = Document::default();
+        document.source_path = Some(PathBuf::from("plant-MyCad.dwg"));
+        assert_eq!(
+            in_place_cad_path(&document, false),
+            Some(Path::new("plant-MyCad.dwg"))
+        );
+    }
+
+    #[test]
+    fn session_written_dwg_can_save_in_place() {
+        let mut document = Document::default();
+        document.source_path = Some(PathBuf::from("custom.dwg"));
+        assert_eq!(
+            in_place_cad_path(&document, true),
+            Some(Path::new("custom.dwg"))
+        );
+    }
+
+    #[test]
+    fn saved_dxf_can_save_in_place() {
+        let mut document = Document::default();
+        document.source_path = Some(PathBuf::from("plant.dxf"));
+        assert_eq!(
+            in_place_cad_path(&document, false),
+            Some(Path::new("plant.dxf"))
+        );
+    }
+
+    #[test]
+    fn pdf_source_cannot_save_in_place() {
+        let mut document = Document::default();
+        document.source_path = Some(PathBuf::from("sheet.pdf"));
+        assert!(in_place_cad_path(&document, false).is_none());
+    }
+
+    #[test]
+    fn pdf_name_does_not_reuse_dxf_extension() {
+        let mut document = Document::default();
+        document.source_path = Some(PathBuf::from("plant.dxf"));
+        assert_eq!(suggested_pdf_name(&document), "plant.pdf");
+    }
+
+    #[test]
+    fn export_status_does_not_say_saved() {
+        let report = SaveReport {
+            warnings: Vec::new(),
+            entities_written: 2,
+        };
+        assert_eq!(
+            format_pdf_export_status(Path::new("Plant.pdf"), &report),
+            "Exported Plant.pdf"
+        );
+    }
+
+    #[test]
+    fn save_status_uses_the_file_name() {
+        let report = SaveReport {
+            warnings: Vec::new(),
+            entities_written: 4,
+        };
+        assert_eq!(
+            format_save_status(Path::new("Plant.dxf"), &report),
+            "Saved Plant.dxf"
+        );
+        assert_eq!(
+            format_save_status(Path::new("Plant.dwg"), &report),
+            "Saved Plant.dwg"
+        );
+    }
+
+    #[test]
+    fn dwg_status_reports_compatibility_warnings() {
+        let report = SaveReport {
+            warnings: vec![
+                "DIMENSION fallback".into(),
+                "MLINE exploded".into(),
+                "HATCH spline edge".into(),
+            ],
+            entities_written: 12,
+        };
+        assert_eq!(
+            format_save_status(Path::new("Plant.dwg"), &report),
+            "DWG saved with 3 compatibility warnings"
+        );
+        let one = SaveReport {
+            warnings: vec!["DIMENSION fallback".into()],
+            entities_written: 2,
+        };
+        assert_eq!(
+            format_save_status(Path::new("Plant.dwg"), &one),
+            "DWG saved with 1 compatibility warning"
+        );
+        assert_eq!(
+            format_save_status(Path::new("Plant.dxf"), &report),
+            "Saved Plant.dxf"
+        );
+    }
+
+    #[test]
+    fn save_failed_status_prefixes_the_error() {
+        assert_eq!(format_save_failed("disk full"), "Save failed: disk full");
+    }
+
+    #[test]
+    fn save_quick_access_tooltip_is_save_and_shortcut() {
+        assert_eq!(SAVE_TOOLTIP, "Save\nCtrl+S");
+    }
+
+    #[test]
+    fn unsupported_entities_require_a_lossy_save_warning() {
+        let mut document = Document::default();
+        assert!(!needs_lossy_save_warning(&document));
+        document.diagnostics.bump_unsupported("PROXY");
+        document.diagnostics.bump_unsupported("PROXY");
+        document.diagnostics.bump_unsupported("XREF");
+        assert_eq!(document.diagnostics.unsupported_total(), 3);
+        assert!(needs_lossy_save_warning(&document));
+    }
+
+    #[test]
+    fn lossy_save_message_uses_singular_and_plural() {
+        assert_eq!(
+            lossy_save_message(1),
+            "This drawing contains 1 entity that MyCad cannot fully preserve. Saving as DWG/DXF may change or remove unsupported content."
+        );
+        assert_eq!(
+            lossy_save_message(14),
+            "This drawing contains 14 entities that MyCad cannot fully preserve. Saving as DWG/DXF may change or remove unsupported content."
+        );
     }
 }

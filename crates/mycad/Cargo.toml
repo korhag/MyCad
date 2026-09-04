@@ -13,6 +13,7 @@ path = "src/main.rs"
 cad-core.workspace = true
 cad-viewport.workspace = true
 cad-render.workspace = true
+cad-io.workspace = true
 dwg-import.workspace = true
 eframe.workspace = true
 egui.workspace = true
