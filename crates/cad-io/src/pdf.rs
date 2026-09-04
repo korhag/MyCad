@@ -5,8 +5,8 @@ use std::path::Path;
 
 use cad_core::{
     arc_points, bspline_points, circle_points, default_extrusion, ellipse_points, polyline_points,
-    stroke_text, strip_mtext, CadColor, Document, Entity, Extents2, Geometry, HatchEdge,
-    HatchPath, Point2, Point3, Rgb, Transform2, CIRCLE_SEGMENTS,
+    strip_mtext, stroke_text, CadColor, Document, Entity, Extents2, Geometry, HatchEdge, HatchPath,
+    Point2, Point3, Rgb, Transform2, CIRCLE_SEGMENTS,
 };
 
 use crate::error::ExportError;
@@ -436,7 +436,11 @@ fn color_stroke(
     block_color: CadColor,
     options: PdfExportOptions,
 ) {
-    set_stroke_color(out, options.style, entity_rgb(document, entity, block_color));
+    set_stroke_color(
+        out,
+        options.style,
+        entity_rgb(document, entity, block_color),
+    );
 }
 
 fn color_fill(

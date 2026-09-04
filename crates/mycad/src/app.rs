@@ -30,9 +30,9 @@ use crate::context_menu::{self, ContextAction, ContextKind, MenuResult, Viewport
 use crate::drafting::DraftingState;
 use crate::dynamic_input::{DynamicInput, DynamicKeyResult, DynamicLayout, LiveValues};
 use crate::history::{Edit, History};
-use crate::input::InputAction;
+use crate::input::{InputAction, InputMap};
 use crate::measurement::{self, CardAction, MeasurementOverlay};
-use crate::selection::{box_pick_entities_into, pick_entity, Selection};
+use crate::selection::{box_pick_entities_into, pick_entity, Selection, SelectionOp};
 use crate::settings::{scroll_to_zoom_factor, AppSettings, RgbColor};
 use crate::settings_ui::{self, CaptureTarget, SettingsAction, SettingsTab};
 use crate::theme;
@@ -58,7 +58,7 @@ struct BoxSelectDrag {
     button: PointerButton,
     start: egui::Pos2,
     current: egui::Pos2,
-    toggle: bool,
+    op: SelectionOp,
     candidates: Vec<cad_core::EntityId>,
 }
 
@@ -678,6 +678,10 @@ impl MyCadApp {
     }
 
     fn finish_command(&mut self) {
+        if self.command.is_erase_picking() {
+            self.idle_after_command("Ready");
+            return;
+        }
         if self.command.is_selecting_objects() {
             self.confirm_modify_selection();
             return;
@@ -734,14 +738,7 @@ impl MyCadApp {
     fn undo_last_in_command(&mut self) {
         match self.command.kind() {
             CommandKind::Line => {
-                if self.command.undo_last() {
-                    if let Some(edit) = self.history.pop_last_open_edit() {
-                        if let Some(document) = self.document.as_mut() {
-                            edit.invert().apply(document);
-                        }
-                        self.refresh_derived();
-                    }
-                }
+                let _ = self.command.undo_last();
             }
             CommandKind::Polyline => {
                 let _ = self.command.undo_last();
@@ -787,6 +784,11 @@ impl MyCadApp {
                 if stays_active {
                     self.sync_dynamic_layout();
                     self.dynamic_input.reset_values();
+                    if kind == CommandKind::Line {
+                        self.drafting.clear_acquisition();
+                        self.command_snaps.clear();
+                    }
+                    self.status = self.command.prompt().into();
                 } else {
                     self.finish_active_transaction();
                     self.dynamic_input.set_layout(DynamicLayout::Hidden);
@@ -1100,10 +1102,15 @@ impl MyCadApp {
     }
 
     pub(crate) fn erase_selected(&mut self) {
-        if !self.command.is_idle() && !self.command.is_selecting_objects() {
+        if !self.command.is_idle() && !self.command.is_erase_picking() {
             return;
         }
         let ids = self.selection.ids().to_vec();
+        let stay = self.command.is_erase_picking();
+        self.erase_ids(&ids, stay);
+    }
+
+    fn erase_ids(&mut self, ids: &[cad_core::EntityId], stay_in_erase: bool) {
         if ids.is_empty() {
             return;
         }
@@ -1137,6 +1144,14 @@ impl MyCadApp {
         }
         self.remember_completed(CommandKind::Erase);
         self.finish_active_transaction();
+        self.selection.remove_all(ids.iter().copied());
+        if stay_in_erase && self.command.is_erase_picking() {
+            self.dynamic_input.set_layout(DynamicLayout::Hidden);
+            self.drafting.clear_acquisition();
+            self.refresh_derived();
+            self.status = self.command.prompt().into();
+            return;
+        }
         self.command.finish();
         self.dynamic_input.set_layout(DynamicLayout::Hidden);
         self.drafting.clear_acquisition();
@@ -1771,7 +1786,26 @@ impl eframe::App for MyCadApp {
             && self.pending_discard.is_none()
             && !self.pending_lossy_save
             && self.pdf_plot.is_none()
-            && !ctx.wants_keyboard_input()
+        {
+            let text_editing = crate::input::text_field_has_focus(ctx);
+            if crate::input::erase_hotkey_allowed(
+                self.command.is_active() && !self.command.is_erase_picking(),
+                self.dynamic_input.is_active(),
+                text_editing,
+            ) && ctx.input(|input| {
+                self.settings
+                    .bindings
+                    .key_pressed(InputAction::EraseSelection, input)
+            }) {
+                self.erase_selected();
+            }
+        }
+        if self.capture.is_none()
+            && !self.show_settings
+            && self.pending_discard.is_none()
+            && !self.pending_lossy_save
+            && self.pdf_plot.is_none()
+            && !crate::input::text_field_has_focus(ctx)
         {
             let keys = ctx.input(|input| {
                 let ctrl = input.modifiers.ctrl || input.modifiers.command;
@@ -1801,17 +1835,6 @@ impl eframe::App for MyCadApp {
             }
             if keys.f8 {
                 self.toggle_ortho();
-            }
-            if crate::input::erase_hotkey_allowed(
-                self.command.is_active(),
-                self.dynamic_input.is_active(),
-                false,
-            ) && ctx.input(|input| {
-                self.settings
-                    .bindings
-                    .key_pressed(InputAction::EraseSelection, input)
-            }) {
-                self.erase_selected();
             }
             if keys.undo {
                 self.undo();
@@ -2124,7 +2147,7 @@ fn handle_viewport_input(app: &mut MyCadApp, ui: &Ui, response: &egui::Response,
     let size = Point2::new(rect.width() as f64, rect.height() as f64);
     let bindings = app.settings.bindings.clone();
     let modifiers = ui.input(|i| i.modifiers);
-    let typing = ui.ctx().wants_keyboard_input();
+    let typing = crate::input::text_field_has_focus(ui.ctx());
 
     let pointer_pos = if response.hovered() || response.dragged() {
         ui.input(|input| input.pointer.latest_pos())
@@ -2267,15 +2290,17 @@ fn handle_viewport_input(app: &mut MyCadApp, ui: &Ui, response: &egui::Response,
                     size,
                 )
             });
-            if bindings.clicked(InputAction::SelectToggle, button, modifiers) {
-                if let Some(Some(id)) = world_hit {
-                    app.selection.toggle(id);
+            let hit = world_hit.flatten();
+            if app.command.is_erase_picking()
+                && (bindings.clicked(InputAction::SelectReplace, button, modifiers)
+                    || bindings.clicked(InputAction::SelectAdd, button, modifiers)
+                    || bindings.clicked(InputAction::SelectRemove, button, modifiers))
+            {
+                if let Some(id) = hit {
+                    app.erase_ids(&[id], true);
                 }
-            } else if bindings.clicked(InputAction::SelectReplace, button, modifiers) {
-                match world_hit {
-                    Some(Some(id)) => app.selection.replace(id),
-                    _ => app.selection.clear(),
-                }
+            } else if let Some(op) = selection_op_for_click(&bindings, button, modifiers) {
+                app.selection.apply_click(hit, op);
             }
         }
     }
@@ -2324,13 +2349,9 @@ fn update_box_select(
             if bindings.dragged(InputAction::Pan, button, modifiers) {
                 continue;
             }
-            let toggle =
-                bindings.selects_with_pointer(InputAction::SelectToggle, button, modifiers);
-            let replace =
-                bindings.selects_with_pointer(InputAction::SelectReplace, button, modifiers);
-            if !toggle && !replace {
+            let Some(op) = selection_op_for_pointer(&bindings, button, modifiers) else {
                 continue;
-            }
+            };
             let Some(start) = ui
                 .input(|i| i.pointer.press_origin())
                 .or(response.interact_pointer_pos())
@@ -2343,7 +2364,7 @@ fn update_box_select(
                 button,
                 start,
                 current,
-                toggle,
+                op,
                 candidates: Vec::new(),
             });
             started_this_frame = true;
@@ -2393,8 +2414,44 @@ fn update_box_select(
         response.drag_stopped_by(button) || ui.input(|i| i.pointer.button_released(button));
     if released && !started_this_frame {
         if let Some(drag) = app.box_select.take() {
-            app.selection.commit_box(&drag.candidates, drag.toggle);
+            if app.command.is_erase_picking() {
+                app.erase_ids(&drag.candidates, true);
+            } else {
+                app.selection.commit_box(&drag.candidates, drag.op);
+            }
         }
+    }
+}
+
+fn selection_op_for_click(
+    bindings: &InputMap,
+    button: PointerButton,
+    modifiers: egui::Modifiers,
+) -> Option<SelectionOp> {
+    if bindings.clicked(InputAction::SelectRemove, button, modifiers) {
+        Some(SelectionOp::Remove)
+    } else if bindings.clicked(InputAction::SelectAdd, button, modifiers) {
+        Some(SelectionOp::Add)
+    } else if bindings.clicked(InputAction::SelectReplace, button, modifiers) {
+        Some(SelectionOp::Replace)
+    } else {
+        None
+    }
+}
+
+fn selection_op_for_pointer(
+    bindings: &InputMap,
+    button: PointerButton,
+    modifiers: egui::Modifiers,
+) -> Option<SelectionOp> {
+    if bindings.selects_with_pointer(InputAction::SelectRemove, button, modifiers) {
+        Some(SelectionOp::Remove)
+    } else if bindings.selects_with_pointer(InputAction::SelectAdd, button, modifiers) {
+        Some(SelectionOp::Add)
+    } else if bindings.selects_with_pointer(InputAction::SelectReplace, button, modifiers) {
+        Some(SelectionOp::Replace)
+    } else {
+        None
     }
 }
 
@@ -2843,10 +2900,7 @@ mod command_switch_tests {
         app.start_circle_command();
         app.accept_command_point(Point2::new(0.0, 0.0));
         assert!(app.dynamic_input.is_active());
-        assert!(app
-            .command
-            .preview(Some(Point2::new(4.0, 0.0)))
-            .is_some());
+        assert!(app.command.preview(Some(Point2::new(4.0, 0.0))).is_some());
         app.start_rectangle_command();
         assert_eq!(app.command.kind(), CommandKind::Rectangle);
         assert_eq!(model_count(&app), 0);
@@ -2873,7 +2927,8 @@ mod command_switch_tests {
         app.accept_command_point(Point2::new(10.0, 0.0));
         assert_eq!(model_count(&app), 1);
         app.command.write_snap_features(&mut app.command_snaps);
-        assert!(!app.command_snaps.is_empty());
+        assert!(app.command_snaps.is_empty());
+        assert_eq!(app.command.base_point(), None);
         app.start_distance_command();
         assert_eq!(app.command.kind(), CommandKind::Distance);
         assert_eq!(model_count(&app), 1);
@@ -2954,5 +3009,158 @@ mod command_switch_tests {
             assert_eq!(app.command.kind(), kind);
             assert_no_stale_interaction(&app);
         }
+    }
+}
+
+#[cfg(test)]
+mod interaction_tests {
+    use super::*;
+    use cad_core::{Entity, EntityId, Geometry, Point3};
+
+    fn model_count(app: &MyCadApp) -> usize {
+        app.document
+            .as_ref()
+            .map(|document| document.model_space.len())
+            .unwrap_or(0)
+    }
+
+    fn add_line(app: &mut MyCadApp, x0: f64, y0: f64, x1: f64, y1: f64) -> EntityId {
+        let document = app.document.get_or_insert_with(Document::default);
+        let entity = document.add_entity(Entity::new(Geometry::Line {
+            start: Point3::from_xy(x0, y0),
+            end: Point3::from_xy(x1, y1),
+        }));
+        let id = entity.id;
+        app.refresh_derived();
+        id
+    }
+
+    #[test]
+    fn line_second_click_commits_then_waits_for_a_new_first_point() {
+        let mut app = MyCadApp::for_test();
+        app.start_line_command();
+        assert_eq!(app.status, "LINE • Specify first point");
+        app.accept_command_point(Point2::new(0.0, 0.0));
+        assert_eq!(model_count(&app), 0);
+        assert_eq!(app.status, "LINE • Specify second point");
+        app.accept_command_point(Point2::new(10.0, 0.0));
+        assert_eq!(model_count(&app), 1);
+        assert_eq!(app.command.kind(), CommandKind::Line);
+        assert_eq!(app.command.base_point(), None);
+        assert!(!app.dynamic_input.is_active());
+        assert_eq!(app.status, "LINE • Specify first point");
+        app.accept_command_point(Point2::new(2.0, 3.0));
+        assert_eq!(model_count(&app), 1);
+        app.accept_command_point(Point2::new(8.0, 3.0));
+        assert_eq!(model_count(&app), 2);
+        match &app.document.as_ref().unwrap().model_space[1].geometry {
+            Geometry::Line { start, end } => {
+                assert_eq!(start.xy(), Point2::new(2.0, 3.0));
+                assert_eq!(end.xy(), Point2::new(8.0, 3.0));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn preselection_erase_and_delete_remove_immediately() {
+        let mut app = MyCadApp::for_test();
+        let a = add_line(&mut app, 0.0, 0.0, 1.0, 0.0);
+        let b = add_line(&mut app, 0.0, 1.0, 1.0, 1.0);
+        let c = add_line(&mut app, 0.0, 2.0, 1.0, 2.0);
+        app.selection.replace_all([a, b, c]);
+        app.erase_selected();
+        assert_eq!(model_count(&app), 0);
+        assert!(app.selection.is_empty());
+        assert!(app.command.is_idle());
+        app.undo();
+        assert_eq!(model_count(&app), 3);
+        assert!(app.document.as_ref().unwrap().entity_by_id(a).is_some());
+        assert!(app.document.as_ref().unwrap().entity_by_id(b).is_some());
+        assert!(app.document.as_ref().unwrap().entity_by_id(c).is_some());
+        app.redo();
+        assert_eq!(model_count(&app), 0);
+
+        let d = add_line(&mut app, 4.0, 0.0, 5.0, 0.0);
+        let e = add_line(&mut app, 4.0, 1.0, 5.0, 1.0);
+        app.selection.replace_all([d, e]);
+        app.start_erase_command();
+        assert_eq!(model_count(&app), 0);
+        assert!(app.command.is_idle());
+        app.undo();
+        assert_eq!(model_count(&app), 2);
+    }
+
+    #[test]
+    fn command_first_erase_click_and_window_stay_active() {
+        let mut app = MyCadApp::for_test();
+        let a = add_line(&mut app, 0.0, 0.0, 1.0, 0.0);
+        let b = add_line(&mut app, 0.0, 2.0, 1.0, 2.0);
+        let c = add_line(&mut app, 0.0, 4.0, 1.0, 4.0);
+        app.start_erase_command();
+        assert!(app.command.is_erase_picking());
+        assert_eq!(app.status, "ERASE • Click objects to erase • Esc to finish");
+        app.erase_ids(&[a], true);
+        assert_eq!(model_count(&app), 2);
+        assert!(app.command.is_erase_picking());
+        assert!(!app.selection.contains(a));
+        app.erase_ids(&[b, c], true);
+        assert_eq!(model_count(&app), 0);
+        assert!(app.command.is_erase_picking());
+        app.undo();
+        assert_eq!(model_count(&app), 2);
+        app.undo();
+        assert_eq!(model_count(&app), 3);
+        app.cancel_command();
+        assert!(app.command.is_idle());
+    }
+
+    #[test]
+    fn delete_hotkey_is_blocked_while_editing_or_drawing() {
+        assert!(crate::input::erase_hotkey_allowed(false, false, false));
+        assert!(!crate::input::erase_hotkey_allowed(true, false, false));
+        assert!(!crate::input::erase_hotkey_allowed(false, true, false));
+        assert!(!crate::input::erase_hotkey_allowed(false, false, true));
+        let mut app = MyCadApp::for_test();
+        let id = add_line(&mut app, 0.0, 0.0, 2.0, 0.0);
+        app.selection.replace(id);
+        app.start_line_command();
+        app.erase_selected();
+        assert_eq!(model_count(&app), 1);
+        assert!(app.selection.contains(id));
+        app.cancel_command();
+        app.erase_selected();
+        assert_eq!(model_count(&app), 0);
+    }
+
+    #[test]
+    fn pointer_selection_ops_match_replace_add_remove() {
+        let map = InputMap::standard();
+        let none = egui::Modifiers::default();
+        let mut shift = egui::Modifiers::default();
+        shift.shift = true;
+        let mut ctrl = egui::Modifiers::default();
+        ctrl.ctrl = true;
+        ctrl.command = true;
+        assert_eq!(
+            selection_op_for_click(&map, PointerButton::Primary, none),
+            Some(SelectionOp::Replace)
+        );
+        assert_eq!(
+            selection_op_for_click(&map, PointerButton::Primary, shift),
+            Some(SelectionOp::Add)
+        );
+        assert_eq!(
+            selection_op_for_click(&map, PointerButton::Primary, ctrl),
+            Some(SelectionOp::Remove)
+        );
+        assert_eq!(
+            selection_op_for_pointer(&map, PointerButton::Primary, shift),
+            Some(SelectionOp::Add)
+        );
+        assert_eq!(
+            selection_op_for_pointer(&map, PointerButton::Primary, ctrl),
+            Some(SelectionOp::Remove)
+        );
     }
 }

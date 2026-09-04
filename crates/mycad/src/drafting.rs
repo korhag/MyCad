@@ -175,7 +175,7 @@ pub fn paint_overlay(
         let point = camera.world_to_screen(point, origin, size);
         Pos2::new(point.x as f32, point.y as f32)
     };
-    let stroke = Stroke::new(1.5, Color32::from_rgb(235, 235, 235));
+    let stroke = Stroke::new(1.5_f32, Color32::from_rgb(235, 235, 235));
 
     if let Some(preview) = preview {
         paint_preview(painter, &to_screen, preview, stroke);
@@ -223,7 +223,7 @@ pub fn paint_world_axis(
     let b = Point2::new(start.x + ux * span, start.y + uy * span);
     painter.line_segment(
         [to_screen(a), to_screen(b)],
-        Stroke::new(1.0, Color32::from_rgb(90, 140, 150)),
+        Stroke::new(1.0_f32, Color32::from_rgb(90, 140, 150)),
     );
 }
 
@@ -294,7 +294,7 @@ fn paint_polyline(painter: &egui::Painter, points: &[Pos2], closed: bool, stroke
 
 fn paint_snap_marker(painter: &egui::Painter, center: Pos2, kind: SnapKind) {
     let color = Color32::from_rgb(80, 230, 220);
-    let stroke = Stroke::new(1.5, color);
+    let stroke = Stroke::new(1.5_f32, color);
     let radius = SNAP_MARKER_RADIUS;
     match kind {
         SnapKind::Endpoint => {

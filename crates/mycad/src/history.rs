@@ -150,6 +150,7 @@ impl History {
         }
     }
 
+    #[cfg(test)]
     pub fn pop_last_open_edit(&mut self) -> Option<Edit> {
         self.open.as_mut()?.edits.pop()
     }

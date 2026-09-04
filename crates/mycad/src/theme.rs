@@ -20,7 +20,7 @@ pub fn apply(ctx: &egui::Context) {
         },
         selection: egui::style::Selection {
             bg_fill: egui::Color32::from_rgb(70, 110, 78),
-            stroke: egui::Stroke::new(1.0, egui::Color32::from_rgb(160, 200, 140)),
+            stroke: egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(160, 200, 140)),
         },
         hyperlink_color: egui::Color32::from_rgb(140, 190, 150),
         ..egui::Visuals::dark()
@@ -28,7 +28,8 @@ pub fn apply(ctx: &egui::Context) {
     ctx.style_mut(|style| {
         style.spacing.item_spacing = egui::vec2(8.0, 6.0);
         style.spacing.window_margin = egui::Margin::same(10);
-        style.visuals.window_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 90, 72));
+        style.visuals.window_stroke =
+            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(70, 90, 72));
     });
 }
 
@@ -36,8 +37,8 @@ fn widget(fill: egui::Color32) -> egui::style::WidgetVisuals {
     egui::style::WidgetVisuals {
         bg_fill: fill,
         weak_bg_fill: fill,
-        bg_stroke: egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 86, 72)),
-        fg_stroke: egui::Stroke::new(1.0, egui::Color32::from_rgb(220, 228, 214)),
+        bg_stroke: egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(70, 86, 72)),
+        fg_stroke: egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(220, 228, 214)),
         corner_radius: egui::CornerRadius::ZERO,
         expansion: 0.0,
     }

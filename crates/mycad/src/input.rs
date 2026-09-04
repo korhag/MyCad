@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum InputAction {
     SelectReplace,
-    SelectToggle,
+    SelectAdd,
+    SelectRemove,
     SelectClear,
     Pan,
     ZoomExtents,
@@ -22,9 +23,10 @@ pub enum InputAction {
 }
 
 impl InputAction {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::SelectReplace,
-        Self::SelectToggle,
+        Self::SelectAdd,
+        Self::SelectRemove,
         Self::SelectClear,
         Self::Pan,
         Self::ZoomExtents,
@@ -35,7 +37,8 @@ impl InputAction {
     pub fn label(self) -> &'static str {
         match self {
             Self::SelectReplace => "Select",
-            Self::SelectToggle => "Add / remove from selection",
+            Self::SelectAdd => "Add to selection",
+            Self::SelectRemove => "Remove from selection",
             Self::SelectClear => "Clear selection",
             Self::Pan => "Pan",
             Self::ZoomExtents => "Zoom extents",
@@ -46,7 +49,9 @@ impl InputAction {
 
     pub fn group(self) -> &'static str {
         match self {
-            Self::SelectReplace | Self::SelectToggle | Self::SelectClear => "Selection",
+            Self::SelectReplace | Self::SelectAdd | Self::SelectRemove | Self::SelectClear => {
+                "Selection"
+            }
             Self::Pan | Self::ZoomExtents => "View",
             Self::ContextMenu => "Viewport",
             Self::EraseSelection => "Modify",
@@ -59,11 +64,15 @@ impl InputAction {
 }
 
 pub fn erase_hotkey_allowed(
-    command_active: bool,
+    command_blocks_erase: bool,
     dynamic_input_active: bool,
-    wants_keyboard: bool,
+    text_editing: bool,
 ) -> bool {
-    !command_active && !dynamic_input_active && !wants_keyboard
+    !command_blocks_erase && !dynamic_input_active && !text_editing
+}
+
+pub fn text_field_has_focus(ctx: &egui::Context) -> bool {
+    ctx.output(|output| output.mutable_text_under_cursor)
 }
 
 // ------------------------------------------------------------
@@ -317,6 +326,10 @@ fn join_mods(parts: &[&str]) -> String {
 #[serde(default)]
 pub struct InputMap {
     pub select_replace: Vec<Binding>,
+    pub select_add: Vec<Binding>,
+    pub select_remove: Vec<Binding>,
+    /// Deprecated toggle bindings from older settings. Migrated in [`Self::sanitize`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub select_toggle: Vec<Binding>,
     pub select_clear: Vec<Binding>,
     pub pan: Vec<Binding>,
@@ -340,12 +353,15 @@ impl InputMap {
                 Binding::click(MouseButtonKind::Left),
                 Binding::drag(MouseButtonKind::Left),
             ],
-            select_toggle: vec![
-                Binding::click(MouseButtonKind::Left).with_ctrl(),
+            select_add: vec![
                 Binding::click(MouseButtonKind::Left).with_shift(),
-                Binding::drag(MouseButtonKind::Left).with_ctrl(),
                 Binding::drag(MouseButtonKind::Left).with_shift(),
             ],
+            select_remove: vec![
+                Binding::click(MouseButtonKind::Left).with_ctrl(),
+                Binding::drag(MouseButtonKind::Left).with_ctrl(),
+            ],
+            select_toggle: Vec::new(),
             select_clear: vec![Binding::key("escape")],
             pan: vec![Binding::drag(MouseButtonKind::Middle)],
             zoom_extents: vec![
@@ -360,7 +376,8 @@ impl InputMap {
     fn list(&self, action: InputAction) -> &Vec<Binding> {
         match action {
             InputAction::SelectReplace => &self.select_replace,
-            InputAction::SelectToggle => &self.select_toggle,
+            InputAction::SelectAdd => &self.select_add,
+            InputAction::SelectRemove => &self.select_remove,
             InputAction::SelectClear => &self.select_clear,
             InputAction::Pan => &self.pan,
             InputAction::ZoomExtents => &self.zoom_extents,
@@ -372,7 +389,8 @@ impl InputMap {
     fn list_mut(&mut self, action: InputAction) -> &mut Vec<Binding> {
         match action {
             InputAction::SelectReplace => &mut self.select_replace,
-            InputAction::SelectToggle => &mut self.select_toggle,
+            InputAction::SelectAdd => &mut self.select_add,
+            InputAction::SelectRemove => &mut self.select_remove,
             InputAction::SelectClear => &mut self.select_clear,
             InputAction::Pan => &mut self.pan,
             InputAction::ZoomExtents => &mut self.zoom_extents,
@@ -382,6 +400,7 @@ impl InputMap {
     }
 
     pub fn sanitize(&mut self) {
+        self.migrate_select_toggle();
         let defaults = Self::standard();
         for action in InputAction::ALL {
             let entries = self.list_mut(action);
@@ -393,10 +412,35 @@ impl InputMap {
         self.ensure_select_drag_companions();
     }
 
+    fn migrate_select_toggle(&mut self) {
+        if self.select_toggle.is_empty() {
+            return;
+        }
+        let legacy = std::mem::take(&mut self.select_toggle);
+        if self.select_add.is_empty() {
+            self.select_add = legacy
+                .iter()
+                .filter(|binding| binding.shift && !binding.ctrl && !binding.command)
+                .cloned()
+                .collect();
+        }
+        if self.select_remove.is_empty() {
+            self.select_remove = legacy
+                .iter()
+                .filter(|binding| (binding.ctrl || binding.command) && !binding.shift)
+                .cloned()
+                .collect();
+        }
+    }
+
     // Click-select and box-select share a button. Older saved maps only
     // stored the click, which made left-drag a no-op after the threshold.
     fn ensure_select_drag_companions(&mut self) {
-        for action in [InputAction::SelectReplace, InputAction::SelectToggle] {
+        for action in [
+            InputAction::SelectReplace,
+            InputAction::SelectAdd,
+            InputAction::SelectRemove,
+        ] {
             let companions: Vec<Binding> = self
                 .list(action)
                 .iter()
@@ -668,23 +712,32 @@ mod tests {
     #[test]
     fn unmodified_click_does_not_match_ctrl_click() {
         let select = Binding::click(MouseButtonKind::Left);
-        let toggle = Binding::click(MouseButtonKind::Left).with_ctrl();
+        let remove = Binding::click(MouseButtonKind::Left).with_ctrl();
         let none = mods(false, false, false, false);
         let ctrl = mods(true, false, false, true);
         assert!(select.matches_click(PointerButton::Primary, none));
         assert!(!select.matches_click(PointerButton::Primary, ctrl));
-        assert!(toggle.matches_click(PointerButton::Primary, ctrl));
-        assert!(!toggle.matches_click(PointerButton::Primary, none));
+        assert!(remove.matches_click(PointerButton::Primary, ctrl));
+        assert!(!remove.matches_click(PointerButton::Primary, none));
     }
 
     #[test]
-    fn shift_and_ctrl_are_distinct_toggle_bindings() {
+    fn shift_add_and_ctrl_remove_are_distinct_bindings() {
         let ctrl = Binding::click(MouseButtonKind::Left).with_ctrl();
         let shift = Binding::click(MouseButtonKind::Left).with_shift();
         assert!(!ctrl.conflicts_with(&shift));
         assert!(ctrl.matches_click(PointerButton::Primary, mods(true, false, false, true)));
         assert!(shift.matches_click(PointerButton::Primary, mods(false, true, false, false)));
         assert!(!ctrl.matches_click(PointerButton::Primary, mods(false, true, false, false)));
+        let map = InputMap::standard();
+        let none = mods(false, false, false, false);
+        let add = mods(false, true, false, false);
+        let remove = mods(true, false, false, true);
+        assert!(map.clicked(InputAction::SelectReplace, PointerButton::Primary, none));
+        assert!(map.clicked(InputAction::SelectAdd, PointerButton::Primary, add));
+        assert!(map.clicked(InputAction::SelectRemove, PointerButton::Primary, remove));
+        assert!(!map.clicked(InputAction::SelectAdd, PointerButton::Primary, none));
+        assert!(!map.clicked(InputAction::SelectRemove, PointerButton::Primary, add));
     }
 
     #[test]
@@ -735,6 +788,8 @@ mod tests {
     fn sanitize_restores_missing_actions() {
         let mut map = InputMap {
             select_replace: Vec::new(),
+            select_add: Vec::new(),
+            select_remove: Vec::new(),
             select_toggle: Vec::new(),
             select_clear: Vec::new(),
             pan: Vec::new(),
@@ -757,7 +812,9 @@ mod tests {
     fn sanitize_adds_drag_companion_for_saved_select_click() {
         let mut map = InputMap {
             select_replace: vec![Binding::click(MouseButtonKind::Left)],
-            select_toggle: vec![Binding::click(MouseButtonKind::Left).with_ctrl()],
+            select_add: vec![Binding::click(MouseButtonKind::Left).with_shift()],
+            select_remove: vec![Binding::click(MouseButtonKind::Left).with_ctrl()],
+            select_toggle: Vec::new(),
             select_clear: vec![Binding::key("escape")],
             pan: vec![Binding::drag(MouseButtonKind::Middle)],
             zoom_extents: vec![Binding::double_click(MouseButtonKind::Left)],
@@ -766,9 +823,11 @@ mod tests {
         };
         map.sanitize();
         let none = mods(false, false, false, false);
+        let shift = mods(false, true, false, false);
         let ctrl = mods(true, false, false, true);
         assert!(map.dragged(InputAction::SelectReplace, PointerButton::Primary, none));
-        assert!(map.dragged(InputAction::SelectToggle, PointerButton::Primary, ctrl));
+        assert!(map.dragged(InputAction::SelectAdd, PointerButton::Primary, shift));
+        assert!(map.dragged(InputAction::SelectRemove, PointerButton::Primary, ctrl));
         assert!(map.selects_with_pointer(InputAction::SelectReplace, PointerButton::Primary, none));
     }
 
@@ -776,6 +835,8 @@ mod tests {
     fn sanitize_does_not_override_existing_pan_drag() {
         let mut map = InputMap {
             select_replace: vec![Binding::click(MouseButtonKind::Left)],
+            select_add: Vec::new(),
+            select_remove: Vec::new(),
             select_toggle: Vec::new(),
             select_clear: vec![Binding::key("escape")],
             pan: vec![Binding::drag(MouseButtonKind::Left)],
@@ -801,5 +862,33 @@ mod tests {
                 .as_deref(),
             Some("delete")
         );
+    }
+
+    #[test]
+    fn sanitize_migrates_legacy_select_toggle_without_losing_selection() {
+        let json = r#"{
+            "select_replace": [{"mouse":"left","gesture":"click","ctrl":false,"shift":false,"alt":false,"command":false}],
+            "select_toggle": [
+                {"mouse":"left","gesture":"click","ctrl":true,"shift":false,"alt":false,"command":false},
+                {"mouse":"left","gesture":"click","ctrl":false,"shift":true,"alt":false,"command":false},
+                {"mouse":"left","gesture":"drag","ctrl":true,"shift":false,"alt":false,"command":false},
+                {"mouse":"left","gesture":"drag","ctrl":false,"shift":true,"alt":false,"command":false}
+            ],
+            "select_clear": [{"key":"escape","gesture":"key","ctrl":false,"shift":false,"alt":false,"command":false}],
+            "pan": [{"mouse":"middle","gesture":"drag","ctrl":false,"shift":false,"alt":false,"command":false}],
+            "zoom_extents": [{"mouse":"left","gesture":"double_click","ctrl":false,"shift":false,"alt":false,"command":false}]
+        }"#;
+        let mut map: InputMap = serde_json::from_str(json).expect("legacy map");
+        map.sanitize();
+        assert!(map.select_toggle.is_empty());
+        let none = mods(false, false, false, false);
+        let shift = mods(false, true, false, false);
+        let ctrl = mods(true, false, false, true);
+        assert!(map.clicked(InputAction::SelectReplace, PointerButton::Primary, none));
+        assert!(map.clicked(InputAction::SelectAdd, PointerButton::Primary, shift));
+        assert!(map.clicked(InputAction::SelectRemove, PointerButton::Primary, ctrl));
+        assert!(map.dragged(InputAction::SelectAdd, PointerButton::Primary, shift));
+        assert!(map.dragged(InputAction::SelectRemove, PointerButton::Primary, ctrl));
+        assert!(map.conflicts().is_empty());
     }
 }

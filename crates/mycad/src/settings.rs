@@ -314,6 +314,41 @@ mod tests {
     }
 
     #[test]
+    fn old_select_toggle_settings_migrate_to_add_and_remove() {
+        let json = r#"{
+            "schema_version": 4,
+            "bindings": {
+                "select_replace": [{"mouse":"left","gesture":"click","ctrl":false,"shift":false,"alt":false,"command":false}],
+                "select_toggle": [
+                    {"mouse":"left","gesture":"click","ctrl":true,"shift":false,"alt":false,"command":false},
+                    {"mouse":"left","gesture":"click","ctrl":false,"shift":true,"alt":false,"command":false}
+                ],
+                "select_clear": [{"key":"escape","gesture":"key","ctrl":false,"shift":false,"alt":false,"command":false}],
+                "pan": [{"mouse":"middle","gesture":"drag","ctrl":false,"shift":false,"alt":false,"command":false}],
+                "zoom_extents": [{"mouse":"left","gesture":"double_click","ctrl":false,"shift":false,"alt":false,"command":false}]
+            }
+        }"#;
+        let decoded = AppSettings::from_portable_json(json).expect("legacy toggle");
+        assert!(decoded.bindings.select_toggle.is_empty());
+        assert!(!decoded
+            .bindings
+            .bindings_for(InputAction::SelectAdd)
+            .is_empty());
+        assert!(!decoded
+            .bindings
+            .bindings_for(InputAction::SelectRemove)
+            .is_empty());
+        assert!(decoded.bindings.clicked(
+            InputAction::SelectAdd,
+            eframe::egui::PointerButton::Primary,
+            eframe::egui::Modifiers {
+                shift: true,
+                ..eframe::egui::Modifiers::default()
+            }
+        ));
+    }
+
+    #[test]
     fn future_schema_is_rejected() {
         let err = AppSettings::from_portable_json("{\"schema_version\":99,\"zoom_speed\":1.0}")
             .expect_err("future");

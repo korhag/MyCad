@@ -7,6 +7,17 @@ use cad_render::{hit_test, DisplayList, SelectBoxMode, DEFAULT_PICK_TOLERANCE_PX
 use cad_viewport::Camera2;
 
 // ------------------------------------------------------------
+// Enum: SelectionOp
+// Purpose: Explicit replace / add / remove. Never toggle.
+// ------------------------------------------------------------
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionOp {
+    Replace,
+    Add,
+    Remove,
+}
+
+// ------------------------------------------------------------
 // Type: Selection
 // Purpose: Ordered set of top-level model-space entity IDs.
 // ------------------------------------------------------------
@@ -38,6 +49,18 @@ impl Selection {
         self.members.contains(&id)
     }
 
+    pub fn add(&mut self, id: EntityId) {
+        if self.members.insert(id) {
+            self.ids.push(id);
+        }
+    }
+
+    pub fn remove(&mut self, id: EntityId) {
+        if self.members.remove(&id) {
+            self.ids.retain(|existing| *existing != id);
+        }
+    }
+
     pub fn replace(&mut self, id: EntityId) {
         self.ids.clear();
         self.members.clear();
@@ -45,60 +68,43 @@ impl Selection {
         self.members.insert(id);
     }
 
-    pub fn toggle(&mut self, id: EntityId) {
-        if self.members.remove(&id) {
-            self.ids.retain(|existing| *existing != id);
-        } else {
-            self.members.insert(id);
-            self.ids.push(id);
+    pub fn add_all(&mut self, ids: impl IntoIterator<Item = EntityId>) {
+        for id in ids {
+            self.add(id);
         }
+    }
+
+    pub fn remove_all(&mut self, ids: impl IntoIterator<Item = EntityId>) {
+        let drop: HashSet<EntityId> = ids.into_iter().collect();
+        if drop.is_empty() {
+            return;
+        }
+        self.ids.retain(|id| !drop.contains(id));
+        self.members.retain(|id| !drop.contains(id));
     }
 
     pub fn replace_all(&mut self, ids: impl IntoIterator<Item = EntityId>) {
         self.ids.clear();
         self.members.clear();
-        for id in ids {
-            if self.members.insert(id) {
-                self.ids.push(id);
-            }
+        self.add_all(ids);
+    }
+
+    pub fn apply_click(&mut self, hit: Option<EntityId>, op: SelectionOp) {
+        match (op, hit) {
+            (SelectionOp::Replace, Some(id)) => self.replace(id),
+            (SelectionOp::Replace, None) => self.clear(),
+            (SelectionOp::Add, Some(id)) => self.add(id),
+            (SelectionOp::Add, None) => {}
+            (SelectionOp::Remove, Some(id)) => self.remove(id),
+            (SelectionOp::Remove, None) => {}
         }
     }
 
-    pub fn toggle_all(&mut self, ids: impl IntoIterator<Item = EntityId>) {
-        let mut odd = HashSet::new();
-        for id in ids {
-            if !odd.remove(&id) {
-                odd.insert(id);
-            }
-        }
-        if odd.is_empty() {
-            return;
-        }
-        let mut add = Vec::new();
-        let mut remove = HashSet::new();
-        for id in odd {
-            if self.members.contains(&id) {
-                remove.insert(id);
-            } else {
-                add.push(id);
-            }
-        }
-        if !remove.is_empty() {
-            self.ids.retain(|id| !remove.contains(id));
-            self.members.retain(|id| !remove.contains(id));
-        }
-        for id in add {
-            if self.members.insert(id) {
-                self.ids.push(id);
-            }
-        }
-    }
-
-    pub fn commit_box(&mut self, candidates: &[EntityId], toggle: bool) {
-        if toggle {
-            self.toggle_all(candidates.iter().copied());
-        } else {
-            self.replace_all(candidates.iter().copied());
+    pub fn commit_box(&mut self, candidates: &[EntityId], op: SelectionOp) {
+        match op {
+            SelectionOp::Replace => self.replace_all(candidates.iter().copied()),
+            SelectionOp::Add => self.add_all(candidates.iter().copied()),
+            SelectionOp::Remove => self.remove_all(candidates.iter().copied()),
         }
     }
 
@@ -200,12 +206,43 @@ mod tests {
     }
 
     #[test]
-    fn toggle_adds_and_removes() {
+    fn add_keeps_existing_and_appends_new() {
         let mut selection = Selection::default();
-        selection.toggle(id(1));
-        selection.toggle(id(3));
-        selection.toggle(id(1));
-        assert_eq!(selection.ids(), &[id(3)]);
+        selection.add(id(1));
+        selection.add(id(3));
+        selection.add(id(1));
+        assert_eq!(selection.ids(), &[id(1), id(3)]);
+        assert!(selection.contains(id(1)));
+        assert!(selection.contains(id(3)));
+    }
+
+    #[test]
+    fn remove_drops_selected_and_ignores_unselected() {
+        let mut selection = Selection::default();
+        selection.replace_all([id(1), id(2)]);
+        selection.remove(id(1));
+        selection.remove(id(9));
+        assert_eq!(selection.ids(), &[id(2)]);
+        assert!(!selection.contains(id(1)));
+        assert!(!selection.contains(id(9)));
+    }
+
+    #[test]
+    fn apply_click_replace_add_remove_and_empty_space() {
+        let mut selection = Selection::default();
+        selection.apply_click(Some(id(1)), SelectionOp::Replace);
+        selection.apply_click(Some(id(2)), SelectionOp::Add);
+        selection.apply_click(Some(id(2)), SelectionOp::Add);
+        assert_eq!(selection.ids(), &[id(1), id(2)]);
+        selection.apply_click(None, SelectionOp::Add);
+        assert_eq!(selection.ids(), &[id(1), id(2)]);
+        selection.apply_click(Some(id(1)), SelectionOp::Remove);
+        selection.apply_click(Some(id(8)), SelectionOp::Remove);
+        assert_eq!(selection.ids(), &[id(2)]);
+        selection.apply_click(None, SelectionOp::Remove);
+        assert_eq!(selection.ids(), &[id(2)]);
+        selection.apply_click(None, SelectionOp::Replace);
+        assert!(selection.is_empty());
     }
 
     #[test]
@@ -228,8 +265,8 @@ mod tests {
             end: Point3::from_xy(2.0, 0.0),
         }));
         let mut selection = Selection::default();
-        selection.toggle(first.id);
-        selection.toggle(second.id);
+        selection.add(first.id);
+        selection.add(second.id);
         document.remove_model_entity(second.id);
         selection.retain_valid(&document);
         assert_eq!(selection.ids(), &[first.id]);
@@ -246,20 +283,14 @@ mod tests {
     }
 
     #[test]
-    fn toggle_all_adds_and_removes_candidates() {
-        let mut selection = Selection::default();
-        selection.replace_all([id(1), id(2)]);
-        selection.toggle_all([id(2), id(3)]);
-        assert_eq!(selection.ids(), &[id(1), id(3)]);
-    }
-
-    #[test]
-    fn commit_box_replace_and_toggle() {
+    fn commit_box_replace_add_and_remove() {
         let mut selection = Selection::default();
         selection.replace(id(4));
-        selection.commit_box(&[id(1), id(2)], false);
+        selection.commit_box(&[id(1), id(2)], SelectionOp::Replace);
         assert_eq!(selection.ids(), &[id(1), id(2)]);
-        selection.commit_box(&[id(2), id(5)], true);
+        selection.commit_box(&[id(2), id(5)], SelectionOp::Add);
+        assert_eq!(selection.ids(), &[id(1), id(2), id(5)]);
+        selection.commit_box(&[id(2), id(9)], SelectionOp::Remove);
         assert_eq!(selection.ids(), &[id(1), id(5)]);
     }
 
@@ -269,10 +300,14 @@ mod tests {
         let many: Vec<EntityId> = (1..20_001).map(EntityId).collect();
         selection.replace_all(many.iter().copied());
         assert_eq!(selection.len(), 20_000);
-        selection.toggle_all((1..10_001).map(EntityId));
+        selection.remove_all((1..10_001).map(EntityId));
         assert_eq!(selection.len(), 10_000);
         assert_eq!(selection.ids()[0], id(10_001));
         assert!(selection.contains(id(20_000)));
         assert!(!selection.contains(id(1)));
+        selection.add_all((1..5_001).map(EntityId));
+        assert_eq!(selection.len(), 15_000);
+        assert!(selection.contains(id(1)));
+        assert!(selection.contains(id(20_000)));
     }
 }

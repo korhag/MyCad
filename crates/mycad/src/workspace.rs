@@ -335,7 +335,7 @@ pub fn paint_box_select_rect(
         rect,
         0.0,
         fill,
-        Stroke::new(1.5, border),
+        Stroke::new(1.5_f32, border),
         StrokeKind::Inside,
     );
 }

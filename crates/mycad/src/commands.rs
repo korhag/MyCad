@@ -187,7 +187,7 @@ pub enum PreviewGeometry {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LineState {
-    pub points: Vec<Point2>,
+    pub first: Option<Point2>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -291,6 +291,17 @@ impl CommandState {
         )
     }
 
+    pub fn is_erase_picking(&self) -> bool {
+        matches!(
+            self,
+            Self::Modify(ModifyState {
+                kind: ModifyKind::Erase,
+                phase: ModifyPhase::Selecting,
+                ..
+            })
+        )
+    }
+
     pub fn modify_targets(&self) -> &[EntityId] {
         match self {
             Self::Modify(state) => &state.targets,
@@ -317,7 +328,7 @@ impl CommandState {
     }
 
     pub fn start_line(&mut self) {
-        *self = Self::Line(LineState { points: Vec::new() });
+        *self = Self::Line(LineState { first: None });
     }
 
     pub fn start_polyline(&mut self) {
@@ -401,7 +412,7 @@ impl CommandState {
 
     pub fn start_vertex(&self) -> Option<Point2> {
         match self {
-            Self::Line(state) => state.points.first().copied(),
+            Self::Line(state) => state.first,
             Self::Polyline(state) => state.vertices.first().copied(),
             _ => None,
         }
@@ -410,7 +421,6 @@ impl CommandState {
     pub fn write_snap_features(&self, out: &mut Vec<SnapFeature>) {
         out.clear();
         let points: &[Point2] = match self {
-            Self::Line(state) => &state.points,
             Self::Polyline(state) => &state.vertices,
             _ => return,
         };
@@ -439,7 +449,7 @@ impl CommandState {
 
     pub fn base_point(&self) -> Option<Point2> {
         match self {
-            Self::Line(state) => state.points.last().copied(),
+            Self::Line(state) => state.first,
             Self::Polyline(state) => state.vertices.last().copied(),
             Self::Circle(state) => state.center,
             Self::Arc(state) => state.mid.or(state.start),
@@ -454,7 +464,7 @@ impl CommandState {
 
     pub fn dynamic_layout(&self) -> DynamicLayout {
         match self {
-            Self::Line(state) if !state.points.is_empty() => DynamicLayout::LengthAngle,
+            Self::Line(state) if state.first.is_some() => DynamicLayout::LengthAngle,
             Self::Polyline(state) if !state.vertices.is_empty() => DynamicLayout::LengthAngle,
             Self::Circle(state) if state.center.is_some() => DynamicLayout::Radius,
             Self::Rectangle(state) if state.first.is_some() => DynamicLayout::WidthHeight,
@@ -470,16 +480,15 @@ impl CommandState {
 
     pub fn can_finish(&self) -> bool {
         match self {
-            Self::Line(state) => !state.points.is_empty(),
+            Self::Line(state) => state.first.is_some(),
             Self::Polyline(state) => state.vertices.len() >= 2,
             Self::Area(AreaState::Points { vertices }) => vertices.len() >= 3,
             Self::Circle(_) | Self::Arc(_) | Self::Rectangle(_) => true,
             Self::Modify(ModifyState {
                 kind: ModifyKind::Erase,
                 phase: ModifyPhase::Selecting,
-                targets,
                 ..
-            }) => !targets.is_empty(),
+            }) => true,
             Self::Modify(ModifyState {
                 phase: ModifyPhase::Selecting,
                 targets,
@@ -491,7 +500,6 @@ impl CommandState {
 
     pub fn can_close(&self) -> bool {
         match self {
-            Self::Line(state) => polyline_can_close(&state.points),
             Self::Polyline(state) => polyline_can_close(&state.vertices),
             _ => false,
         }
@@ -499,7 +507,7 @@ impl CommandState {
 
     pub fn can_undo_last(&self) -> bool {
         match self {
-            Self::Line(state) => state.points.len() >= 2,
+            Self::Line(state) => state.first.is_some(),
             Self::Polyline(state) => !state.vertices.is_empty(),
             Self::Area(AreaState::Points { vertices }) => !vertices.is_empty(),
             Self::Modify(state) => state.phase != ModifyPhase::Selecting,
@@ -525,8 +533,8 @@ impl CommandState {
 
     pub fn undo_last(&mut self) -> bool {
         match self {
-            Self::Line(state) if state.points.len() >= 2 => {
-                state.points.pop();
+            Self::Line(state) if state.first.is_some() => {
+                state.first = None;
                 true
             }
             Self::Polyline(state) if !state.vertices.is_empty() => {
@@ -759,11 +767,6 @@ impl CommandState {
 
     pub fn close_geometry(&self) -> Option<Geometry> {
         match self {
-            Self::Line(state) if state.points.len() >= 3 => {
-                let first = *state.points.first()?;
-                let last = *state.points.last()?;
-                (first.distance(last) > GEOM_TOLERANCE).then(|| line_geometry(last, first))
-            }
             Self::Polyline(state) if polyline_can_close(&state.vertices) => {
                 Some(lwpolyline_geometry(&state.vertices, true))
             }
@@ -780,9 +783,9 @@ impl CommandState {
             | Self::Area(_)
             | Self::Modify(_) => None,
             Self::Line(state) => {
-                let last = *state.points.last()?;
+                let first = state.first?;
                 let current = current?;
-                Some(PreviewGeometry::LineSegment([last, current]))
+                Some(PreviewGeometry::LineSegment([first, current]))
             }
             Self::Polyline(state) => {
                 if state.vertices.is_empty() {
@@ -812,52 +815,55 @@ impl CommandState {
     pub fn prompt(&self) -> &'static str {
         match self {
             Self::Idle => "Command: Ready",
-            Self::Line(state) if state.points.is_empty() => "LINE — Specify first point",
-            Self::Line(_) => "LINE — Specify next point or press Enter to finish",
-            Self::Polyline(state) if state.vertices.is_empty() => "PLINE — Specify start point",
-            Self::Polyline(_) => "PLINE — Specify next vertex or press Enter to finish",
-            Self::Circle(state) if state.center.is_none() => "CIRCLE — Specify center point",
-            Self::Circle(_) => "CIRCLE — Specify radius",
-            Self::Arc(state) if state.start.is_none() => "ARC — Specify start point",
-            Self::Arc(state) if state.mid.is_none() => "ARC — Specify point on arc",
-            Self::Arc(_) => "ARC — Specify end point",
-            Self::Rectangle(state) if state.first.is_none() => "RECTANGLE — Specify first corner",
-            Self::Rectangle(_) => "RECTANGLE — Specify opposite corner",
-            Self::Distance(state) if state.first.is_none() => "DIST — Specify first point",
-            Self::Distance(_) => "DIST — Specify second point",
+            Self::Line(state) if state.first.is_none() => "LINE • Specify first point",
+            Self::Line(_) => "LINE • Specify second point",
+            Self::Polyline(state) if state.vertices.is_empty() => "PLINE • Specify start point",
+            Self::Polyline(_) => "PLINE • Specify next vertex or press Enter to finish",
+            Self::Circle(state) if state.center.is_none() => "CIRCLE • Specify center point",
+            Self::Circle(_) => "CIRCLE • Specify radius",
+            Self::Arc(state) if state.start.is_none() => "ARC • Specify start point",
+            Self::Arc(state) if state.mid.is_none() => "ARC • Specify point on arc",
+            Self::Arc(_) => "ARC • Specify end point",
+            Self::Rectangle(state) if state.first.is_none() => "RECTANGLE • Specify first corner",
+            Self::Rectangle(_) => "RECTANGLE • Specify opposite corner",
+            Self::Distance(state) if state.first.is_none() => "DIST • Specify first point",
+            Self::Distance(_) => "DIST • Specify second point",
             Self::Angle(AngleState::Prompt) => {
-                "ANGLE — Select first line, or click empty space to specify the vertex"
+                "ANGLE • Select first line, or click empty space to specify the vertex"
             }
-            Self::Angle(AngleState::FirstSegment { .. }) => "ANGLE — Select second line",
+            Self::Angle(AngleState::FirstSegment { .. }) => "ANGLE • Select second line",
             Self::Angle(AngleState::ThreePoint { vertex: None, .. }) => {
-                "ANGLE — Specify the vertex"
+                "ANGLE • Specify the vertex"
             }
             Self::Angle(AngleState::ThreePoint { ray: None, .. }) => {
-                "ANGLE — Specify the first ray"
+                "ANGLE • Specify the first ray"
             }
-            Self::Angle(AngleState::ThreePoint { .. }) => "ANGLE — Specify the second ray",
-            Self::Radius => "RADIUS — Select a Circle or Arc",
-            Self::Area(AreaState::Prompt) => "AREA — Select a closed object or specify first point",
+            Self::Angle(AngleState::ThreePoint { .. }) => "ANGLE • Specify the second ray",
+            Self::Radius => "RADIUS • Select a Circle or Arc",
+            Self::Area(AreaState::Prompt) => "AREA • Select a closed object or specify first point",
             Self::Area(AreaState::Points { vertices }) if vertices.len() < 3 => {
-                "AREA — Specify next boundary point"
+                "AREA • Specify next boundary point"
             }
-            Self::Area(AreaState::Points { .. }) => "AREA — Specify next point, or Enter to finish",
+            Self::Area(AreaState::Points { .. }) => "AREA • Specify next point, or Enter to finish",
             Self::Modify(state) => modify_prompt(state),
         }
     }
 }
 
 fn accept_line_point(state: &mut LineState, point: Point2) -> CommandOutput {
-    if state.points.is_empty() {
-        state.points.push(point);
-        return CommandOutput::None;
+    match state.first {
+        None => {
+            state.first = Some(point);
+            CommandOutput::None
+        }
+        Some(first) => {
+            if first.distance(point) <= GEOM_TOLERANCE {
+                return CommandOutput::Rejected("Length must be greater than zero");
+            }
+            state.first = None;
+            CommandOutput::Geometry(line_geometry(first, point))
+        }
     }
-    let last = *state.points.last().expect("line has a point");
-    if last.distance(point) <= GEOM_TOLERANCE {
-        return CommandOutput::Rejected("Length must be greater than zero");
-    }
-    state.points.push(point);
-    CommandOutput::Geometry(line_geometry(last, point))
 }
 
 fn accept_polyline_point(state: &mut PolylineState, point: Point2) -> CommandOutput {
@@ -999,20 +1005,24 @@ fn modify_preview_transform(
 
 fn modify_prompt(state: &ModifyState) -> &'static str {
     match (state.kind, state.phase) {
-        (_, ModifyPhase::Selecting) => "Select objects, then press Enter",
-        (ModifyKind::Move, ModifyPhase::BasePoint) => "MOVE — Specify base point",
-        (ModifyKind::Move, _) => "MOVE — Specify destination point",
-        (ModifyKind::Copy, ModifyPhase::BasePoint) => "COPY — Specify base point",
-        (ModifyKind::Copy, _) => "COPY — Specify destination point",
-        (ModifyKind::Rotate, ModifyPhase::BasePoint) => "ROTATE — Specify base point",
-        (ModifyKind::Rotate, _) => "ROTATE — Specify rotation angle",
+        (ModifyKind::Erase, _) => "ERASE • Click objects to erase • Esc to finish",
+        (ModifyKind::Move, ModifyPhase::Selecting) => "MOVE • Select objects",
+        (ModifyKind::Move, ModifyPhase::BasePoint) => "MOVE • Specify base point",
+        (ModifyKind::Move, _) => "MOVE • Specify destination point",
+        (ModifyKind::Copy, ModifyPhase::Selecting) => "COPY • Select objects",
+        (ModifyKind::Copy, ModifyPhase::BasePoint) => "COPY • Specify base point",
+        (ModifyKind::Copy, _) => "COPY • Specify destination point",
+        (ModifyKind::Rotate, ModifyPhase::Selecting) => "ROTATE • Select objects",
+        (ModifyKind::Rotate, ModifyPhase::BasePoint) => "ROTATE • Specify base point",
+        (ModifyKind::Rotate, _) => "ROTATE • Specify rotation angle",
+        (ModifyKind::Mirror, ModifyPhase::Selecting) => "MIRROR • Select objects",
         (ModifyKind::Mirror, ModifyPhase::BasePoint) => {
-            "MIRROR — Specify first point of mirror line"
+            "MIRROR • Specify first point of mirror line"
         }
-        (ModifyKind::Mirror, _) => "MIRROR — Specify second point of mirror line",
-        (ModifyKind::Scale, ModifyPhase::BasePoint) => "SCALE — Specify base point",
-        (ModifyKind::Scale, _) => "SCALE — Specify scale factor",
-        (ModifyKind::Erase, _) => "ERASE — Select objects, then press Enter",
+        (ModifyKind::Mirror, _) => "MIRROR • Specify second point of mirror line",
+        (ModifyKind::Scale, ModifyPhase::Selecting) => "SCALE • Select objects",
+        (ModifyKind::Scale, ModifyPhase::BasePoint) => "SCALE • Specify base point",
+        (ModifyKind::Scale, _) => "SCALE • Specify scale factor",
     }
 }
 
@@ -1262,17 +1272,70 @@ mod tests {
     fn line_command_emits_each_completed_segment() {
         let mut command = CommandState::Idle;
         command.start_line();
+        assert_eq!(command.prompt(), "LINE • Specify first point");
         assert!(matches!(
             command.accept_point(Point2::new(1.0, 2.0)),
             CommandOutput::None
         ));
+        assert_eq!(command.prompt(), "LINE • Specify second point");
         assert!(is_line(
             &command.accept_point(Point2::new(5.0, 2.0)),
             Point2::new(1.0, 2.0),
             Point2::new(5.0, 2.0)
         ));
-        assert_eq!(command.base_point(), Some(Point2::new(5.0, 2.0)));
+        assert_eq!(command.base_point(), None);
         assert_eq!(command.kind(), CommandKind::Line);
+        assert_eq!(command.prompt(), "LINE • Specify first point");
+        assert!(command.preview(Some(Point2::new(9.0, 2.0))).is_none());
+    }
+
+    #[test]
+    fn line_resets_after_commit_and_does_not_chain() {
+        let mut command = CommandState::Idle;
+        command.start_line();
+        assert!(matches!(
+            command.accept_point(Point2::new(0.0, 0.0)),
+            CommandOutput::None
+        ));
+        assert!(is_line(
+            &command.accept_point(Point2::new(10.0, 0.0)),
+            Point2::new(0.0, 0.0),
+            Point2::new(10.0, 0.0)
+        ));
+        assert_eq!(command.base_point(), None);
+        assert!(matches!(
+            command.accept_point(Point2::new(4.0, 6.0)),
+            CommandOutput::None
+        ));
+        assert_eq!(command.base_point(), Some(Point2::new(4.0, 6.0)));
+        assert!(is_line(
+            &command.accept_point(Point2::new(4.0, 9.0)),
+            Point2::new(4.0, 6.0),
+            Point2::new(4.0, 9.0)
+        ));
+        assert_eq!(command.kind(), CommandKind::Line);
+        assert_eq!(command.base_point(), None);
+    }
+
+    #[test]
+    fn polyline_stays_continuous_after_each_vertex() {
+        let mut command = CommandState::Idle;
+        command.start_polyline();
+        command.accept_point(Point2::new(0.0, 0.0));
+        command.accept_point(Point2::new(3.0, 0.0));
+        assert_eq!(command.base_point(), Some(Point2::new(3.0, 0.0)));
+        command.accept_point(Point2::new(3.0, 4.0));
+        assert_eq!(command.base_point(), Some(Point2::new(3.0, 4.0)));
+        assert_eq!(command.kind(), CommandKind::Polyline);
+        match command.finish_geometry() {
+            Some(Geometry::LwPolyline {
+                vertices, closed, ..
+            }) => {
+                assert!(!closed);
+                assert_eq!(vertices.len(), 3);
+            }
+            other => panic!("expected polyline, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1517,6 +1580,10 @@ mod tests {
         }];
         command.write_snap_features(&mut snaps);
         assert!(snaps.is_empty());
+        command.accept_point(Point2::new(4.0, 1.0));
+        command.write_snap_features(&mut snaps);
+        assert!(snaps.is_empty());
+        assert_eq!(command.base_point(), None);
     }
 
     #[test]

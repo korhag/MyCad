@@ -47,6 +47,7 @@ pub enum ContextKind {
     TwoPointDraw,
     AreaPoints,
     Modify,
+    Erase,
     Entity,
     Empty,
 }
@@ -93,8 +94,8 @@ pub fn kind_for_command(kind: CommandKind) -> Option<ContextKind> {
         | CommandKind::Copy
         | CommandKind::Rotate
         | CommandKind::Mirror
-        | CommandKind::Scale
-        | CommandKind::Erase => Some(ContextKind::Modify),
+        | CommandKind::Scale => Some(ContextKind::Modify),
+        CommandKind::Erase => Some(ContextKind::Erase),
         CommandKind::Idle => None,
     }
 }
@@ -128,7 +129,7 @@ pub fn show(
             Frame::popup(ui.style())
                 .inner_margin(Margin::same(4))
                 .corner_radius(CornerRadius::same(CORNER as u8))
-                .stroke(Stroke::new(1.0, Color32::from_rgb(48, 58, 56)))
+                .stroke(Stroke::new(1.0_f32, Color32::from_rgb(48, 58, 56)))
                 .shadow(Shadow {
                     offset: [0, 6],
                     blur: 16,
@@ -154,20 +155,11 @@ pub fn show(
                             row(
                                 ui,
                                 None,
-                                "Undo last segment",
+                                "Undo first point",
                                 None,
                                 can_undo,
                                 &mut action,
                                 ContextAction::UndoLast,
-                            );
-                            row(
-                                ui,
-                                None,
-                                "Close",
-                                Some("C"),
-                                can_close,
-                                &mut action,
-                                ContextAction::Close,
                             );
                             separator(ui);
                             row(
@@ -290,6 +282,26 @@ pub fn show(
                                 can_undo,
                                 &mut action,
                                 ContextAction::UndoLast,
+                            );
+                            row(
+                                ui,
+                                None,
+                                "Cancel",
+                                Some("Esc"),
+                                true,
+                                &mut action,
+                                ContextAction::Cancel,
+                            );
+                        }
+                        ContextKind::Erase => {
+                            row(
+                                ui,
+                                None,
+                                "Finish",
+                                Some("Esc"),
+                                true,
+                                &mut action,
+                                ContextAction::Finish,
                             );
                             row(
                                 ui,
@@ -496,7 +508,7 @@ fn separator(ui: &mut Ui) {
     ui.painter().hline(
         rect.min.x + 6.0..=rect.max.x - 6.0,
         y,
-        Stroke::new(1.0, Color32::from_rgb(42, 52, 50)),
+        Stroke::new(1.0_f32, Color32::from_rgb(42, 52, 50)),
     );
     ui.add_space(6.0);
 }
@@ -601,7 +613,7 @@ mod tests {
         );
         assert_eq!(
             kind_for_command(CommandKind::Erase),
-            Some(ContextKind::Modify)
+            Some(ContextKind::Erase)
         );
     }
 

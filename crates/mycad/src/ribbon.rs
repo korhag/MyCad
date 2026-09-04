@@ -502,7 +502,7 @@ fn group_separator(ui: &mut Ui, metrics: &RibbonMetrics, row_left: f32) {
         return;
     }
     let (rect, _) = ui.allocate_exact_size(Vec2::new(metrics.group_gap, height), Sense::hover());
-    let stroke = Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color);
+    let stroke = Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color);
     ui.painter()
         .vline(rect.center().x, rect.y_range().shrink(2.0), stroke);
 }
@@ -656,7 +656,7 @@ fn paint_chip(ui: &Ui, rect: egui::Rect, enabled: bool, active: bool, response: 
     let stroke = if active {
         ui.visuals().selection.stroke
     } else if hovered && enabled {
-        Stroke::new(1.0, ui.visuals().widgets.hovered.bg_stroke.color)
+        Stroke::new(1.0_f32, ui.visuals().widgets.hovered.bg_stroke.color)
     } else {
         Stroke::NONE
     };

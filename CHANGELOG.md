@@ -5,9 +5,23 @@ All notable changes to MyCad are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project versions with [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Workspace version is `0.17.1` (`Cargo.toml`).
+Workspace version is `0.18.0` (`Cargo.toml`).
 
 ## [Unreleased]
+
+## [0.18.0] - 2026-09-04
+
+### Changed
+
+- LINE is a repeated two-point command: each pair of clicks commits one segment and waits for a new first point, instead of chaining from the previous endpoint. POLYLINE keeps continuous vertices, Close, and vertex undo.
+- Selection uses explicit Replace / Add / Remove. Left click replaces or clears, Shift adds, Ctrl removes, including window and crossing boxes. Toggle is no longer the default.
+- Erase deletes immediately from preselection, the Delete key, a click in Erase mode, or a completed erase window. Esc finishes Erase mode; a hidden Enter confirmation is no longer required.
+- Command prompts name the next action (`LINE • Specify first point`, `ERASE • Click objects to erase • Esc to finish`).
+
+### Fixed
+
+- Delete erases the current selection from the viewport even when a ribbon button or other non-text widget has focus. Typing in a text or numeric field still blocks Delete.
+- Saved settings that still contain `select_toggle` migrate to Add (Shift) and Remove (Ctrl) instead of leaving selection unusable.
 
 ## [0.17.1] - 2026-09-04
 

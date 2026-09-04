@@ -379,12 +379,7 @@ fn create_vertex_buffer(device: &wgpu::Device, capacity: u32, label: &str) -> Op
     }))
 }
 
-fn write_vertex_tail(
-    queue: &wgpu::Queue,
-    chunks: &[VertexChunk],
-    start: u32,
-    verts: &[GpuVertex],
-) {
+fn write_vertex_tail(queue: &wgpu::Queue, chunks: &[VertexChunk], start: u32, verts: &[GpuVertex]) {
     write_vertex_range(queue, chunks, start, verts);
 }
 

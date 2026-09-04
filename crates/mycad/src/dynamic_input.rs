@@ -332,7 +332,7 @@ impl DynamicInput {
             painter.rect_stroke(
                 rect,
                 3.0,
-                Stroke::new(1.0, border),
+                Stroke::new(1.0_f32, border),
                 egui::StrokeKind::Inside,
             );
             let live_value = live_for(field.kind, live);

@@ -1,7 +1,7 @@
 //! Curve sampling shared by viewport tessellation and vector PDF export.
 
-use crate::geom::{ocs_to_wcs, Point2, Point3};
 use crate::entity::PolyVertex;
+use crate::geom::{ocs_to_wcs, Point2, Point3};
 use crate::measure::bulge_circle;
 
 pub const CIRCLE_SEGMENTS: usize = 32;

@@ -1357,7 +1357,10 @@ mod tests {
         let entities = entities_section(&dxf);
         let first_3 = entities.find("\n  3\n").expect("group 3");
         let last_1 = entities.rfind("\n  1\n").expect("group 1");
-        assert!(first_3 < last_1, "group 3 chunks must precede the last group 1");
+        assert!(
+            first_3 < last_1,
+            "group 3 chunks must precede the last group 1"
+        );
         assert!(dxf.contains("\\U+0130"));
         let group_3_count = entities.matches("\n  3\n").count();
         assert!(group_3_count >= 2);
