@@ -1,0 +1,18 @@
+---
+description: Do not finish until the app builds and tests with zero errors and zero warnings
+alwaysApply: true
+---
+
+# Clean build gate
+
+Do not finish implementation, a fix, or a UI change until MyCad **builds and tests with no errors and no warnings**.
+
+1. Run `cargo test --workspace` and a binary build (`cargo build -p mycad` or `cargo build --release`).
+2. Treat rustc **warnings as failures**. Fix them in the same change (`dead_code`, unused imports, and similar). Do not leave `#[allow]` unless the warning is a proven false positive with a one-line reason.
+3. Read the compiler output. `Finished` with `generated N warning` is not done. `error: could not compile` is not done.
+4. If rustc itself dies with `STATUS_ACCESS_VIOLATION` or `STATUS_HEAP_CORRUPTION`, retry once with `-j 1`. That is a toolchain crash, not a source error. If a real warning or error is also in the log, fix that first and rebuild.
+
+```text
+BAD — tests passed, ignore "warning: method `mark_clean` is never used"
+GOOD — use or remove the symbol, rebuild, confirm 0 warnings
+```

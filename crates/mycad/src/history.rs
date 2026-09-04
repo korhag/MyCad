@@ -132,7 +132,7 @@ impl History {
         self.redo.clear();
         self.open = None;
         self.revision = 0;
-        self.clean_revision = 0;
+        self.mark_clean();
     }
 
     pub fn begin(&mut self) {

@@ -37,6 +37,20 @@ impl CommandState {
         !matches!(self, Self::Idle)
     }
 
+    pub fn is_line(self) -> bool {
+        matches!(
+            self,
+            Self::LineWaitingForFirstPoint | Self::LineWaitingForNextPoint { .. }
+        )
+    }
+
+    pub fn is_distance(self) -> bool {
+        matches!(
+            self,
+            Self::DistanceWaitingForFirstPoint | Self::DistanceWaitingForSecondPoint { .. }
+        )
+    }
+
     pub fn requests_point(self) -> bool {
         !matches!(self, Self::Idle)
     }

@@ -10,6 +10,7 @@ mod home;
 mod input;
 mod preview;
 mod properties;
+mod ribbon;
 mod selection;
 mod settings;
 mod settings_ui;

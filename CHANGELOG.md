@@ -9,26 +9,27 @@ Workspace version is `0.3.0` (`Cargo.toml`).
 
 ## [Unreleased]
 
-## [0.3.0] - 2026-09-03
+## [0.3.0] - 2026-09-04
 
 ### Added
 
 - Add an interactive LINE command with first/next-point prompts, live preview, repeated segments, Enter or right-click to finish, Esc to cancel, and one undoable transaction per invocation.
 - Add persistent ORTHO (F8) and OSNAP (F3) drafting controls to the status bar, including coordinates and Shift temporary ORTHO reversal while a command requests a point.
 - Add semantic Endpoint, Midpoint, and Center object snaps with fixed-screen-aperture markers and nested INSERT transforms, avoiding false snaps from tessellated curve samples.
-- Add a dockable Home icon ribbon above the viewport with History, Draw, Modify, Measure, and current-layer controls. LINE and Distance start with one click; later drawing, modify, and measurement tools stay visible but disabled until their releases.
+- Add a dockable Home ribbon above the viewport with History, Draw, Modify, Measure, and current-layer controls. LINE and Distance start with one click; later drawing, modify, and measurement tools stay visible but disabled until their releases.
 - Add a one-time dock-layout migration that places Home above the viewport for layouts saved before the toolbar existed, without reopening Home after the user closes it.
 - Add Undo/Redo (Ctrl+Z / Ctrl+Y) so accepted LINE segments can be reversed as a single command.
 - Add a Distance measurement command that reports length, ΔX, ΔY, and angle without modifying the drawing, using imported $INSUNITS when available.
 - Add stable `EntityId` values, current-layer creation defaults from DWG `$CLAYER`, and `$INSUNITS` import so new geometry inherits ByLayer properties and measurements can name millimetres or inches.
 - Add a dirty indicator in the window title and status bar, with discard confirmation on Open or Quit. Editing stays in memory and never overwrites the source DWG.
+- Add a Cursor rule that work is not finished until `cargo` reports no errors and no warnings.
 
 ### Changed
 
 - Change LINE commits to append tessellation, object snaps, extents, and GPU vertices for the new segment so drawing stays interactive on large DWGs. Undo, redo, and file load still rebuild the full display.
-- Shrink the Home ribbon to the icon row so the dock strip is only as tall as the tools, leaving the rest of the window for the viewport.
-- Make the Home ribbon vertically resizable, scaling its icon tiles with the available height and switching to compact text menus when space is limited.
+- Replace the Home icon-tile strip with an adaptive ribbon: horizontal icon+text commands, height-based Micro/Compact/Normal/Expanded density, width-based group overflow instead of a horizontal scrollbar, content-sized controls, and a persistent Layer chip that stays visible as the window shrinks.
 - Fix blank Home ribbons after resizing by using one stable dock-body height for responsive layout and recovering oversized saved splits once.
+- Mark a cleared undo history as the clean baseline so loaded drawings are not dirty and release builds no longer warn about unused `mark_clean`.
 
 ## [0.2.1] - 2026-09-03
 

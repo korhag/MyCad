@@ -319,6 +319,14 @@ impl MyCadApp {
         self.command.is_active()
     }
 
+    pub(crate) fn line_command_is_active(&self) -> bool {
+        self.command.is_line()
+    }
+
+    pub(crate) fn distance_command_is_active(&self) -> bool {
+        self.command.is_distance()
+    }
+
     pub(crate) fn can_undo(&self) -> bool {
         self.history.can_undo()
     }
