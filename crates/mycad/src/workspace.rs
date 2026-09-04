@@ -1,7 +1,7 @@
 //! Persistent dockable workspace: Home, Properties, Viewport, Diagnostics.
 
-use eframe::egui::{self, Color32, Pos2, Rect, Stroke, StrokeKind, Ui};
-use egui_dock::{DockArea, DockState, Node, NodeIndex, Split, Style, TabViewer};
+use eframe::egui::{self, Color32, Margin, Pos2, Rect, Stroke, StrokeKind, Ui};
+use egui_dock::{DockArea, DockState, Node, NodeIndex, Split, Style, TabStyle, TabViewer};
 use serde::{Deserialize, Serialize};
 
 use crate::app::MyCadApp;
@@ -32,13 +32,28 @@ impl WorkspaceTab {
     }
 }
 
-const HOME_SPLIT_FRACTION: f32 = 0.08;
+/// Total Home leaf height used for Reset / first layout (tab bar + body).
+pub const HOME_DEFAULT_HEIGHT_PX: f32 = 50.0;
+/// Smallest Home leaf the splitter will allow. Matches a ~40–45 px ribbon.
+pub const HOME_MIN_LEAF_PX: f32 = 42.0;
+pub const HOME_TAB_BAR_HEIGHT: f32 = 20.0;
+const ASSUMED_WORKSPACE_HEIGHT: f32 = 800.0;
+const LEGACY_HOME_SPLIT_FRACTION: f32 = 0.08;
+
+pub fn home_split_fraction(workspace_height: f32) -> f32 {
+    let height = workspace_height.max(HOME_DEFAULT_HEIGHT_PX);
+    (HOME_DEFAULT_HEIGHT_PX / height).clamp(0.02, 0.25)
+}
+
+fn default_home_fraction() -> f32 {
+    home_split_fraction(ASSUMED_WORKSPACE_HEIGHT)
+}
 
 pub fn default_dock_state() -> DockState<WorkspaceTab> {
     let mut state = DockState::new(vec![WorkspaceTab::Viewport]);
     let [viewport, _home] = state.main_surface_mut().split_above(
         NodeIndex::root(),
-        HOME_SPLIT_FRACTION,
+        default_home_fraction(),
         vec![WorkspaceTab::Home],
     );
     let [viewport, _props] =
@@ -78,7 +93,7 @@ pub fn migrate_home_tab(state: &mut DockState<WorkspaceTab>, already_migrated: b
         let _ = state.split(
             (surface, node),
             Split::Above,
-            HOME_SPLIT_FRACTION,
+            default_home_fraction(),
             Node::leaf(WorkspaceTab::Home),
         );
     } else {
@@ -113,15 +128,74 @@ pub fn recover_home_split_once(
         && ((home_is_top && split.fraction > 0.28) || (home_is_bottom && split.fraction < 0.72))
     {
         let fraction = if home_is_top {
-            HOME_SPLIT_FRACTION
+            default_home_fraction()
         } else {
-            1.0 - HOME_SPLIT_FRACTION
+            1.0 - default_home_fraction()
         };
         if let Node::Vertical(split) = &mut state[surface][parent] {
             split.fraction = fraction;
         }
     }
     true
+}
+
+pub fn apply_compact_home_height(
+    state: &mut DockState<WorkspaceTab>,
+    workspace_height: f32,
+    already_applied: bool,
+) -> bool {
+    if already_applied {
+        return true;
+    }
+    if workspace_height < HOME_DEFAULT_HEIGHT_PX * 2.0 {
+        return false;
+    }
+    let Some((surface, home, _)) = state.find_tab(&WorkspaceTab::Home) else {
+        return true;
+    };
+    let Some(parent) = home.parent() else {
+        return true;
+    };
+    let is_home_leaf = state[surface][home]
+        .tabs()
+        .is_some_and(|tabs| tabs.len() == 1 && tabs[0] == WorkspaceTab::Home);
+    let Node::Vertical(split) = &state[surface][parent] else {
+        return true;
+    };
+    let home_is_top = parent.left() == home;
+    let home_is_bottom = parent.right() == home;
+    if !is_home_leaf || !(home_is_top || home_is_bottom) {
+        return true;
+    }
+    let home_frac = if home_is_top {
+        split.fraction
+    } else {
+        1.0 - split.fraction
+    };
+    let looks_like_default = (home_frac - LEGACY_HOME_SPLIT_FRACTION).abs() < 0.005
+        || (home_frac - default_home_fraction()).abs() < 0.005
+        || home_frac > 0.28;
+    if !looks_like_default {
+        return true;
+    }
+    let fraction = home_split_fraction(workspace_height);
+    if let Node::Vertical(split) = &mut state[surface][parent] {
+        split.fraction = if home_is_top {
+            fraction
+        } else {
+            1.0 - fraction
+        };
+    }
+    true
+}
+
+fn dock_style(ui: &Ui) -> Style {
+    let mut style = Style::from_egui(ui.style().as_ref());
+    style.separator.extra = HOME_MIN_LEAF_PX;
+    style.separator.width = 1.0;
+    style.separator.extra_interact_width = 10.0;
+    style.tab_bar.height = HOME_TAB_BAR_HEIGHT;
+    style
 }
 
 pub fn ensure_tab(state: &mut DockState<WorkspaceTab>, tab: WorkspaceTab) {
@@ -179,7 +253,12 @@ fn replace_null_numbers(value: &mut serde_json::Value) {
 
 pub fn show_workspace(ui: &mut Ui, app: &mut MyCadApp) {
     let mut dock_state = std::mem::replace(&mut app.dock_state, default_dock_state());
-    let style = Style::from_egui(ui.style().as_ref());
+    app.settings.compact_home_height_applied = apply_compact_home_height(
+        &mut dock_state,
+        ui.available_height(),
+        app.settings.compact_home_height_applied,
+    );
+    let style = dock_style(ui);
     {
         let mut viewer = WorkspaceViewer { app };
         DockArea::new(&mut dock_state)
@@ -215,7 +294,7 @@ impl TabViewer for WorkspaceViewer<'_> {
         }
     }
 
-    fn closeable(&mut self, tab: &mut Self::Tab) -> bool {
+    fn is_closeable(&self, tab: &Self::Tab) -> bool {
         !matches!(tab, WorkspaceTab::Viewport)
     }
 
@@ -224,10 +303,18 @@ impl TabViewer for WorkspaceViewer<'_> {
         false
     }
 
+    fn tab_style_override(&self, tab: &Self::Tab, global_style: &TabStyle) -> Option<TabStyle> {
+        if !matches!(tab, WorkspaceTab::Home) {
+            return None;
+        }
+        let mut style = global_style.clone();
+        style.tab_body.inner_margin = Margin::symmetric(4, 2);
+        Some(style)
+    }
+
     fn scroll_bars(&self, tab: &Self::Tab) -> [bool; 2] {
         match tab {
-            WorkspaceTab::Viewport => [false, false],
-            WorkspaceTab::Home => [true, false],
+            WorkspaceTab::Viewport | WorkspaceTab::Home => [false, false],
             _ => [true, true],
         }
     }
@@ -333,13 +420,70 @@ mod layout_tests {
         let Node::Vertical(split) = &mut state[surface][parent] else {
             unreachable!();
         };
-        assert_eq!(split.fraction, HOME_SPLIT_FRACTION);
+        assert_eq!(split.fraction, default_home_fraction());
         split.fraction = 0.6;
         assert!(recover_home_split_once(&mut state, true));
         let Node::Vertical(split) = &state[surface][parent] else {
             unreachable!();
         };
         assert_eq!(split.fraction, 0.6);
+    }
+
+    #[test]
+    fn default_home_split_is_a_pixel_height_not_a_percentage_guess() {
+        let tall = home_split_fraction(1600.0);
+        let short = home_split_fraction(800.0);
+        assert!((short * 800.0 - HOME_DEFAULT_HEIGHT_PX).abs() < 0.5);
+        assert!((tall * 1600.0 - HOME_DEFAULT_HEIGHT_PX).abs() < 0.5);
+        assert!(tall < short);
+        assert!(HOME_MIN_LEAF_PX >= 40.0 && HOME_MIN_LEAF_PX <= 45.0);
+        assert!(HOME_TAB_BAR_HEIGHT >= 18.0 && HOME_TAB_BAR_HEIGHT <= 20.0);
+    }
+
+    #[test]
+    fn compact_home_height_rewrites_legacy_defaults_once() {
+        let mut state = default_dock_state();
+        let (surface, home, _) = state.find_tab(&WorkspaceTab::Home).expect("Home");
+        let parent = home.parent().expect("Home split");
+        let Node::Vertical(split) = &mut state[surface][parent] else {
+            panic!("Home should be above viewport");
+        };
+        split.fraction = LEGACY_HOME_SPLIT_FRACTION;
+        assert!(!apply_compact_home_height(&mut state, 40.0, false));
+        assert!(apply_compact_home_height(&mut state, 900.0, false));
+        {
+            let Node::Vertical(split) = &state[surface][parent] else {
+                unreachable!();
+            };
+            assert!((split.fraction - home_split_fraction(900.0)).abs() < 1e-5);
+        }
+        {
+            let Node::Vertical(split) = &mut state[surface][parent] else {
+                unreachable!();
+            };
+            split.fraction = 0.18;
+        }
+        assert!(apply_compact_home_height(&mut state, 900.0, true));
+        let Node::Vertical(split) = &state[surface][parent] else {
+            unreachable!();
+        };
+        assert!((split.fraction - 0.18).abs() < 1e-5);
+    }
+
+    #[test]
+    fn compact_home_height_preserves_a_user_resized_strip() {
+        let mut state = default_dock_state();
+        let (surface, home, _) = state.find_tab(&WorkspaceTab::Home).expect("Home");
+        let parent = home.parent().expect("Home split");
+        let Node::Vertical(split) = &mut state[surface][parent] else {
+            panic!("Home should be above viewport");
+        };
+        split.fraction = 0.15;
+        assert!(apply_compact_home_height(&mut state, 900.0, false));
+        let Node::Vertical(split) = &state[surface][parent] else {
+            unreachable!();
+        };
+        assert!((split.fraction - 0.15).abs() < 1e-5);
     }
 
     #[test]

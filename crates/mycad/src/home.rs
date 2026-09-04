@@ -9,12 +9,20 @@ use egui_phosphor::regular::{
 };
 
 use crate::app::MyCadApp;
+use crate::commands::CommandKind;
 use crate::ribbon::{self, LayerChoice, LayerState, RibbonAction, RibbonCommand, RibbonGroup};
 
 const CMD_UNDO: &str = "undo";
 const CMD_REDO: &str = "redo";
 const CMD_LINE: &str = "line";
+const CMD_POLYLINE: &str = "polyline";
+const CMD_CIRCLE: &str = "circle";
+const CMD_ARC: &str = "arc";
+const CMD_RECTANGLE: &str = "rectangle";
 const CMD_DISTANCE: &str = "distance";
+const CMD_ANGLE: &str = "angle";
+const CMD_RADIUS: &str = "radius";
+const CMD_AREA: &str = "area";
 
 pub fn show(ui: &mut Ui, app: &mut MyCadApp) {
     let available = ui.available_size();
@@ -28,9 +36,17 @@ pub fn show(ui: &mut Ui, app: &mut MyCadApp) {
 }
 
 fn home_groups(app: &MyCadApp) -> Vec<RibbonGroup> {
-    let idle = !app.command_is_active();
-    let line_active = app.line_command_is_active();
-    let distance_active = app.distance_command_is_active();
+    let kind = app.command_kind();
+    let idle = kind.is_idle();
+    let line_active = kind == CommandKind::Line;
+    let polyline_active = kind == CommandKind::Polyline;
+    let circle_active = kind == CommandKind::Circle;
+    let arc_active = kind == CommandKind::Arc;
+    let rectangle_active = kind == CommandKind::Rectangle;
+    let distance_active = kind == CommandKind::Distance;
+    let angle_active = kind == CommandKind::Angle;
+    let radius_active = kind == CommandKind::Radius;
+    let area_active = kind == CommandKind::Area;
     vec![
         RibbonGroup {
             id: "history",
@@ -72,10 +88,46 @@ fn home_groups(app: &MyCadApp) -> Vec<RibbonGroup> {
                     idle || line_active,
                     line_active,
                 ),
-                later(LINE_SEGMENTS, "Polyline", "PLine", "v0.4.0", 1),
-                later(CIRCLE, "Circle", "Circle", "v0.4.0", 2),
-                later(PATH, "Arc", "Arc", "v0.4.0", 3),
-                later(RECTANGLE, "Rectangle", "Rect", "v0.4.0", 4),
+                command(
+                    CMD_POLYLINE,
+                    "Polyline",
+                    "PLine",
+                    LINE_SEGMENTS,
+                    "P",
+                    1,
+                    idle || polyline_active,
+                    polyline_active,
+                ),
+                command(
+                    CMD_CIRCLE,
+                    "Circle",
+                    "Circle",
+                    CIRCLE,
+                    "C",
+                    2,
+                    idle || circle_active,
+                    circle_active,
+                ),
+                command(
+                    CMD_ARC,
+                    "Arc",
+                    "Arc",
+                    PATH,
+                    "A",
+                    3,
+                    idle || arc_active,
+                    arc_active,
+                ),
+                command(
+                    CMD_RECTANGLE,
+                    "Rectangle",
+                    "Rect",
+                    RECTANGLE,
+                    "R",
+                    4,
+                    idle || rectangle_active,
+                    rectangle_active,
+                ),
             ],
         },
         RibbonGroup {
@@ -104,9 +156,36 @@ fn home_groups(app: &MyCadApp) -> Vec<RibbonGroup> {
                     idle || distance_active,
                     distance_active,
                 ),
-                later(ANGLE, "Angle", "Angle", "v0.6.0", 1),
-                later(CIRCLE, "Radius", "Radius", "v0.6.0", 2),
-                later(POLYGON, "Area", "Area", "v0.6.0", 3),
+                command(
+                    CMD_ANGLE,
+                    "Angle",
+                    "Angle",
+                    ANGLE,
+                    "Angle",
+                    1,
+                    idle || angle_active,
+                    angle_active,
+                ),
+                command(
+                    CMD_RADIUS,
+                    "Radius",
+                    "Radius",
+                    CIRCLE,
+                    "Radius",
+                    2,
+                    idle || radius_active,
+                    radius_active,
+                ),
+                command(
+                    CMD_AREA,
+                    "Area",
+                    "Area",
+                    POLYGON,
+                    "Area",
+                    3,
+                    idle || area_active,
+                    area_active,
+                ),
             ],
         },
     ]
@@ -211,7 +290,14 @@ fn dispatch(app: &mut MyCadApp, action: RibbonAction) {
         RibbonAction::Command(CMD_UNDO) => app.undo(),
         RibbonAction::Command(CMD_REDO) => app.redo(),
         RibbonAction::Command(CMD_LINE) => app.start_line_command(),
+        RibbonAction::Command(CMD_POLYLINE) => app.start_polyline_command(),
+        RibbonAction::Command(CMD_CIRCLE) => app.start_circle_command(),
+        RibbonAction::Command(CMD_ARC) => app.start_arc_command(),
+        RibbonAction::Command(CMD_RECTANGLE) => app.start_rectangle_command(),
         RibbonAction::Command(CMD_DISTANCE) => app.start_distance_command(),
+        RibbonAction::Command(CMD_ANGLE) => app.start_angle_command(),
+        RibbonAction::Command(CMD_RADIUS) => app.start_radius_command(),
+        RibbonAction::Command(CMD_AREA) => app.start_area_command(),
         RibbonAction::Command(_) => {}
         RibbonAction::SetLayer(name) => app.set_current_layer(&name),
         RibbonAction::SetSelectedLayerCurrent => app.set_selected_layer_current(),
@@ -249,7 +335,16 @@ mod tests {
                 name: "Draw",
                 commands: vec![
                     command(CMD_LINE, "Line", "Line", LINE_SEGMENT, "L", 0, idle, false),
-                    later(LINE_SEGMENTS, "Polyline", "PLine", "v0.4.0", 1),
+                    command(
+                        CMD_POLYLINE,
+                        "Polyline",
+                        "PLine",
+                        LINE_SEGMENTS,
+                        "P",
+                        1,
+                        idle,
+                        false,
+                    ),
                 ],
             },
             "Modify" => RibbonGroup {
@@ -285,9 +380,10 @@ mod tests {
     #[test]
     fn home_never_uses_icon_above_text_density() {
         assert_ne!(density_from_height(80.0), RibbonDensity::Micro);
-        let expanded = crate::ribbon::metrics_for(RibbonDensity::Expanded, 80.0);
-        assert!(expanded.show_icons);
-        assert!(expanded.icon_text_gap > 0.0);
+        let compact = crate::ribbon::metrics_for(RibbonDensity::Compact, 80.0);
+        assert!(compact.show_icons);
+        assert!(compact.icon_text_gap > 0.0);
+        assert_eq!(compact.rows, 1);
     }
 
     #[test]

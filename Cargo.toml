@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.6.1"
 edition = "2021"
 license = "GPL-3.0-or-later"
 authors = ["MyCad"]
@@ -43,3 +43,8 @@ thiserror = "2"
 # MSVC 14.41 ICEs on vendored LibreDWG decode.c at /O2 (C1001, 0xC0000005).
 [profile.release.package."libredwg-sys"]
 opt-level = 1
+
+# rustc on Windows MSVC can STATUS_HEAP_CORRUPTION while codegenning mycad
+# at the default 16 release codegen-units. One unit keeps cargo run --release stable.
+[profile.release.package.mycad]
+codegen-units = 1

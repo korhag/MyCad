@@ -1,22 +1,17 @@
 //! Adaptive ribbon: density, overflow packing, and horizontal command chrome.
 //!
-//! Height chooses Micro / Compact / Normal / Expanded. Width hides lower-priority
-//! commands into each group's dropdown. Buttons are content-sized `[icon] Label`.
+//! Desktop density stays compact: `[icon] Label`, one row, overflow menus.
+//! Extra Home height does not enlarge controls. A second row is only a last
+//! resort after group overflow still cannot fit the width.
 
 use eframe::egui::{
     self, Align, Color32, FontId, Layout, Pos2, RichText, Sense, Stroke, StrokeKind, Ui, Vec2,
 };
 
-const MICRO_ENTER: f32 = 29.0;
-const MICRO_LEAVE: f32 = 31.0;
-const COMPACT_ENTER: f32 = 41.0;
-const COMPACT_LEAVE: f32 = 43.0;
-const NORMAL_ENTER: f32 = 62.0;
-const NORMAL_LEAVE: f32 = 66.0;
-
-const MICRO_MAX: f32 = 30.0;
-const COMPACT_MAX: f32 = 42.0;
-const NORMAL_MAX: f32 = 64.0;
+const MICRO_ENTER: f32 = 20.0;
+const MICRO_LEAVE: f32 = 24.0;
+const MICRO_MAX: f32 = 22.0;
+const COMPACT_BODY: f32 = 28.0;
 
 // ------------------------------------------------------------
 // Enum: RibbonDensity
@@ -26,8 +21,6 @@ const NORMAL_MAX: f32 = 64.0;
 pub enum RibbonDensity {
     Micro,
     Compact,
-    Normal,
-    Expanded,
 }
 
 // ------------------------------------------------------------
@@ -123,56 +116,16 @@ pub struct PackedGroup {
 pub fn density_from_height(height: f32) -> RibbonDensity {
     if height < MICRO_MAX {
         RibbonDensity::Micro
-    } else if height < COMPACT_MAX {
-        RibbonDensity::Compact
-    } else if height < NORMAL_MAX {
-        RibbonDensity::Normal
     } else {
-        RibbonDensity::Expanded
+        RibbonDensity::Compact
     }
 }
 
 pub fn resolve_density(height: f32, previous: Option<RibbonDensity>) -> RibbonDensity {
-    let target = density_from_height(height);
-    let Some(prev) = previous else {
-        return target;
-    };
-    if prev == target {
-        return prev;
-    }
-    match prev {
-        RibbonDensity::Micro => {
-            if height > MICRO_LEAVE {
-                target
-            } else {
-                prev
-            }
-        }
-        RibbonDensity::Compact => {
-            if height < MICRO_ENTER {
-                RibbonDensity::Micro
-            } else if height > COMPACT_LEAVE {
-                target
-            } else {
-                prev
-            }
-        }
-        RibbonDensity::Normal => {
-            if height < COMPACT_ENTER {
-                density_from_height(height.min(COMPACT_ENTER - 0.01))
-            } else if height > NORMAL_LEAVE {
-                RibbonDensity::Expanded
-            } else {
-                prev
-            }
-        }
-        RibbonDensity::Expanded => {
-            if height < NORMAL_ENTER {
-                target
-            } else {
-                prev
-            }
-        }
+    match previous {
+        Some(RibbonDensity::Micro) if height <= MICRO_LEAVE => RibbonDensity::Micro,
+        Some(RibbonDensity::Compact) if height >= MICRO_ENTER => RibbonDensity::Compact,
+        _ => density_from_height(height),
     }
 }
 
@@ -190,7 +143,7 @@ pub fn metrics_for(density: RibbonDensity, height: f32) -> RibbonMetrics {
             density,
             font_size: 11.0,
             icon_size: 0.0,
-            row_height: height.clamp(16.0, 26.0),
+            row_height: height.clamp(16.0, 22.0),
             pad_h: 5.0,
             pad_v: 2.0,
             icon_text_gap: 0.0,
@@ -202,9 +155,9 @@ pub fn metrics_for(density: RibbonDensity, height: f32) -> RibbonMetrics {
             rows: 1,
         },
         RibbonDensity::Compact => {
-            let t = ((height - MICRO_MAX) / (COMPACT_MAX - MICRO_MAX)).clamp(0.0, 1.0);
+            let t = ((height - MICRO_MAX) / (COMPACT_BODY - MICRO_MAX)).clamp(0.0, 1.0);
             RibbonMetrics {
-                density,
+                density: RibbonDensity::Compact,
                 font_size: 11.0,
                 icon_size: lerp(12.0, 14.0, t),
                 row_height: lerp(22.0, 26.0, t).clamp(16.0, height.max(16.0)),
@@ -219,53 +172,18 @@ pub fn metrics_for(density: RibbonDensity, height: f32) -> RibbonMetrics {
                 rows: 1,
             }
         }
-        RibbonDensity::Normal => {
-            let t = ((height - COMPACT_MAX) / (NORMAL_MAX - COMPACT_MAX)).clamp(0.0, 1.0);
-            let row_height = lerp(26.0, 31.0, t);
-            let rows = if height >= 52.0 { 2 } else { 1 };
-            RibbonMetrics {
-                density,
-                font_size: lerp(11.0, 13.0, t),
-                icon_size: lerp(14.0, 18.0, t),
-                row_height,
-                pad_h: 5.0,
-                pad_v: 3.0,
-                icon_text_gap: 4.0,
-                button_gap: 2.0,
-                group_gap: 5.0,
-                caption_size: 0.0,
-                show_captions: false,
-                show_icons: true,
-                rows,
-            }
-        }
-        RibbonDensity::Expanded => {
-            let t = ((height - NORMAL_MAX) / 40.0).clamp(0.0, 1.0);
-            let show_captions = height >= 70.0;
-            let row_height = lerp(31.0, 34.0, t);
-            let caption = if show_captions { 10.0 } else { 0.0 };
-            let content = (height - caption - 4.0).max(row_height);
-            let rows = if content >= row_height * 2.0 + 2.0 {
-                2
-            } else {
-                1
-            };
-            RibbonMetrics {
-                density,
-                font_size: lerp(13.0, 14.0, t),
-                icon_size: lerp(18.0, 20.0, t),
-                row_height,
-                pad_h: 6.0,
-                pad_v: 3.0,
-                icon_text_gap: 4.0,
-                button_gap: 2.0,
-                group_gap: 6.0,
-                caption_size: caption,
-                show_captions,
-                show_icons: true,
-                rows,
-            }
-        }
+    }
+}
+
+impl RibbonMetrics {
+    pub fn height_for_rows(self, rows: usize) -> f32 {
+        let caption = if self.show_captions {
+            self.caption_size + 2.0
+        } else {
+            0.0
+        };
+        let rows = rows.max(1) as f32;
+        caption + self.row_height * rows + (rows - 1.0) * 2.0
     }
 }
 
@@ -377,55 +295,83 @@ pub fn show(
         .iter()
         .map(|group| measure_group(ui, group, metrics))
         .collect();
-    let packed = pack_ribbon(
+    let packed_one = pack_ribbon(
         &measured,
         command_width,
         metrics.button_gap,
         metrics.group_gap,
-        metrics.rows,
+        1,
     );
+    let one_row_widths: Vec<f32> = measured
+        .iter()
+        .zip(packed_one.iter())
+        .map(|(group, plan)| packed_group_width(group, plan, metrics.button_gap))
+        .collect();
+    let one_row_fits = groups_fit(&one_row_widths, command_width, 1, metrics.group_gap);
+    let use_second_row =
+        should_use_second_row(one_row_fits, available.y, metrics.height_for_rows(2));
+    let packed = if use_second_row {
+        pack_ribbon(
+            &measured,
+            command_width,
+            metrics.button_gap,
+            metrics.group_gap,
+            2,
+        )
+    } else {
+        packed_one
+    };
+    let used_rows = if use_second_row { 2 } else { 1 };
     let packed_widths: Vec<f32> = measured
         .iter()
         .zip(packed.iter())
         .map(|(group, plan)| packed_group_width(group, plan, metrics.button_gap))
         .collect();
-    let emergency = !groups_fit(
-        &packed_widths,
-        command_width,
-        metrics.rows.max(1),
-        metrics.group_gap,
-    );
+    let emergency = !groups_fit(&packed_widths, command_width, used_rows, metrics.group_gap);
+    let content_h = metrics
+        .height_for_rows(used_rows)
+        .min(available.y.max(metrics.row_height));
 
     let mut action = None;
     ui.spacing_mut().item_spacing = Vec2::new(metrics.button_gap, 1.0);
-    ui.horizontal(|ui| {
-        let command_size = Vec2::new(command_width, available.y);
-        ui.allocate_ui(command_size, |ui| {
-            if emergency {
-                egui::ScrollArea::horizontal()
-                    .id_salt("ribbon-overflow-scroll")
-                    .auto_shrink([false, true])
-                    .scroll_bar_visibility(
-                        egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded,
-                    )
-                    .show(ui, |ui| {
-                        action = draw_command_row(ui, groups, &packed, metrics, false);
+    ui.allocate_ui(Vec2::new(available.x, content_h), |ui| {
+        ui.horizontal(|ui| {
+            let command_size = Vec2::new(command_width, content_h);
+            ui.allocate_ui(command_size, |ui| {
+                if emergency {
+                    egui::ScrollArea::horizontal()
+                        .id_salt("ribbon-overflow-scroll")
+                        .auto_shrink([false, true])
+                        .scroll_bar_visibility(
+                            egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded,
+                        )
+                        .show(ui, |ui| {
+                            action = draw_command_row(ui, groups, &packed, metrics, false);
+                        });
+                } else {
+                    action = draw_command_row(ui, groups, &packed, metrics, use_second_row);
+                }
+            });
+            if let Some(state) = layer {
+                ui.allocate_ui(Vec2::new(layer_width, content_h), |ui| {
+                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                        if let Some(layer_action) = layer_control(ui, state, metrics, available.x) {
+                            action = Some(layer_action);
+                        }
                     });
-            } else {
-                action = draw_command_row(ui, groups, &packed, metrics, metrics.rows > 1);
+                });
             }
         });
-        if let Some(state) = layer {
-            ui.allocate_ui(Vec2::new(layer_width, available.y), |ui| {
-                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                    if let Some(layer_action) = layer_control(ui, state, metrics, available.x) {
-                        action = Some(layer_action);
-                    }
-                });
-            });
-        }
     });
     action
+}
+
+pub fn should_use_second_row(
+    one_row_fits: bool,
+    available_height: f32,
+    two_row_height: f32,
+) -> bool {
+    !one_row_fits && available_height + 0.5 >= two_row_height
 }
 
 fn draw_command_row(
@@ -761,19 +707,13 @@ fn estimate_layer_width(
 }
 
 fn show_set_from_selected(density: RibbonDensity, total_width: f32) -> bool {
-    match density {
-        RibbonDensity::Micro | RibbonDensity::Compact => false,
-        RibbonDensity::Normal => total_width >= 860.0,
-        RibbonDensity::Expanded => true,
-    }
+    !matches!(density, RibbonDensity::Micro) && total_width >= 860.0
 }
 
 fn layer_name_budget(density: RibbonDensity) -> f32 {
     match density {
         RibbonDensity::Micro => 0.0,
-        RibbonDensity::Compact => 90.0,
-        RibbonDensity::Normal => 120.0,
-        RibbonDensity::Expanded => 200.0,
+        RibbonDensity::Compact => 120.0,
     }
 }
 
@@ -795,7 +735,7 @@ fn ellipsize(ui: &Ui, text: &str, font_size: f32, max_width: f32) -> String {
 fn layer_chip_label(ui: &Ui, state: &LayerState, metrics: &RibbonMetrics) -> String {
     match metrics.density {
         RibbonDensity::Micro => "Layer ▾".into(),
-        RibbonDensity::Compact | RibbonDensity::Normal => {
+        RibbonDensity::Compact => {
             let name = ellipsize(
                 ui,
                 &state.current,
@@ -803,15 +743,6 @@ fn layer_chip_label(ui: &Ui, state: &LayerState, metrics: &RibbonMetrics) -> Str
                 layer_name_budget(metrics.density),
             );
             format!("{name} ▾")
-        }
-        RibbonDensity::Expanded => {
-            let name = ellipsize(
-                ui,
-                &state.current,
-                metrics.font_size,
-                layer_name_budget(metrics.density),
-            );
-            format!("Layer: {name} ▾")
         }
     }
 }
@@ -904,74 +835,57 @@ mod tests {
     }
 
     #[test]
-    fn density_breakpoints_match_the_height_table() {
-        assert_eq!(density_from_height(28.0), RibbonDensity::Micro);
-        assert_eq!(density_from_height(30.0), RibbonDensity::Compact);
-        assert_eq!(density_from_height(41.9), RibbonDensity::Compact);
-        assert_eq!(density_from_height(42.0), RibbonDensity::Normal);
-        assert_eq!(density_from_height(63.9), RibbonDensity::Normal);
-        assert_eq!(density_from_height(64.0), RibbonDensity::Expanded);
+    fn density_stays_compact_when_the_pane_is_tall() {
+        assert_eq!(density_from_height(18.0), RibbonDensity::Micro);
+        assert_eq!(density_from_height(22.0), RibbonDensity::Compact);
+        assert_eq!(density_from_height(80.0), RibbonDensity::Compact);
+        assert_eq!(density_from_height(200.0), RibbonDensity::Compact);
     }
 
     #[test]
     fn hysteresis_avoids_flashing_around_micro() {
         assert_eq!(
-            resolve_density(30.5, Some(RibbonDensity::Micro)),
+            resolve_density(23.0, Some(RibbonDensity::Micro)),
             RibbonDensity::Micro
         );
         assert_eq!(
-            resolve_density(31.5, Some(RibbonDensity::Micro)),
+            resolve_density(25.0, Some(RibbonDensity::Micro)),
             RibbonDensity::Compact
         );
         assert_eq!(
-            resolve_density(29.5, Some(RibbonDensity::Compact)),
+            resolve_density(21.0, Some(RibbonDensity::Compact)),
             RibbonDensity::Compact
         );
         assert_eq!(
-            resolve_density(28.5, Some(RibbonDensity::Compact)),
+            resolve_density(19.0, Some(RibbonDensity::Compact)),
             RibbonDensity::Micro
         );
     }
 
     #[test]
-    fn hysteresis_holds_normal_and_expanded() {
-        assert_eq!(
-            resolve_density(42.5, Some(RibbonDensity::Compact)),
-            RibbonDensity::Compact
-        );
-        assert_eq!(
-            resolve_density(43.5, Some(RibbonDensity::Compact)),
-            RibbonDensity::Normal
-        );
-        assert_eq!(
-            resolve_density(63.0, Some(RibbonDensity::Expanded)),
-            RibbonDensity::Expanded
-        );
-        assert_eq!(
-            resolve_density(61.0, Some(RibbonDensity::Expanded)),
-            RibbonDensity::Normal
-        );
+    fn tall_home_does_not_enlarge_compact_controls() {
+        let compact = metrics_for(RibbonDensity::Compact, 28.0);
+        let tall = metrics_for(RibbonDensity::Compact, 200.0);
+        assert_eq!(compact.font_size, tall.font_size);
+        assert!((compact.icon_size - tall.icon_size).abs() < 1e-4);
+        assert!((compact.row_height - tall.row_height).abs() < 1e-4);
+        assert_eq!(compact.rows, 1);
+        assert_eq!(tall.rows, 1);
+        assert!(tall.height_for_rows(1) <= 28.0);
+        assert!(tall.icon_size <= 14.0);
+        assert!(tall.font_size <= 11.0 + 1e-4);
     }
 
     #[test]
-    fn normal_metrics_lerp_inside_the_breakpoint() {
-        let low = metrics_for(RibbonDensity::Normal, 42.0);
-        let high = metrics_for(RibbonDensity::Normal, 64.0);
-        assert!((low.font_size - 11.0).abs() < 1e-4);
-        assert!((high.font_size - 13.0).abs() < 1e-4);
-        assert!((low.icon_size - 14.0).abs() < 1e-4);
-        assert!((high.icon_size - 18.0).abs() < 1e-4);
-        assert!(high.row_height > low.row_height);
-        assert_eq!(low.rows, 1);
-        assert_eq!(metrics_for(RibbonDensity::Normal, 52.0).rows, 2);
-        assert!(!low.show_icons || low.density == RibbonDensity::Normal);
-        assert!(low.show_icons);
-        assert!(!low.show_captions);
+    fn second_row_is_last_resort_after_overflow() {
+        assert!(!should_use_second_row(true, 80.0, 54.0));
+        assert!(should_use_second_row(false, 80.0, 54.0));
+        assert!(!should_use_second_row(false, 40.0, 54.0));
     }
 
     #[test]
     fn micro_is_text_only_and_single_row() {
-        let metrics = metrics_for(RibbonDensity::Micro, 28.0);
+        let metrics = metrics_for(RibbonDensity::Micro, 20.0);
         assert!(!metrics.show_icons);
         assert_eq!(metrics.rows, 1);
         assert_eq!(metrics.icon_size, 0.0);

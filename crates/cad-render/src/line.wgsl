@@ -2,6 +2,7 @@ struct Uniforms {
     view_proj: mat4x4<f32>,
     overlay_color: vec4<f32>,
     overlay_params: vec4<f32>,
+    model: mat4x4<f32>,
 };
 
 @group(0) @binding(0)
@@ -20,7 +21,7 @@ struct VertexOutput {
 @vertex
 fn vs_main(in: VertexInput) -> VertexOutput {
     var out: VertexOutput;
-    out.clip_position = uniforms.view_proj * vec4<f32>(in.position, 0.0, 1.0);
+    out.clip_position = uniforms.view_proj * uniforms.model * vec4<f32>(in.position, 0.0, 1.0);
     out.color = mix(in.color, uniforms.overlay_color, uniforms.overlay_params.x);
     return out;
 }

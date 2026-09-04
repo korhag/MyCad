@@ -30,10 +30,12 @@ cargo build --release -p mycad
 `libredwg-sys`.
 
 On Windows, `cargo build --release` can hit an MSVC internal compiler error in
-`decode.c`. Use a debug run instead, or keep the workspace `libredwg-sys`
-release `opt-level = 1` override:
+`decode.c`. Keep the workspace `libredwg-sys` release `opt-level = 1` override.
+If rustc itself exits with `STATUS_HEAP_CORRUPTION` while compiling `mycad`,
+retry with `-j 1` (the workspace also pins `mycad` release `codegen-units = 1`):
 
 ```powershell
+cargo run --release -j 1
 cargo run -p mycad -- "test-data/KD-1413-260825 Assir Poultry Internal Logistics.dwg"
 ```
 

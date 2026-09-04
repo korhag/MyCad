@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use cad_core::Point2;
+use cad_core::{Point2, Transform2};
 use cad_viewport::Camera2;
 use egui::PaintCallbackInfo;
 use egui_wgpu::wgpu;
@@ -15,10 +15,11 @@ struct Uniforms {
     view_proj: [[f32; 4]; 4],
     overlay_color: [f32; 4],
     overlay_params: [f32; 4],
+    model: [[f32; 4]; 4],
 }
 
 const UNIFORM_SIZE: u64 = std::mem::size_of::<Uniforms>() as u64;
-const _: () = assert!(UNIFORM_SIZE == 96);
+const _: () = assert!(UNIFORM_SIZE == 160);
 
 struct UniformSlot {
     buffer: wgpu::Buffer,
@@ -300,11 +301,13 @@ impl UniformSlot {
         aspect: f64,
         overlay_color: [f32; 4],
         overlay_mix: f32,
+        model: [[f32; 4]; 4],
     ) {
         let uniforms = Uniforms {
             view_proj: camera.view_proj_f32(origin, aspect),
             overlay_color,
             overlay_params: [overlay_mix, 0.0, 0.0, 0.0],
+            model,
         };
         queue.write_buffer(&self.buffer, 0, bytemuck::bytes_of(&uniforms));
     }
@@ -402,6 +405,7 @@ pub struct CadFrame {
     pub selection_color: [f32; 4],
     pub preview: OverlayBatches,
     pub preview_color: [f32; 4],
+    pub preview_model: [[f32; 4]; 4],
 }
 
 impl egui_wgpu::CallbackTrait for CadFrame {
@@ -417,8 +421,15 @@ impl egui_wgpu::CallbackTrait for CadFrame {
             return Vec::new();
         };
         gpu.upload(device, queue, &self.display, self.generation, self.upload);
-        gpu.scene
-            .write(queue, self.camera, self.origin, self.aspect, [0.0; 4], 0.0);
+        gpu.scene.write(
+            queue,
+            self.camera,
+            self.origin,
+            self.aspect,
+            [0.0; 4],
+            0.0,
+            Transform2::identity_mat4(),
+        );
         gpu.selection.write(
             queue,
             self.camera,
@@ -426,6 +437,7 @@ impl egui_wgpu::CallbackTrait for CadFrame {
             self.aspect,
             self.selection_color,
             1.0,
+            Transform2::identity_mat4(),
         );
         gpu.preview.write(
             queue,
@@ -434,6 +446,7 @@ impl egui_wgpu::CallbackTrait for CadFrame {
             self.aspect,
             self.preview_color,
             1.0,
+            self.preview_model,
         );
         Vec::new()
     }
@@ -517,11 +530,26 @@ fn draw_overlay(
 #[cfg(test)]
 mod tests {
     use super::{plan_gpu_upload, GpuUpload, GpuUploadPlan};
+    use cad_core::Transform2;
 
     #[test]
-    fn overlay_uniforms_are_96_bytes() {
-        assert_eq!(super::UNIFORM_SIZE, 96);
-        assert_eq!(std::mem::size_of::<super::Uniforms>(), 96);
+    fn overlay_uniforms_are_160_bytes() {
+        assert_eq!(super::UNIFORM_SIZE, 160);
+        assert_eq!(std::mem::size_of::<super::Uniforms>(), 160);
+    }
+
+    #[test]
+    fn large_coordinate_preview_model_matches_local_origin_transform() {
+        let origin = cad_core::Point2::new(1.0e8, -5.0e7);
+        let world = Transform2::translate(12.0, 8.0);
+        let local = world.to_local_origin(origin);
+        let stored = cad_core::Point2::new(4.0, 1.0);
+        let preview = local.apply(stored);
+        assert!((preview.x - 16.0).abs() < 1e-6);
+        assert!((preview.y - 9.0).abs() < 1e-6);
+        let model = local.to_mat4();
+        assert!((model[3][0] - 12.0).abs() < 1e-4);
+        assert!((model[3][1] - 8.0).abs() < 1e-4);
     }
 
     #[test]

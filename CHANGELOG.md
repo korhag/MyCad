@@ -5,9 +5,58 @@ All notable changes to MyCad are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project versions with [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Workspace version is `0.3.0` (`Cargo.toml`).
+Workspace version is `0.6.1` (`Cargo.toml`).
 
 ## [Unreleased]
+
+## [0.6.1] - 2026-09-04
+
+### Added
+
+- Add Endpoint and Midpoint snaps from accepted Line and Polyline vertices before the command commits, merged with drawing snaps inside the same 9-pixel aperture.
+
+### Fixed
+
+- Close a Polyline by snapping to the first vertex, pressing C, or right-click Close without storing the start point twice, and keep explicit Close working when OSNAP is off.
+- Keep Length and Angle dynamic-input fields on the snapped point unless a typed or locked value forbids that snap.
+
+## [0.6.0] - 2026-09-04
+
+### Added
+
+- Add inspect-only Distance, Angle, Radius, and Area tools that never create Dimension entities, dirty the drawing, or enter Undo history.
+- Add a shared double-precision measurement model so the viewport overlay, status prompt, Properties panel, and clipboard copy the same formatted values and `$INSUNITS` labels, including area units such as `mm²`.
+- Add a semantic `MeasureIndex`, built once per drawing like object snaps, so Radius and Angle pick exact Circle, Arc, and straight segment geometry—including uniformly scaled nested INSERTs—instead of tessellated display paths.
+- Add a transient amber measurement overlay with constant-pixel markers, a compact result card (Copy / Close), live Distance/Area previews, and a top-level Measure menu beside the Home ribbon commands.
+
+### Changed
+
+- Change Distance to keep OSNAP, live ΔX/ΔY/angle beside the cursor, a measurement line until the second click, and the finished result until Esc, Close, file load, or a document edit.
+- Enable Angle, Radius, and Area on the Home ribbon while keeping the super-tight adaptive layout and content-sized controls.
+
+### Fixed
+
+- Reject non-uniformly scaled Circles as ellipses with a clear message instead of reporting a false radius.
+- Reject open and self-intersecting Area boundaries with a short explanation, and keep clockwise and counterclockwise closed polylines, including bulge arcs, reporting the same area.
+
+## [0.4.0] - 2026-09-04
+
+### Added
+
+- Add Polyline, Circle, Arc, and Rectangle drawing commands alongside LINE, so Basic Draw can create the geometry types the renderer already displays.
+- Add compact Length/Angle, Radius, and Width/Height fields beside the cursor for exact numeric input, including Tab to lock a value and Enter to accept the point.
+- Add a viewport right-click menu (rebindable, default unmodified right-click) with Finish/Undo/Close during Line and Polyline, Back/Cancel during Circle, Arc, and Rectangle, and Properties, layer, repeat, and Zoom Extents when idle.
+- Add a tested `arc_from_three_points()` constructor so three-point arcs pass through the middle point for both clockwise and counterclockwise clicks.
+
+### Changed
+
+- Change drawing commands to share one `CommandState` / `CommandKind` foundation and a generic `commit_geometry` path that assigns the current layer, records one history edit, and appends display and snap data without rebuilding the drawing.
+- Enable the Home ribbon and Draw menu entries for Polyline, Circle, Arc, and Rectangle, highlight the active tool, and keep a second drawing command from starting until the current one finishes or is canceled.
+
+### Fixed
+
+- Keep right-drag pan from opening the context menu, and keep a right-click from both opening the menu and placing a point.
+- Pin `mycad` release `codegen-units` to 1 so Windows `cargo run --release` does not die in rustc with `STATUS_HEAP_CORRUPTION`.
 
 ## [0.3.0] - 2026-09-04
 
@@ -27,7 +76,8 @@ Workspace version is `0.3.0` (`Cargo.toml`).
 ### Changed
 
 - Change LINE commits to append tessellation, object snaps, extents, and GPU vertices for the new segment so drawing stays interactive on large DWGs. Undo, redo, and file load still rebuild the full display.
-- Replace the Home icon-tile strip with an adaptive ribbon: horizontal icon+text commands, height-based Micro/Compact/Normal/Expanded density, width-based group overflow instead of a horizontal scrollbar, content-sized controls, and a persistent Layer chip that stays visible as the window shrinks.
+- Replace the Home icon-tile strip with an adaptive ribbon: horizontal icon+text commands, a compact desktop density that does not grow with unused Home height, width-based group overflow instead of a dock scrollbar, content-sized controls, and a persistent Layer chip.
+- Size the default Home split from a ~50 px leaf height instead of a window-percentage, lower the dock splitter floor so Home can shrink to about 42 px, and keep the separator easy to grab.
 - Fix blank Home ribbons after resizing by using one stable dock-body height for responsive layout and recovering oversized saved splits once.
 - Mark a cleared undo history as the clean baseline so loaded drawings are not dirty and release builds no longer warn about unused `mark_clean`.
 

@@ -10,7 +10,7 @@ use crate::workspace::{
 };
 
 pub const STORAGE_KEY: &str = "mycad_settings";
-pub const SETTINGS_SCHEMA_VERSION: u32 = 4;
+pub const SETTINGS_SCHEMA_VERSION: u32 = 5;
 pub const DEFAULT_ZOOM_SPEED: f64 = 1.0;
 pub const ZOOM_SPEED_MIN: f64 = 0.25;
 pub const ZOOM_SPEED_MAX: f64 = 10.0;
@@ -116,6 +116,8 @@ pub struct AppSettings {
     pub home_layout_migrated: bool,
     #[serde(default)]
     pub responsive_ribbon_recovered: bool,
+    #[serde(default)]
+    pub compact_home_height_applied: bool,
 }
 
 impl Default for AppSettings {
@@ -128,6 +130,7 @@ impl Default for AppSettings {
             drafting: DraftingPreferences::default(),
             home_layout_migrated: false,
             responsive_ribbon_recovered: false,
+            compact_home_height_applied: false,
         }
     }
 }
@@ -269,7 +272,7 @@ mod tests {
                 .as_deref(),
             Some("space")
         );
-        assert!(json.contains("\"schema_version\": 4"));
+        assert!(json.contains("\"schema_version\": 5"));
         assert!(!json.to_lowercase().contains(".dwg"));
     }
 
@@ -293,6 +296,10 @@ mod tests {
         assert!(!decoded
             .bindings
             .bindings_for(InputAction::SelectReplace)
+            .is_empty());
+        assert!(!decoded
+            .bindings
+            .bindings_for(InputAction::ContextMenu)
             .is_empty());
     }
 

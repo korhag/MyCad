@@ -6,7 +6,11 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
-use cad_core::{DistanceReport, Document, Extents2, Geometry, Point2, Point3, SnapIndex};
+use cad_core::{
+    Document, Entity, EntityTransform, Geometry, MeasureIndex, MeasureRole, MeasurementResult,
+    Point2, SnapFeature, SnapIndex, Transform2, TransformError, GEOM_TOLERANCE, reference_radius,
+    transform_entity, validate_entities,
+};
 use cad_render::{
     tessellate_document, CadFrame, CadGpu, DisplayList, GpuUpload, OverlayBatches, SelectBoxMode,
 };
@@ -14,9 +18,12 @@ use cad_viewport::Camera2;
 use dwg_import::ImportError;
 use eframe::egui::{self, PointerButton, Rect, Ui};
 
-use crate::commands::{CommandOutput, CommandState};
+use crate::commands::{AngleState, AreaState, CommandKind, CommandOutput, CommandState, ModifyKind};
+use crate::context_menu::{self, ContextAction, ContextKind, MenuResult, ViewportMenu};
 use crate::drafting::DraftingState;
+use crate::dynamic_input::{DynamicInput, DynamicKeyResult, DynamicLayout, LiveValues};
 use crate::history::{Edit, History};
+use crate::measurement::{self, CardAction, MeasurementOverlay};
 use crate::input::InputAction;
 use crate::selection::{box_pick_entities_into, pick_entity, Selection};
 use crate::settings::{scroll_to_zoom_factor, AppSettings, RgbColor};
@@ -31,6 +38,7 @@ enum LoadMsg {
         document: Box<Document>,
         display: Box<DisplayList>,
         snaps: Box<SnapIndex>,
+        measures: Box<MeasureIndex>,
     },
     Failure {
         path: PathBuf,
@@ -56,6 +64,10 @@ struct KeyChord {
     f3: bool,
     f8: bool,
     line: bool,
+    polyline: bool,
+    circle: bool,
+    arc: bool,
+    rectangle: bool,
     distance: bool,
     enter: bool,
     escape: bool,
@@ -88,14 +100,22 @@ pub struct MyCadApp {
     pub(crate) selection: Selection,
     pub(crate) drafting: DraftingState,
     command: CommandState,
+    last_command: Option<CommandKind>,
+    dynamic_input: DynamicInput,
+    context_menu: Option<ViewportMenu>,
     history: History,
     snaps: Arc<SnapIndex>,
+    measures: Arc<MeasureIndex>,
+    measurement: Option<MeasurementOverlay>,
+    measure_card_hovered: bool,
+    viewport_height: f64,
     cursor_world: Option<Point2>,
     input_consumed_escape: bool,
     pending_open: Option<PathBuf>,
     pending_discard: Option<PendingDiscard>,
     last_pointer: Option<egui::Pos2>,
     box_select: Option<BoxSelectDrag>,
+    command_snaps: Vec<SnapFeature>,
 }
 
 impl MyCadApp {
@@ -131,14 +151,22 @@ impl MyCadApp {
             selection: Selection::default(),
             drafting: DraftingState::new(drafting_preferences),
             command: CommandState::Idle,
+            last_command: None,
+            dynamic_input: DynamicInput::default(),
+            context_menu: None,
             history: History::default(),
             snaps: Arc::new(SnapIndex::default()),
+            measures: Arc::new(MeasureIndex::default()),
+            measurement: None,
+            measure_card_hovered: false,
+            viewport_height: 600.0,
             cursor_world: None,
             input_consumed_escape: false,
             pending_open: initial_path,
             pending_discard: None,
             last_pointer: None,
             box_select: None,
+            command_snaps: Vec::new(),
         };
         workspace::sanitize_dock_state(&mut app.dock_state);
         if let Some(path) = app.pending_open.take() {
@@ -164,6 +192,9 @@ impl MyCadApp {
         self.selection.clear();
         self.box_select = None;
         self.command.cancel();
+        self.measurement = None;
+        self.dynamic_input.set_layout(DynamicLayout::Hidden);
+        self.context_menu = None;
         self.drafting.clear_acquisition();
         self.history.commit_open();
         self.loading_path = Some(path.clone());
@@ -177,11 +208,13 @@ impl MyCadApp {
                     let prepare = Instant::now();
                     let display = tessellate_document(&document);
                     let snaps = SnapIndex::build(&document);
+                    let measures = MeasureIndex::build(&document);
                     document.diagnostics.render_prepare_time = prepare.elapsed();
                     let _ = tx.send(LoadMsg::Success {
                         document: Box::new(document),
                         display: Box::new(display),
                         snaps: Box::new(snaps),
+                        measures: Box::new(measures),
                     });
                 }
                 Err(err) => {
@@ -203,6 +236,7 @@ impl MyCadApp {
                 document,
                 display,
                 snaps,
+                measures,
             }) => {
                 let document = *document;
                 let display = *display;
@@ -226,11 +260,13 @@ impl MyCadApp {
                 self.selection.clear();
                 self.box_select = None;
                 self.command.cancel();
+                self.measurement = None;
                 self.drafting.clear_acquisition();
                 self.history.clear();
                 self.document = Some(document);
                 self.display = Arc::new(display);
                 self.snaps = Arc::new(*snaps);
+                self.measures = Arc::new(*measures);
                 self.gpu_upload = GpuUpload::Full;
                 self.display_generation = self.display_generation.wrapping_add(1);
                 self.loading_path = None;
@@ -319,12 +355,8 @@ impl MyCadApp {
         self.command.is_active()
     }
 
-    pub(crate) fn line_command_is_active(&self) -> bool {
-        self.command.is_line()
-    }
-
-    pub(crate) fn distance_command_is_active(&self) -> bool {
-        self.command.is_distance()
+    pub(crate) fn command_kind(&self) -> CommandKind {
+        self.command.kind()
     }
 
     pub(crate) fn can_undo(&self) -> bool {
@@ -340,34 +372,263 @@ impl MyCadApp {
     }
 
     pub(crate) fn start_line_command(&mut self) {
-        self.box_select = None;
-        self.history.commit_open();
-        self.history.begin();
-        self.command.start_line();
-        self.drafting.clear_acquisition();
-        self.status = "LINE started".into();
+        self.start_kind(CommandKind::Line);
+    }
+
+    pub(crate) fn start_polyline_command(&mut self) {
+        self.start_kind(CommandKind::Polyline);
+    }
+
+    pub(crate) fn start_circle_command(&mut self) {
+        self.start_kind(CommandKind::Circle);
+    }
+
+    pub(crate) fn start_arc_command(&mut self) {
+        self.start_kind(CommandKind::Arc);
+    }
+
+    pub(crate) fn start_rectangle_command(&mut self) {
+        self.start_kind(CommandKind::Rectangle);
     }
 
     pub(crate) fn start_distance_command(&mut self) {
+        self.start_kind(CommandKind::Distance);
+    }
+
+    pub(crate) fn start_angle_command(&mut self) {
+        self.start_kind(CommandKind::Angle);
+    }
+
+    pub(crate) fn start_radius_command(&mut self) {
+        self.start_kind(CommandKind::Radius);
+    }
+
+    pub(crate) fn start_area_command(&mut self) {
+        self.start_kind(CommandKind::Area);
+    }
+
+    pub(crate) fn start_move_command(&mut self) {
+        self.start_kind(CommandKind::Move);
+    }
+
+    pub(crate) fn start_copy_command(&mut self) {
+        self.start_kind(CommandKind::Copy);
+    }
+
+    pub(crate) fn start_rotate_command(&mut self) {
+        self.start_kind(CommandKind::Rotate);
+    }
+
+    pub(crate) fn start_mirror_command(&mut self) {
+        self.start_kind(CommandKind::Mirror);
+    }
+
+    pub(crate) fn start_scale_command(&mut self) {
+        self.start_kind(CommandKind::Scale);
+    }
+
+    pub(crate) fn start_erase_command(&mut self) {
+        if self.command.is_active() {
+            return;
+        }
+        if self.selection.is_empty() {
+            self.start_kind(CommandKind::Erase);
+            return;
+        }
+        self.erase_selected();
+    }
+
+    fn start_kind(&mut self, kind: CommandKind) {
+        if self.command.kind() == kind || self.command.is_active() {
+            return;
+        }
         self.box_select = None;
-        self.finish_active_transaction();
-        self.command.start_distance();
+        self.context_menu = None;
+        self.measurement = None;
+        if kind.is_measure() {
+            self.finish_active_transaction();
+        } else if kind == CommandKind::Idle {
+            return;
+        } else {
+            self.history.commit_open();
+            self.history.begin();
+        }
+        match kind {
+            CommandKind::Line => self.command.start_line(),
+            CommandKind::Polyline => self.command.start_polyline(),
+            CommandKind::Circle => self.command.start_circle(),
+            CommandKind::Arc => self.command.start_arc(),
+            CommandKind::Rectangle => self.command.start_rectangle(),
+            CommandKind::Distance => self.command.start_distance(),
+            CommandKind::Angle => self.command.start_angle(),
+            CommandKind::Radius => self.command.start_radius(),
+            CommandKind::Area => self.command.start_area(),
+            CommandKind::Move
+            | CommandKind::Copy
+            | CommandKind::Rotate
+            | CommandKind::Mirror
+            | CommandKind::Scale
+            | CommandKind::Erase => {
+                let selected = self.selection.ids().to_vec();
+                let modify = kind.modify_kind().expect("modify kind");
+                if !selected.is_empty() {
+                    if let Err(err) = self.validate_modify_selection(&selected) {
+                        self.history.commit_open();
+                        self.status = err.to_string();
+                        return;
+                    }
+                }
+                self.command.start_modify(modify, selected.clone());
+                if !selected.is_empty() && modify != ModifyKind::Erase {
+                    self.set_modify_reference_radius();
+                }
+            }
+            CommandKind::Idle => {}
+        }
+        self.sync_dynamic_layout();
         self.drafting.clear_acquisition();
-        self.status = "DIST started".into();
+        if kind.is_measure() {
+            self.try_immediate_measurement();
+        }
+        if self.command.is_active() {
+            self.status = self.command.prompt().into();
+        }
+    }
+
+    fn sync_dynamic_layout(&mut self) {
+        let layout = self.command.dynamic_layout();
+        if self.dynamic_input.layout() != layout {
+            self.dynamic_input.set_layout(layout);
+        }
     }
 
     fn finish_command(&mut self) {
-        self.finish_active_transaction();
-        self.command.finish();
-        self.drafting.clear_acquisition();
-        self.status = "Ready".into();
+        if self.command.is_selecting_objects() {
+            self.confirm_modify_selection();
+            return;
+        }
+        match self.command.finish_measurement() {
+            Some(Ok(result)) => {
+                self.complete_measurement(result);
+                return;
+            }
+            Some(Err(err)) => {
+                self.status = err.message().into();
+                return;
+            }
+            None => {}
+        }
+        if matches!(self.command.kind(), CommandKind::Polyline) && !self.command.can_finish() {
+            return;
+        }
+        if let Some(geometry) = self.command.finish_geometry() {
+            self.commit_geometry(geometry);
+        }
+        self.idle_after_command("Ready");
+    }
+
+    fn close_command(&mut self) {
+        let Some(geometry) = self.command.close_geometry() else {
+            return;
+        };
+        self.commit_geometry(geometry);
+        self.idle_after_command("Ready");
     }
 
     fn cancel_command(&mut self) {
+        self.idle_after_command("Command canceled");
+    }
+
+    fn idle_after_command(&mut self, status: &str) {
         self.finish_active_transaction();
-        self.command.cancel();
+        self.command.finish();
+        self.dynamic_input.set_layout(DynamicLayout::Hidden);
         self.drafting.clear_acquisition();
-        self.status = "Command canceled".into();
+        self.status = status.into();
+    }
+
+    fn undo_last_in_command(&mut self) {
+        match self.command.kind() {
+            CommandKind::Line => {
+                if self.command.undo_last() {
+                    if let Some(edit) = self.history.pop_last_open_edit() {
+                        if let Some(document) = self.document.as_mut() {
+                            edit.invert().apply(document);
+                        }
+                        self.refresh_derived();
+                    }
+                }
+            }
+            CommandKind::Polyline => {
+                let _ = self.command.undo_last();
+            }
+            CommandKind::Area => {
+                let _ = self.command.undo_last();
+            }
+            _ => {}
+        }
+        self.sync_dynamic_layout();
+        self.dynamic_input.reset_values();
+        self.drafting.command_base_point = self.command.base_point();
+    }
+
+    fn back_in_command(&mut self) {
+        if self.command.back() {
+            self.sync_dynamic_layout();
+            self.dynamic_input.reset_values();
+            self.drafting.command_base_point = self.command.base_point();
+            self.status = self.command.prompt().into();
+        }
+    }
+
+    fn accept_command_point(&mut self, point: Point2) {
+        let kind = self.command.kind();
+        let output = if kind.is_modify() {
+            self.command.accept_modify_point(
+                point,
+                self.dynamic_input.typed_angle_deg(),
+                self.dynamic_input.typed_factor(),
+            )
+        } else {
+            self.command.accept_point(point)
+        };
+        match output {
+            CommandOutput::Geometry(geometry) => {
+                let stays_active = self.command.is_active();
+                self.commit_geometry(geometry);
+                self.remember_completed(kind);
+                if stays_active {
+                    self.sync_dynamic_layout();
+                    self.dynamic_input.reset_values();
+                } else {
+                    self.finish_active_transaction();
+                    self.dynamic_input.set_layout(DynamicLayout::Hidden);
+                    self.drafting.clear_acquisition();
+                }
+            }
+            CommandOutput::Distance(report) => {
+                self.complete_measurement(MeasurementResult::Distance(report));
+            }
+            CommandOutput::Measurement(result) => {
+                self.complete_measurement(result);
+            }
+            CommandOutput::Modify { transform, copies } => {
+                self.commit_modify(transform, copies);
+            }
+            CommandOutput::Erase => self.erase_selected(),
+            CommandOutput::Rejected(message) => {
+                self.status = message.into();
+            }
+            CommandOutput::None => {
+                self.sync_dynamic_layout();
+                self.dynamic_input.reset_values();
+                self.status = self.command.prompt().into();
+                if matches!(self.command.kind(), CommandKind::Scale) {
+                    self.set_modify_reference_radius();
+                }
+            }
+        }
+        self.drafting.command_base_point = self.command.base_point();
     }
 
     fn finish_active_transaction(&mut self) {
@@ -377,6 +638,9 @@ impl MyCadApp {
     pub(crate) fn undo(&mut self) {
         self.finish_active_transaction();
         self.command.cancel();
+        self.measurement = None;
+        self.dynamic_input.set_layout(DynamicLayout::Hidden);
+        self.context_menu = None;
         self.drafting.clear_acquisition();
         let Some(document) = self.document.as_mut() else {
             return;
@@ -390,6 +654,9 @@ impl MyCadApp {
     pub(crate) fn redo(&mut self) {
         self.finish_active_transaction();
         self.command.cancel();
+        self.measurement = None;
+        self.dynamic_input.set_layout(DynamicLayout::Hidden);
+        self.context_menu = None;
         self.drafting.clear_acquisition();
         let Some(document) = self.document.as_mut() else {
             return;
@@ -429,6 +696,8 @@ impl MyCadApp {
         let Some(document) = self.document.as_mut() else {
             self.display = Arc::new(DisplayList::default());
             self.snaps = Arc::new(SnapIndex::default());
+            self.measures = Arc::new(MeasureIndex::default());
+            self.measurement = None;
             self.gpu_upload = GpuUpload::Full;
             self.display_generation = self.display_generation.wrapping_add(1);
             self.selection.clear();
@@ -437,32 +706,27 @@ impl MyCadApp {
         document.diagnostics.extents = document.compute_extents();
         self.display = Arc::new(tessellate_document(document));
         self.snaps = Arc::new(SnapIndex::build(document));
+        self.measures = Arc::new(MeasureIndex::build(document));
+        self.measurement = None;
         self.gpu_upload = GpuUpload::Full;
         self.display_generation = self.display_generation.wrapping_add(1);
         self.selection.retain_valid(document);
     }
 
-    fn commit_line_segment(&mut self, [start, end]: [Point2; 2]) {
+    fn commit_geometry(&mut self, geometry: Geometry) {
+        let type_name = geometry.type_name();
         let (edit, entity) = {
             let Some(document) = self.ensure_document() else {
                 return;
             };
             let index = document.model_space.len();
-            let entity = document.new_entity(Geometry::Line {
-                start: Point3::from_xy(start.x, start.y),
-                end: Point3::from_xy(end.x, end.y),
-            });
+            let entity = document.new_entity(geometry);
             let entity = document.insert_model_entity(index, entity);
             document
                 .diagnostics
                 .bump_entity(entity.geometry.type_name());
             document.diagnostics.object_count = document.diagnostics.object_count.saturating_add(1);
-            if let Some(extents) = document.diagnostics.extents.as_mut() {
-                extents.include(start);
-                extents.include(end);
-            } else {
-                document.diagnostics.extents = Extents2::from_points([start, end]);
-            }
+            document.expand_extents_for(&entity);
             (
                 Edit::Insert {
                     index,
@@ -478,6 +742,8 @@ impl MyCadApp {
         let display = Arc::make_mut(&mut self.display);
         let appended = display.append_entity(document, &entity);
         Arc::make_mut(&mut self.snaps).append_entity(document, &entity);
+        Arc::make_mut(&mut self.measures).append_entity(document, &entity);
+        self.measurement = None;
         self.gpu_upload = match appended {
             Some(range) => GpuUpload::Append {
                 line_start: range.line_start,
@@ -486,22 +752,350 @@ impl MyCadApp {
             None => GpuUpload::Full,
         };
         self.display_generation = self.display_generation.wrapping_add(1);
-        self.status = "LINE segment added".into();
+        self.status = format!("{type_name} added");
     }
 
-    fn report_distance(&mut self, report: DistanceReport) {
-        let units = self
-            .document
-            .as_ref()
-            .map(|document| document.units.label())
-            .unwrap_or("drawing units");
-        self.status = format!(
-            "Distance {:.4} {units}  ΔX {:.4}  ΔY {:.4}  Angle {:.2}°",
-            report.distance,
-            report.delta_x,
-            report.delta_y,
-            report.angle.to_degrees()
-        );
+    fn remember_completed(&mut self, kind: CommandKind) {
+        if !kind.is_idle() {
+            self.last_command = Some(kind);
+        }
+    }
+
+    fn validate_modify_selection(&self, ids: &[cad_core::EntityId]) -> Result<(), TransformError> {
+        let document = self.document.as_ref().ok_or(TransformError::Invalid("No drawing is open"))?;
+        let entities: Vec<_> = ids
+            .iter()
+            .filter_map(|id| document.entity_by_id(*id))
+            .collect();
+        if entities.is_empty() {
+            return Err(TransformError::Invalid("Select objects first"));
+        }
+        validate_entities(entities)
+    }
+
+    fn set_modify_reference_radius(&mut self) {
+        let Some(base) = self.command.base_point().or(self.drafting.current_point) else {
+            return;
+        };
+        let Some(document) = self.document.as_ref() else {
+            return;
+        };
+        let entities: Vec<_> = self
+            .command
+            .modify_targets()
+            .iter()
+            .filter_map(|id| document.entity_by_id(*id))
+            .collect();
+        let radius = reference_radius(entities, base);
+        self.command.set_scale_reference(radius);
+    }
+
+    fn confirm_modify_selection(&mut self) {
+        if !self.command.is_selecting_objects() {
+            return;
+        }
+        let ids = self.selection.ids().to_vec();
+        if ids.is_empty() {
+            self.status = "Select objects first".into();
+            return;
+        }
+        if self.command.kind() == CommandKind::Erase {
+            self.erase_selected();
+            return;
+        }
+        if let Err(err) = self.validate_modify_selection(&ids) {
+            self.cancel_command();
+            self.status = err.to_string();
+            return;
+        }
+        let radius = {
+            let document = self.document.as_ref();
+            document
+                .map(|document| {
+                    let entities: Vec<_> = ids
+                        .iter()
+                        .filter_map(|id| document.entity_by_id(*id))
+                        .collect();
+                    reference_radius(entities, Point2::new(0.0, 0.0))
+                })
+                .unwrap_or(1.0)
+        };
+        self.command.confirm_modify_selection(ids, radius);
+        self.sync_dynamic_layout();
+        self.status = self.command.prompt().into();
+    }
+
+    fn commit_modify(&mut self, transform: EntityTransform, copies: bool) {
+        let kind = self.command.kind();
+        let targets = self.command.modify_targets().to_vec();
+        let Some(document) = self.document.as_ref() else {
+            self.cancel_command();
+            self.status = "No drawing is open".into();
+            return;
+        };
+        let originals: Vec<Entity> = targets
+            .iter()
+            .filter_map(|id| document.entity_by_id(*id).cloned())
+            .collect();
+        if let Err(err) = validate_entities(&originals) {
+            self.cancel_command();
+            self.status = err.to_string();
+            return;
+        }
+        let mut transformed = Vec::new();
+        for entity in &originals {
+            match transform_entity(entity, transform) {
+                Ok(after) => transformed.push(after),
+                Err(TransformError::NoOp) => {
+                    self.cancel_command();
+                    self.status = "Nothing to transform".into();
+                    return;
+                }
+                Err(err) => {
+                    self.cancel_command();
+                    self.status = err.to_string();
+                    return;
+                }
+            }
+        }
+        {
+            let Some(document) = self.document.as_mut() else {
+                return;
+            };
+            if copies {
+                let mut created = Vec::new();
+                for entity in transformed {
+                    let mut entity = entity;
+                    entity.id = cad_core::EntityId::UNASSIGNED;
+                    let index = document.model_space.len();
+                    let entity = document.insert_model_entity(index, entity);
+                    document
+                        .diagnostics
+                        .bump_entity(entity.geometry.type_name());
+                    document.diagnostics.object_count =
+                        document.diagnostics.object_count.saturating_add(1);
+                    self.history.record(Edit::Insert {
+                        index,
+                        entity: entity.clone(),
+                    });
+                    created.push(entity.id);
+                }
+                self.selection.replace_all(created);
+            } else {
+                for (before, after) in originals.iter().zip(transformed) {
+                    let Some(index) = document.entity_index(before.id) else {
+                        continue;
+                    };
+                    let _ = document.replace_model_entity(before.id, after.clone());
+                    self.history.record(Edit::Replace {
+                        index,
+                        before: before.clone(),
+                        after,
+                    });
+                }
+                self.selection.replace_all(targets);
+            }
+        }
+        self.remember_completed(kind);
+        self.finish_active_transaction();
+        self.command.finish();
+        self.dynamic_input.set_layout(DynamicLayout::Hidden);
+        self.drafting.clear_acquisition();
+        self.refresh_derived();
+        self.status = format!("{} complete", kind.label());
+    }
+
+    pub(crate) fn erase_selected(&mut self) {
+        if !self.command.is_idle() && !self.command.is_selecting_objects() {
+            return;
+        }
+        let ids = self.selection.ids().to_vec();
+        if ids.is_empty() {
+            return;
+        }
+        let Some(document) = self.document.as_ref() else {
+            return;
+        };
+        let mut removals: Vec<(usize, Entity)> = ids
+            .iter()
+            .filter_map(|id| {
+                document
+                    .entity_by_id(*id)
+                    .cloned()
+                    .and_then(|entity| document.entity_index(*id).map(|index| (index, entity)))
+            })
+            .collect();
+        if removals.is_empty() {
+            return;
+        }
+        removals.sort_by_key(|(index, _)| std::cmp::Reverse(*index));
+        self.history.commit_open();
+        self.history.begin();
+        {
+            let Some(document) = self.document.as_mut() else {
+                return;
+            };
+            for (index, entity) in removals {
+                if document.remove_model_entity(entity.id).is_some() {
+                    if let Some(count) = document
+                        .diagnostics
+                        .entity_counts
+                        .get_mut(entity.geometry.type_name())
+                    {
+                        *count = count.saturating_sub(1);
+                        if *count == 0 {
+                            document
+                                .diagnostics
+                                .entity_counts
+                                .remove(entity.geometry.type_name());
+                        }
+                    }
+                    document.diagnostics.object_count =
+                        document.diagnostics.object_count.saturating_sub(1);
+                    self.history.record(Edit::Remove { index, entity });
+                }
+            }
+        }
+        self.remember_completed(CommandKind::Erase);
+        self.finish_active_transaction();
+        self.command.finish();
+        self.dynamic_input.set_layout(DynamicLayout::Hidden);
+        self.drafting.clear_acquisition();
+        self.selection.clear();
+        self.refresh_derived();
+        self.status = "Erase complete".into();
+    }
+
+    fn last_started_modify(&self) -> CommandKind {
+        self.command.kind()
+    }
+
+    fn complete_measurement(&mut self, result: MeasurementResult) {
+        self.measurement = Some(MeasurementOverlay::final_result(result));
+        self.command.finish();
+        self.dynamic_input.set_layout(DynamicLayout::Hidden);
+        self.drafting.clear_acquisition();
+        self.status = self.command.prompt().into();
+    }
+
+    fn try_immediate_measurement(&mut self) {
+        match self.immediate_measurement() {
+            Some(Ok(result)) => self.complete_measurement(result),
+            Some(Err(message)) => self.status = message.into(),
+            None => {}
+        }
+    }
+
+    fn immediate_measurement(&self) -> Option<Result<MeasurementResult, &'static str>> {
+        let document = self.document.as_ref()?;
+        let ids = self.selection.ids();
+        match self.command.kind() {
+            CommandKind::Angle if ids.len() == 2 => {
+                let a = document.entity_by_id(ids[0]).and_then(line_segment)?;
+                let b = document.entity_by_id(ids[1]).and_then(line_segment)?;
+                Some(
+                    cad_core::AngleMeasurement::from_segments(a.0, a.1, b.0, b.1)
+                        .map(MeasurementResult::Angle)
+                        .ok_or("Directions are coincident or zero-length"),
+                )
+            }
+            CommandKind::Radius if ids.len() == 1 => {
+                radius_from_entity(document.entity_by_id(ids[0])).map(|result| {
+                    result
+                        .map(MeasurementResult::Radius)
+                        .map_err(cad_core::MeasureError::message)
+                })
+            }
+            CommandKind::Area if ids.len() == 1 => {
+                area_from_entity(document.entity_by_id(ids[0])).map(|result| {
+                    result
+                        .map(MeasurementResult::Area)
+                        .map_err(cad_core::MeasureError::message)
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn accept_measure_click(&mut self, point: Point2) {
+        let aperture = measurement::world_aperture(&self.camera, self.viewport_height);
+        let kind = self.command.kind();
+        let angle_three = matches!(self.command, CommandState::Angle(AngleState::ThreePoint { .. }));
+        let area_points = matches!(self.command, CommandState::Area(AreaState::Points { .. }));
+        match kind {
+            CommandKind::Distance => self.accept_command_point(point),
+            CommandKind::Angle if angle_three => self.accept_command_point(point),
+            CommandKind::Angle => {
+                let segment = self
+                    .measures
+                    .pick(point, aperture, Some(MeasureRole::Straight))
+                    .and_then(cad_core::straight_of);
+                if let Some((start, end)) = segment {
+                    let output = self.command.accept_straight_segment(start, end);
+                    self.apply_command_output(output);
+                } else {
+                    let output = self.command.begin_three_point_angle(point);
+                    self.apply_command_output(output);
+                }
+            }
+            CommandKind::Radius => {
+                let measured = self
+                    .measures
+                    .pick(point, aperture, Some(MeasureRole::Curve))
+                    .map(|hit| cad_core::radius_from_primitive(hit, point));
+                match measured {
+                    Some(Ok(radius)) => {
+                        self.complete_measurement(MeasurementResult::Radius(radius))
+                    }
+                    Some(Err(err)) => self.status = err.message().into(),
+                    None => self.status = cad_core::MeasureError::Unsupported.message().into(),
+                }
+            }
+            CommandKind::Area if area_points => self.accept_command_point(point),
+            CommandKind::Area => {
+                let measured = self
+                    .measures
+                    .pick(point, aperture, Some(MeasureRole::Closed))
+                    .map(cad_core::area_from_primitive);
+                match measured {
+                    Some(Ok(area)) => self.complete_measurement(MeasurementResult::Area(area)),
+                    Some(Err(err)) => self.status = err.message().into(),
+                    None => {
+                        let output = self.command.begin_area_points(point);
+                        self.apply_command_output(output);
+                    }
+                }
+            }
+            _ => self.accept_command_point(point),
+        }
+        self.drafting.command_base_point = self.command.base_point();
+    }
+
+    fn apply_command_output(&mut self, output: CommandOutput) {
+        match output {
+            CommandOutput::Geometry(geometry) => {
+                let stays_active = self.command.is_active();
+                self.commit_geometry(geometry);
+                if stays_active {
+                    self.sync_dynamic_layout();
+                    self.dynamic_input.reset_values();
+                } else {
+                    self.finish_active_transaction();
+                    self.dynamic_input.set_layout(DynamicLayout::Hidden);
+                    self.drafting.clear_acquisition();
+                }
+            }
+            CommandOutput::Distance(report) => {
+                self.complete_measurement(MeasurementResult::Distance(report));
+            }
+            CommandOutput::Measurement(result) => self.complete_measurement(result),
+            CommandOutput::Rejected(message) => self.status = message.into(),
+            CommandOutput::None => {
+                self.sync_dynamic_layout();
+                self.dynamic_input.reset_values();
+                self.status = self.command.prompt().into();
+            }
+        }
     }
 
     fn toggle_ortho(&mut self) {
@@ -525,7 +1119,29 @@ impl MyCadApp {
 
     pub(crate) fn show_viewport(&mut self, ui: &mut Ui) {
         let rect = ui.available_rect_before_wrap();
+        self.viewport_height = rect.height() as f64;
         self.poll_load(rect);
+        let units = self
+            .document
+            .as_ref()
+            .map(|document| document.units)
+            .unwrap_or_default();
+        let card = self
+            .measurement
+            .as_ref()
+            .filter(|overlay| !overlay.live)
+            .cloned();
+        if let Some(overlay) = card {
+            let (action, hovered) = measurement::show_card(ui.ctx(), rect, &overlay, units);
+            self.measure_card_hovered = hovered;
+            match action {
+                CardAction::Close => self.measurement = None,
+                CardAction::Copy => self.status = "Copied measurement".into(),
+                CardAction::None => {}
+            }
+        } else if self.measurement.is_none() {
+            self.measure_card_hovered = false;
+        }
         ui.advance_cursor_after_rect(rect);
         let response = ui.interact(
             rect,
@@ -593,16 +1209,53 @@ impl MyCadApp {
                 color.to_fill(),
             );
         }
+        let start = self.command.start_vertex();
+        let start_marker = start.filter(|start| {
+            self.drafting.preferences.osnap_enabled
+                && self.drafting.preferences.running_snaps.endpoint
+                && !self
+                    .command
+                    .base_point()
+                    .is_some_and(|base| start.distance(base) <= GEOM_TOLERANCE)
+        });
+        let acquired_snap = self
+            .command
+            .requests_point()
+            .then_some(self.drafting.acquired_snap)
+            .flatten();
+        let close_hint = self.command.can_close()
+            && start.is_some_and(|start| {
+                acquired_snap.is_some_and(|snap| snap.point.distance(start) <= GEOM_TOLERANCE)
+            });
         crate::drafting::paint_overlay(
             &painter,
             rect,
             self.camera,
             self.command.preview(self.drafting.current_point),
-            self.command
-                .requests_point()
-                .then_some(self.drafting.acquired_snap)
-                .flatten(),
+            acquired_snap,
+            start_marker,
+            close_hint,
         );
+        let units = self
+            .document
+            .as_ref()
+            .map(|document| document.units)
+            .unwrap_or_default();
+        if let Some(result) = self.command.live_measurement(self.drafting.current_point) {
+            let overlay = MeasurementOverlay::live(result);
+            measurement::paint(&painter, rect, self.camera, &overlay, units);
+            if let Some(cursor) = self.last_pointer.filter(|pos| rect.contains(*pos)) {
+                let text = overlay.result.format(units);
+                measurement::live_cursor_label(&painter, rect, cursor, &text.primary);
+            }
+        } else if let Some(overlay) = &self.measurement {
+            measurement::paint(&painter, rect, self.camera, overlay, units);
+        }
+        if let Some(cursor) = self.last_pointer.filter(|pos| rect.contains(*pos)) {
+            let live =
+                LiveValues::from_points(self.command.base_point(), self.drafting.current_point);
+            self.dynamic_input.paint(&painter, rect, cursor, live);
+        }
     }
 
     fn zoom_extents(&mut self, width: f64, height: f64) {
@@ -635,6 +1288,78 @@ impl MyCadApp {
             format!("{name}*")
         } else {
             name
+        }
+    }
+
+    fn open_context_menu(&mut self, pos: egui::Pos2, origin: Point2, size: Point2) {
+        if let Some(kind) = context_menu::kind_for_state(&self.command) {
+            self.context_menu = Some(ViewportMenu::new(pos, kind));
+            return;
+        }
+        let hit = pick_entity(
+            &self.display,
+            &self.camera,
+            Point2::new(pos.x as f64, pos.y as f64),
+            origin,
+            size,
+        );
+        if let Some(id) = hit {
+            if !self.selection.contains(id) {
+                self.selection.replace(id);
+            }
+            self.context_menu = Some(ViewportMenu::new(pos, ContextKind::Entity));
+        } else {
+            self.context_menu = Some(ViewportMenu::new(pos, ContextKind::Empty));
+        }
+    }
+
+    fn show_viewport_menu(&mut self, ctx: &egui::Context) {
+        let Some(mut menu) = self.context_menu.take() else {
+            return;
+        };
+        let can_set_layer = self.document.as_ref().is_some_and(|document| {
+            self.selection
+                .shared_layer(document)
+                .is_some_and(|layer| document.layer_can_be_current(&layer))
+        });
+        let result = context_menu::show(
+            ctx,
+            &mut menu,
+            self.command.can_finish(),
+            self.command.can_close(),
+            self.command.can_undo_last(),
+            self.command.can_back(),
+            can_set_layer,
+            self.last_command.is_some() && !self.command.is_active(),
+        );
+        match result {
+            MenuResult::StayOpen => self.context_menu = Some(menu),
+            MenuResult::Dismissed => {}
+            MenuResult::Action(action) => {
+                let size = ctx.available_rect();
+                self.apply_context_action(action, size.width() as f64, size.height() as f64);
+            }
+        }
+    }
+
+    fn apply_context_action(&mut self, action: ContextAction, width: f64, height: f64) {
+        match action {
+            ContextAction::Finish => self.finish_command(),
+            ContextAction::UndoLast => self.undo_last_in_command(),
+            ContextAction::Close => self.close_command(),
+            ContextAction::Back => self.back_in_command(),
+            ContextAction::Cancel => self.cancel_command(),
+            ContextAction::Properties => {
+                workspace::ensure_tab(&mut self.dock_state, WorkspaceTab::Properties);
+            }
+            ContextAction::SetCurrentLayerFromObject => self.set_selected_layer_current(),
+            ContextAction::Deselect => self.selection.clear(),
+            ContextAction::RepeatLast => {
+                if let Some(kind) = self.last_command {
+                    self.start_kind(kind);
+                }
+            }
+            ContextAction::ZoomExtents => self.zoom_extents(width, height),
         }
     }
 
@@ -702,6 +1427,10 @@ impl eframe::App for MyCadApp {
                     f3: input.key_pressed(egui::Key::F3),
                     f8: input.key_pressed(egui::Key::F8),
                     line: plain && input.key_pressed(egui::Key::L),
+                    polyline: plain && input.key_pressed(egui::Key::P),
+                    circle: plain && input.key_pressed(egui::Key::C),
+                    arc: plain && input.key_pressed(egui::Key::A),
+                    rectangle: plain && input.key_pressed(egui::Key::R),
                     distance: plain && input.key_pressed(egui::Key::D),
                     enter: input.key_pressed(egui::Key::Enter),
                     escape: input.key_pressed(egui::Key::Escape),
@@ -721,15 +1450,66 @@ impl eframe::App for MyCadApp {
                 self.undo();
             } else if keys.redo {
                 self.redo();
+            } else if keys.escape && self.context_menu.take().is_some() {
+                self.input_consumed_escape = true;
             } else if keys.escape && self.command.is_active() {
                 self.cancel_command();
                 self.input_consumed_escape = true;
-            } else if keys.enter && self.command.is_active() {
-                self.finish_command();
-            } else if keys.line && !self.command.is_active() {
-                self.start_line_command();
-            } else if keys.distance && !self.command.is_active() {
-                self.start_distance_command();
+            } else if keys.escape && self.measurement.take().is_some() {
+                self.input_consumed_escape = true;
+            } else if self.context_menu.is_none() {
+                let live =
+                    LiveValues::from_points(self.command.base_point(), self.drafting.current_point);
+                let finish_empty = matches!(
+                    self.command.kind(),
+                    CommandKind::Line | CommandKind::Polyline
+                );
+                let numeric =
+                    ctx.input_mut(|input| self.dynamic_input.consume(input, live, finish_empty));
+                match numeric {
+                    DynamicKeyResult::Submit => {
+                        if let Some(point) = self.drafting.current_point {
+                            self.accept_command_point(point);
+                        }
+                    }
+                    DynamicKeyResult::FinishEmpty => {
+                        if self.command.can_finish() {
+                            self.finish_command();
+                        }
+                    }
+                    DynamicKeyResult::Invalid(message) => {
+                        self.status = message.into();
+                    }
+                    DynamicKeyResult::Handled => {}
+                    DynamicKeyResult::None => {
+                        if keys.enter && self.command.is_active() {
+                            self.finish_command();
+                        } else if keys.enter
+                            && !self.command.is_active()
+                            && self.last_command.is_some_and(CommandKind::is_measure)
+                        {
+                            if let Some(kind) = self.last_command {
+                                self.start_kind(kind);
+                            }
+                        } else if keys.line {
+                            self.start_line_command();
+                        } else if keys.polyline {
+                            self.start_polyline_command();
+                        } else if keys.circle {
+                            if self.command.can_close() {
+                                self.close_command();
+                            } else {
+                                self.start_circle_command();
+                            }
+                        } else if keys.arc {
+                            self.start_arc_command();
+                        } else if keys.rectangle {
+                            self.start_rectangle_command();
+                        } else if keys.distance {
+                            self.start_distance_command();
+                        }
+                    }
+                }
             }
         }
         if self.load_rx.is_some() || self.capture.is_some() {
@@ -772,22 +1552,72 @@ impl eframe::App for MyCadApp {
                     }
                 });
                 ui.menu_button("Draw", |ui| {
+                    let idle = !self.command_is_active();
                     if ui
-                        .add_enabled(!self.command.is_active(), egui::Button::new("Line    L"))
+                        .add_enabled(idle, egui::Button::new("Line    L"))
                         .clicked()
                     {
                         ui.close();
                         self.start_line_command();
                     }
                     if ui
-                        .add_enabled(
-                            !self.command.is_active(),
-                            egui::Button::new("Distance    D"),
-                        )
+                        .add_enabled(idle, egui::Button::new("Polyline    P"))
+                        .clicked()
+                    {
+                        ui.close();
+                        self.start_polyline_command();
+                    }
+                    if ui
+                        .add_enabled(idle, egui::Button::new("Circle    C"))
+                        .clicked()
+                    {
+                        ui.close();
+                        self.start_circle_command();
+                    }
+                    if ui
+                        .add_enabled(idle, egui::Button::new("Arc    A"))
+                        .clicked()
+                    {
+                        ui.close();
+                        self.start_arc_command();
+                    }
+                    if ui
+                        .add_enabled(idle, egui::Button::new("Rectangle    R"))
+                        .clicked()
+                    {
+                        ui.close();
+                        self.start_rectangle_command();
+                    }
+                });
+                ui.menu_button("Measure", |ui| {
+                    let idle = !self.command_is_active();
+                    if ui
+                        .add_enabled(idle, egui::Button::new("Distance    D"))
                         .clicked()
                     {
                         ui.close();
                         self.start_distance_command();
+                    }
+                    if ui
+                        .add_enabled(idle, egui::Button::new("Angle"))
+                        .clicked()
+                    {
+                        ui.close();
+                        self.start_angle_command();
+                    }
+                    if ui
+                        .add_enabled(idle, egui::Button::new("Radius"))
+                        .clicked()
+                    {
+                        ui.close();
+                        self.start_radius_command();
+                    }
+                    if ui
+                        .add_enabled(idle, egui::Button::new("Area"))
+                        .clicked()
+                    {
+                        ui.close();
+                        self.start_area_command();
                     }
                 });
                 ui.menu_button("View", |ui| {
@@ -811,6 +1641,7 @@ impl eframe::App for MyCadApp {
                     if ui.button("Reset layout").clicked() {
                         ui.close();
                         self.dock_state = workspace::default_dock_state();
+                        self.settings.compact_home_height_applied = false;
                     }
                 });
                 ui.menu_button("Settings", |ui| {
@@ -837,7 +1668,11 @@ impl eframe::App for MyCadApp {
             ui.horizontal(|ui| {
                 ui.monospace(self.status_file_label());
                 ui.separator();
-                ui.label(self.command.prompt()).on_hover_text(&self.status);
+                ui.label(self.command.prompt()).on_hover_text(
+                    self.last_command
+                        .map(|kind| format!("{} — {}", kind.label(), self.status))
+                        .unwrap_or_else(|| self.status.clone()),
+                );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
                         .selectable_label(self.drafting.preferences.osnap_enabled, "OSNAP  F3")
@@ -868,6 +1703,8 @@ impl eframe::App for MyCadApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             workspace::show_workspace(ui, self);
         });
+
+        self.show_viewport_menu(ctx);
 
         self.show_discard_dialog(ctx);
 
@@ -902,16 +1739,37 @@ fn handle_viewport_input(app: &mut MyCadApp, ui: &Ui, response: &egui::Response,
                 .screen_to_world(Point2::new(screen.x as f64, screen.y as f64), origin, size);
         app.cursor_world = Some(raw);
         if app.command.requests_point() {
-            let point = app.drafting.resolve_point(
-                raw,
-                app.command.base_point(),
-                modifiers.shift,
-                &app.camera,
-                size.y,
-                &app.snaps,
-            );
-            app.cursor_world = Some(point);
+            if app.command.uses_osnap() {
+                let base = app.command.base_point();
+                app.command.write_snap_features(&mut app.command_snaps);
+                let resolved = app.drafting.resolve_point(
+                    raw,
+                    base,
+                    modifiers.shift,
+                    &app.camera,
+                    size.y,
+                    &app.snaps,
+                    &app.command_snaps,
+                );
+                let constrained = app.dynamic_input.constrain(base, resolved);
+                if let Some(snap) = app.drafting.acquired_snap {
+                    if snap.point.distance(constrained) > GEOM_TOLERANCE {
+                        app.drafting.acquired_snap = None;
+                    }
+                }
+                app.drafting.current_point = Some(constrained);
+                app.cursor_world = Some(constrained);
+            } else {
+                app.drafting.acquired_snap = None;
+                app.drafting.current_point = Some(raw);
+                app.cursor_world = Some(raw);
+            }
         }
+    }
+
+    if app.context_menu.is_some() {
+        app.last_pointer = ui.input(|i| i.pointer.latest_pos());
+        return;
     }
 
     if !typing
@@ -931,24 +1789,63 @@ fn handle_viewport_input(app: &mut MyCadApp, ui: &Ui, response: &egui::Response,
     }
     let box_active = box_was_active || app.box_select.is_some();
 
-    if app.command.requests_point() {
-        if response.clicked_by(PointerButton::Secondary) {
-            app.finish_command();
-        } else if response.clicked_by(PointerButton::Primary) {
-            if let Some(point) = app.drafting.current_point {
-                match app.command.accept_point(point) {
-                    Some(CommandOutput::LineSegment(segment)) => {
-                        app.commit_line_segment(segment);
-                    }
-                    Some(CommandOutput::Distance(report)) => {
-                        app.report_distance(report);
-                    }
-                    None => {}
+    let mut panning = false;
+    if !box_active {
+        for button in [
+            PointerButton::Primary,
+            PointerButton::Middle,
+            PointerButton::Secondary,
+        ] {
+            if response.dragged_by(button) && bindings.dragged(InputAction::Pan, button, modifiers)
+            {
+                panning = true;
+                if let (Some(prev), Some(now)) =
+                    (app.last_pointer, ui.input(|i| i.pointer.latest_pos()))
+                {
+                    let delta = app.camera.pan_screen(
+                        Point2::new(prev.x as f64, prev.y as f64),
+                        Point2::new(now.x as f64, now.y as f64),
+                        origin,
+                        size,
+                    );
+                    app.camera.pan_world(delta);
                 }
-                app.drafting.command_base_point = app.command.base_point();
             }
         }
-    } else if !box_active {
+    }
+
+    let mut opened_menu = false;
+    if !panning && !box_active {
+        for button in [
+            PointerButton::Primary,
+            PointerButton::Middle,
+            PointerButton::Secondary,
+        ] {
+            if response.clicked_by(button)
+                && bindings.clicked(InputAction::ContextMenu, button, modifiers)
+            {
+                let pos = response
+                    .interact_pointer_pos()
+                    .or(app.last_pointer)
+                    .unwrap_or(rect.center());
+                app.open_context_menu(pos, origin, size);
+                opened_menu = true;
+                break;
+            }
+        }
+    }
+
+    if !opened_menu && !app.measure_card_hovered && app.command.requests_point() {
+        if response.clicked_by(PointerButton::Primary) {
+            if let Some(point) = app.drafting.current_point {
+                if app.command.kind().is_measure() {
+                    app.accept_measure_click(point);
+                } else {
+                    app.accept_command_point(point);
+                }
+            }
+        }
+    } else if !opened_menu && !box_active && !app.measure_card_hovered {
         for button in [
             PointerButton::Primary,
             PointerButton::Middle,
@@ -985,28 +1882,6 @@ fn handle_viewport_input(app: &mut MyCadApp, ui: &Ui, response: &egui::Response,
         }
     }
 
-    if !box_active {
-        for button in [
-            PointerButton::Primary,
-            PointerButton::Middle,
-            PointerButton::Secondary,
-        ] {
-            if response.dragged_by(button) && bindings.dragged(InputAction::Pan, button, modifiers)
-            {
-                if let (Some(prev), Some(now)) =
-                    (app.last_pointer, ui.input(|i| i.pointer.latest_pos()))
-                {
-                    let delta = app.camera.pan_screen(
-                        Point2::new(prev.x as f64, prev.y as f64),
-                        Point2::new(now.x as f64, now.y as f64),
-                        origin,
-                        size,
-                    );
-                    app.camera.pan_world(delta);
-                }
-            }
-        }
-    }
     app.last_pointer = ui.input(|i| i.pointer.latest_pos());
 
     if !box_active && response.hovered() {
@@ -1138,5 +2013,66 @@ fn format_import_error(err: &ImportError) -> String {
         ),
         ImportError::InvalidPath => "The file path is not valid UTF-8.".into(),
         ImportError::Io(e) => format!("Could not open file: {e}"),
+    }
+}
+
+fn line_segment(entity: &Entity) -> Option<(Point2, Point2)> {
+    match entity.geometry {
+        Geometry::Line { start, end } => Some((start.xy(), end.xy())),
+        _ => None,
+    }
+}
+
+fn radius_from_entity(
+    entity: Option<&Entity>,
+) -> Option<Result<cad_core::RadiusMeasurement, cad_core::MeasureError>> {
+    let entity = entity?;
+    match &entity.geometry {
+        Geometry::Circle { center, radius, .. } => {
+            let toward = Point2::new(center.x + *radius, center.y);
+            Some(
+                cad_core::RadiusMeasurement::circle(center.xy(), *radius, toward)
+                    .ok_or(cad_core::MeasureError::InvalidGeometry),
+            )
+        }
+        Geometry::Arc {
+            center,
+            radius,
+            start_angle,
+            end_angle,
+            ..
+        } => {
+            let toward = Point2::new(center.x + *radius, center.y);
+            Some(
+                cad_core::RadiusMeasurement::arc(
+                    center.xy(),
+                    *radius,
+                    *start_angle,
+                    *end_angle,
+                    toward,
+                )
+                .ok_or(cad_core::MeasureError::InvalidGeometry),
+            )
+        }
+        _ => None,
+    }
+}
+
+fn area_from_entity(
+    entity: Option<&Entity>,
+) -> Option<Result<cad_core::AreaMeasurement, cad_core::MeasureError>> {
+    let entity = entity?;
+    match &entity.geometry {
+        Geometry::Circle { center, radius, .. } => Some(
+            cad_core::AreaMeasurement::from_circle(center.xy(), *radius)
+                .ok_or(cad_core::MeasureError::InvalidGeometry),
+        ),
+        Geometry::LwPolyline {
+            vertices, closed, ..
+        }
+        | Geometry::Polyline {
+            vertices, closed, ..
+        } => Some(cad_core::AreaMeasurement::from_polyline(vertices, *closed)),
+        _ => None,
     }
 }

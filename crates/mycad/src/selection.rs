@@ -34,7 +34,6 @@ impl Selection {
         &self.ids
     }
 
-    #[allow(dead_code)]
     pub fn contains(&self, id: EntityId) -> bool {
         self.members.contains(&id)
     }

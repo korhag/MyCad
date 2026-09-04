@@ -17,15 +17,17 @@ pub enum InputAction {
     SelectClear,
     Pan,
     ZoomExtents,
+    ContextMenu,
 }
 
 impl InputAction {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::SelectReplace,
         Self::SelectToggle,
         Self::SelectClear,
         Self::Pan,
         Self::ZoomExtents,
+        Self::ContextMenu,
     ];
 
     pub fn label(self) -> &'static str {
@@ -35,6 +37,7 @@ impl InputAction {
             Self::SelectClear => "Clear selection",
             Self::Pan => "Pan",
             Self::ZoomExtents => "Zoom extents",
+            Self::ContextMenu => "Context menu",
         }
     }
 
@@ -42,6 +45,7 @@ impl InputAction {
         match self {
             Self::SelectReplace | Self::SelectToggle | Self::SelectClear => "Selection",
             Self::Pan | Self::ZoomExtents => "View",
+            Self::ContextMenu => "Viewport",
         }
     }
 
@@ -305,6 +309,8 @@ pub struct InputMap {
     pub select_clear: Vec<Binding>,
     pub pan: Vec<Binding>,
     pub zoom_extents: Vec<Binding>,
+    #[serde(default)]
+    pub context_menu: Vec<Binding>,
 }
 
 impl Default for InputMap {
@@ -332,6 +338,7 @@ impl InputMap {
                 Binding::double_click(MouseButtonKind::Left),
                 Binding::key("e").with_command(),
             ],
+            context_menu: vec![Binding::click(MouseButtonKind::Right)],
         }
     }
 
@@ -342,6 +349,7 @@ impl InputMap {
             InputAction::SelectClear => &self.select_clear,
             InputAction::Pan => &self.pan,
             InputAction::ZoomExtents => &self.zoom_extents,
+            InputAction::ContextMenu => &self.context_menu,
         }
     }
 
@@ -352,6 +360,7 @@ impl InputMap {
             InputAction::SelectClear => &mut self.select_clear,
             InputAction::Pan => &mut self.pan,
             InputAction::ZoomExtents => &mut self.zoom_extents,
+            InputAction::ContextMenu => &mut self.context_menu,
         }
     }
 
@@ -679,6 +688,16 @@ mod tests {
             PointerButton::Primary,
             mods(false, false, false, false)
         ));
+        assert!(map.clicked(
+            InputAction::ContextMenu,
+            PointerButton::Secondary,
+            mods(false, false, false, false)
+        ));
+        assert!(!map.dragged(
+            InputAction::ContextMenu,
+            PointerButton::Secondary,
+            mods(false, false, false, false)
+        ));
     }
 
     #[test]
@@ -703,6 +722,7 @@ mod tests {
             select_clear: Vec::new(),
             pan: Vec::new(),
             zoom_extents: Vec::new(),
+            context_menu: Vec::new(),
         };
         map.sanitize();
         assert!(!map.bindings_for(InputAction::SelectReplace).is_empty());
@@ -717,6 +737,7 @@ mod tests {
             select_clear: vec![Binding::key("escape")],
             pan: vec![Binding::drag(MouseButtonKind::Middle)],
             zoom_extents: vec![Binding::double_click(MouseButtonKind::Left)],
+            context_menu: vec![Binding::click(MouseButtonKind::Right)],
         };
         map.sanitize();
         let none = mods(false, false, false, false);
@@ -734,6 +755,7 @@ mod tests {
             select_clear: vec![Binding::key("escape")],
             pan: vec![Binding::drag(MouseButtonKind::Left)],
             zoom_extents: vec![Binding::double_click(MouseButtonKind::Left)],
+            context_menu: vec![Binding::click(MouseButtonKind::Right)],
         };
         map.sanitize();
         let none = mods(false, false, false, false);

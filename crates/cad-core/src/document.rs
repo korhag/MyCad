@@ -165,6 +165,13 @@ impl DrawingUnits {
             Self::Parsecs => "pc",
         }
     }
+
+    pub fn area_label(self) -> String {
+        match self {
+            Self::Unspecified | Self::Other(_) => "drawing units²".into(),
+            _ => format!("{}²", self.label()),
+        }
+    }
 }
 
 // ------------------------------------------------------------
@@ -375,6 +382,28 @@ impl Document {
 
     pub fn effective_linetype_scale(&self, entity: &Entity) -> f64 {
         (self.ltscale * entity.linetype_scale).max(1e-6)
+    }
+
+    pub fn expand_extents_for(&mut self, entity: &Entity) {
+        let extra = {
+            let mut extents = Extents2::empty();
+            let mut any = false;
+            let mut stack = Vec::new();
+            collect_entity_points(self, entity, Transform2::identity(), &mut stack, &mut |p| {
+                if p.is_finite() {
+                    extents.include(p);
+                    any = true;
+                }
+            });
+            any.then_some(extents)
+        };
+        let Some(extra) = extra else {
+            return;
+        };
+        match self.diagnostics.extents.as_mut() {
+            Some(existing) => existing.union(extra),
+            None => self.diagnostics.extents = Some(extra),
+        }
     }
 
     pub fn compute_extents(&self) -> Option<Extents2> {
@@ -812,5 +841,24 @@ mod tests {
         assert_eq!(DrawingUnits::from_insunits(4).label(), "mm");
         assert_eq!(DrawingUnits::from_insunits(1).label(), "in");
         assert_eq!(DrawingUnits::from_insunits(99).label(), "drawing units");
+    }
+
+    #[test]
+    fn expand_extents_for_appends_without_rebuilding() {
+        let mut document = Document::default();
+        let first = document.new_entity(Geometry::Line {
+            start: Point3::from_xy(0.0, 0.0),
+            end: Point3::from_xy(2.0, 0.0),
+        });
+        document.expand_extents_for(&first);
+        let second = document.new_entity(Geometry::Circle {
+            center: Point3::from_xy(10.0, 0.0),
+            radius: 1.0,
+            extrusion: crate::entity::default_extrusion(),
+        });
+        document.expand_extents_for(&second);
+        let extents = document.diagnostics.extents.expect("extents");
+        assert!((extents.min.x - 0.0).abs() < 1e-12);
+        assert!((extents.max.x - 11.0).abs() < 1e-12);
     }
 }

@@ -158,7 +158,7 @@ impl Geometry {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PolyVertex {
     pub point: Point3,
     pub bulge: f64,

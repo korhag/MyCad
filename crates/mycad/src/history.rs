@@ -150,6 +150,10 @@ impl History {
         }
     }
 
+    pub fn pop_last_open_edit(&mut self) -> Option<Edit> {
+        self.open.as_mut()?.edits.pop()
+    }
+
     pub fn commit_open(&mut self) {
         if let Some(open) = self.open.take() {
             if !open.is_empty() {
@@ -239,6 +243,29 @@ mod tests {
         history.commit_open();
         assert!(!history.can_undo());
         assert!(!history.is_dirty());
+    }
+
+    #[test]
+    fn popping_last_open_edit_undoes_one_segment() {
+        let mut document = Document::default();
+        let mut history = History::default();
+        history.begin();
+        let first = document.add_entity(line(0.0, 0.0, 1.0, 0.0));
+        history.record(Edit::Insert {
+            index: 0,
+            entity: first.clone(),
+        });
+        let second = document.add_entity(line(1.0, 0.0, 2.0, 0.0));
+        history.record(Edit::Insert {
+            index: 1,
+            entity: second,
+        });
+        let popped = history.pop_last_open_edit().expect("open edit");
+        popped.invert().apply(&mut document);
+        assert_eq!(document.model_space.len(), 1);
+        assert_eq!(document.model_space[0].id, first.id);
+        history.commit_open();
+        assert!(history.can_undo());
     }
 
     #[test]

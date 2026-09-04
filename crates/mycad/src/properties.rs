@@ -2,7 +2,10 @@
 
 use std::collections::BTreeMap;
 
-use cad_core::{line_length, polyline_length, CadColor, Document, Entity, Geometry, Point3};
+use cad_core::{
+    arc_length, arc_sweep, circle_area, format_angle_deg, format_area, format_length,
+    polyline_length, AreaMeasurement, CadColor, Document, Entity, Geometry, Point3,
+};
 use eframe::egui::{self, RichText, Ui};
 
 use crate::app::MyCadApp;
@@ -58,7 +61,7 @@ fn show_single(ui: &mut Ui, document: &Document, entity: &Entity) {
         .num_columns(2)
         .spacing([12.0, 4.0])
         .show(ui, |ui| {
-            geometry_rows(ui, &entity.geometry);
+            geometry_rows(ui, document, &entity.geometry);
         });
 }
 
@@ -109,17 +112,23 @@ fn show_multiple(ui: &mut Ui, document: &Document, ids: &[cad_core::EntityId]) {
         });
 }
 
-fn geometry_rows(ui: &mut Ui, geometry: &Geometry) {
+fn geometry_rows(ui: &mut Ui, document: &Document, geometry: &Geometry) {
+    let units = document.units;
     match geometry {
         Geometry::Line { start, end } => {
             kv(ui, "Start", point_label(*start));
             kv(ui, "End", point_label(*end));
-            kv(ui, "Length", format_num(line_length(start.xy(), end.xy())));
+            kv(
+                ui,
+                "Length",
+                format_length(start.xy().distance(end.xy()), units),
+            );
         }
         Geometry::Circle { center, radius, .. } => {
             kv(ui, "Center", point_label(*center));
-            kv(ui, "Radius", format_num(*radius));
-            kv(ui, "Diameter", format_num(*radius * 2.0));
+            kv(ui, "Radius", format_length(*radius, units));
+            kv(ui, "Diameter", format_length(*radius * 2.0, units));
+            kv(ui, "Area", format_area(circle_area(*radius), units));
         }
         Geometry::Arc {
             center,
@@ -129,9 +138,19 @@ fn geometry_rows(ui: &mut Ui, geometry: &Geometry) {
             ..
         } => {
             kv(ui, "Center", point_label(*center));
-            kv(ui, "Radius", format_num(*radius));
-            kv(ui, "Start", format_deg(*start_angle));
-            kv(ui, "End", format_deg(*end_angle));
+            kv(ui, "Radius", format_length(*radius, units));
+            kv(ui, "Start", format_angle_deg(*start_angle));
+            kv(ui, "End", format_angle_deg(*end_angle));
+            kv(
+                ui,
+                "Included angle",
+                format_angle_deg(arc_sweep(*start_angle, *end_angle)),
+            );
+            kv(
+                ui,
+                "Arc length",
+                format_length(arc_length(*radius, *start_angle, *end_angle), units),
+            );
         }
         Geometry::LwPolyline {
             vertices,
@@ -146,7 +165,17 @@ fn geometry_rows(ui: &mut Ui, geometry: &Geometry) {
         } => {
             kv(ui, "Vertices", vertices.len().to_string());
             kv(ui, "Closed", yes_no(*closed));
-            kv(ui, "Length", format_num(polyline_length(vertices, *closed)));
+            kv(
+                ui,
+                "Length",
+                format_length(polyline_length(vertices, *closed), units),
+            );
+            if *closed {
+                if let Ok(area) = AreaMeasurement::from_polyline(vertices, true) {
+                    kv(ui, "Area", format_area(area.area, units));
+                    kv(ui, "Perimeter", format_length(area.perimeter, units));
+                }
+            }
             kv(
                 ui,
                 "Linetype generation",
@@ -170,7 +199,7 @@ fn geometry_rows(ui: &mut Ui, geometry: &Geometry) {
             kv(ui, "Block", block_name.clone());
             kv(ui, "Insertion", point_label(*insertion));
             kv(ui, "Scale", format!("{:.4}, {:.4}", scale.x, scale.y));
-            kv(ui, "Rotation", format_deg(*rotation));
+            kv(ui, "Rotation", format_angle_deg(*rotation));
             if *column_count > 1 || *row_count > 1 {
                 kv(ui, "Array", format!("{column_count} × {row_count}"));
             }
@@ -202,7 +231,7 @@ fn geometry_rows(ui: &mut Ui, geometry: &Geometry) {
         Geometry::Text(text) => {
             kv(ui, "Insertion", point_label(text.insertion));
             kv(ui, "Height", format_num(text.height));
-            kv(ui, "Rotation", format_deg(text.rotation));
+            kv(ui, "Rotation", format_angle_deg(text.rotation));
             kv(ui, "Value", truncate(&text.value, 48));
         }
         Geometry::MText(text) => {
@@ -258,10 +287,6 @@ fn format_num(value: f64) -> String {
     } else {
         format!("{value:.4}")
     }
-}
-
-fn format_deg(radians: f64) -> String {
-    format!("{:.2}°", radians.to_degrees())
 }
 
 fn truncate(value: &str, max: usize) -> String {

@@ -3,10 +3,13 @@
 mod app;
 mod audit;
 mod commands;
+mod context_menu;
 mod diagnostics;
 mod drafting;
+mod dynamic_input;
 mod history;
 mod home;
+mod measurement;
 mod input;
 mod preview;
 mod properties;

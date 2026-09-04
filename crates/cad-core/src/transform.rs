@@ -126,6 +126,43 @@ impl Transform2 {
         }
     }
 
+    pub fn apply_vector(self, v: Point2) -> Point2 {
+        Point2 {
+            x: self.m00 * v.x + self.m01 * v.y,
+            y: self.m10 * v.x + self.m11 * v.y,
+        }
+    }
+
+    pub fn determinant(self) -> f64 {
+        self.m00 * self.m11 - self.m01 * self.m10
+    }
+
+    pub fn reverses_orientation(self) -> bool {
+        self.determinant() < 0.0
+    }
+
+    /// Map a world-space affine into DisplayList local coordinates
+    /// (`vertex = world - origin`): `T(-origin) · world · T(origin)`.
+    pub fn to_local_origin(self, origin: Point2) -> Self {
+        Self::translate(-origin.x, -origin.y)
+            .then(self)
+            .then(Self::translate(origin.x, origin.y))
+    }
+
+    /// Column-major mat4x4 matching `Camera2::view_proj_f32`.
+    pub fn to_mat4(self) -> [[f32; 4]; 4] {
+        [
+            [self.m00 as f32, self.m10 as f32, 0.0, 0.0],
+            [self.m01 as f32, self.m11 as f32, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [self.tx as f32, self.ty as f32, 0.0, 1.0],
+        ]
+    }
+
+    pub fn identity_mat4() -> [[f32; 4]; 4] {
+        Self::identity().to_mat4()
+    }
+
     pub fn rotation_component(self) -> f64 {
         self.m10.atan2(self.m00)
     }
@@ -136,6 +173,31 @@ impl Transform2 {
 
     pub fn scale_y(self) -> f64 {
         (self.m01 * self.m01 + self.m11 * self.m11).sqrt()
+    }
+
+    pub fn is_uniform_scale(self) -> bool {
+        let sx = self.scale_x();
+        let sy = self.scale_y();
+        (sx - sy).abs() <= crate::geom::GEOM_TOLERANCE * sx.max(sy).max(1.0)
+    }
+
+    pub fn uniform_scale(self) -> Option<f64> {
+        self.is_uniform_scale().then_some(self.scale_x())
+    }
+
+    pub fn try_inverse(self) -> Option<Self> {
+        let det = self.m00 * self.m11 - self.m01 * self.m10;
+        if !det.is_finite() || det.abs() <= crate::geom::GEOM_TOLERANCE {
+            return None;
+        }
+        Some(Self {
+            m00: self.m11 / det,
+            m01: -self.m01 / det,
+            m10: -self.m10 / det,
+            m11: self.m00 / det,
+            tx: (self.m01 * self.ty - self.m11 * self.tx) / det,
+            ty: (self.m10 * self.tx - self.m00 * self.ty) / det,
+        })
     }
 }
 
@@ -221,5 +283,46 @@ mod tests {
         let p = t.apply(Point2::new(10.0, 4.0));
         assert!((p.x + 110.0).abs() < 1e-9);
         assert!((p.y - 4.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn try_inverse_roundtrips_and_uniform_scale_detects_mirroring() {
+        let t = Transform2::insert(
+            Point3::from_xy(10.0, -4.0),
+            Point3::new(2.0, 3.0, 1.0),
+            0.4,
+        );
+        let inv = t.try_inverse().expect("invertible");
+        let p = Point2::new(7.0, 1.5);
+        let back = inv.apply(t.apply(p));
+        assert!((back.x - p.x).abs() < 1e-9);
+        assert!((back.y - p.y).abs() < 1e-9);
+        assert!(Transform2::scale(-1.0, 1.0).is_uniform_scale());
+        assert!(!Transform2::scale(2.0, 1.0).is_uniform_scale());
+    }
+
+    #[test]
+    fn then_applies_the_inner_transform_first() {
+        let translated = Transform2::translate(10.0, 0.0)
+            .then(Transform2::rotate(std::f64::consts::FRAC_PI_2))
+            .apply(Point2::new(1.0, 0.0));
+        assert!(translated.x.abs() < 1e-12);
+        assert!((translated.y - 1.0).abs() < 1e-12);
+        let rotated_then_moved = Transform2::rotate(std::f64::consts::FRAC_PI_2)
+            .then(Transform2::translate(10.0, 0.0))
+            .apply(Point2::new(1.0, 0.0));
+        assert!((rotated_then_moved.x + 10.0).abs() < 1e-12);
+        assert!((rotated_then_moved.y - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn local_origin_preview_does_not_drift_at_large_coordinates() {
+        let origin = Point2::new(1.0e8, 2.0e8);
+        let world = Transform2::translate(10.0, -4.0);
+        let local = world.to_local_origin(origin);
+        let stored = Point2::new(3.0, 5.0);
+        let preview = local.apply(stored);
+        assert!((preview.x - 13.0).abs() < 1e-9);
+        assert!((preview.y - 1.0).abs() < 1e-9);
     }
 }
