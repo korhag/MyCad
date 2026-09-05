@@ -693,6 +693,7 @@ fn clone_definition_with_new_ids(
             entity_map.insert(old, entity.id);
         }
     }
+    let vertex_map = document.remap_entity_vertex_ids(&mut definition.entities);
     if let Some(dynamic) = definition.dynamic.as_mut() {
         let mut parameters = std::collections::BTreeMap::new();
         let mut options = std::collections::BTreeMap::new();
@@ -708,7 +709,7 @@ fn clone_definition_with_new_ids(
         for behavior in &dynamic.behaviors {
             actions.insert(behavior.id, document.allocate_action_id());
         }
-        let _ = dynamic.remap_ids(&parameters, &options, &actions, &entity_map);
+        let _ = dynamic.remap_ids(&parameters, &options, &actions, &entity_map, &vertex_map);
     }
     (definition, entity_map)
 }

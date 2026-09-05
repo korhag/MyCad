@@ -5,11 +5,26 @@ All notable changes to MyCad are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project versions with [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Workspace version is `0.22.0` (`Cargo.toml`).
+Workspace version is `0.23.0` (`Cargo.toml`).
 
 ## [Unreleased]
 
-## [0.22.0] - 2026-09-05
+## [0.23.0] - 2026-09-05
+
+### Added
+
+- Combined Test compare/defaults, screen-space stretch handles, native size-metadata round-trip.
+- Guided Add Size authoring: pick two points, choose local-axis or along-picked measurement, set a first/second/center anchor, and optionally restrict the size to a numeric list.
+- Persistent size metadata, allowed-value domains, and durable straight-polyline vertex stretch targets survive native save/reopen and copy/make-unique remapping.
+- Combined Test mode keeps a full configuration keyed by parameter ID, with Move/Stretch follow-side controls, handle and window target picking, and viewport overlays that are not drawing entities.
+
+### Changed
+
+- Parameter and numeric edits use persistent drafts, structured field errors, and coalesced previews so typing, Escape, and invalid test values no longer silently commit or rebuild the whole drawing on every keystroke.
+
+### Fixed
+
+- Integer values such as `100` keep their zeros at display precision zero, required-increment input is rejected instead of silently snapped, and one click no longer assigns stretch endpoints on every selected line.
 
 ### Added
 

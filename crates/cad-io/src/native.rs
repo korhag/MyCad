@@ -4,12 +4,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use cad_core::{
-    validate_definition, ActionId, BlockDefinition, BlockDefinitionId, BooleanParameter, CadColor,
-    ChoiceOption, ChoiceParameter, CompositionRule, Document, DrawingUnits, DynamicBehavior,
-    DynamicDefinition, Entity, EntityId, Geometry, GeometryTarget, HatchData, HatchEdge, HatchPath,
-    HatchPatternLine, InstanceConfiguration, Layer, LineType, MTextData, NumericParameter,
-    NumericQuantity, OptionId, ParameterDef, ParameterId, ParameterKind, ParameterUnit,
-    ParameterValue, Point3, PolyVertex, StepOrigin, StepPolicy, TextData, TextParameter,
+    validate_definition, ActionId, AnchorPolicy, BlockDefinition, BlockDefinitionId,
+    BooleanParameter, CadColor, ChoiceOption, ChoiceParameter, CompositionRule, Document,
+    DrawingUnits, DynamicBehavior, DynamicDefinition, Entity, EntityId, FollowRole, Geometry,
+    GeometryTarget, HatchData, HatchEdge, HatchPath, HatchPatternLine, InstanceConfiguration,
+    Layer, LineType, MeasureMode, MTextData, NumericDomain, NumericParameter, NumericQuantity,
+    OptionId, ParameterDef, ParameterId, ParameterKind, ParameterUnit, ParameterValue, Point3,
+    PolyVertex, SizeAuthoring, StepOrigin, StepPolicy, TextData, TextParameter, VertexId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -47,6 +48,8 @@ struct WireDocument {
     next_parameter_id: u64,
     next_option_id: u64,
     next_action_id: u64,
+    #[serde(default)]
+    next_vertex_id: u64,
     content_generation: u64,
     saved_revision: u64,
     layers: Vec<WireLayer>,
@@ -198,6 +201,8 @@ enum WireGeometry {
 struct WireVertex {
     point: [f64; 3],
     bulge: f64,
+    #[serde(default)]
+    vertex_id: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -306,6 +311,10 @@ enum WireParameterKind {
         step_origin: String,
         display_precision: u8,
         display_order: i32,
+        #[serde(default)]
+        domain: Option<WireDomain>,
+        #[serde(default)]
+        size: Option<WireSizeAuthoring>,
     },
     Choice {
         options: Vec<WireChoiceOption>,
@@ -345,6 +354,10 @@ struct WireBehavior {
     reference_value: f64,
     multiplier: f64,
     composition: String,
+    #[serde(default)]
+    follow: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -353,6 +366,26 @@ enum WireTarget {
     Entity { id: u64 },
     LineStart { id: u64 },
     LineEnd { id: u64 },
+    Vertex { entity: u64, vertex: u64 },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+enum WireDomain {
+    Continuous,
+    AllowedValues { values: Vec<f64> },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WireSizeAuthoring {
+    point_a: [f64; 2],
+    point_b: [f64; 2],
+    measure: String,
+    direction: [f64; 2],
+    anchor: String,
+    label_offset: [f64; 2],
+    #[serde(default)]
+    bound_anchor: Option<WireTarget>,
 }
 
 pub fn write_mycad(document: &Document, path: &Path) -> Result<SaveReport, ExportError> {
@@ -460,6 +493,7 @@ pub fn import_block_asset(
                 entity_map.insert(old, entity.id);
             }
         }
+        let vertex_map = document.remap_entity_vertex_ids(&mut block.entities);
         if let Some(dynamic) = block.dynamic.as_mut() {
             for parameter in &mut dynamic.parameters {
                 let old = parameter.id;
@@ -479,7 +513,13 @@ pub fn import_block_asset(
                 action_map.insert(old, behavior.id);
             }
             dynamic
-                .remap_ids(&parameter_map, &option_map, &action_map, &entity_map)
+                .remap_ids(
+                    &parameter_map,
+                    &option_map,
+                    &action_map,
+                    &entity_map,
+                    &vertex_map,
+                )
                 .map_err(|err| ExportError::Validation(err.to_string()))?;
         }
         if document.block_key(&block.name).is_some() {
@@ -561,6 +601,7 @@ fn to_wire_document(document: &Document) -> WireDocument {
         next_parameter_id,
         next_option_id,
         next_action_id,
+        next_vertex_id: document.next_vertex_id(),
         content_generation,
         saved_revision,
         layers: document
@@ -653,6 +694,7 @@ fn from_wire_document(wire: WireDocument) -> Result<Document, ExportError> {
         wire.content_generation,
         wire.saved_revision,
     );
+    document.set_next_vertex_id(wire.next_vertex_id);
     document.assign_missing_ids();
     for block in document.blocks.values() {
         if let Some(dynamic) = &block.dynamic {
@@ -1050,6 +1092,8 @@ fn to_parameter(parameter: &ParameterDef) -> WireParameter {
                 },
                 display_precision: numeric.display_precision,
                 display_order: numeric.display_order,
+                domain: Some(to_domain(&numeric.domain)),
+                size: numeric.size.as_ref().map(to_size),
             },
             ParameterKind::Choice(choice) => WireParameterKind::Choice {
                 options: choice
@@ -1090,6 +1134,8 @@ fn from_parameter(parameter: WireParameter) -> Result<ParameterDef, ExportError>
                 step_origin,
                 display_precision,
                 display_order,
+                domain,
+                size,
             } => ParameterKind::Number(NumericParameter {
                 quantity: parse_quantity(&quantity)?,
                 unit: from_unit(unit),
@@ -1102,6 +1148,8 @@ fn from_parameter(parameter: WireParameter) -> Result<ParameterDef, ExportError>
                 step_origin: parse_step_origin(&step_origin)?,
                 display_precision,
                 display_order,
+                domain: from_domain(domain),
+                size: size.map(from_size).transpose()?,
             }),
             WireParameterKind::Choice { options, default } => {
                 ParameterKind::Choice(ChoiceParameter {
@@ -1136,6 +1184,13 @@ fn to_behavior(behavior: &DynamicBehavior) -> WireBehavior {
         reference_value: behavior.reference_value,
         multiplier: behavior.multiplier,
         composition: "additive".into(),
+        follow: Some(match behavior.follow {
+            FollowRole::First => "first".into(),
+            FollowRole::Second => "second".into(),
+            FollowRole::Center => "center".into(),
+            FollowRole::Custom => "custom".into(),
+        }),
+        name: behavior.name.clone(),
     }
 }
 
@@ -1167,6 +1222,18 @@ fn from_behavior(behavior: WireBehavior) -> Result<DynamicBehavior, ExportError>
                 )))
             }
         },
+        follow: match behavior.follow.as_deref() {
+            Some("first") => FollowRole::First,
+            Some("second") => FollowRole::Second,
+            Some("center") => FollowRole::Center,
+            Some("custom") | None | Some("") => FollowRole::Custom,
+            Some(other) => {
+                return Err(ExportError::Validation(format!(
+                    "unknown follow role '{other}'"
+                )))
+            }
+        },
+        name: behavior.name,
     })
 }
 
@@ -1175,6 +1242,10 @@ fn to_target(target: &GeometryTarget) -> WireTarget {
         GeometryTarget::Entity(id) => WireTarget::Entity { id: id.raw() },
         GeometryTarget::LineStart(id) => WireTarget::LineStart { id: id.raw() },
         GeometryTarget::LineEnd(id) => WireTarget::LineEnd { id: id.raw() },
+        GeometryTarget::Vertex { entity, vertex } => WireTarget::Vertex {
+            entity: entity.raw(),
+            vertex: vertex.raw(),
+        },
     }
 }
 
@@ -1183,7 +1254,77 @@ fn from_target(target: WireTarget) -> GeometryTarget {
         WireTarget::Entity { id } => GeometryTarget::Entity(EntityId(id)),
         WireTarget::LineStart { id } => GeometryTarget::LineStart(EntityId(id)),
         WireTarget::LineEnd { id } => GeometryTarget::LineEnd(EntityId(id)),
+        WireTarget::Vertex { entity, vertex } => GeometryTarget::Vertex {
+            entity: EntityId(entity),
+            vertex: VertexId(vertex),
+        },
     }
+}
+
+fn to_domain(domain: &NumericDomain) -> WireDomain {
+    match domain {
+        NumericDomain::Continuous => WireDomain::Continuous,
+        NumericDomain::AllowedValues(values) => WireDomain::AllowedValues {
+            values: values.clone(),
+        },
+    }
+}
+
+fn from_domain(domain: Option<WireDomain>) -> NumericDomain {
+    match domain {
+        None | Some(WireDomain::Continuous) => NumericDomain::Continuous,
+        Some(WireDomain::AllowedValues { values }) => NumericDomain::AllowedValues(values),
+    }
+}
+
+fn to_size(size: &SizeAuthoring) -> WireSizeAuthoring {
+    WireSizeAuthoring {
+        point_a: [size.point_a.x, size.point_a.y],
+        point_b: [size.point_b.x, size.point_b.y],
+        measure: match size.measure {
+            MeasureMode::AlongPicked => "along".into(),
+            MeasureMode::LocalX => "local_x".into(),
+            MeasureMode::LocalY => "local_y".into(),
+        },
+        direction: [size.direction.x, size.direction.y],
+        anchor: match size.anchor {
+            AnchorPolicy::FirstFixed => "first".into(),
+            AnchorPolicy::SecondFixed => "second".into(),
+            AnchorPolicy::CenterFixed => "center".into(),
+        },
+        label_offset: [size.label_offset.x, size.label_offset.y],
+        bound_anchor: size.bound_anchor.as_ref().map(to_target),
+    }
+}
+
+fn from_size(size: WireSizeAuthoring) -> Result<SizeAuthoring, ExportError> {
+    Ok(SizeAuthoring {
+        point_a: cad_core::Point2::new(size.point_a[0], size.point_a[1]),
+        point_b: cad_core::Point2::new(size.point_b[0], size.point_b[1]),
+        measure: match size.measure.as_str() {
+            "along" | "along_picked" => MeasureMode::AlongPicked,
+            "local_x" | "x" => MeasureMode::LocalX,
+            "local_y" | "y" => MeasureMode::LocalY,
+            other => {
+                return Err(ExportError::Validation(format!(
+                    "unknown measure mode '{other}'"
+                )))
+            }
+        },
+        direction: cad_core::Point2::new(size.direction[0], size.direction[1]),
+        anchor: match size.anchor.as_str() {
+            "first" => AnchorPolicy::FirstFixed,
+            "second" => AnchorPolicy::SecondFixed,
+            "center" => AnchorPolicy::CenterFixed,
+            other => {
+                return Err(ExportError::Validation(format!(
+                    "unknown anchor '{other}'"
+                )))
+            }
+        },
+        label_offset: cad_core::Point2::new(size.label_offset[0], size.label_offset[1]),
+        bound_anchor: size.bound_anchor.map(from_target),
+    })
 }
 
 fn to_config(config: &InstanceConfiguration) -> WireConfig {
@@ -1266,6 +1407,7 @@ fn to_vertex(vertex: &PolyVertex) -> WireVertex {
     WireVertex {
         point: pt(vertex.point),
         bulge: vertex.bulge,
+        vertex_id: vertex.vertex_id.raw(),
     }
 }
 
@@ -1273,6 +1415,7 @@ fn from_vertex(vertex: WireVertex) -> PolyVertex {
     PolyVertex {
         point: from_pt(vertex.point),
         bulge: vertex.bulge,
+        vertex_id: VertexId(vertex.vertex_id),
     }
 }
 
@@ -1475,8 +1618,9 @@ fn from_pt(point: [f64; 3]) -> Point3 {
 mod tests {
     use super::*;
     use cad_core::{
-        identity_insert, primitives_document, BehaviorKind, GeometryTarget, NumericParameter,
-        ParameterDef, Point2,
+        identity_insert, primitives_document, AnchorPolicy, BehaviorKind, FollowRole, GeometryTarget,
+        MeasureMode, NumericDomain, NumericParameter, ParameterDef, ParameterKind, Point2,
+        SizeAuthoring,
     };
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1528,6 +1672,8 @@ mod tests {
                 reference_value: 800.0,
                 multiplier: 1.0,
                 composition: CompositionRule::Additive,
+                follow: FollowRole::Second,
+                name: None,
             }],
         });
         document.replace_block_definition(definition);
@@ -1558,6 +1704,94 @@ mod tests {
     }
 
     #[test]
+    fn size_metadata_domain_and_vertex_targets_roundtrip() {
+        let mut document = Document::default();
+        let param = document.allocate_parameter_id();
+        let vertex = document.allocate_vertex_id();
+        let mut polyline = Entity::new(Geometry::LwPolyline {
+            vertices: vec![
+                cad_core::PolyVertex {
+                    point: Point3::from_xy(0.0, 0.0),
+                    bulge: 0.0,
+                    vertex_id: vertex,
+                },
+                cad_core::PolyVertex {
+                    point: Point3::from_xy(800.0, 0.0),
+                    bulge: 0.0,
+                    vertex_id: document.allocate_vertex_id(),
+                },
+            ],
+            closed: false,
+            extrusion: Point3::new(0.0, 0.0, 1.0),
+            linetype_generation_continuous: false,
+        });
+        polyline.id = document.allocate_id();
+        let mut numeric = NumericParameter::length(800.0);
+        numeric.reference = 800.0;
+        numeric.default = 800.0;
+        numeric.domain = NumericDomain::AllowedValues(vec![250.0, 400.0, 800.0]);
+        numeric.size = Some(SizeAuthoring {
+            point_a: Point2::new(0.0, 0.0),
+            point_b: Point2::new(800.0, 0.0),
+            measure: MeasureMode::LocalX,
+            direction: Point2::new(1.0, 0.0),
+            anchor: AnchorPolicy::FirstFixed,
+            label_offset: Point2::new(0.0, 12.0),
+            bound_anchor: None,
+        });
+        let mut definition = BlockDefinition::plain(
+            "AdjustableFrame",
+            Point3::from_xy(0.0, 0.0),
+            vec![polyline.clone()],
+        );
+        definition.dynamic = Some(DynamicDefinition {
+            parameters: vec![ParameterDef::number(param, "Span", numeric)],
+            behaviors: vec![DynamicBehavior {
+                id: document.allocate_action_id(),
+                kind: BehaviorKind::Stretch,
+                parameter: param,
+                targets: vec![GeometryTarget::Vertex {
+                    entity: polyline.id,
+                    vertex,
+                }],
+                local_direction: Point2::new(1.0, 0.0),
+                reference_value: 800.0,
+                multiplier: 1.0,
+                composition: CompositionRule::Additive,
+                follow: FollowRole::Second,
+                name: Some("right rail".into()),
+            }],
+        });
+        document.replace_block_definition(definition);
+        let path = temp("size-meta.mycad");
+        write_mycad(&document, &path).expect("write");
+        let loaded = read_mycad(&path).expect("read");
+        let _ = std::fs::remove_file(&path);
+        let def = loaded.block_by_name("AdjustableFrame").unwrap();
+        let numeric = match &def.dynamic.as_ref().unwrap().parameters[0].kind {
+            ParameterKind::Number(numeric) => numeric,
+            _ => panic!("number"),
+        };
+        assert!(matches!(numeric.domain, NumericDomain::AllowedValues(ref values) if values.len() == 3));
+        let size = numeric.size.as_ref().expect("size metadata");
+        assert_eq!(size.measure, MeasureMode::LocalX);
+        assert_eq!(size.anchor, AnchorPolicy::FirstFixed);
+        assert!((size.point_b.x - 800.0).abs() < 1e-12);
+        assert!((size.label_offset.y - 12.0).abs() < 1e-12);
+        assert_eq!(
+            def.dynamic.as_ref().unwrap().behaviors[0].targets[0],
+            GeometryTarget::Vertex {
+                entity: polyline.id,
+                vertex,
+            }
+        );
+        assert_eq!(
+            def.dynamic.as_ref().unwrap().behaviors[0].name.as_deref(),
+            Some("right rail")
+        );
+    }
+
+    #[test]
     fn block_asset_roundtrip_remaps_identities_on_import() {
         let mut document = Document::default();
         let param = document.allocate_parameter_id();
@@ -1584,6 +1818,8 @@ mod tests {
                 reference_value: 10.0,
                 multiplier: 1.0,
                 composition: CompositionRule::Additive,
+                follow: FollowRole::Second,
+                name: None,
             }],
         });
         document.replace_block_definition(definition);
@@ -1613,6 +1849,20 @@ mod tests {
             imported.dynamic.as_ref().unwrap().behaviors[0].targets[0].entity_id(),
             imported.entities[0].id
         );
+    }
+
+    #[test]
+    fn schema_1_numeric_without_domain_loads_as_continuous() {
+        let json = r#"{"format":"mycad","schema":1,"document":{"units":0,"ltscale":1,"current_layer":"0","next_entity_id":3,"next_definition_id":2,"next_parameter_id":2,"next_option_id":1,"next_action_id":2,"content_generation":1,"saved_revision":0,"layers":[],"linetypes":[],"blocks":[{"id":1,"name":"Frame","base_pt":[0,0,0],"content_revision":1,"entities":[{"id":1,"layer":"0","color":{"kind":"ByLayer"},"linetype":"BYLAYER","linetype_scale":1,"visible":true,"geometry":{"type":"Line","start":[0,0,0],"end":[10,0,0]}}],"dynamic":{"parameters":[{"id":1,"name":"Span","description":null,"kind":{"type":"Number","quantity":"length","unit":{"kind":"None"},"default":10,"reference":10,"min":null,"max":null,"step":null,"step_policy":"increment_only","step_origin":"minimum","display_precision":4,"display_order":0}}],"behaviors":[{"id":1,"kind":"stretch","parameter":1,"targets":[{"kind":"LineEnd","id":1}],"local_direction":[1,0],"reference_value":10,"multiplier":1,"composition":"additive"}]}}],"model_space":[]}}"#;
+        let loaded = parse_mycad_bytes(json.as_bytes()).expect("schema-1");
+        let def = loaded.block_by_name("Frame").unwrap();
+        let numeric = match &def.dynamic.as_ref().unwrap().parameters[0].kind {
+            ParameterKind::Number(numeric) => numeric,
+            _ => panic!("number"),
+        };
+        assert!(matches!(numeric.domain, NumericDomain::Continuous));
+        assert!(numeric.size.is_none());
+        assert_eq!(def.dynamic.as_ref().unwrap().behaviors[0].follow, FollowRole::Custom);
     }
 
     #[test]

@@ -472,7 +472,8 @@ unsafe fn convert_geometry(
                     .map(|(i, p)| PolyVertex {
                         point: Point3::from_xy(p.x, p.y),
                         bulge: bulges.get(i).copied().unwrap_or(0.0),
-                    })
+                    vertex_id: Default::default(),
+        })
                     .collect(),
                 closed,
                 extrusion: extrusion_of(entity_ptr, "LWPOLYLINE"),
@@ -747,7 +748,8 @@ fn convert_hatch_path(path: &libredwg_sys::Dwg_HATCH_Path) -> HatchPath {
                 .map(|v| PolyVertex {
                     point: Point3::from_xy(v.point.x, v.point.y),
                     bulge: v.bulge,
-                })
+                vertex_id: Default::default(),
+        })
                 .collect(),
             closed: path.closed != 0,
         }
@@ -850,7 +852,8 @@ unsafe fn polyline_2d_vertices(
                 verts.push(PolyVertex {
                     point: pt3(p),
                     bulge,
-                });
+                vertex_id: Default::default(),
+        });
             }
         }
         sub = unsafe { libredwg_sys::get_next_owned_subentity(obj, sub) };
@@ -870,7 +873,8 @@ unsafe fn polyline_2d_vertices(
             .map(|p| PolyVertex {
                 point: Point3::from_xy(p.x, p.y),
                 bulge: 0.0,
-            })
+            vertex_id: Default::default(),
+        })
             .collect();
         unsafe { libc::free(points_ptr.cast()) };
     }
@@ -892,6 +896,7 @@ unsafe fn polyline_3d_vertices(obj: *mut libredwg_sys::Dwg_Object) -> Vec<PolyVe
         .map(|p| PolyVertex {
             point: pt3(*p),
             bulge: 0.0,
+        vertex_id: Default::default(),
         })
         .collect();
     unsafe { libc::free(points_ptr.cast()) };

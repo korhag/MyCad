@@ -9,7 +9,7 @@ use crate::dynamic::DynamicDefinition;
 use crate::entity::{Entity, EntityId, Geometry};
 use crate::extents::Extents2;
 use crate::geom::{Point2, Point3};
-use crate::ids::{ActionId, BlockDefinitionId, OptionId, ParameterId};
+use crate::ids::{ActionId, BlockDefinitionId, OptionId, ParameterId, VertexId};
 use crate::linetype::{is_byblock_name, is_bylayer_name, normalize_linetype_name, LineType};
 use crate::transform::Transform2;
 
@@ -312,6 +312,7 @@ pub struct Document {
     next_parameter_id: u64,
     next_option_id: u64,
     next_action_id: u64,
+    next_vertex_id: u64,
     content_generation: u64,
     saved_revision: u64,
     entity_locations: HashMap<EntityId, EntityLocation>,
@@ -335,6 +336,7 @@ impl Default for Document {
             next_parameter_id: 1,
             next_option_id: 1,
             next_action_id: 1,
+            next_vertex_id: 1,
             content_generation: 1,
             saved_revision: 0,
             entity_locations: HashMap::new(),
@@ -392,6 +394,20 @@ impl Document {
         let id = ActionId(self.next_action_id);
         self.next_action_id = self.next_action_id.saturating_add(1).max(1);
         id
+    }
+
+    pub fn allocate_vertex_id(&mut self) -> VertexId {
+        let id = VertexId(self.next_vertex_id);
+        self.next_vertex_id = self.next_vertex_id.saturating_add(1).max(1);
+        id
+    }
+
+    pub fn next_vertex_id(&self) -> u64 {
+        self.next_vertex_id
+    }
+
+    pub fn set_next_vertex_id(&mut self, next: u64) {
+        self.next_vertex_id = next.max(1);
     }
 
     pub fn content_generation(&self) -> u64 {
@@ -457,6 +473,7 @@ impl Document {
         }
         self.next_entity_id = next;
         self.assign_missing_definition_ids();
+        self.assign_missing_vertex_ids();
         self.rebuild_entity_index();
     }
 
@@ -499,6 +516,50 @@ impl Document {
         self.next_parameter_id = next_param;
         self.next_option_id = next_option;
         self.next_action_id = next_action;
+    }
+
+    pub fn assign_missing_vertex_ids(&mut self) {
+        let mut next = self.next_vertex_id.max(1);
+        for entity in self.model_space.iter_mut().chain(
+            self.blocks
+                .values_mut()
+                .flat_map(|block| block.entities.iter_mut()),
+        ) {
+            bump_vertex_counter(entity, &mut next);
+        }
+        for entity in self.model_space.iter_mut().chain(
+            self.blocks
+                .values_mut()
+                .flat_map(|block| block.entities.iter_mut()),
+        ) {
+            assign_entity_vertex_ids(entity, &mut next);
+        }
+        self.next_vertex_id = next;
+    }
+
+    pub fn ensure_entity_vertex_ids(&mut self, entity: &mut Entity) {
+        assign_entity_vertex_ids(entity, &mut self.next_vertex_id);
+    }
+
+    pub fn remap_entity_vertex_ids(
+        &mut self,
+        entities: &mut [Entity],
+    ) -> std::collections::BTreeMap<VertexId, VertexId> {
+        let mut map = std::collections::BTreeMap::new();
+        for entity in entities.iter_mut() {
+            if let Some(vertices) = entity.geometry.polyline_vertices_mut() {
+                for vertex in vertices {
+                    if vertex.vertex_id.is_assigned() {
+                        let new_id = self.allocate_vertex_id();
+                        map.insert(vertex.vertex_id, new_id);
+                        vertex.vertex_id = new_id;
+                    } else {
+                        vertex.vertex_id = self.allocate_vertex_id();
+                    }
+                }
+            }
+        }
+        map
     }
 
     pub fn new_entity(&self, geometry: Geometry) -> Entity {
@@ -557,6 +618,7 @@ impl Document {
         } else {
             entity.id = self.allocate_id();
         }
+        assign_entity_vertex_ids(&mut entity, &mut self.next_vertex_id);
         let space = self.canonical_space(space)?;
         let index = {
             let entities = self.entities_mut(&space)?;
@@ -757,6 +819,14 @@ impl Document {
             definition.id = self.allocate_definition_id();
         } else {
             self.next_definition_id = self.next_definition_id.max(definition.id.raw() + 1);
+        }
+        for entity in &mut definition.entities {
+            if entity.id.is_assigned() {
+                self.next_entity_id = self.next_entity_id.max(entity.id.raw() + 1);
+            } else {
+                entity.id = self.allocate_id();
+            }
+            assign_entity_vertex_ids(entity, &mut self.next_vertex_id);
         }
         let previous = if let Some(key) = self.block_key(&definition.name) {
             self.forget_space(&EntitySpace::Block(key.clone()));
@@ -1178,6 +1248,29 @@ fn collect_entity_points(
     }
 }
 
+fn bump_vertex_counter(entity: &Entity, next: &mut u64) {
+    if let Some(vertices) = entity.geometry.polyline_vertices() {
+        for vertex in vertices {
+            if vertex.vertex_id.is_assigned() {
+                *next = (*next).max(vertex.vertex_id.raw() + 1);
+            }
+        }
+    }
+}
+
+fn assign_entity_vertex_ids(entity: &mut Entity, next: &mut u64) {
+    if let Some(vertices) = entity.geometry.polyline_vertices_mut() {
+        for vertex in vertices {
+            if !vertex.vertex_id.is_assigned() {
+                vertex.vertex_id = VertexId(*next);
+                *next = next.saturating_add(1).max(1);
+            } else {
+                *next = (*next).max(vertex.vertex_id.raw() + 1);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1311,11 +1404,13 @@ mod tests {
                 PolyVertex {
                     point: Point3::from_xy(0.0, 0.0),
                     bulge: 0.0,
-                },
+                vertex_id: Default::default(),
+        },
                 PolyVertex {
                     point: Point3::from_xy(8.0, 2.0),
                     bulge: 0.0,
-                },
+                vertex_id: Default::default(),
+        },
             ],
             closed: false,
             extrusion: Point3::new(0.0, 0.0, 1.0),

@@ -107,6 +107,32 @@ impl fmt::Display for ActionId {
     }
 }
 
+// ------------------------------------------------------------
+// Type: VertexId
+// Purpose: Durable identity for a polyline vertex. Vector indices
+//          are not stable across insert, delete, or reorder.
+// ------------------------------------------------------------
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct VertexId(pub u64);
+
+impl VertexId {
+    pub const UNASSIGNED: Self = Self(0);
+
+    pub fn is_assigned(self) -> bool {
+        self.0 != 0
+    }
+
+    pub fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for VertexId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "vtx:{}", self.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,6 +143,7 @@ mod tests {
         assert!(!ParameterId::UNASSIGNED.is_assigned());
         assert!(!OptionId::UNASSIGNED.is_assigned());
         assert!(!ActionId::UNASSIGNED.is_assigned());
+        assert!(!VertexId::UNASSIGNED.is_assigned());
     }
 
     #[test]

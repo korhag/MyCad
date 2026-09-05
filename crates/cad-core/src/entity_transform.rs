@@ -363,6 +363,7 @@ fn transform_poly_vertices(vertices: &[PolyVertex], matrix: Transform2) -> Vec<P
             } else {
                 vertex.bulge
             },
+            vertex_id: vertex.vertex_id,
         })
         .collect()
 }
@@ -747,11 +748,13 @@ mod tests {
                 PolyVertex {
                     point: Point3::from_xy(0.0, 0.0),
                     bulge: 0.5,
-                },
+                vertex_id: Default::default(),
+        },
                 PolyVertex {
                     point: Point3::from_xy(2.0, 0.0),
                     bulge: -0.25,
-                },
+                vertex_id: Default::default(),
+        },
             ],
             closed: false,
             extrusion: default_extrusion(),

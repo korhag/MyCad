@@ -3,6 +3,7 @@
 use crate::color::CadColor;
 use crate::dynamic::InstanceConfiguration;
 use crate::geom::Point3;
+use crate::ids::VertexId;
 
 // ------------------------------------------------------------
 // Type: EntityId
@@ -193,12 +194,42 @@ impl Geometry {
             *configuration = value;
         }
     }
+
+    pub fn polyline_vertices(&self) -> Option<&[PolyVertex]> {
+        match self {
+            Self::LwPolyline { vertices, .. } | Self::Polyline { vertices, .. } => Some(vertices),
+            _ => None,
+        }
+    }
+
+    pub fn polyline_vertices_mut(&mut self) -> Option<&mut Vec<PolyVertex>> {
+        match self {
+            Self::LwPolyline { vertices, .. } | Self::Polyline { vertices, .. } => Some(vertices),
+            _ => None,
+        }
+    }
+
+    pub fn polyline_has_curves(&self) -> bool {
+        self.polyline_vertices()
+            .is_some_and(|vertices| vertices.iter().any(|vertex| vertex.bulge.abs() > 1e-12))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PolyVertex {
     pub point: Point3,
     pub bulge: f64,
+    pub vertex_id: VertexId,
+}
+
+impl PolyVertex {
+    pub fn new(point: Point3, bulge: f64) -> Self {
+        Self {
+            point,
+            bulge,
+            vertex_id: VertexId::UNASSIGNED,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

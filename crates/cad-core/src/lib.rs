@@ -47,13 +47,15 @@ pub use document::{
     BlockDefinition, Document, DrawingUnits, EntityLocation, EntitySpace, ImportDiagnostics, Layer,
 };
 pub use dynamic::{
-    capability_for, increment_numeric, normalize_direction, resolve_values, snap_numeric,
-    validate_definition, validate_numeric_value, validate_parameter_def, validate_parameter_value,
-    BehaviorKind, BooleanParameter, ChoiceOption,
-    ChoiceParameter, CompositionRule, DynamicBehavior, DynamicDefinition, DynamicError,
-    GeometryTarget, InstanceConfiguration, NumericParameter, NumericQuantity, ParameterDef,
-    ParameterKind, ParameterUnit, ParameterValue, StepOrigin, StepPolicy, TextParameter,
-    EVALUATOR_VERSION,
+    apply_anchor_policy, apply_size_axis, capability_for, collect_broken_bindings, dedupe_targets,
+    follow_multiplier, format_display_number, increment_numeric, measure_size, nearest_allowed_values,
+    nearest_step_values, normalize_direction, numbers_equal, parse_allowed_value_list,
+    resolve_values, snap_numeric, validate_behavior_conflicts, validate_definition,
+    validate_numeric_value, validate_parameter_def, validate_parameter_value, AnchorPolicy,
+    BehaviorKind, BooleanParameter, ChoiceOption, ChoiceParameter, CompositionRule, DynamicBehavior,
+    DynamicDefinition, DynamicError, FollowRole, GeometryTarget, InstanceConfiguration, MeasureMode,
+    NumericDomain, NumericParameter, NumericQuantity, ParameterDef, ParameterKind, ParameterUnit,
+    ParameterValue, SizeAuthoring, StepOrigin, StepPolicy, TextParameter, EVALUATOR_VERSION,
 };
 pub use entity::{
     default_extrusion, Entity, EntityId, Geometry, HatchData, HatchEdge, HatchPath,
@@ -76,7 +78,7 @@ pub use geom::{
     GEOM_TOLERANCE,
 };
 pub use hatch::hatch_path_points;
-pub use ids::{ActionId, BlockDefinitionId, OptionId, ParameterId};
+pub use ids::{ActionId, BlockDefinitionId, OptionId, ParameterId, VertexId};
 pub use linetype::{
     is_byblock_name, is_bylayer_name, is_continuous_name, normalize_linetype_name, LineType,
 };

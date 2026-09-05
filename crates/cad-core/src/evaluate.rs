@@ -273,6 +273,7 @@ fn apply_behaviors(
                     let slot = match target {
                         GeometryTarget::LineStart(_) => TargetSlot::LineStart,
                         GeometryTarget::LineEnd(_) => TargetSlot::LineEnd,
+                        GeometryTarget::Vertex { vertex, .. } => TargetSlot::Vertex(*vertex),
                         GeometryTarget::Entity(_) => {
                             return Err(DynamicError::UnsupportedTarget {
                                 action: behavior.id,
@@ -308,6 +309,7 @@ enum TargetSlot {
     Whole,
     LineStart,
     LineEnd,
+    Vertex(crate::ids::VertexId),
 }
 
 fn compose_displacements(
@@ -365,6 +367,28 @@ fn apply_slot(entity: &mut Entity, slot: TargetSlot, delta: Point2) -> Result<()
                 reason: "stretch",
             }),
         },
+        TargetSlot::Vertex(vertex_id) => {
+            let Some(vertices) = entity.geometry.polyline_vertices_mut() else {
+                return Err(DynamicError::UnsupportedTarget {
+                    action: ActionId::UNASSIGNED,
+                    target: GeometryTarget::Vertex {
+                        entity: entity.id,
+                        vertex: vertex_id,
+                    },
+                    reason: "stretch",
+                });
+            };
+            let Some(vertex) = vertices.iter_mut().find(|item| item.vertex_id == vertex_id) else {
+                return Err(DynamicError::MissingVertex {
+                    target: GeometryTarget::Vertex {
+                        entity: entity.id,
+                        vertex: vertex_id,
+                    },
+                });
+            };
+            vertex.point = translate_point(vertex.point, delta);
+            Ok(())
+        }
     }
 }
 
@@ -662,6 +686,8 @@ mod tests {
                     reference_value: 800.0,
                     multiplier: 1.0,
                     composition: CompositionRule::Additive,
+                    follow: crate::dynamic::FollowRole::Second,
+                    name: None,
                 },
                 DynamicBehavior {
                     id: document.allocate_action_id(),
@@ -672,6 +698,8 @@ mod tests {
                     reference_value: 800.0,
                     multiplier: 1.0,
                     composition: CompositionRule::Additive,
+                    follow: crate::dynamic::FollowRole::Second,
+                    name: None,
                 },
             ],
         });
@@ -768,6 +796,8 @@ mod tests {
                 reference_value: 0.0,
                 multiplier: 1.0,
                 composition: CompositionRule::Additive,
+                follow: crate::dynamic::FollowRole::Second,
+                name: None,
             }],
         });
         document.replace_block_definition(definition.clone());
@@ -1013,16 +1043,18 @@ mod tests {
     }
 
     #[test]
-    fn polyline_vertex_stretch_is_rejected() {
+    fn polyline_entity_stretch_is_rejected_but_straight_vertices_are_not() {
         let mut line = Entity::new(Geometry::LwPolyline {
             vertices: vec![
                 crate::entity::PolyVertex {
                     point: Point3::from_xy(0.0, 0.0),
                     bulge: 0.0,
+                    vertex_id: crate::ids::VertexId(1),
                 },
                 crate::entity::PolyVertex {
                     point: Point3::from_xy(10.0, 0.0),
                     bulge: 0.0,
+                    vertex_id: crate::ids::VertexId(2),
                 },
             ],
             closed: false,
@@ -1036,6 +1068,186 @@ mod tests {
             GeometryTarget::Entity(line.id),
         )
         .unwrap_err();
-        assert!(err.contains("durable vertex identity"));
+        assert!(err.contains("straight vertices"));
+        capability_for(
+            BehaviorKind::Stretch,
+            &line.geometry,
+            GeometryTarget::Vertex {
+                entity: line.id,
+                vertex: crate::ids::VertexId(2),
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn straight_polyline_vertex_stretch_moves_the_bound_vertex() {
+        let mut document = Document::default();
+        let param = document.allocate_parameter_id();
+        let mut polyline = Entity::new(Geometry::LwPolyline {
+            vertices: vec![
+                crate::entity::PolyVertex {
+                    point: Point3::from_xy(0.0, 0.0),
+                    bulge: 0.0,
+                    vertex_id: crate::ids::VertexId(11),
+                },
+                crate::entity::PolyVertex {
+                    point: Point3::from_xy(10.0, 0.0),
+                    bulge: 0.0,
+                    vertex_id: crate::ids::VertexId(12),
+                },
+            ],
+            closed: false,
+            extrusion: crate::entity::default_extrusion(),
+            linetype_generation_continuous: false,
+        });
+        polyline.id = document.allocate_id();
+        let mut numeric = NumericParameter::length(10.0);
+        numeric.reference = 10.0;
+        let mut definition =
+            BlockDefinition::plain("Rail", Point3::from_xy(0.0, 0.0), vec![polyline.clone()]);
+        definition.dynamic = Some(DynamicDefinition {
+            parameters: vec![ParameterDef::number(param, "Span", numeric)],
+            behaviors: vec![DynamicBehavior {
+                id: document.allocate_action_id(),
+                kind: BehaviorKind::Stretch,
+                parameter: param,
+                targets: vec![GeometryTarget::Vertex {
+                    entity: polyline.id,
+                    vertex: crate::ids::VertexId(12),
+                }],
+                local_direction: Point2::new(1.0, 0.0),
+                reference_value: 10.0,
+                multiplier: 1.0,
+                composition: CompositionRule::Additive,
+                follow: crate::dynamic::FollowRole::Second,
+                name: None,
+            }],
+        });
+        document.replace_block_definition(definition.clone());
+        let definition = document.block_by_name("Rail").unwrap().clone();
+        let mut config = InstanceConfiguration::default();
+        config.set(param, ParameterValue::Number(15.0));
+        let request = EvaluationRequest {
+            generation: document.content_generation(),
+        };
+        let evaluated = evaluate_definition(
+            &document,
+            &definition,
+            Some(&config),
+            &mut EvaluationCache::default(),
+            request,
+        )
+        .unwrap();
+        let Geometry::LwPolyline { vertices, .. } = &evaluated.entities[0].geometry else {
+            panic!("polyline");
+        };
+        assert!((vertices[0].point.x - 0.0).abs() < 1e-12);
+        assert!((vertices[1].point.x - 15.0).abs() < 1e-12);
+        assert_eq!(vertices[1].vertex_id, crate::ids::VertexId(12));
+    }
+
+    #[test]
+    fn small_frame_preview_evaluation_is_measurable() {
+        let (document, _, param) = span_frame();
+        let definition = document.block_by_name("AdjustableFrame").unwrap().clone();
+        let mut config = InstanceConfiguration::default();
+        config.set(param, ParameterValue::Number(1200.0));
+        let request = EvaluationRequest {
+            generation: document.content_generation(),
+        };
+        let start = std::time::Instant::now();
+        for _ in 0..50 {
+            let _ = evaluate_definition(
+                &document,
+                &definition,
+                Some(&config),
+                &mut EvaluationCache::default(),
+                request,
+            )
+            .unwrap();
+        }
+        let elapsed = start.elapsed();
+        eprintln!("small-frame 50 evaluates: {elapsed:?}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "small dynamic frame evaluation took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn two_parameters_apply_together_and_center_moves_half() {
+        let mut document = Document::default();
+        let span = document.allocate_parameter_id();
+        let depth = document.allocate_parameter_id();
+        let mut line = Entity::new(Geometry::Line {
+            start: Point3::from_xy(0.0, 0.0),
+            end: Point3::from_xy(800.0, 10.0),
+        });
+        line.id = document.allocate_id();
+        let mut span_num = NumericParameter::length(800.0);
+        span_num.reference = 800.0;
+        let mut depth_num = NumericParameter::length(10.0);
+        depth_num.reference = 10.0;
+        let mut definition = BlockDefinition::plain(
+            "Frame",
+            Point3::from_xy(0.0, 0.0),
+            vec![line.clone()],
+        );
+        definition.dynamic = Some(DynamicDefinition {
+            parameters: vec![
+                ParameterDef::number(span, "Span", span_num),
+                ParameterDef::number(depth, "Depth", depth_num),
+            ],
+            behaviors: vec![
+                DynamicBehavior {
+                    id: document.allocate_action_id(),
+                    kind: BehaviorKind::Stretch,
+                    parameter: span,
+                    targets: vec![GeometryTarget::LineEnd(line.id)],
+                    local_direction: Point2::new(1.0, 0.0),
+                    reference_value: 800.0,
+                    multiplier: 1.0,
+                    composition: CompositionRule::Additive,
+                    follow: crate::dynamic::FollowRole::Second,
+                    name: None,
+                },
+                DynamicBehavior {
+                    id: document.allocate_action_id(),
+                    kind: BehaviorKind::Stretch,
+                    parameter: depth,
+                    targets: vec![GeometryTarget::LineEnd(line.id)],
+                    local_direction: Point2::new(0.0, 1.0),
+                    reference_value: 10.0,
+                    multiplier: 0.5,
+                    composition: CompositionRule::Additive,
+                    follow: crate::dynamic::FollowRole::Center,
+                    name: None,
+                },
+            ],
+        });
+        document.replace_block_definition(definition.clone());
+        let definition = document.block_by_name("Frame").unwrap().clone();
+        let mut config = InstanceConfiguration::default();
+        config.set(span, ParameterValue::Number(1000.0));
+        config.set(depth, ParameterValue::Number(30.0));
+        let evaluated = evaluate_definition(
+            &document,
+            &definition,
+            Some(&config),
+            &mut EvaluationCache::default(),
+            EvaluationRequest {
+                generation: document.content_generation(),
+            },
+        )
+        .unwrap();
+        match &evaluated.entities[0].geometry {
+            Geometry::Line { start, end } => {
+                assert!((start.x - 0.0).abs() < 1e-12);
+                assert!((end.x - 1000.0).abs() < 1e-12);
+                assert!((end.y - 20.0).abs() < 1e-12);
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }

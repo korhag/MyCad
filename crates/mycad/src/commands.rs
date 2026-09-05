@@ -1184,7 +1184,8 @@ pub fn lwpolyline_geometry(points: &[Point2], closed: bool) -> Geometry {
             .map(|point| PolyVertex {
                 point: Point3::from_xy(point.x, point.y),
                 bulge: 0.0,
-            })
+            vertex_id: Default::default(),
+        })
             .collect(),
         closed,
         extrusion: default_extrusion(),

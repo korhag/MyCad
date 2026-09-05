@@ -595,6 +595,7 @@ fn push_polyline(
             } else {
                 vertex.bulge
             },
+        vertex_id: Default::default(),
         })
         .collect();
     let n = world.len();

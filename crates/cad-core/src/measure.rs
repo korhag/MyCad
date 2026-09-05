@@ -221,7 +221,8 @@ impl AreaMeasurement {
             .map(|p| PolyVertex {
                 point: crate::geom::Point3::from_xy(p.x, p.y),
                 bulge: 0.0,
-            })
+            vertex_id: Default::default(),
+        })
             .collect();
         Self::from_polyline(&vertices, true)
     }
@@ -563,7 +564,8 @@ fn circle_as_loop(center: Point2, radius: f64) -> Vec<PolyVertex> {
                     center.y + radius * a.sin(),
                 ),
                 bulge: 0.0,
-            }
+            vertex_id: Default::default(),
+        }
         })
         .collect()
 }
@@ -661,6 +663,7 @@ mod tests {
         PolyVertex {
             point: Point3::from_xy(x, y),
             bulge,
+            vertex_id: Default::default(),
         }
     }
 

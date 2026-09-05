@@ -389,11 +389,13 @@ mod tests {
             PolyVertex {
                 point: Point3::from_xy(a.x, a.y),
                 bulge,
-            },
+            vertex_id: Default::default(),
+        },
             PolyVertex {
                 point: Point3::from_xy(b.x, b.y),
                 bulge: 0.0,
-            },
+            vertex_id: Default::default(),
+        },
         ]
     }
 
@@ -543,15 +545,18 @@ mod tests {
             PolyVertex {
                 point: Point3::from_xy(0.0, 0.0),
                 bulge: 0.0,
-            },
+            vertex_id: Default::default(),
+        },
             PolyVertex {
                 point: Point3::from_xy(1.0, 0.0),
                 bulge: 0.0,
-            },
+            vertex_id: Default::default(),
+        },
             PolyVertex {
                 point: Point3::from_xy(1.0, 1.0),
                 bulge: 0.0,
-            },
+            vertex_id: Default::default(),
+        },
         ];
         let pts = polyline_points(&verts, true, Point3::new(0.0, 0.0, 1.0));
         assert!((pts.first().unwrap().x - 0.0).abs() < 1e-12);

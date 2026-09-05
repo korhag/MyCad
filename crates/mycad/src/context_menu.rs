@@ -44,8 +44,10 @@ pub enum ContextAction {
     RemoveFromBlock,
     MakeUnique,
     CreateDynamicBlock,
-    AttachMove,
-    AttachStretch,
+    EditDynamicBlock,
+    AttachMoveTo(cad_core::ParameterId),
+    AttachStretchTo(cad_core::ParameterId),
+    NewSize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,7 +110,7 @@ pub fn kind_for_command(kind: CommandKind) -> Option<ContextKind> {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct BlockMenuState {
     pub can_create: bool,
     pub can_edit: bool,
@@ -116,7 +118,9 @@ pub struct BlockMenuState {
     pub can_remove: bool,
     pub can_make_unique: bool,
     pub can_create_dynamic: bool,
+    pub can_edit_dynamic: bool,
     pub can_attach: bool,
+    pub size_parameters: Vec<(cad_core::ParameterId, String)>,
 }
 
 pub enum MenuResult {
@@ -446,24 +450,46 @@ fn idle_menu(
             ContextAction::CreateDynamicBlock,
         );
     }
-    if block_menu.can_attach {
+    if block_menu.can_edit_dynamic {
         row(
             ui,
             None,
-            "Attach to Parameter → Move",
+            "Edit Dynamic Block…",
             None,
             true,
             action,
-            ContextAction::AttachMove,
+            ContextAction::EditDynamicBlock,
         );
+    }
+    if block_menu.can_attach {
+        for (id, name) in &block_menu.size_parameters {
+            row(
+                ui,
+                None,
+                &format!("Attach to {name} → Move"),
+                None,
+                true,
+                action,
+                ContextAction::AttachMoveTo(*id),
+            );
+            row(
+                ui,
+                None,
+                &format!("Attach to {name} → Stretch"),
+                None,
+                true,
+                action,
+                ContextAction::AttachStretchTo(*id),
+            );
+        }
         row(
             ui,
             None,
-            "Attach to Parameter → Stretch",
+            "Attach to Parameter → New Size…",
             None,
             true,
             action,
-            ContextAction::AttachStretch,
+            ContextAction::NewSize,
         );
     }
     if block_menu.can_make_unique {
@@ -501,6 +527,9 @@ fn idle_menu(
     }
     if block_menu.can_create
         || block_menu.can_edit
+        || block_menu.can_create_dynamic
+        || block_menu.can_edit_dynamic
+        || block_menu.can_attach
         || block_menu.can_make_unique
         || block_menu.can_add
         || block_menu.can_remove

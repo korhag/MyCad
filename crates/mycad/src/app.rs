@@ -112,6 +112,24 @@ enum LoadMsg {
     },
 }
 
+enum PreviewMsg {
+    Ready {
+        document_generation: u64,
+        session_generation: u64,
+        preview_generation: u64,
+        display: Box<DisplayList>,
+        snaps: Box<SnapIndex>,
+        measures: Box<MeasureIndex>,
+        extents: Option<Extents2>,
+    },
+    Failed {
+        document_generation: u64,
+        session_generation: u64,
+        preview_generation: u64,
+        message: String,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IoKind {
     SavingDxf,
@@ -219,7 +237,7 @@ pub struct MyCadApp {
     /// True after MyCAD wrote `document.source_path` this session.
     source_written_by_mycad: bool,
     pdf_plot: PdfPlotUi,
-    last_pointer: Option<egui::Pos2>,
+    pub(crate) last_pointer: Option<egui::Pos2>,
     box_select: Option<BoxSelectDrag>,
     command_snaps: Vec<SnapFeature>,
     pub(crate) block_edit: BlockEditSession,
@@ -230,6 +248,9 @@ pub struct MyCadApp {
     pub(crate) dynamic_convert: Option<ConvertDialog>,
     pub(crate) parameter_drafts: BTreeMap<(EntityId, ParameterId), String>,
     pub(crate) parameter_previews: BTreeMap<EntityId, InstanceConfiguration>,
+    preview_pending: bool,
+    preview_rx: Option<Receiver<PreviewMsg>>,
+    last_eval_ok: bool,
     last_context_world: Option<Point2>,
     pub(crate) status: String,
 }
@@ -304,6 +325,9 @@ impl MyCadApp {
             dynamic_convert: None,
             parameter_drafts: BTreeMap::new(),
             parameter_previews: BTreeMap::new(),
+            preview_pending: false,
+            preview_rx: None,
+            last_eval_ok: true,
             last_context_world: None,
             status: "Ready".to_string(),
         }
@@ -1299,6 +1323,7 @@ impl MyCadApp {
                     },
                 ) {
                     Ok(mut evaluated) => {
+                        let mut apply_display = true;
                         if let Some(authoring) = authoring.as_ref() {
                             if let Some(test) = authoring.test_config(document) {
                                 if let Err(err) = apply_definition_preview(
@@ -1310,23 +1335,30 @@ impl MyCadApp {
                                     request,
                                 ) {
                                     status = Some(err.to_string());
+                                    apply_display = !self.last_eval_ok;
                                 }
                             }
                         }
-                        document.diagnostics.extents = evaluated.compute_extents();
-                        self.display = Arc::new(if let Some(view) = tess_view {
-                            tessellate_document_for_block_edit(&evaluated, &view)
-                        } else {
-                            tessellate_document(&evaluated)
-                        });
-                        self.snaps = Arc::new(SnapIndex::build(&evaluated));
-                        self.measures = Arc::new(MeasureIndex::build(&evaluated));
+                        if apply_display {
+                            document.diagnostics.extents = evaluated.compute_extents();
+                            self.display = Arc::new(if let Some(view) = tess_view {
+                                tessellate_document_for_block_edit(&evaluated, &view)
+                            } else {
+                                tessellate_document(&evaluated)
+                            });
+                            self.snaps = Arc::new(SnapIndex::build(&evaluated));
+                            self.measures = Arc::new(MeasureIndex::build(&evaluated));
+                            self.last_eval_ok = true;
+                        }
                     }
                     Err(err) => {
                         status = Some(err.to_string());
-                        self.display = Arc::new(tessellate_document(document));
-                        self.snaps = Arc::new(SnapIndex::build(document));
-                        self.measures = Arc::new(MeasureIndex::build(document));
+                        if self.last_eval_ok {
+                            self.display = Arc::new(tessellate_document(document));
+                            self.snaps = Arc::new(SnapIndex::build(document));
+                            self.measures = Arc::new(MeasureIndex::build(document));
+                        }
+                        self.last_eval_ok = false;
                     }
                 }
             } else {
@@ -1347,6 +1379,214 @@ impl MyCadApp {
         self.gpu_upload = GpuUpload::Full;
         self.display_generation = self.display_generation.wrapping_add(1);
         self.eval_cache = cache;
+    }
+
+    pub(crate) fn request_preview(&mut self) {
+        self.preview_pending = true;
+        if let Some(authoring) = self.dynamic_authoring.as_mut() {
+            authoring.mark_preview_dirty();
+        }
+    }
+
+    fn flush_preview(&mut self) {
+        if !self.preview_pending {
+            return;
+        }
+        if self.preview_rx.is_some() {
+            return;
+        }
+        self.preview_pending = false;
+        self.spawn_preview();
+    }
+
+    fn spawn_preview(&mut self) {
+        let Some(document) = self.document.clone() else {
+            self.refresh_derived();
+            return;
+        };
+        if !document_has_dynamic_content(document.as_ref())
+            && self.dynamic_authoring.is_none()
+            && self.parameter_previews.is_empty()
+        {
+            self.refresh_derived();
+            return;
+        }
+        let document_generation = document.content_generation();
+        let session_generation = self
+            .dynamic_authoring
+            .as_ref()
+            .map(|state| state.session_generation)
+            .unwrap_or(0);
+        let preview_generation = self
+            .dynamic_authoring
+            .as_ref()
+            .map(|state| state.preview_generation)
+            .unwrap_or(0);
+        let authoring = self.dynamic_authoring.clone();
+        let overrides = self.parameter_previews.clone();
+        let tess_view = self.block_edit.tess_view();
+        let (tx, rx) = mpsc::channel();
+        self.preview_rx = Some(rx);
+        let _ = thread::Builder::new()
+            .name("mycad-preview".into())
+            .spawn(move || {
+                let _span = cad_core::perf::span("preview_worker");
+                let mut cache = EvaluationCache::default();
+                let mut source = (*document).clone();
+                source.recompute_cached_extents();
+                let request = EvaluationRequest {
+                    generation: document_generation,
+                };
+                let evaluated = if document_has_dynamic_content(&source) {
+                    materialize_evaluated_with(
+                        &source,
+                        &mut cache,
+                        request,
+                        if overrides.is_empty() {
+                            None
+                        } else {
+                            Some(&overrides)
+                        },
+                    )
+                } else {
+                    Ok(source.clone())
+                };
+                match evaluated {
+                    Ok(mut evaluated) => {
+                        if let Some(authoring) = authoring.as_ref() {
+                            if let Some(test) = authoring.test_config(&source) {
+                                if let Err(err) = apply_definition_preview(
+                                    &source,
+                                    &mut evaluated,
+                                    &authoring.block_name,
+                                    &test,
+                                    &mut cache,
+                                    request,
+                                ) {
+                                    let _ = tx.send(PreviewMsg::Failed {
+                                        document_generation,
+                                        session_generation,
+                                        preview_generation,
+                                        message: err.to_string(),
+                                    });
+                                    return;
+                                }
+                            }
+                        }
+                        let display = if let Some(view) = tess_view {
+                            tessellate_document_for_block_edit(&evaluated, &view)
+                        } else {
+                            tessellate_document(&evaluated)
+                        };
+                        let snaps = SnapIndex::build(&evaluated);
+                        let measures = MeasureIndex::build(&evaluated);
+                        let extents = evaluated.compute_extents();
+                        let _ = tx.send(PreviewMsg::Ready {
+                            document_generation,
+                            session_generation,
+                            preview_generation,
+                            display: Box::new(display),
+                            snaps: Box::new(snaps),
+                            measures: Box::new(measures),
+                            extents,
+                        });
+                    }
+                    Err(err) => {
+                        let _ = tx.send(PreviewMsg::Failed {
+                            document_generation,
+                            session_generation,
+                            preview_generation,
+                            message: err.to_string(),
+                        });
+                    }
+                }
+            });
+    }
+
+    fn poll_preview(&mut self, ctx: &egui::Context) {
+        let Some(rx) = self.preview_rx.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(message) => {
+                self.preview_rx = None;
+                let current_doc = self
+                    .document
+                    .as_ref()
+                    .map(|document| document.content_generation())
+                    .unwrap_or(0);
+                let current_session = self
+                    .dynamic_authoring
+                    .as_ref()
+                    .map(|state| state.session_generation)
+                    .unwrap_or(0);
+                let current_preview = self
+                    .dynamic_authoring
+                    .as_ref()
+                    .map(|state| state.preview_generation)
+                    .unwrap_or(0);
+                let current = match &message {
+                    PreviewMsg::Ready {
+                        document_generation,
+                        session_generation,
+                        preview_generation,
+                        ..
+                    }
+                    | PreviewMsg::Failed {
+                        document_generation,
+                        session_generation,
+                        preview_generation,
+                        ..
+                    } => crate::dynamic_block::preview_result_is_current(
+                        *document_generation,
+                        *session_generation,
+                        *preview_generation,
+                        current_doc,
+                        current_session,
+                        current_preview,
+                    ),
+                };
+                if !current {
+                    self.status = "Discarded superseded preview".into();
+                } else {
+                    match message {
+                        PreviewMsg::Ready {
+                            display,
+                            snaps,
+                            measures,
+                            extents,
+                            ..
+                        } => {
+                            if let Some(document) = self.document.as_mut().map(Arc::make_mut) {
+                                document.diagnostics.extents = extents;
+                            }
+                            self.display = Arc::new(*display);
+                            self.snaps = Arc::new(*snaps);
+                            self.measures = Arc::new(*measures);
+                            self.last_eval_ok = true;
+                            self.gpu_upload = GpuUpload::Full;
+                            self.display_generation = self.display_generation.wrapping_add(1);
+                        }
+                        PreviewMsg::Failed { message, .. } => {
+                            self.status = message;
+                        }
+                    }
+                }
+                if self.preview_pending {
+                    self.preview_pending = false;
+                    self.spawn_preview();
+                }
+                ctx.request_repaint();
+            }
+            Err(TryRecvError::Empty) => ctx.request_repaint(),
+            Err(TryRecvError::Disconnected) => {
+                self.preview_rx = None;
+                if self.preview_pending {
+                    self.preview_pending = false;
+                    self.spawn_preview();
+                }
+            }
+        }
     }
 
     fn rebuild_block_tree(&mut self) {
@@ -2128,6 +2368,20 @@ impl MyCadApp {
 
     fn can_make_unique(&self) -> bool {
         self.can_edit_selected_block()
+    }
+
+    fn selected_insert_is_dynamic(&self) -> bool {
+        let Some(document) = self.document.as_ref() else {
+            return false;
+        };
+        let Some(id) = self.selection.ids().first().copied() else {
+            return false;
+        };
+        document
+            .entity_by_id(id)
+            .and_then(|entity| entity.geometry.insert_block_name())
+            .and_then(|name| document.block_by_name(name))
+            .is_some_and(|block| block.is_dynamic())
     }
 
     fn open_create_block_dialog(&mut self) {
@@ -3061,6 +3315,7 @@ impl MyCadApp {
             start_marker,
             close_hint,
         );
+        crate::dynamic_block::paint_authoring_overlays(&painter, self, rect);
         if let Some([start, end]) = self
             .command
             .preview_mirror_axis(self.drafting.current_point)
@@ -3191,10 +3446,14 @@ impl MyCadApp {
                 can_add: self.can_add_to_block(),
                 can_remove: self.can_remove_from_block(),
                 can_make_unique: self.can_make_unique(),
-                can_create_dynamic: self.can_edit_selected_block(),
+                can_create_dynamic: self.can_edit_selected_block()
+                    && !self.selected_insert_is_dynamic(),
+                can_edit_dynamic: self.can_edit_selected_block()
+                    && self.selected_insert_is_dynamic(),
                 can_attach: self.dynamic_authoring.is_some()
                     && self.block_edit.is_active()
                     && !self.selection.is_empty(),
+                size_parameters: crate::dynamic_block::authoring_size_parameters(self),
             },
         );
         match result {
@@ -3240,14 +3499,18 @@ impl MyCadApp {
             ContextAction::AddToBlock => self.add_selected_to_block(),
             ContextAction::RemoveFromBlock => self.remove_selected_from_block(),
             ContextAction::MakeUnique => self.make_selected_unique(),
-            ContextAction::CreateDynamicBlock => crate::dynamic_block::begin_create_dynamic(self),
-            ContextAction::AttachMove => {
-                crate::dynamic_block::attach_from_selection(self, cad_core::BehaviorKind::Move, 1.0)
+            ContextAction::CreateDynamicBlock | ContextAction::EditDynamicBlock => {
+                crate::dynamic_block::begin_create_dynamic(self)
             }
-            ContextAction::AttachStretch => crate::dynamic_block::attach_stretch_from_click(
-                self,
-                self.last_context_world,
-            ),
+            ContextAction::AttachMoveTo(id) => {
+                crate::dynamic_block::select_authoring_parameter(self, id);
+                crate::dynamic_block::attach_from_selection(self, cad_core::BehaviorKind::Move, 1.0);
+            }
+            ContextAction::AttachStretchTo(id) => {
+                crate::dynamic_block::select_authoring_parameter(self, id);
+                crate::dynamic_block::attach_stretch_from_click(self, None);
+            }
+            ContextAction::NewSize => crate::dynamic_block::begin_new_size_from_menu(self),
         }
     }
 
@@ -3560,6 +3823,7 @@ impl eframe::App for MyCadApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         let _span = cad_core::perf::span("MyCadApp::update");
         self.poll_io(ctx);
+        self.poll_preview(ctx);
         self.input_consumed_escape = false;
         if ctx.input(|input| input.viewport().close_requested())
             && (self.is_dirty() || self.block_edit.is_active())
@@ -3656,6 +3920,8 @@ impl eframe::App for MyCadApp {
             } else if keys.escape && self.command.is_active() {
                 self.cancel_command();
                 self.input_consumed_escape = true;
+            } else if keys.escape && crate::dynamic_block::cancel_authoring_pick(self) {
+                self.input_consumed_escape = true;
             } else if keys.escape && self.measurement.take().is_some() {
                 self.input_consumed_escape = true;
             } else if keys.escape
@@ -3719,7 +3985,7 @@ impl eframe::App for MyCadApp {
                 }
             }
         }
-        if self.load_rx.is_some() || self.io_rx.is_some() || self.capture.is_some() {
+        if self.load_rx.is_some() || self.io_rx.is_some() || self.preview_rx.is_some() || self.capture.is_some() {
             ctx.request_repaint();
         }
 
@@ -3958,6 +4224,7 @@ impl eframe::App for MyCadApp {
             SettingsAction::Cancel => self.cancel_settings(),
             SettingsAction::None => {}
         }
+        self.flush_preview();
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -4137,17 +4404,26 @@ fn handle_viewport_input(app: &mut MyCadApp, ui: &Ui, response: &egui::Response,
         }
     }
 
-    if app
-        .dynamic_authoring
-        .as_ref()
-        .is_some_and(|state| state.pick != AuthoringPick::Idle)
-        && response.clicked_by(PointerButton::Primary)
-    {
+    let authoring_picks = app.dynamic_authoring.as_ref().is_some_and(|state| {
+        state.pick != AuthoringPick::Idle || state.attach.is_some()
+    });
+    if authoring_picks {
         if let Some(world) = app.cursor_world {
             let local = app.block_edit.local_from_world().apply(world);
-            crate::dynamic_block::handle_authoring_pick(app, local);
-            app.last_pointer = ui.input(|i| i.pointer.latest_pos());
-            return;
+            crate::dynamic_block::update_authoring_hover(app, local);
+            if response.clicked_by(PointerButton::Primary) {
+                let Some(pos) = ui.input(|i| i.pointer.latest_pos()) else {
+                    return;
+                };
+                let screen = Point2::new(pos.x as f64, pos.y as f64);
+                let add = modifiers.shift;
+                let remove = modifiers.ctrl || modifiers.command;
+                crate::dynamic_block::handle_authoring_pick(
+                    app, local, screen, origin, size, add, remove,
+                );
+                app.last_pointer = Some(pos);
+                return;
+            }
         }
     }
 
