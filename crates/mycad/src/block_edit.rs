@@ -179,6 +179,16 @@ impl BlockEditSession {
         if !is_user_editable_block_name(block_name) {
             return Err("Cannot edit a system block".into());
         }
+        if !self.stack.is_empty() {
+            if document
+                .block_by_name(block_name)
+                .is_some_and(|definition| definition.is_dynamic())
+            {
+                return Err(
+                    "Editing a nested dynamic reference independently is not supported yet".into(),
+                );
+            }
+        }
         if self
             .stack
             .iter()
@@ -254,11 +264,14 @@ impl BlockEditSession {
             .ok_or_else(|| "Not editing a block".to_string())?;
         let name = frame.block_name.clone();
         let mark = frame.undo_mark;
-        history.collapse_since(mark);
         let after = document
             .block_by_name(&name)
             .cloned()
             .ok_or_else(|| format!("Block '{name}' was not found"))?;
+        if let Some(dynamic) = after.dynamic.as_ref() {
+            cad_core::validate_definition(dynamic, &after.entities).map_err(|err| err.to_string())?;
+        }
+        history.collapse_since(mark);
         if let Some(frame) = self.current_mut() {
             frame.baseline = after;
             frame.dirty = false;
@@ -613,6 +626,7 @@ mod tests {
             row_count: 1,
             column_spacing: 0.0,
             row_spacing: 0.0,
+            configuration: None,
         });
         assert!(!insert_is_editable(&entity));
     }

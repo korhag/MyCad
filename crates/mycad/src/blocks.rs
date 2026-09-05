@@ -575,6 +575,7 @@ mod tests {
             row_count: 1,
             column_spacing: 0.0,
             row_spacing: 0.0,
+            configuration: None,
         })
     }
 
@@ -604,11 +605,13 @@ mod tests {
             name: "Motor".into(),
             base_pt: Point3::from_xy(0.0, 0.0),
             entities: vec![insert("Machine")],
+            ..Default::default()
         });
         document.replace_block_definition(BlockDefinition {
             name: "Machine".into(),
             base_pt: Point3::from_xy(0.0, 0.0),
             entities: vec![insert("Motor"), insert("Motor")],
+            ..Default::default()
         });
         document.add_entity(insert("Machine"));
         let index = BlockTreeIndex::build(&document);
@@ -630,11 +633,13 @@ mod tests {
             name: "Motor".into(),
             base_pt: Point3::from_xy(0.0, 0.0),
             entities: Vec::new(),
+            ..Default::default()
         });
         document.replace_block_definition(BlockDefinition {
             name: "Machine".into(),
             base_pt: Point3::from_xy(0.0, 0.0),
             entities: vec![insert("Motor")],
+            ..Default::default()
         });
         document.add_entity(insert("Machine"));
         let index = BlockTreeIndex::build(&document);
@@ -661,11 +666,13 @@ mod tests {
             name: "Motor".into(),
             base_pt: Point3::from_xy(0.0, 0.0),
             entities: Vec::new(),
+            ..Default::default()
         });
         document.replace_block_definition(BlockDefinition {
             name: "Machine".into(),
             base_pt: Point3::from_xy(0.0, 0.0),
             entities: vec![insert("Motor")],
+            ..Default::default()
         });
         document.add_entity(insert("Machine"));
         let index = BlockTreeIndex::build(&document);
@@ -682,11 +689,13 @@ mod tests {
             name: "Motor".into(),
             base_pt: Point3::from_xy(0.0, 0.0),
             entities: Vec::new(),
+            ..Default::default()
         });
         document.replace_block_definition(BlockDefinition {
             name: "Drive".into(),
             base_pt: Point3::from_xy(0.0, 0.0),
             entities: Vec::new(),
+            ..Default::default()
         });
         assert!(matches!(
             validate_block_rename(&document, "Motor", ""),

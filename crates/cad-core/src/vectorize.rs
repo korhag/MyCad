@@ -172,6 +172,7 @@ pub fn vectorize_entity(
             row_count,
             column_spacing,
             row_spacing,
+            configuration: _,
         } => {
             if stack.iter().any(|n| n.eq_ignore_ascii_case(block_name)) {
                 return;
@@ -735,6 +736,7 @@ mod tests {
                         is_attrib_def: true,
                     })),
                 ],
+                ..Default::default()
             },
         );
         document.add_entity(Entity::new(Geometry::Insert {
@@ -755,6 +757,7 @@ mod tests {
             row_count: 1,
             column_spacing: 0.0,
             row_spacing: 0.0,
+            configuration: None,
         }));
         let plot = plot_geometry(&document);
         let placeholder = stroke_text(Point2::new(0.0, 1.0), 1.0, 0.0, "PLACEHOLDER");

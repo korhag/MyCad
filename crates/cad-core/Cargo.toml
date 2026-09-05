@@ -5,5 +5,10 @@ edition.workspace = true
 license.workspace = true
 description = "Native CAD document model, independent of any DWG library"
 
+[features]
+default = []
+# Instant span logs for MYCAD_PERF=1 (debug) or always when this feature is on.
+perf = []
+
 [dependencies]
 thiserror.workspace = true

@@ -1,5 +1,7 @@
 //! Semantic measurable primitives, built once per document like SnapIndex.
 
+use std::collections::HashMap;
+
 use crate::entity::PolyVertex;
 use crate::measure::{
     angle_on_arc, bulge_circle, point_bulge_distance, point_in_closed_polyline, point_on_circle,
@@ -125,6 +127,9 @@ impl MeasurePrimitive {
 #[derive(Debug, Clone, Default)]
 pub struct MeasureIndex {
     primitives: Vec<MeasurePrimitive>,
+    alive: Vec<bool>,
+    live_count: usize,
+    owner_slots: HashMap<EntityId, Vec<u32>>,
     cells: Vec<Vec<u32>>,
     origin: Point2,
     inv_cell: f64,
@@ -134,6 +139,7 @@ pub struct MeasureIndex {
 
 impl MeasureIndex {
     pub fn build(document: &Document) -> Self {
+        let _span = crate::perf::span("MeasureIndex::build");
         let mut primitives = Vec::new();
         let mut stack = Vec::new();
         let mut path = Vec::new();
@@ -174,8 +180,33 @@ impl MeasureIndex {
         for primitive in added {
             let slot = self.primitives.len() as u32;
             self.insert_slot(slot, primitive.bounds);
+            self.owner_slots
+                .entry(primitive.owner)
+                .or_default()
+                .push(slot);
+            self.alive.push(true);
+            self.live_count += 1;
             self.primitives.push(primitive);
         }
+    }
+
+    pub fn remove_entity(&mut self, id: EntityId) {
+        let Some(slots) = self.owner_slots.remove(&id) else {
+            return;
+        };
+        for slot in slots {
+            if let Some(alive) = self.alive.get_mut(slot as usize) {
+                if *alive {
+                    *alive = false;
+                    self.live_count = self.live_count.saturating_sub(1);
+                }
+            }
+        }
+    }
+
+    pub fn replace_entity(&mut self, document: &Document, entity: &Entity) {
+        self.remove_entity(entity.id);
+        self.append_entity(document, entity);
     }
 
     pub fn from_primitives(primitives: Vec<MeasurePrimitive>) -> Self {
@@ -191,8 +222,12 @@ impl MeasureIndex {
         let cell_size = (span / target as f64).max(1e-9);
         let cols = ((world.width() / cell_size).ceil() as usize).clamp(1, 96);
         let rows = ((world.height() / cell_size).ceil() as usize).clamp(1, 96);
+        let n = primitives.len();
         let mut index = Self {
             primitives,
+            alive: vec![true; n],
+            live_count: n,
+            owner_slots: HashMap::new(),
             cells: vec![Vec::new(); cols * rows],
             origin: world.min,
             inv_cell: 1.0 / cell_size,
@@ -200,6 +235,12 @@ impl MeasureIndex {
             rows,
         };
         for slot in 0..index.primitives.len() {
+            let owner = index.primitives[slot].owner;
+            index
+                .owner_slots
+                .entry(owner)
+                .or_default()
+                .push(slot as u32);
             let bounds = index.primitives[slot].bounds;
             index.insert_slot(slot as u32, bounds);
         }
@@ -207,7 +248,7 @@ impl MeasureIndex {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.primitives.is_empty()
+        self.live_count == 0
     }
 
     pub fn pick(
@@ -222,6 +263,9 @@ impl MeasureIndex {
         );
         let mut best: Option<(f64, usize)> = None;
         self.for_region(region, |slot| {
+            if !self.alive.get(slot).copied().unwrap_or(false) {
+                return;
+            }
             let primitive = &self.primitives[slot];
             if let Some(want) = role {
                 if !matches_role(&primitive.geom, want) {
@@ -240,7 +284,19 @@ impl MeasureIndex {
     }
 
     pub fn primitives_for_owner(&self, owner: EntityId) -> impl Iterator<Item = &MeasurePrimitive> {
-        self.primitives.iter().filter(move |p| p.owner == owner)
+        self.owner_slots
+            .get(&owner)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter_map(|slot| {
+                let slot = slot as usize;
+                if self.alive.get(slot).copied().unwrap_or(false) {
+                    self.primitives.get(slot)
+                } else {
+                    None
+                }
+            })
     }
 
     fn for_region(&self, region: Extents2, mut visit: impl FnMut(usize)) {
@@ -715,6 +771,7 @@ mod tests {
                     radius: 2.0,
                     extrusion: default_extrusion(),
                 })],
+                ..Default::default()
             },
         );
         document.model_space.push(Entity::new(Geometry::Insert {
@@ -728,6 +785,7 @@ mod tests {
             row_count: 1,
             column_spacing: 0.0,
             row_spacing: 0.0,
+            configuration: None,
         }));
         document.assign_missing_ids();
         let index = MeasureIndex::build(&document);
@@ -751,6 +809,7 @@ mod tests {
                     radius: 5.0,
                     extrusion: default_extrusion(),
                 })],
+                ..Default::default()
             },
         );
         document.model_space.push(Entity::new(Geometry::Insert {
@@ -764,6 +823,7 @@ mod tests {
             row_count: 1,
             column_spacing: 0.0,
             row_spacing: 0.0,
+            configuration: None,
         }));
         document.assign_missing_ids();
         let index = MeasureIndex::build(&document);
@@ -787,6 +847,7 @@ mod tests {
                     radius: 2.0,
                     extrusion: default_extrusion(),
                 })],
+                ..Default::default()
             },
         );
         document.model_space.push(Entity::new(Geometry::Insert {
@@ -800,6 +861,7 @@ mod tests {
             row_count: 1,
             column_spacing: 0.0,
             row_spacing: 0.0,
+            configuration: None,
         }));
         document.assign_missing_ids();
         let index = MeasureIndex::build(&document);
@@ -810,5 +872,38 @@ mod tests {
             radius_from_primitive(hit, Point2::new(4.0, 0.0)),
             Err(MeasureError::NonUniformScale)
         );
+    }
+
+    #[test]
+    fn replace_and_remove_entity_drop_stale_primitives() {
+        let mut document = Document::default();
+        let line = document.add_entity(Entity::new(Geometry::Line {
+            start: Point3::from_xy(0.0, 0.0),
+            end: Point3::from_xy(10.0, 0.0),
+        }));
+        let mut index = MeasureIndex::build(&document);
+        assert!(index
+            .pick(Point2::new(5.0, 0.02), 0.1, Some(MeasureRole::Straight))
+            .is_some());
+
+        let mut moved = line.clone();
+        if let Geometry::Line { start, end } = &mut moved.geometry {
+            *start = Point3::from_xy(0.0, 6.0);
+            *end = Point3::from_xy(10.0, 6.0);
+        }
+        document.replace_entity_in(&crate::EntitySpace::ModelSpace, line.id, moved.clone());
+        index.replace_entity(&document, &moved);
+        assert!(index
+            .pick(Point2::new(5.0, 0.02), 0.1, Some(MeasureRole::Straight))
+            .is_none());
+        assert!(index
+            .pick(Point2::new(5.0, 6.02), 0.1, Some(MeasureRole::Straight))
+            .is_some());
+
+        index.remove_entity(line.id);
+        assert!(index
+            .pick(Point2::new(5.0, 6.02), 0.1, Some(MeasureRole::Straight))
+            .is_none());
+        assert!(index.primitives_for_owner(line.id).next().is_none());
     }
 }

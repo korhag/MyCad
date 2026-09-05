@@ -21,6 +21,10 @@ pub enum ExportError {
     },
     #[error("{0}")]
     Invalid(&'static str),
+    #[error("{0}")]
+    Unsupported(String),
+    #[error("{0}")]
+    Validation(String),
 }
 
 impl ExportError {

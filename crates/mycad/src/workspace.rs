@@ -1,4 +1,4 @@
-//! Persistent dockable workspace: Home, Properties, Viewport, Diagnostics, Blocks.
+//! Persistent dockable workspace: Home, Properties, Viewport, Diagnostics, Blocks, Dynamic Block.
 
 use eframe::egui::{self, Color32, Margin, Pos2, Rect, Stroke, StrokeKind, Ui};
 use egui_dock::{DockArea, DockState, Node, NodeIndex, Split, Style, TabStyle, TabViewer};
@@ -20,6 +20,7 @@ pub enum WorkspaceTab {
     Properties,
     Diagnostics,
     Blocks,
+    DynamicBlock,
 }
 
 impl WorkspaceTab {
@@ -30,6 +31,7 @@ impl WorkspaceTab {
             Self::Properties => "Properties",
             Self::Diagnostics => "Diagnostics",
             Self::Blocks => "Blocks",
+            Self::DynamicBlock => "Dynamic Block",
         }
     }
 }
@@ -224,7 +226,7 @@ pub fn ensure_tab(state: &mut DockState<WorkspaceTab>, tab: WorkspaceTab) {
     if state.find_tab(&tab).is_some() {
         return;
     }
-    if tab == WorkspaceTab::Blocks {
+    if tab == WorkspaceTab::Blocks || tab == WorkspaceTab::DynamicBlock {
         if let Some((surface, node, _)) = state.find_tab(&WorkspaceTab::Properties) {
             state[surface][node].append_tab(tab);
             return;
@@ -321,6 +323,7 @@ impl TabViewer for WorkspaceViewer<'_> {
             WorkspaceTab::Properties => properties::show(ui, self.app),
             WorkspaceTab::Diagnostics => crate::diagnostics::show(ui, self.app),
             WorkspaceTab::Blocks => crate::blocks::show(ui, self.app),
+            WorkspaceTab::DynamicBlock => crate::dynamic_block::show_authoring(ui, self.app),
         }
     }
 
@@ -398,6 +401,21 @@ mod layout_tests {
         assert!(tabs.contains(&WorkspaceTab::Properties));
         assert!(tabs.contains(&WorkspaceTab::Blocks));
         assert_eq!(tabs.len(), 2);
+    }
+
+    #[test]
+    fn dynamic_block_tab_restores_beside_properties() {
+        let mut state = default_dock_state();
+        assert!(state.find_tab(&WorkspaceTab::DynamicBlock).is_none());
+        ensure_tab(&mut state, WorkspaceTab::DynamicBlock);
+        let (p_surface, p_node, _) = state
+            .find_tab(&WorkspaceTab::Properties)
+            .expect("Properties");
+        let (d_surface, d_node, _) = state
+            .find_tab(&WorkspaceTab::DynamicBlock)
+            .expect("Dynamic Block");
+        assert_eq!(p_surface, d_surface);
+        assert_eq!(p_node, d_node);
     }
 
     #[test]
@@ -608,8 +626,12 @@ mod highlight_tests {
     use cad_render::{box_select, stroke_edges, tessellate_document, PickKind, SelectBoxMode};
 
     fn reference_dwg() -> std::path::PathBuf {
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../test-data/KD-1413-260825 Assir Poultry Internal Logistics.dwg")
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let samples = root.join("samples/KD-1413-260825 Assir Poultry Internal Logistics.dwg");
+        if samples.is_file() {
+            return samples;
+        }
+        root.join("test-data/KD-1413-260825 Assir Poultry Internal Logistics.dwg")
     }
 
     fn is_logistics(name: &str) -> bool {

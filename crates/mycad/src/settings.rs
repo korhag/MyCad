@@ -10,7 +10,7 @@ use crate::workspace::{
 };
 
 pub const STORAGE_KEY: &str = "mycad_settings";
-pub const SETTINGS_SCHEMA_VERSION: u32 = 5;
+pub const SETTINGS_SCHEMA_VERSION: u32 = 6;
 pub const DEFAULT_ZOOM_SPEED: f64 = 1.0;
 pub const ZOOM_SPEED_MIN: f64 = 0.25;
 pub const ZOOM_SPEED_MAX: f64 = 10.0;
@@ -98,6 +98,48 @@ impl DisplaySettings {
 }
 
 // ------------------------------------------------------------
+// Type: LibraryPreviewSettings
+// Purpose: Thumbnail display, generation, and refresh are independent.
+//          The library browser is a later phase; these settings are
+//          the contract that browser will honor.
+// ------------------------------------------------------------
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LibraryPreviewSettings {
+    pub show_thumbnails: bool,
+    pub generate_missing: bool,
+    pub refresh_policy: ThumbnailRefreshPolicySetting,
+}
+
+impl Default for LibraryPreviewSettings {
+    fn default() -> Self {
+        Self {
+            show_thumbnails: true,
+            generate_missing: true,
+            refresh_policy: ThumbnailRefreshPolicySetting::Ask,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThumbnailRefreshPolicySetting {
+    Ask,
+    Automatic,
+    Manual,
+}
+
+impl ThumbnailRefreshPolicySetting {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ask => "Ask",
+            Self::Automatic => "Automatic",
+            Self::Manual => "Manual",
+        }
+    }
+}
+
+// ------------------------------------------------------------
 // Type: AppSettings
 // Purpose: User preferences that survive restart and can be copied
 //          between machines as JSON. New fields must carry
@@ -120,6 +162,8 @@ pub struct AppSettings {
     pub responsive_ribbon_recovered: bool,
     #[serde(default)]
     pub compact_home_height_applied: bool,
+    #[serde(default)]
+    pub library_preview: LibraryPreviewSettings,
 }
 
 impl Default for AppSettings {
@@ -134,6 +178,7 @@ impl Default for AppSettings {
             blocks_tab_migrated: false,
             responsive_ribbon_recovered: false,
             compact_home_height_applied: false,
+            library_preview: LibraryPreviewSettings::default(),
         }
     }
 }
@@ -276,7 +321,7 @@ mod tests {
                 .as_deref(),
             Some("space")
         );
-        assert!(json.contains("\"schema_version\": 5"));
+        assert!(json.contains("\"schema_version\": 6"));
         assert!(!json.to_lowercase().contains(".dwg"));
     }
 
@@ -544,5 +589,23 @@ mod tests {
             "users can still close Blocks after the one-time migration"
         );
         assert!(settings.blocks_tab_migrated);
+    }
+
+    #[test]
+    fn library_preview_settings_are_independent() {
+        let mut settings = AppSettings::default();
+        settings.library_preview.show_thumbnails = false;
+        assert!(settings.library_preview.generate_missing);
+        let mut core = cad_core::ThumbnailSettings {
+            show_thumbnails: settings.library_preview.show_thumbnails,
+            generate_missing: settings.library_preview.generate_missing,
+            refresh_policy: cad_core::ThumbnailRefreshPolicy::Ask,
+        };
+        assert!(!core.show_thumbnails);
+        assert!(!core.hover_may_decode_source());
+        settings.library_preview.generate_missing = false;
+        core.generate_missing = false;
+        assert!(!core.generation_allowed());
+        assert!(!core.hover_may_decode_source());
     }
 }

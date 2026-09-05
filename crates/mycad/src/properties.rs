@@ -12,6 +12,7 @@ use crate::app::MyCadApp;
 use crate::block_edit::insert_is_editable;
 
 pub fn show(ui: &mut Ui, app: &mut MyCadApp) {
+    let _span = cad_core::perf::span("properties");
     ui.heading("Properties");
     ui.separator();
     let edit_block = {
@@ -53,6 +54,15 @@ pub fn show(ui: &mut Ui, app: &mut MyCadApp) {
         ui.add_space(8.0);
         if ui.button("Edit Block").clicked() {
             app.edit_named_block(&name);
+        }
+    }
+    if app.selection.len() == 1 {
+        if let Some(entity) = app
+            .document
+            .as_ref()
+            .and_then(|document| document.entity_by_id(app.selection.ids()[0]).cloned())
+        {
+            crate::dynamic_block::show_instance_parameters(ui, app, &entity);
         }
     }
 }

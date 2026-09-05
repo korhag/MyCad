@@ -9,6 +9,10 @@ description = "Linux-native 2D CAD application (Milestone 1: DWG viewer)"
 name = "mycad"
 path = "src/main.rs"
 
+[features]
+default = []
+perf = ["cad-core/perf"]
+
 [dependencies]
 cad-core.workspace = true
 cad-viewport.workspace = true

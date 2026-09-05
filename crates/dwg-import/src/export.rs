@@ -280,6 +280,7 @@ mod tests {
                     start: cad_core::Point3::from_xy(10.0, 20.0),
                     end: cad_core::Point3::from_xy(30.0, 20.0),
                 })],
+                ..Default::default()
             },
         );
         document.add_entity(cad_core::Entity::new(cad_core::Geometry::Dimension {

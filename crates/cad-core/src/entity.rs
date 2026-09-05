@@ -1,6 +1,7 @@
 //! Native CAD entities. These types must not mention LibreDWG.
 
 use crate::color::CadColor;
+use crate::dynamic::InstanceConfiguration;
 use crate::geom::Point3;
 
 // ------------------------------------------------------------
@@ -111,6 +112,8 @@ pub enum Geometry {
         row_count: u32,
         column_spacing: f64,
         row_spacing: f64,
+        /// Instance parameter values for this reference. Absent for static blocks.
+        configuration: Option<InstanceConfiguration>,
     },
     Text(TextData),
     MText(MTextData),
@@ -154,6 +157,40 @@ impl Geometry {
             Self::Solid { .. } => "Solid",
             Self::Leader { .. } => "Leader",
             Self::MLine { .. } => "MLine",
+        }
+    }
+
+    pub fn insert_block_name(&self) -> Option<&str> {
+        match self {
+            Self::Insert { block_name, .. } | Self::Dimension { block_name } => Some(block_name),
+            _ => None,
+        }
+    }
+
+    pub fn insert_block_name_mut(&mut self) -> Option<&mut String> {
+        match self {
+            Self::Insert { block_name, .. } => Some(block_name),
+            _ => None,
+        }
+    }
+
+    pub fn insert_configuration(&self) -> Option<&InstanceConfiguration> {
+        match self {
+            Self::Insert { configuration, .. } => configuration.as_ref(),
+            _ => None,
+        }
+    }
+
+    pub fn insert_configuration_mut(&mut self) -> Option<&mut Option<InstanceConfiguration>> {
+        match self {
+            Self::Insert { configuration, .. } => Some(configuration),
+            _ => None,
+        }
+    }
+
+    pub fn set_insert_configuration(&mut self, value: Option<InstanceConfiguration>) {
+        if let Self::Insert { configuration, .. } = self {
+            *configuration = value;
         }
     }
 }

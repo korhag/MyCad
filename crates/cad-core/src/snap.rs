@@ -1,6 +1,10 @@
 //! Semantic object-snap features extracted from native CAD geometry.
 
-use crate::{ocs_to_wcs, Document, Entity, Extents2, Geometry, Point2, Point3, Transform2};
+use std::collections::HashMap;
+
+use crate::{
+    ocs_to_wcs, Document, Entity, EntityId, Extents2, Geometry, Point2, Point3, Transform2,
+};
 
 // ------------------------------------------------------------
 // Type: SnapKind
@@ -33,6 +37,9 @@ pub struct SnapFeature {
 #[derive(Debug, Clone, Default)]
 pub struct SnapIndex {
     features: Vec<SnapFeature>,
+    alive: Vec<bool>,
+    live_count: usize,
+    owner_slots: HashMap<EntityId, Vec<u32>>,
     cells: Vec<Vec<u32>>,
     origin: Point2,
     inv_cell: f64,
@@ -42,18 +49,20 @@ pub struct SnapIndex {
 
 impl SnapIndex {
     pub fn build(document: &Document) -> Self {
+        let _span = crate::perf::span("SnapIndex::build");
         let mut features = Vec::new();
         let mut stack = Vec::new();
         for entity in &document.model_space {
             collect_entity_features(
                 document,
                 entity,
+                entity.id,
                 Transform2::identity(),
                 &mut stack,
                 &mut features,
             );
         }
-        Self::from_features(features)
+        Self::from_owned(features)
     }
 
     pub fn append_entity(&mut self, document: &Document, entity: &Entity) {
@@ -62,6 +71,7 @@ impl SnapIndex {
         collect_entity_features(
             document,
             entity,
+            entity.id,
             Transform2::identity(),
             &mut stack,
             &mut added,
@@ -70,18 +80,58 @@ impl SnapIndex {
             return;
         }
         if self.cells.is_empty() {
-            *self = Self::from_features(added);
+            *self = Self::from_owned(added);
             return;
         }
-        for feature in added {
+        for (feature, owner) in added {
             let slot = self.features.len() as u32;
             let (x, y) = self.cell(feature.point);
             self.features.push(feature);
+            self.alive.push(true);
+            self.live_count += 1;
+            self.owner_slots.entry(owner).or_default().push(slot);
             self.cells[y * self.cols + x].push(slot);
         }
     }
 
+    pub fn remove_entity(&mut self, id: EntityId) {
+        let Some(slots) = self.owner_slots.remove(&id) else {
+            return;
+        };
+        for slot in slots {
+            if let Some(alive) = self.alive.get_mut(slot as usize) {
+                if *alive {
+                    *alive = false;
+                    self.live_count = self.live_count.saturating_sub(1);
+                }
+            }
+        }
+    }
+
+    pub fn replace_entity(&mut self, document: &Document, entity: &Entity) {
+        self.remove_entity(entity.id);
+        self.append_entity(document, entity);
+    }
+
     pub fn from_features(features: Vec<SnapFeature>) -> Self {
+        Self::from_owned(
+            features
+                .into_iter()
+                .map(|feature| (feature, EntityId::UNASSIGNED))
+                .collect(),
+        )
+    }
+
+    fn from_owned(items: Vec<(SnapFeature, EntityId)>) -> Self {
+        if items.is_empty() {
+            return Self::default();
+        }
+        let mut features = Vec::with_capacity(items.len());
+        let mut owner_slots: HashMap<EntityId, Vec<u32>> = HashMap::new();
+        for (index, (feature, owner)) in items.into_iter().enumerate() {
+            owner_slots.entry(owner).or_default().push(index as u32);
+            features.push(feature);
+        }
         let Some(world) = Extents2::from_points(features.iter().map(|feature| feature.point))
         else {
             return Self::default();
@@ -91,8 +141,12 @@ impl SnapIndex {
         let cell_size = (span / target as f64).max(1e-9);
         let cols = ((world.width() / cell_size).ceil() as usize).clamp(1, 96);
         let rows = ((world.height() / cell_size).ceil() as usize).clamp(1, 96);
+        let live_count = features.len();
         let mut index = Self {
+            alive: vec![true; live_count],
+            live_count,
             features,
+            owner_slots,
             cells: vec![Vec::new(); cols * rows],
             origin: world.min,
             inv_cell: 1.0 / cell_size,
@@ -108,11 +162,11 @@ impl SnapIndex {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.features.is_empty()
+        self.live_count == 0
     }
 
     pub fn len(&self) -> usize {
-        self.features.len()
+        self.live_count
     }
 
     pub fn query(&self, region: Extents2, out: &mut Vec<SnapFeature>) {
@@ -127,7 +181,9 @@ impl SnapIndex {
                 out.extend(
                     self.cells[y * self.cols + x]
                         .iter()
-                        .filter_map(|slot| self.features.get(*slot as usize))
+                        .copied()
+                        .filter(|&slot| self.alive.get(slot as usize).copied().unwrap_or(false))
+                        .filter_map(|slot| self.features.get(slot as usize))
                         .copied()
                         .filter(|feature| region.contains(feature.point)),
                 );
@@ -149,9 +205,10 @@ impl SnapIndex {
 fn collect_entity_features(
     document: &Document,
     entity: &Entity,
+    owner: EntityId,
     transform: Transform2,
     block_stack: &mut Vec<String>,
-    out: &mut Vec<SnapFeature>,
+    out: &mut Vec<(SnapFeature, EntityId)>,
 ) {
     if !entity.visible || !document.layer_is_visible(&entity.layer) {
         return;
@@ -195,7 +252,7 @@ fn collect_entity_features(
                     .then(array_offset);
                     let nested = transform.then(local);
                     for child in &block.entities {
-                        collect_entity_features(document, child, nested, block_stack, out);
+                        collect_entity_features(document, child, owner, nested, block_stack, out);
                     }
                 }
             }
@@ -211,7 +268,7 @@ fn collect_entity_features(
             if let Some(block) = document.blocks.get(block_name) {
                 block_stack.push(block_name.clone());
                 for child in &block.entities {
-                    collect_entity_features(document, child, transform, block_stack, out);
+                    collect_entity_features(document, child, owner, transform, block_stack, out);
                 }
                 block_stack.pop();
             }
@@ -219,15 +276,16 @@ fn collect_entity_features(
         Geometry::Line { start, end } => {
             let start = transform.apply(start.xy());
             let end = transform.apply(end.xy());
-            push(out, start, SnapKind::Endpoint);
-            push(out, end, SnapKind::Endpoint);
-            push(out, start.lerp(end, 0.5), SnapKind::Midpoint);
+            push(out, owner, start, SnapKind::Endpoint);
+            push(out, owner, end, SnapKind::Endpoint);
+            push(out, owner, start.lerp(end, 0.5), SnapKind::Midpoint);
         }
         Geometry::Circle {
             center, extrusion, ..
         } => {
             push(
                 out,
+                owner,
                 transform.apply(ocs_to_wcs(*center, *extrusion).xy()),
                 SnapKind::Center,
             );
@@ -264,13 +322,20 @@ fn collect_entity_features(
             };
             push(
                 out,
+                owner,
                 transform.apply(ocs_to_wcs(*center, *extrusion).xy()),
                 SnapKind::Center,
             );
-            push(out, point_at(*start_angle), SnapKind::Endpoint);
-            push(out, point_at(*start_angle + sweep), SnapKind::Endpoint);
+            push(out, owner, point_at(*start_angle), SnapKind::Endpoint);
             push(
                 out,
+                owner,
+                point_at(*start_angle + sweep),
+                SnapKind::Endpoint,
+            );
+            push(
+                out,
+                owner,
                 point_at(*start_angle + sweep * 0.5),
                 SnapKind::Midpoint,
             );
@@ -280,7 +345,7 @@ fn collect_entity_features(
             closed,
             extrusion,
             ..
-        } => collect_polyline_features(vertices, *closed, *extrusion, transform, out),
+        } => collect_polyline_features(vertices, *closed, *extrusion, transform, owner, out),
         Geometry::Polyline {
             vertices, closed, ..
         } => collect_polyline_features(
@@ -288,6 +353,7 @@ fn collect_entity_features(
             *closed,
             Point3::new(0.0, 0.0, 1.0),
             transform,
+            owner,
             out,
         ),
         _ => {}
@@ -299,11 +365,13 @@ fn collect_polyline_features(
     closed: bool,
     extrusion: Point3,
     transform: Transform2,
-    out: &mut Vec<SnapFeature>,
+    owner: EntityId,
+    out: &mut Vec<(SnapFeature, EntityId)>,
 ) {
     for vertex in vertices {
         push(
             out,
+            owner,
             transform.apply(ocs_to_wcs(vertex.point, extrusion).xy()),
             SnapKind::Endpoint,
         );
@@ -319,7 +387,7 @@ fn collect_polyline_features(
         let midpoint = bulge_midpoint(a.point.xy(), b.point.xy(), a.bulge)
             .unwrap_or_else(|| a.point.xy().lerp(b.point.xy(), 0.5));
         let midpoint = ocs_to_wcs(Point3::new(midpoint.x, midpoint.y, a.point.z), extrusion).xy();
-        push(out, transform.apply(midpoint), SnapKind::Midpoint);
+        push(out, owner, transform.apply(midpoint), SnapKind::Midpoint);
     }
 }
 
@@ -347,9 +415,9 @@ fn bulge_midpoint(start: Point2, end: Point2, bulge: f64) -> Option<Point2> {
     ))
 }
 
-fn push(out: &mut Vec<SnapFeature>, point: Point2, kind: SnapKind) {
+fn push(out: &mut Vec<(SnapFeature, EntityId)>, owner: EntityId, point: Point2, kind: SnapKind) {
     if point.is_finite() {
-        out.push(SnapFeature { point, kind });
+        out.push((SnapFeature { point, kind }, owner));
     }
 }
 
@@ -442,6 +510,7 @@ mod tests {
                     start: Point3::from_xy(1.0, 0.0),
                     end: Point3::from_xy(3.0, 0.0),
                 })],
+                ..Default::default()
             },
         );
         document.model_space.push(Entity::new(Geometry::Insert {
@@ -455,6 +524,7 @@ mod tests {
             row_count: 1,
             column_spacing: 0.0,
             row_spacing: 0.0,
+            configuration: None,
         }));
         let index = SnapIndex::build(&document);
         let mut found = Vec::new();
@@ -485,13 +555,59 @@ mod tests {
             false,
             Point3::new(0.0, 0.0, 1.0),
             Transform2::identity(),
+            EntityId::UNASSIGNED,
             &mut features,
         );
         let midpoint = features
             .iter()
-            .find(|feature| feature.kind == SnapKind::Midpoint)
+            .find(|(feature, _)| feature.kind == SnapKind::Midpoint)
+            .map(|(feature, _)| feature)
             .unwrap();
         assert!((midpoint.point.x - 5.0).abs() < 1e-9);
         assert!((midpoint.point.y + 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn replace_and_remove_entity_update_nearby_snaps() {
+        let mut document = Document::default();
+        let first = document.add_entity(Entity::new(Geometry::Line {
+            start: Point3::from_xy(0.0, 0.0),
+            end: Point3::from_xy(10.0, 0.0),
+        }));
+        let second = document.add_entity(Entity::new(Geometry::Line {
+            start: Point3::from_xy(0.0, 4.0),
+            end: Point3::from_xy(10.0, 4.0),
+        }));
+        let mut index = SnapIndex::build(&document);
+        assert_eq!(index.len(), 6);
+
+        let mut moved = first.clone();
+        if let Geometry::Line { start, end } = &mut moved.geometry {
+            *start = Point3::from_xy(0.0, 8.0);
+            *end = Point3::from_xy(10.0, 8.0);
+        }
+        document.replace_entity_in(&crate::EntitySpace::ModelSpace, first.id, moved.clone());
+        index.replace_entity(&document, &moved);
+
+        let mut found = Vec::new();
+        index.query(
+            Extents2::from_corners(Point2::new(4.9, -0.1), Point2::new(5.1, 0.1)),
+            &mut found,
+        );
+        assert!(found.is_empty());
+        index.query(
+            Extents2::from_corners(Point2::new(4.9, 7.9), Point2::new(5.1, 8.1)),
+            &mut found,
+        );
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].kind, SnapKind::Midpoint);
+
+        index.remove_entity(second.id);
+        assert_eq!(index.len(), 3);
+        index.query(
+            Extents2::from_corners(Point2::new(4.9, 3.9), Point2::new(5.1, 4.1)),
+            &mut found,
+        );
+        assert!(found.is_empty());
     }
 }

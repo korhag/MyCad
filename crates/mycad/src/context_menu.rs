@@ -43,6 +43,9 @@ pub enum ContextAction {
     AddToBlock,
     RemoveFromBlock,
     MakeUnique,
+    CreateDynamicBlock,
+    AttachMove,
+    AttachStretch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,6 +115,8 @@ pub struct BlockMenuState {
     pub can_add: bool,
     pub can_remove: bool,
     pub can_make_unique: bool,
+    pub can_create_dynamic: bool,
+    pub can_attach: bool,
 }
 
 pub enum MenuResult {
@@ -428,6 +433,37 @@ fn idle_menu(
             true,
             action,
             ContextAction::EditBlock,
+        );
+    }
+    if block_menu.can_create_dynamic {
+        row(
+            ui,
+            None,
+            "Create a Dynamic Block…",
+            None,
+            true,
+            action,
+            ContextAction::CreateDynamicBlock,
+        );
+    }
+    if block_menu.can_attach {
+        row(
+            ui,
+            None,
+            "Attach to Parameter → Move",
+            None,
+            true,
+            action,
+            ContextAction::AttachMove,
+        );
+        row(
+            ui,
+            None,
+            "Attach to Parameter → Stretch",
+            None,
+            true,
+            action,
+            ContextAction::AttachStretch,
         );
     }
     if block_menu.can_make_unique {

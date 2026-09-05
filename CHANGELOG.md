@@ -5,9 +5,36 @@ All notable changes to MyCad are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project versions with [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Workspace version is `0.20.0` (`Cargo.toml`).
+Workspace version is `0.22.0` (`Cargo.toml`).
 
 ## [Unreleased]
+
+## [0.22.0] - 2026-09-05
+
+### Added
+
+- Create a Dynamic Block from a selected reference, with a dockable authoring panel for numeric parameters and Move/Stretch bindings.
+- Independent numeric values on each INSERT reference, with Properties editing, undo/redo, and evaluation that always starts from source geometry.
+- Native `.mycad` drawings and `.mycadblock` assets preserve definition identities, parameters, bindings, and instance values. DWG/DXF/PDF export writes evaluated geometry so different configurations stay distinct.
+- Library thumbnail settings and a metadata/fingerprint contract so later library hover never decodes a DWG.
+
+### Changed
+
+- Viewport drawing, snaps, measurements, extents, and interchange export share one evaluated geometry route so a parameter change cannot move a visible endpoint while leaving its snap behind.
+
+## [0.21.0] - 2026-09-05
+
+### Added
+
+- Debug-only Instant spans around `MyCadApp::update`, `refresh_derived`, tessellation, snap/measure/block-tree indexes, click picking, marquee selection, overlay batches, Properties, and DXF/DWG/PDF save. Enable with `MYCAD_PERF=1` in debug builds, or `--features perf` in release; only operations slower than 8 ms are logged.
+- `mycad --perf-baseline [drawing]` reports CPU timings for open, pick, marquee, full derived rebuild (Move/Undo/Erase proxy), Block Edit tessellation, `Document` clone, and DXF/DWG/PDF write. Defaults to the 51 MB Assir Poultry sample.
+- `Document` keeps a maintained `EntityId` → location map so `entity_by_id` and `find_entity_location` are O(1) after import, insert, remove, replace, block rename, and undo/redo.
+- DXF/DWG save and PDF export run on a worker after the file dialog returns. The live document is shared with `Arc` so the UI is not frozen by serialization or by cloning the drawing first. A second save is rejected with status text instead of blocking.
+- Move, Copy, Erase, and matching Undo/Redo update tessellation, object snaps, and measure primitives for the changed model-space entities instead of retessellating the whole drawing. Block Edit and block-definition edits still rebuild.
+
+### Changed
+
+- The DWG import acceptance test looks in `samples/` first, then `test-data/`, so the stress drawing is found after it moved out of the ignored local data directory.
 
 ## [0.20.0] - 2026-09-05
 

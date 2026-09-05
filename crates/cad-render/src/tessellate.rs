@@ -134,9 +134,105 @@ impl DisplayList {
         }
         Some(appended)
     }
+
+    pub fn replace_entity(&mut self, document: &Document, entity: &Entity) -> bool {
+        if !self.pick_of.contains_key(&entity.id) {
+            return self.append_entity(document, entity).is_some();
+        }
+        let mut scratch = DisplayList {
+            origin: self.origin,
+            ..DisplayList::default()
+        };
+        let mut stack = Vec::new();
+        if emit_top_level_entity(document, entity, 0, &mut scratch, &mut stack).is_none() {
+            return self.remove_entity(entity.id);
+        }
+        let Some(&slot) = self.pick_of.get(&entity.id) else {
+            return false;
+        };
+        let old_range = self.draw_ranges[slot as usize];
+        let old_bounds = self.picks[slot as usize].bounds;
+        let new_pick = scratch.picks.pop().expect("tessellated pick");
+        let new_range = scratch.draw_ranges.pop().expect("tessellated range");
+        let new_line_count = new_range.line_end - new_range.line_start;
+        let new_fill_count = new_range.fill_end - new_range.fill_start;
+        let old_line_count = old_range.line_end - old_range.line_start;
+        let old_fill_count = old_range.fill_end - old_range.fill_start;
+        self.spatial.remove(slot, old_bounds);
+        if new_line_count == old_line_count && new_fill_count == old_fill_count {
+            let line_start = old_range.line_start as usize;
+            let fill_start = old_range.fill_start as usize;
+            self.line_vertices[line_start..line_start + new_line_count as usize]
+                .copy_from_slice(&scratch.line_vertices);
+            self.triangle_vertices[fill_start..fill_start + new_fill_count as usize]
+                .copy_from_slice(&scratch.triangle_vertices);
+            self.picks[slot as usize] = new_pick;
+            self.spatial.insert(slot, self.picks[slot as usize].bounds);
+            return true;
+        }
+        collapse_vertices(
+            &mut self.line_vertices,
+            old_range.line_start,
+            old_range.line_end,
+        );
+        collapse_vertices(
+            &mut self.triangle_vertices,
+            old_range.fill_start,
+            old_range.fill_end,
+        );
+        let line_start = self.line_vertices.len() as u32;
+        let fill_start = self.triangle_vertices.len() as u32;
+        self.line_vertices.extend_from_slice(&scratch.line_vertices);
+        self.triangle_vertices
+            .extend_from_slice(&scratch.triangle_vertices);
+        self.draw_ranges[slot as usize] = EntityDrawRange {
+            line_start,
+            line_end: self.line_vertices.len() as u32,
+            fill_start,
+            fill_end: self.triangle_vertices.len() as u32,
+        };
+        self.picks[slot as usize] = new_pick;
+        self.spatial.insert(slot, self.picks[slot as usize].bounds);
+        true
+    }
+
+    pub fn remove_entity(&mut self, entity_id: EntityId) -> bool {
+        let Some(&slot) = self.pick_of.get(&entity_id) else {
+            return false;
+        };
+        let range = self.draw_ranges[slot as usize];
+        let old_bounds = self.picks[slot as usize].bounds;
+        collapse_vertices(&mut self.line_vertices, range.line_start, range.line_end);
+        collapse_vertices(
+            &mut self.triangle_vertices,
+            range.fill_start,
+            range.fill_end,
+        );
+        self.spatial.remove(slot, old_bounds);
+        self.picks[slot as usize] = EntityPick::new(entity_id);
+        self.draw_ranges[slot as usize] = EntityDrawRange::default();
+        self.pick_of.remove(&entity_id);
+        true
+    }
+}
+
+fn collapse_vertices(verts: &mut [GpuVertex], start: u32, end: u32) {
+    let start = start as usize;
+    let end = (end as usize).min(verts.len());
+    if start >= end {
+        return;
+    }
+    let collapsed = GpuVertex {
+        position: verts[start].position,
+        color: [0.0; 4],
+    };
+    for vertex in &mut verts[start..end] {
+        *vertex = collapsed;
+    }
 }
 
 pub fn overlay_batches(display: &DisplayList, ids: &[EntityId]) -> OverlayBatches {
+    let _span = cad_core::perf::span("overlay_batches");
     let mut lines = Vec::with_capacity(ids.len());
     let mut fills = Vec::with_capacity(ids.len());
     for &entity_id in ids {
@@ -221,6 +317,7 @@ impl VectorSink for TessSink<'_> {
 }
 
 pub fn tessellate_document(document: &Document) -> DisplayList {
+    let _span = cad_core::perf::span("tessellate_document");
     let origin = document
         .diagnostics
         .extents
@@ -268,6 +365,7 @@ pub fn tessellate_document_for_block_edit(
     document: &Document,
     view: &BlockEditView,
 ) -> DisplayList {
+    let _span = cad_core::perf::span("tessellate_document_for_block_edit");
     let origin = document
         .diagnostics
         .extents

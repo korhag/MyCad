@@ -357,6 +357,7 @@ mod tests {
             row_count: 1,
             column_spacing: 0.0,
             row_spacing: 0.0,
+            configuration: None,
         })
     }
 
@@ -557,6 +558,7 @@ mod tests {
                         is_attrib_def: true,
                     })),
                 ],
+                ..Default::default()
             },
         );
         document.add_entity(insert_entity(
@@ -605,6 +607,7 @@ mod tests {
                     start: Point3::from_xy(0.0, 0.0),
                     end: Point3::from_xy(10.0, 0.0),
                 })],
+                ..Default::default()
             },
         );
         document.add_entity(insert_entity(

@@ -200,6 +200,7 @@ fn nested_block_picks_the_parent_insert() {
                 start: Point3::from_xy(0.0, 0.0),
                 end: Point3::from_xy(10.0, 0.0),
             })],
+            ..Default::default()
         },
     );
     document.model_space.push(Entity::new(Geometry::Insert {
@@ -213,6 +214,7 @@ fn nested_block_picks_the_parent_insert() {
         row_count: 1,
         column_spacing: 0.0,
         row_spacing: 0.0,
+        configuration: None,
     }));
     assert_eq!(
         pick_world(&document, Point2::new(110.0, 50.0)),
@@ -308,6 +310,7 @@ fn nested_byblock_inherits_insert_linetype() {
             name: "SYM".into(),
             base_pt: Point3::from_xy(0.0, 0.0),
             entities: vec![child],
+            ..Default::default()
         },
     );
     let mut insert = Entity::new(Geometry::Insert {
@@ -321,6 +324,7 @@ fn nested_byblock_inherits_insert_linetype() {
         row_count: 1,
         column_spacing: 0.0,
         row_spacing: 0.0,
+        configuration: None,
     });
     insert.linetype = "DASHED".into();
     document.model_space.push(insert);
@@ -434,6 +438,7 @@ fn insert_entity(name: &str, insertion: Point3, scale: Point3, rotation: f64) ->
         row_count: 1,
         column_spacing: 0.0,
         row_spacing: 0.0,
+        configuration: None,
     })
 }
 
@@ -443,6 +448,7 @@ fn separated_block(name: &str) -> BlockDefinition {
         name: name.into(),
         base_pt: Point3::from_xy(0.0, 0.0),
         entities: pairs.into_iter().map(|(a, b)| line_entity(a, b)).collect(),
+        ..Default::default()
     }
 }
 
@@ -601,6 +607,7 @@ fn selected_nested_insert_matches_display_list() {
                 Point3::new(1.0, 1.0, 1.0),
                 0.0,
             )],
+            ..Default::default()
         },
     );
     let outer_ins = Point3::from_xy(20.0, -10.0);
@@ -704,6 +711,7 @@ fn crossing_ignores_empty_gaps_inside_a_block() {
                     end: Point3::from_xy(110.0, 0.0),
                 }),
             ],
+            ..Default::default()
         },
     );
     document.model_space.push(insert_entity(
@@ -803,6 +811,7 @@ fn indexed_crossing_matches_brute_for_fills_and_block_gaps() {
                     end: Point3::from_xy(110.0, 0.0),
                 }),
             ],
+            ..Default::default()
         },
     );
     document.model_space.push(insert_entity(
@@ -1008,6 +1017,60 @@ fn append_line_matches_full_rebuild_for_pick_and_vertices() {
     list.box_select_into(region, SelectBoxMode::Crossing, &mut indexed);
     assert_eq!(brute, indexed);
     assert!(indexed.contains(&second.id));
+}
+
+#[test]
+fn replace_line_overwrites_vertices_and_picks() {
+    let mut document = Document::default();
+    layer0(&mut document);
+    let first = document.add_entity(Entity::new(Geometry::Line {
+        start: Point3::from_xy(0.0, 0.0),
+        end: Point3::from_xy(10.0, 0.0),
+    }));
+    let second = document.add_entity(Entity::new(Geometry::Line {
+        start: Point3::from_xy(0.0, 4.0),
+        end: Point3::from_xy(10.0, 4.0),
+    }));
+    document.diagnostics.extents = document.compute_extents();
+    let mut list = tessellate_document(&document);
+    let mut moved = first.clone();
+    if let Geometry::Line { start, end } = &mut moved.geometry {
+        *start = Point3::from_xy(0.0, 8.0);
+        *end = Point3::from_xy(10.0, 8.0);
+    }
+    document.replace_entity_in(&cad_core::EntitySpace::ModelSpace, first.id, moved.clone());
+    assert!(list.replace_entity(&document, &moved));
+    assert_eq!(pick_from_list(&list, Point2::new(5.0, 0.0)), None);
+    assert_eq!(pick_from_list(&list, Point2::new(5.0, 8.0)), Some(first.id));
+    assert_eq!(
+        pick_from_list(&list, Point2::new(5.0, 4.0)),
+        Some(second.id)
+    );
+    let rebuilt = tessellate_document(&document);
+    segments_match(&world_line_segments(&list), &world_line_segments(&rebuilt));
+}
+
+#[test]
+fn remove_line_hides_pick_and_keeps_neighbors() {
+    let mut document = Document::default();
+    layer0(&mut document);
+    let first = document.add_entity(Entity::new(Geometry::Line {
+        start: Point3::from_xy(0.0, 0.0),
+        end: Point3::from_xy(10.0, 0.0),
+    }));
+    let second = document.add_entity(Entity::new(Geometry::Line {
+        start: Point3::from_xy(0.0, 4.0),
+        end: Point3::from_xy(10.0, 4.0),
+    }));
+    document.diagnostics.extents = document.compute_extents();
+    let mut list = tessellate_document(&document);
+    document.remove_entity_from(&cad_core::EntitySpace::ModelSpace, first.id);
+    assert!(list.remove_entity(first.id));
+    assert_eq!(pick_from_list(&list, Point2::new(5.0, 0.0)), None);
+    assert_eq!(
+        pick_from_list(&list, Point2::new(5.0, 4.0)),
+        Some(second.id)
+    );
 }
 
 #[test]

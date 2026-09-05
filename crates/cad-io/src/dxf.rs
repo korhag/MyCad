@@ -328,6 +328,7 @@ impl<'a> DxfWriter<'a> {
                 name: name.into(),
                 base_pt: Point3::from_xy(0.0, 0.0),
                 entities: Vec::new(),
+                ..Default::default()
             },
         );
     }
@@ -548,6 +549,7 @@ impl<'a> DxfWriter<'a> {
                 column_spacing,
                 row_spacing,
                 attribs,
+                configuration: _,
             } => {
                 if self.block_by_name(block_name).is_none() {
                     self.warn(&format!(
@@ -1175,6 +1177,7 @@ mod tests {
                     start: Point3::from_xy(10.0, 20.0),
                     end: Point3::from_xy(30.0, 20.0),
                 })],
+                ..Default::default()
             },
         );
         document.add_entity(Entity::new(Geometry::Dimension {
@@ -1234,6 +1237,7 @@ mod tests {
                 name: "SYM".into(),
                 base_pt: Point3::from_xy(0.0, 0.0),
                 entities: Vec::new(),
+                ..Default::default()
             },
         );
         document.add_entity(Entity::new(Geometry::Insert {
@@ -1254,6 +1258,7 @@ mod tests {
             row_count: 1,
             column_spacing: 0.0,
             row_spacing: 0.0,
+            configuration: None,
         }));
         let (report, text) = write_to_string(&document);
         assert!(report

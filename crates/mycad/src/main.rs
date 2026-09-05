@@ -8,11 +8,13 @@ mod commands;
 mod context_menu;
 mod diagnostics;
 mod drafting;
+mod dynamic_block;
 mod dynamic_input;
 mod history;
 mod home;
 mod input;
 mod measurement;
+mod perf_baseline;
 mod preview;
 mod properties;
 mod ribbon;
@@ -29,6 +31,7 @@ use std::process::ExitCode;
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     let import_only = args.iter().any(|a| a == "--import-only");
+    let perf_baseline = args.iter().any(|a| a == "--perf-baseline");
     let path = args
         .into_iter()
         .find(|a| !a.starts_with("--"))
@@ -36,6 +39,11 @@ fn main() -> ExitCode {
 
     if import_only {
         return run_import_only(path);
+    }
+    if perf_baseline {
+        return perf_baseline::run_from_path(
+            path.unwrap_or_else(perf_baseline::default_sample_path),
+        );
     }
 
     let native_options = eframe::NativeOptions {

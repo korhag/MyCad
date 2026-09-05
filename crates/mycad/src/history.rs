@@ -166,6 +166,18 @@ pub struct Transaction {
     pub edits: Vec<Edit>,
 }
 
+// ------------------------------------------------------------
+// Enum: ModelSpaceChange
+// Purpose: Classify a transaction that only mutates model-space
+//          geometry so derived caches can update incrementally.
+// ------------------------------------------------------------
+#[derive(Debug, Clone)]
+pub enum ModelSpaceChange {
+    Inserted(Vec<Entity>),
+    Removed(Vec<Entity>),
+    Replaced(Vec<(Entity, Entity)>),
+}
+
 impl Transaction {
     pub fn is_empty(&self) -> bool {
         self.edits.is_empty()
@@ -183,6 +195,40 @@ impl Transaction {
                 _ => None,
             })
             .collect()
+    }
+
+    pub fn model_space_change(&self) -> Option<ModelSpaceChange> {
+        if self.edits.is_empty() {
+            return None;
+        }
+        let mut inserted = Vec::new();
+        let mut removed = Vec::new();
+        let mut replaced = Vec::new();
+        for edit in &self.edits {
+            match edit {
+                Edit::InsertEntity { space, entity, .. } if space.is_model() => {
+                    inserted.push(entity.clone());
+                }
+                Edit::RemoveEntity { space, entity, .. } if space.is_model() => {
+                    removed.push(entity.clone());
+                }
+                Edit::ReplaceEntity {
+                    space,
+                    before,
+                    after,
+                    ..
+                } if space.is_model() => {
+                    replaced.push((before.clone(), after.clone()));
+                }
+                _ => return None,
+            }
+        }
+        match (inserted.is_empty(), removed.is_empty(), replaced.is_empty()) {
+            (false, true, true) => Some(ModelSpaceChange::Inserted(inserted)),
+            (true, false, true) => Some(ModelSpaceChange::Removed(removed)),
+            (true, true, false) => Some(ModelSpaceChange::Replaced(replaced)),
+            _ => None,
+        }
     }
 
     pub fn apply(&self, document: &mut Document) {
@@ -865,5 +911,40 @@ mod tests {
         assert_eq!(document.block_by_name("Drive").unwrap().entities.len(), 1);
         history.undo(&mut document);
         assert!(document.block_by_name("Motor").is_some());
+    }
+
+    #[test]
+    fn undo_redo_keeps_entity_index_consistent() {
+        let mut document = Document::default();
+        let mut history = History::default();
+        history.begin();
+        let first = document.add_entity(line(0.0, 0.0, 1.0, 0.0));
+        history.record(Edit::insert_model(0, first.clone()));
+        let second = document.add_entity(line(1.0, 0.0, 2.0, 0.0));
+        history.record(Edit::insert_model(1, second.clone()));
+        history.commit_open();
+        assert!(document.entity_index_is_consistent());
+
+        history.begin();
+        document.remove_model_entity(first.id);
+        history.record(Edit::remove_model(0, first.clone()));
+        history.commit_open();
+        assert!(document.entity_by_id(first.id).is_none());
+        assert_eq!(
+            document.entity_by_id(second.id).map(|entity| entity.id),
+            Some(second.id)
+        );
+        assert!(document.entity_index_is_consistent());
+
+        assert!(history.undo(&mut document));
+        assert!(document.entity_by_id(first.id).is_some());
+        assert!(document.entity_index_is_consistent());
+        assert!(history.undo(&mut document));
+        assert!(document.model_space.is_empty());
+        assert!(document.entity_index_is_consistent());
+        assert!(history.redo(&mut document));
+        assert!(history.redo(&mut document));
+        assert!(document.entity_by_id(second.id).is_some());
+        assert!(document.entity_index_is_consistent());
     }
 }

@@ -84,6 +84,7 @@ pub unsafe fn convert_document(
                 name,
                 base_pt,
                 entities,
+                ..Default::default()
             },
         );
     }
@@ -194,6 +195,7 @@ unsafe fn fill_named_blocks_from_sequences(
                                         name,
                                         base_pt,
                                         entities: std::mem::take(&mut collected),
+                                        ..Default::default()
                                     },
                                 );
                             }
@@ -589,6 +591,7 @@ unsafe fn convert_geometry(
                 ),
                 column_spacing: get_field::<f64>(entity_ptr, dxf, "col_spacing").unwrap_or(0.0),
                 row_spacing: get_field::<f64>(entity_ptr, dxf, "row_spacing").unwrap_or(0.0),
+                configuration: None,
             }
         }
         libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_TEXT => Geometry::Text(TextData {

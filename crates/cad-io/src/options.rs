@@ -13,6 +13,8 @@ use std::path::Path;
 pub enum CadFileFormat {
     Dxf,
     Dwg,
+    Mycad,
+    MycadBlock,
 }
 
 impl CadFileFormat {
@@ -20,6 +22,8 @@ impl CadFileFormat {
         match self {
             Self::Dxf => "dxf",
             Self::Dwg => "dwg",
+            Self::Mycad => "mycad",
+            Self::MycadBlock => "mycadblock",
         }
     }
 
@@ -31,10 +35,18 @@ impl CadFileFormat {
                     Some(Self::Dxf)
                 } else if ext.eq_ignore_ascii_case("dwg") {
                     Some(Self::Dwg)
+                } else if ext.eq_ignore_ascii_case("mycad") {
+                    Some(Self::Mycad)
+                } else if ext.eq_ignore_ascii_case("mycadblock") {
+                    Some(Self::MycadBlock)
                 } else {
                     None
                 }
             })
+    }
+
+    pub fn is_native(self) -> bool {
+        matches!(self, Self::Mycad | Self::MycadBlock)
     }
 }
 
@@ -270,6 +282,14 @@ mod tests {
         assert_eq!(
             CadFileFormat::from_path(Path::new("plant.dxf")),
             Some(CadFileFormat::Dxf)
+        );
+        assert_eq!(
+            CadFileFormat::from_path(Path::new("plant.mycad")),
+            Some(CadFileFormat::Mycad)
+        );
+        assert_eq!(
+            CadFileFormat::from_path(Path::new("frame.mycadblock")),
+            Some(CadFileFormat::MycadBlock)
         );
         assert_eq!(CadFileFormat::from_path(Path::new("plant.pdf")), None);
     }

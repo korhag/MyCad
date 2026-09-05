@@ -84,6 +84,7 @@ pub struct MakeUniqueResult {
     pub insert_after: Entity,
     pub insert_space: EntitySpace,
     pub insert_index: usize,
+    pub entity_map: std::collections::BTreeMap<EntityId, EntityId>,
 }
 
 pub fn is_system_block_name(name: &str) -> bool {
@@ -197,6 +198,7 @@ pub struct BlockTreeIndex {
 
 impl BlockTreeIndex {
     pub fn build(document: &Document) -> Self {
+        let _span = crate::perf::span("BlockTreeIndex::build");
         let mut children = BTreeMap::new();
         children.insert(
             String::new(),
@@ -355,7 +357,7 @@ pub fn duplicate_block_definition(
         .cloned()
         .ok_or(BlockError::MissingBlock)?;
     let new_name = unique_clone_name(document, &source.name);
-    let definition = clone_definition_with_new_ids(document, &source, new_name);
+    let (definition, _) = clone_definition_with_new_ids(document, &source, new_name);
     document.replace_block_definition(definition.clone());
     Ok(definition)
 }
@@ -380,7 +382,9 @@ impl Document {
         }
         rewrite_insert_names(&mut definition.entities, &old_key, &new_name);
         definition.name = new_name.clone();
-        self.blocks.insert(new_name, definition);
+        self.blocks.insert(new_name.clone(), definition);
+        self.retarget_block_space(&old_key, &new_name);
+        self.bump_generation();
         Ok(())
     }
 }
@@ -477,6 +481,7 @@ pub fn identity_insert(block_name: String, insertion: Point3) -> Geometry {
         row_count: 1,
         column_spacing: 0.0,
         row_spacing: 0.0,
+        configuration: None,
     }
 }
 
@@ -536,11 +541,7 @@ pub fn create_block_from_entities(
             .ok_or(BlockError::MissingEntity)?;
     }
 
-    let definition = BlockDefinition {
-        name: name.clone(),
-        base_pt: Point3::from_xy(0.0, 0.0),
-        entities: local_members,
-    };
+    let definition = BlockDefinition::plain(name.clone(), Point3::from_xy(0.0, 0.0), local_members);
     document.replace_block_definition(definition.clone());
 
     let insert = if replace_with_insert {
@@ -632,11 +633,33 @@ pub fn make_unique_block(
         .cloned()
         .ok_or(BlockError::MissingBlock)?;
     let new_name = unique_clone_name(document, &source.name);
-    let definition = clone_definition_with_new_ids(document, &source, new_name.clone());
+    let (definition, entity_map) =
+        clone_definition_with_new_ids(document, &source, new_name.clone());
     document.replace_block_definition(definition.clone());
     let mut insert_after = insert_before.clone();
-    if let Geometry::Insert { block_name, .. } = &mut insert_after.geometry {
+    if let Geometry::Insert {
+        block_name,
+        configuration,
+        ..
+    } = &mut insert_after.geometry
+    {
         *block_name = new_name.clone();
+        if let (Some(config), Some(dynamic)) = (configuration.as_mut(), definition.dynamic.as_ref())
+        {
+            let parameters: std::collections::BTreeMap<_, _> = source
+                .dynamic
+                .as_ref()
+                .map(|original| {
+                    original
+                        .parameters
+                        .iter()
+                        .zip(dynamic.parameters.iter())
+                        .map(|(from, to)| (from.id, to.id))
+                        .collect()
+                })
+                .unwrap_or_default();
+            config.remap_parameters(&parameters);
+        }
     }
     let _ = document.replace_entity_in(&space, insert_id, insert_after.clone());
     Ok(MakeUniqueResult {
@@ -646,6 +669,7 @@ pub fn make_unique_block(
         insert_after,
         insert_space: space,
         insert_index: index,
+        entity_map,
     })
 }
 
@@ -653,13 +677,40 @@ fn clone_definition_with_new_ids(
     document: &mut Document,
     source: &BlockDefinition,
     new_name: String,
-) -> BlockDefinition {
+) -> (
+    BlockDefinition,
+    std::collections::BTreeMap<EntityId, EntityId>,
+) {
     let mut definition = source.clone();
+    definition.id = document.allocate_definition_id();
     definition.name = new_name;
+    definition.content_revision = 0;
+    let mut entity_map = std::collections::BTreeMap::new();
     for entity in &mut definition.entities {
+        let old = entity.id;
         entity.id = document.allocate_id();
+        if old.is_assigned() {
+            entity_map.insert(old, entity.id);
+        }
     }
-    definition
+    if let Some(dynamic) = definition.dynamic.as_mut() {
+        let mut parameters = std::collections::BTreeMap::new();
+        let mut options = std::collections::BTreeMap::new();
+        let mut actions = std::collections::BTreeMap::new();
+        for parameter in &dynamic.parameters {
+            parameters.insert(parameter.id, document.allocate_parameter_id());
+            if let crate::dynamic::ParameterKind::Choice(choice) = &parameter.kind {
+                for option in &choice.options {
+                    options.insert(option.id, document.allocate_option_id());
+                }
+            }
+        }
+        for behavior in &dynamic.behaviors {
+            actions.insert(behavior.id, document.allocate_action_id());
+        }
+        let _ = dynamic.remap_ids(&parameters, &options, &actions, &entity_map);
+    }
+    (definition, entity_map)
 }
 
 fn unique_clone_name(document: &Document, source: &str) -> String {
@@ -887,16 +938,19 @@ mod tests {
             name: "A".into(),
             base_pt: Point3::from_xy(0.0, 0.0),
             entities: vec![insert_at("B", 0.0, 0.0)],
+            ..Default::default()
         });
         document.replace_block_definition(BlockDefinition {
             name: "B".into(),
             base_pt: Point3::from_xy(0.0, 0.0),
             entities: vec![insert_at("C", 0.0, 0.0)],
+            ..Default::default()
         });
         document.replace_block_definition(BlockDefinition {
             name: "C".into(),
             base_pt: Point3::from_xy(0.0, 0.0),
             entities: vec![line(0.0, 0.0, 1.0, 0.0)],
+            ..Default::default()
         });
         assert!(would_create_block_cycle(&document, "A", "A"));
         assert!(would_create_block_cycle(&document, "C", "A"));
@@ -1003,6 +1057,7 @@ mod tests {
             name: "A".into(),
             base_pt: Point3::from_xy(0.0, 0.0),
             entities: Vec::new(),
+            ..Default::default()
         });
         let circle_ent = document.add_entity(circle(1.0, 0.0, 1.0));
         let xf = Transform2::insert(Point3::from_xy(0.0, 0.0), Point3::new(2.0, 1.0, 1.0), 0.4);
@@ -1184,6 +1239,7 @@ mod tests {
             name: "Motor".into(),
             base_pt: Point3::from_xy(0.0, 0.0),
             entities: vec![line(0.0, 0.0, 1.0, 0.0)],
+            ..Default::default()
         });
         document.replace_block_definition(BlockDefinition {
             name: "Machine".into(),
@@ -1193,6 +1249,7 @@ mod tests {
                 insert_at("Motor", 10.0, 0.0),
                 insert_at("Machine", 20.0, 0.0),
             ],
+            ..Default::default()
         });
         document.add_entity(insert_at("Machine", 0.0, 0.0));
         document.add_entity(insert_at("Machine", 40.0, 0.0));
@@ -1253,6 +1310,7 @@ mod tests {
             name: "Other".into(),
             base_pt: Point3::from_xy(0.0, 0.0),
             entities: Vec::new(),
+            ..Default::default()
         });
         assert!(matches!(
             validate_block_rename(&document, "MOTOR", "other"),
@@ -1271,11 +1329,13 @@ mod tests {
             name: "Motor".into(),
             base_pt: Point3::from_xy(0.0, 0.0),
             entities: vec![line(0.0, 0.0, 1.0, 0.0)],
+            ..Default::default()
         });
         document.replace_block_definition(BlockDefinition {
             name: "Machine".into(),
             base_pt: Point3::from_xy(0.0, 0.0),
             entities: vec![insert_at("Motor", 0.0, 0.0), insert_at("Motor", 10.0, 0.0)],
+            ..Default::default()
         });
         document.add_entity(insert_at("Machine", 0.0, 0.0));
         let machine_insert_id = document.model_space[0].id;

@@ -140,6 +140,7 @@ pub fn pick_entity(
     viewport_origin: Point2,
     viewport_size: Point2,
 ) -> Option<EntityId> {
+    let _span = cad_core::perf::span("click_picking");
     hit_test(
         &display.picks,
         camera,
@@ -181,6 +182,7 @@ pub fn box_pick_entities_into(
     viewport_size: Point2,
     out: &mut Vec<EntityId>,
 ) -> SelectBoxMode {
+    let _span = cad_core::perf::span("box_selection");
     let mode = SelectBoxMode::from_screen_drag(start, current);
     let a = camera.screen_to_world(start, viewport_origin, viewport_size);
     let b = camera.screen_to_world(current, viewport_origin, viewport_size);

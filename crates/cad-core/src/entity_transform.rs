@@ -257,6 +257,7 @@ pub fn transform_geometry(
             row_count,
             column_spacing,
             row_spacing,
+            configuration,
         } => {
             let combined = matrix.then(Transform2::insert(*insertion, *scale, *rotation));
             let (insertion_xy, new_scale, new_rotation) = decompose_insert(combined, scale.z);
@@ -274,6 +275,7 @@ pub fn transform_geometry(
                 row_count: *row_count,
                 column_spacing: *column_spacing * matrix.scale_x(),
                 row_spacing: *row_spacing * matrix.scale_x(),
+                configuration: configuration.clone(),
             }
         }
         Geometry::Text(data) => Geometry::Text(transform_text(data, matrix)),
@@ -817,6 +819,7 @@ mod tests {
             row_count: 1,
             column_spacing: 0.0,
             row_spacing: 0.0,
+            configuration: None,
         });
         let moved = transform_entity(&entity, EntityTransform::Translate { dx: 5.0, dy: -1.0 })
             .expect("move insert");
@@ -972,6 +975,7 @@ mod tests {
                 name: "DOOR".into(),
                 base_pt: Point3::from_xy(0.0, 0.0),
                 entities: vec![line(0.0, 0.0, 1.0, 0.0)],
+                ..Default::default()
             },
         );
         let insert = document.add_entity(Entity::new(Geometry::Insert {
@@ -985,6 +989,7 @@ mod tests {
             row_count: 1,
             column_spacing: 0.0,
             row_spacing: 0.0,
+            configuration: None,
         }));
         let moved = transform_entity(&insert, EntityTransform::Translate { dx: 5.0, dy: 0.0 })
             .expect("move insert");

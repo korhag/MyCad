@@ -7,6 +7,7 @@
 mod atomic;
 mod dxf;
 mod error;
+mod native;
 mod options;
 mod pdf;
 mod r2000;
@@ -16,6 +17,10 @@ pub use atomic::{
 };
 pub use dxf::write_dxf;
 pub use error::ExportError;
+pub use native::{
+    import_block_asset, parse_mycad_bytes, read_mycad, read_mycadblock, write_mycad,
+    write_mycadblock, BlockAsset, MYCAD_BLOCK_FORMAT, MYCAD_FORMAT, MYCAD_SCHEMA,
+};
 pub use options::{
     mm_to_pt, CadFileFormat, DxfAcadVersion, DxfExportOptions, PdfExportOptions, PdfOrientation,
     PdfPaperSize, PdfPlotArea, PdfPlotStyle, SaveReport, PDF_MARGIN_MM, PDF_STROKE_HEAVY_PT,

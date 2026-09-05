@@ -227,6 +227,36 @@ fn display_tab(ui: &mut egui::Ui, app: &mut MyCadApp) {
     if ui.button("Reset display colors").clicked() {
         app.settings_draft.display.reset_all();
     }
+    ui.add_space(16.0);
+    ui.separator();
+    ui.heading("Library thumbnails");
+    ui.weak("Hovering a library item must never decode a DWG. These settings are stored now; the browser arrives in a later phase.");
+    ui.add_space(8.0);
+    ui.checkbox(
+        &mut app.settings_draft.library_preview.show_thumbnails,
+        "Show thumbnails",
+    );
+    ui.checkbox(
+        &mut app.settings_draft.library_preview.generate_missing,
+        "Generate missing thumbnails",
+    );
+    ui.label("Refresh changed thumbnails");
+    egui::ComboBox::from_id_salt("thumbnail-refresh")
+        .selected_text(app.settings_draft.library_preview.refresh_policy.label())
+        .show_ui(ui, |ui| {
+            for policy in [
+                crate::settings::ThumbnailRefreshPolicySetting::Ask,
+                crate::settings::ThumbnailRefreshPolicySetting::Automatic,
+                crate::settings::ThumbnailRefreshPolicySetting::Manual,
+            ] {
+                ui.selectable_value(
+                    &mut app.settings_draft.library_preview.refresh_policy,
+                    policy,
+                    policy.label(),
+                );
+            }
+        });
+    ui.weak("Turning display off does not delete cached images. Turning generation off guarantees hover never decodes a DWG.");
 }
 
 fn color_row(ui: &mut egui::Ui, title: &str, hint: &str, color: &mut RgbColor) {

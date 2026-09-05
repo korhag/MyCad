@@ -257,6 +257,18 @@ impl SpatialIndex {
         }
     }
 
+    pub fn remove(&mut self, id: u32, extents: Extents2) {
+        if self.cells.is_empty() || !extents.is_valid() {
+            return;
+        }
+        let (x0, x1, y0, y1) = self.cell_range(extents);
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                self.cells[y * self.cols + x].retain(|&slot| slot != id);
+            }
+        }
+    }
+
     fn cell_range(&self, region: Extents2) -> (usize, usize, usize, usize) {
         let x0 = self.clamp_col((region.min.x - self.origin_x) * self.inv_cell);
         let x1 = self.clamp_col((region.max.x - self.origin_x) * self.inv_cell);

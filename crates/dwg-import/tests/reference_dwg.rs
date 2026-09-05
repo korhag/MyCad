@@ -1,8 +1,12 @@
 use std::path::PathBuf;
 
 fn reference_dwg() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../test-data/KD-1413-260825 Assir Poultry Internal Logistics.dwg")
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let samples = root.join("samples/KD-1413-260825 Assir Poultry Internal Logistics.dwg");
+    if samples.is_file() {
+        return samples;
+    }
+    root.join("test-data/KD-1413-260825 Assir Poultry Internal Logistics.dwg")
 }
 
 #[test]

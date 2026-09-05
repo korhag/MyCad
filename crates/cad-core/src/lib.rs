@@ -9,17 +9,22 @@ pub mod compare;
 pub mod curves;
 pub mod dash;
 pub mod document;
+pub mod dynamic;
 pub mod entity;
 pub mod entity_transform;
+pub mod evaluate;
 pub mod extents;
 pub mod fixtures;
 pub mod geom;
 pub mod hatch;
+pub mod ids;
 pub mod linetype;
 pub mod measure;
 pub mod measure_index;
+pub mod perf;
 pub mod snap;
 pub mod stroke_font;
+pub mod thumbnail;
 pub mod transform;
 pub mod vectorize;
 
@@ -39,7 +44,16 @@ pub use curves::{
     polyline_points, CIRCLE_SEGMENTS, POLYLINE_BULGE_SEGMENTS,
 };
 pub use document::{
-    BlockDefinition, Document, DrawingUnits, EntitySpace, ImportDiagnostics, Layer,
+    BlockDefinition, Document, DrawingUnits, EntityLocation, EntitySpace, ImportDiagnostics, Layer,
+};
+pub use dynamic::{
+    capability_for, increment_numeric, normalize_direction, resolve_values, snap_numeric,
+    validate_definition, validate_numeric_value, validate_parameter_def, validate_parameter_value,
+    BehaviorKind, BooleanParameter, ChoiceOption,
+    ChoiceParameter, CompositionRule, DynamicBehavior, DynamicDefinition, DynamicError,
+    GeometryTarget, InstanceConfiguration, NumericParameter, NumericQuantity, ParameterDef,
+    ParameterKind, ParameterUnit, ParameterValue, StepOrigin, StepPolicy, TextParameter,
+    EVALUATOR_VERSION,
 };
 pub use entity::{
     default_extrusion, Entity, EntityId, Geometry, HatchData, HatchEdge, HatchPath,
@@ -49,6 +63,12 @@ pub use entity_transform::{
     reference_radius, transform_entity, transform_entity_matrix, transform_geometry,
     validate_entities, EntityTransform, TransformError,
 };
+pub use evaluate::{
+    check_generation, document_has_dynamic_content, evaluate_definition, export_materialized,
+    apply_definition_preview, generated_block_name, is_generated_block_name, materialize_evaluated,
+    materialize_evaluated_with, EvalKey, EvaluatedBlock, EvaluationCache, EvaluationRequest,
+    GENERATED_BLOCK_PREFIX,
+};
 pub use extents::Extents2;
 pub use fixtures::primitives_document;
 pub use geom::{
@@ -56,6 +76,7 @@ pub use geom::{
     GEOM_TOLERANCE,
 };
 pub use hatch::hatch_path_points;
+pub use ids::{ActionId, BlockDefinitionId, OptionId, ParameterId};
 pub use linetype::{
     is_byblock_name, is_bylayer_name, is_continuous_name, normalize_linetype_name, LineType,
 };
@@ -71,6 +92,11 @@ pub use measure_index::{
 };
 pub use snap::{SnapFeature, SnapIndex, SnapKind};
 pub use stroke_font::{measure_width, strip_mtext, stroke_text};
+pub use thumbnail::{
+    path_is_thumbnail_folder, should_scan_asset, ContentFingerprint, SourceIdentity,
+    SourceMetadata, ThumbnailRecord, ThumbnailRefreshPolicy, ThumbnailSettings, ThumbnailStatus,
+    THUMBNAIL_FOLDER_NAME,
+};
 pub use transform::Transform2;
 pub use vectorize::{
     plot_geometry, vectorize_entity, PlotFill, PlotGeometry, PlotStroke, VectorSink,

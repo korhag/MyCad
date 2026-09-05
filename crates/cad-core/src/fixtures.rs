@@ -61,6 +61,7 @@ pub fn primitives_document() -> Document {
                 line.layer = "0".into();
                 line
             }],
+            ..Default::default()
         },
     );
     document.blocks.insert(
@@ -80,11 +81,13 @@ pub fn primitives_document() -> Document {
                     row_count: 1,
                     column_spacing: 0.0,
                     row_spacing: 0.0,
+                    configuration: None,
                 });
                 insert.layer = "0".into();
                 insert.color = CadColor::ByLayer;
                 insert
             }],
+            ..Default::default()
         },
     );
 
@@ -207,6 +210,7 @@ pub fn primitives_document() -> Document {
         row_count: 1,
         column_spacing: 0.0,
         row_spacing: 0.0,
+        configuration: None,
     });
     insert.color = CadColor::Aci(6);
     insert.layer = "0".into();
