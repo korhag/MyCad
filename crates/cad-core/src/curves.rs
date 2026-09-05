@@ -134,9 +134,8 @@ pub fn ellipse_arc_points(
         } else {
             start_param - sweep * t
         };
-        let p = center
-            + major_dir * (major_len * param.cos())
-            + minor_dir * (minor_len * param.sin());
+        let p =
+            center + major_dir * (major_len * param.cos()) + minor_dir * (minor_len * param.sin());
         // ELLIPSE center and major axis are already WCS; only project to XY.
         pts.push(p.xy());
     }
@@ -605,5 +604,41 @@ mod tests {
             assert!(p.x > 637009.0 && p.x < 637011.0, "x={}", p.x);
             assert!(p.y > 295418.0 && p.y < 295421.0, "y={}", p.y);
         }
+    }
+
+    #[test]
+    fn ellipse_arc_cw_and_ccw_keep_start_end_and_side() {
+        let center = Point3::from_xy(0.0, 0.0);
+        let major = Point3::from_xy(2.0, 0.0);
+        let extrusion = Point3::new(0.0, 0.0, 1.0);
+        let ccw = ellipse_arc_points(
+            center,
+            major,
+            0.5,
+            0.0,
+            std::f64::consts::FRAC_PI_2,
+            true,
+            extrusion,
+            32,
+        );
+        let cw = ellipse_arc_points(
+            center,
+            major,
+            0.5,
+            0.0,
+            std::f64::consts::FRAC_PI_2,
+            false,
+            extrusion,
+            32,
+        );
+        assert_point(ccw[0], p(2.0, 0.0), "ccw start");
+        assert_point(*ccw.last().unwrap(), p(0.0, 1.0), "ccw end");
+        assert_point(cw[0], p(2.0, 0.0), "cw start");
+        assert_point(*cw.last().unwrap(), p(0.0, 1.0), "cw end");
+        let ccw_mid = sample_mid(&ccw);
+        let cw_mid = sample_mid(&cw);
+        assert!(ccw_mid.x > 0.0 && ccw_mid.y > 0.0);
+        assert!(cw_mid.x < 0.0 && cw_mid.y < 0.0);
+        assert_ne!(ccw_mid.y.signum(), cw_mid.y.signum());
     }
 }

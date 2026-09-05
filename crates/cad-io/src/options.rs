@@ -1,5 +1,7 @@
 //! Options for native DXF and PDF export.
 
+use cad_core::Extents2;
+
 use std::path::Path;
 
 // ------------------------------------------------------------
@@ -155,13 +157,53 @@ impl Default for PdfPlotStyle {
 
 pub const PDF_MARGIN_MM: [f64; 3] = [5.0, 10.0, 15.0];
 
+pub const PDF_STROKE_THIN_PT: f64 = 0.25;
+pub const PDF_STROKE_NORMAL_PT: f64 = 0.5;
+pub const PDF_STROKE_HEAVY_PT: f64 = 1.0;
+
+pub const PDF_STROKE_WEIGHTS: [(f64, &'static str); 3] = [
+    (PDF_STROKE_THIN_PT, "Thin"),
+    (PDF_STROKE_NORMAL_PT, "Normal"),
+    (PDF_STROKE_HEAVY_PT, "Heavy"),
+];
+
 pub fn mm_to_pt(mm: f64) -> f64 {
     mm * 72.0 / 25.4
 }
 
 // ------------------------------------------------------------
+// Enum: PdfPlotArea
+// Purpose: World region mapped onto the sheet. Window is a clip,
+//          not an entity-intersection filter.
+// ------------------------------------------------------------
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PdfPlotArea {
+    Extents,
+    Window(Extents2),
+}
+
+impl Default for PdfPlotArea {
+    fn default() -> Self {
+        Self::Extents
+    }
+}
+
+impl PdfPlotArea {
+    pub fn is_window(self) -> bool {
+        matches!(self, Self::Window(_))
+    }
+
+    pub fn window(self) -> Option<Extents2> {
+        match self {
+            Self::Extents => None,
+            Self::Window(extents) => Some(extents),
+        }
+    }
+}
+
+// ------------------------------------------------------------
 // Type: PdfExportOptions
-// Purpose: Vector plot of model space. Plot area is extents; scale is fit.
+// Purpose: Vector plot of model space. Scale is fit-to-page.
 // ------------------------------------------------------------
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PdfExportOptions {
@@ -170,6 +212,8 @@ pub struct PdfExportOptions {
     pub style: PdfPlotStyle,
     pub margin_mm: f64,
     pub stroke_pt: f64,
+    pub plot_area: PdfPlotArea,
+    pub center_plot: bool,
 }
 
 impl Default for PdfExportOptions {
@@ -179,7 +223,9 @@ impl Default for PdfExportOptions {
             orientation: PdfOrientation::Portrait,
             style: PdfPlotStyle::Color,
             margin_mm: 10.0,
-            stroke_pt: 0.5,
+            stroke_pt: PDF_STROKE_NORMAL_PT,
+            plot_area: PdfPlotArea::Extents,
+            center_plot: true,
         }
     }
 }
@@ -251,5 +297,11 @@ mod tests {
         assert_eq!(PDF_MARGIN_MM, [5.0, 10.0, 15.0]);
         assert_eq!(PdfPlotStyle::default(), PdfPlotStyle::Color);
         assert_eq!(PdfOrientation::default(), PdfOrientation::Portrait);
+        assert_eq!(PdfPlotArea::default(), PdfPlotArea::Extents);
+        assert!(PdfExportOptions::default().center_plot);
+        assert_eq!(
+            PDF_STROKE_WEIGHTS.map(|(_, label)| label),
+            ["Thin", "Normal", "Heavy"]
+        );
     }
 }

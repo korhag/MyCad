@@ -169,11 +169,14 @@ mod tests {
         let mid = sample_mid(&pts);
         assert_point(
             mid,
-            Point2::new(std::f64::consts::FRAC_1_SQRT_2, std::f64::consts::FRAC_1_SQRT_2),
+            Point2::new(
+                std::f64::consts::FRAC_1_SQRT_2,
+                std::f64::consts::FRAC_1_SQRT_2,
+            ),
             "midpoint",
         );
         assert!(
-            chord_side(pts[0], *pts.last().unwrap(), mid) > 0.0,
+            chord_side(pts[0], *pts.last().unwrap(), mid) < 0.0,
             "CCW quarter stays on the +XY side of the chord"
         );
     }
@@ -191,9 +194,16 @@ mod tests {
         assert_point(pts[0], Point2::new(1.0, 0.0), "start");
         assert_point(*pts.last().unwrap(), Point2::new(0.0, 1.0), "end");
         let mid = sample_mid(&pts);
-        assert_point(mid, Point2::new(-1.0, 0.0), "midpoint");
+        assert_point(
+            mid,
+            Point2::new(
+                -std::f64::consts::FRAC_1_SQRT_2,
+                -std::f64::consts::FRAC_1_SQRT_2,
+            ),
+            "midpoint",
+        );
         assert!(
-            chord_side(pts[0], *pts.last().unwrap(), mid) < 0.0,
+            chord_side(pts[0], *pts.last().unwrap(), mid) > 0.0,
             "CW three-quarter arc stays on the opposite side of the chord"
         );
     }
@@ -212,18 +222,13 @@ mod tests {
         assert_point(pts[0], Point2::new(2.0, 0.0), "start");
         assert_point(*pts.last().unwrap(), Point2::new(0.0, 1.0), "end");
         let mid = sample_mid(&pts);
-        assert_point(
-            mid,
-            Point2::new(std::f64::consts::SQRT_2, 0.5 * std::f64::consts::FRAC_1_SQRT_2 * 2.0 / 2.0 + 0.5 * std::f64::consts::FRAC_1_SQRT_2),
-            "placeholder",
-        );
         let expected = Point2::new(
             2.0 * std::f64::consts::FRAC_1_SQRT_2,
-            0.5 * std::f64::consts::FRAC_1_SQRT_2,
+            std::f64::consts::FRAC_1_SQRT_2,
         );
         assert_point(mid, expected, "ellipse midpoint");
         assert!(
-            chord_side(pts[0], *pts.last().unwrap(), mid) > 0.0,
+            chord_side(pts[0], *pts.last().unwrap(), mid) < 0.0,
             "CCW elliptic quarter stays on the +XY side of the chord"
         );
     }
@@ -242,9 +247,16 @@ mod tests {
         assert_point(pts[0], Point2::new(2.0, 0.0), "start");
         assert_point(*pts.last().unwrap(), Point2::new(0.0, 1.0), "end");
         let mid = sample_mid(&pts);
-        assert_point(mid, Point2::new(-2.0, 0.0), "midpoint");
+        assert_point(
+            mid,
+            Point2::new(
+                -2.0 * std::f64::consts::FRAC_1_SQRT_2,
+                -std::f64::consts::FRAC_1_SQRT_2,
+            ),
+            "midpoint",
+        );
         assert!(
-            chord_side(pts[0], *pts.last().unwrap(), mid) < 0.0,
+            chord_side(pts[0], *pts.last().unwrap(), mid) > 0.0,
             "CW elliptic three-quarter stays on the opposite side of the chord"
         );
     }

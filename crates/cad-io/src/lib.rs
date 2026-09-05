@@ -18,7 +18,8 @@ pub use dxf::write_dxf;
 pub use error::ExportError;
 pub use options::{
     mm_to_pt, CadFileFormat, DxfAcadVersion, DxfExportOptions, PdfExportOptions, PdfOrientation,
-    PdfPaperSize, PdfPlotStyle, SaveReport, PDF_MARGIN_MM,
+    PdfPaperSize, PdfPlotArea, PdfPlotStyle, SaveReport, PDF_MARGIN_MM, PDF_STROKE_HEAVY_PT,
+    PDF_STROKE_NORMAL_PT, PDF_STROKE_THIN_PT, PDF_STROKE_WEIGHTS,
 };
 pub use pdf::export_pdf;
 pub use r2000::{decode_dxf_r2000, encode_dxf_r2000};

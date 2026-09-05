@@ -8,12 +8,12 @@ use std::time::Instant;
 
 use cad_core::{
     reference_radius, transform_entity, validate_entities, Document, Entity, EntityTransform,
-    Geometry, MeasureIndex, MeasureRole, MeasurementResult, Point2, SnapFeature, SnapIndex,
-    Transform2, TransformError, GEOM_TOLERANCE,
+    Extents2, Geometry, MeasureIndex, MeasureRole, MeasurementResult, Point2, SnapFeature,
+    SnapIndex, Transform2, TransformError, GEOM_TOLERANCE,
 };
 use cad_io::{
     export_pdf, write_dxf, CadFileFormat, DxfExportOptions, PdfExportOptions, PdfOrientation,
-    PdfPaperSize, PdfPlotStyle, SaveReport, PDF_MARGIN_MM,
+    PdfPaperSize, PdfPlotArea, PdfPlotStyle, SaveReport, PDF_MARGIN_MM, PDF_STROKE_WEIGHTS,
 };
 use cad_render::{
     tessellate_document, CadFrame, CadGpu, DisplayList, GpuUpload, OverlayBatches, SelectBoxMode,
@@ -40,6 +40,49 @@ use crate::workspace::{self, WorkspaceTab};
 
 const SELECTION_OVERLAY_COLOR: [f32; 4] = [255.0 / 255.0, 196.0 / 255.0, 72.0 / 255.0, 1.0];
 const SAVE_TOOLTIP: &str = "Save\nCtrl+S";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PdfPlotAreaKind {
+    Extents,
+    Window,
+}
+
+impl PdfPlotAreaKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Extents => "Extents",
+            Self::Window => "Window",
+        }
+    }
+}
+
+struct PdfPlotDialogState {
+    options: PdfExportOptions,
+    area: PdfPlotAreaKind,
+    window: Option<Extents2>,
+}
+
+struct PlotWindowPick {
+    options: PdfExportOptions,
+    last_window: Option<Extents2>,
+    first: Option<Point2>,
+}
+
+enum PdfPlotUi {
+    Closed,
+    Dialog(PdfPlotDialogState),
+    PickWindow(PlotWindowPick),
+}
+
+impl PdfPlotUi {
+    fn is_closed(&self) -> bool {
+        matches!(self, Self::Closed)
+    }
+
+    fn is_picking(&self) -> bool {
+        matches!(self, Self::PickWindow(_))
+    }
+}
 
 enum LoadMsg {
     Success {
@@ -127,7 +170,7 @@ pub struct MyCadApp {
     pending_lossy_save: bool,
     /// True after MyCAD wrote `document.source_path` this session.
     source_written_by_mycad: bool,
-    pdf_plot: Option<PdfExportOptions>,
+    pdf_plot: PdfPlotUi,
     last_pointer: Option<egui::Pos2>,
     box_select: Option<BoxSelectDrag>,
     command_snaps: Vec<SnapFeature>,
@@ -190,7 +233,7 @@ impl MyCadApp {
             pending_discard: None,
             pending_lossy_save: false,
             source_written_by_mycad: false,
-            pdf_plot: None,
+            pdf_plot: PdfPlotUi::Closed,
             last_pointer: None,
             box_select: None,
             command_snaps: Vec::new(),
@@ -454,7 +497,11 @@ impl MyCadApp {
             self.status = "No drawing is open".into();
             return;
         }
-        self.pdf_plot = Some(PdfExportOptions::default());
+        self.pdf_plot = PdfPlotUi::Dialog(PdfPlotDialogState {
+            options: PdfExportOptions::default(),
+            area: PdfPlotAreaKind::Extents,
+            window: None,
+        });
     }
 
     fn write_pdf_export(&mut self, options: PdfExportOptions) {
@@ -1416,6 +1463,15 @@ impl MyCadApp {
                 color.to_fill(),
             );
         }
+        if let Some((start, current)) = self.plot_window_screen_rect(rect) {
+            workspace::paint_box_select_rect(
+                &painter,
+                start,
+                current,
+                egui::Color32::from_rgb(80, 180, 220),
+                egui::Color32::from_rgba_unmultiplied(80, 180, 220, 40),
+            );
+        }
         let start = self.command.start_vertex();
         let start_marker = start.filter(|start| {
             self.drafting.preferences.osnap_enabled
@@ -1595,11 +1651,16 @@ impl MyCadApp {
     }
 
     fn show_pdf_plot_dialog(&mut self, ctx: &egui::Context) {
-        let Some(mut options) = self.pdf_plot else {
+        if !matches!(self.pdf_plot, PdfPlotUi::Dialog(_)) {
+            return;
+        }
+        let PdfPlotUi::Dialog(mut state) = std::mem::replace(&mut self.pdf_plot, PdfPlotUi::Closed)
+        else {
             return;
         };
         let mut export = false;
         let mut cancel = false;
+        let mut pick_window = false;
         egui::Window::new("Export PDF")
             .collapsible(false)
             .resizable(false)
@@ -1607,52 +1668,99 @@ impl MyCadApp {
             .show(ctx, |ui| {
                 ui.label("Paper");
                 egui::ComboBox::from_id_salt("pdf-paper")
-                    .selected_text(options.paper.label())
+                    .selected_text(state.options.paper.label())
                     .show_ui(ui, |ui| {
                         for paper in PdfPaperSize::ALL {
-                            ui.selectable_value(&mut options.paper, paper, paper.label());
+                            ui.selectable_value(&mut state.options.paper, paper, paper.label());
                         }
                     });
                 ui.add_space(6.0);
                 ui.label("Orientation");
                 ui.horizontal(|ui| {
                     ui.selectable_value(
-                        &mut options.orientation,
+                        &mut state.options.orientation,
                         PdfOrientation::Portrait,
                         "Portrait",
                     );
                     ui.selectable_value(
-                        &mut options.orientation,
+                        &mut state.options.orientation,
                         PdfOrientation::Landscape,
                         "Landscape",
                     );
                 });
                 ui.add_space(6.0);
-                ui.label("Plot area");
-                ui.label("Extents");
+                ui.label("Plot Area");
+                egui::ComboBox::from_id_salt("pdf-plot-area")
+                    .selected_text(state.area.label())
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut state.area,
+                            PdfPlotAreaKind::Extents,
+                            PdfPlotAreaKind::Extents.label(),
+                        );
+                        ui.selectable_value(
+                            &mut state.area,
+                            PdfPlotAreaKind::Window,
+                            PdfPlotAreaKind::Window.label(),
+                        );
+                    });
+                if state.area == PdfPlotAreaKind::Window {
+                    ui.horizontal(|ui| {
+                        if ui.button("Pick Window").clicked() {
+                            pick_window = true;
+                        }
+                        if let Some(window) = state.window {
+                            ui.label(format!(
+                                "{:.3},{:.3} → {:.3},{:.3}",
+                                window.min.x, window.min.y, window.max.x, window.max.y
+                            ));
+                        }
+                    });
+                }
                 ui.add_space(6.0);
                 ui.label("Scale");
                 ui.label("Fit to page");
                 ui.add_space(6.0);
+                ui.checkbox(&mut state.options.center_plot, "Center Plot");
+                ui.add_space(6.0);
                 ui.label("Style");
                 ui.horizontal(|ui| {
-                    ui.selectable_value(&mut options.style, PdfPlotStyle::Color, "Color");
-                    ui.selectable_value(&mut options.style, PdfPlotStyle::Monochrome, "Monochrome");
+                    ui.selectable_value(&mut state.options.style, PdfPlotStyle::Color, "Color");
+                    ui.selectable_value(
+                        &mut state.options.style,
+                        PdfPlotStyle::Monochrome,
+                        "Monochrome",
+                    );
                 });
                 ui.add_space(6.0);
                 ui.label("Margins");
                 ui.horizontal(|ui| {
                     for millimetres in PDF_MARGIN_MM {
                         ui.selectable_value(
-                            &mut options.margin_mm,
+                            &mut state.options.margin_mm,
                             millimetres,
                             format!("{millimetres:.0} mm"),
                         );
                     }
                 });
+                ui.add_space(6.0);
+                ui.label("Line Thickness");
+                ui.horizontal(|ui| {
+                    for (weight, label) in PDF_STROKE_WEIGHTS {
+                        ui.selectable_value(&mut state.options.stroke_pt, weight, label);
+                    }
+                });
+                ui.add_space(6.0);
+                ui.label("Preview");
+                paint_pdf_preview(ui, &state);
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Export…").clicked() {
+                    let can_export =
+                        state.area != PdfPlotAreaKind::Window || state.window.is_some();
+                    if ui
+                        .add_enabled(can_export, egui::Button::new("Export PDF"))
+                        .clicked()
+                    {
                         export = true;
                     }
                     if ui.button("Cancel").clicked() {
@@ -1663,13 +1771,77 @@ impl MyCadApp {
                     cancel = true;
                 }
             });
-        self.pdf_plot = Some(options);
-        if cancel {
-            self.pdf_plot = None;
-        } else if export {
-            self.pdf_plot = None;
-            self.write_pdf_export(options);
+        if pick_window {
+            self.status = "Specify first corner of plot window".into();
+            self.pdf_plot = PdfPlotUi::PickWindow(PlotWindowPick {
+                options: state.options,
+                last_window: state.window,
+                first: None,
+            });
+            return;
         }
+        if cancel {
+            self.pdf_plot = PdfPlotUi::Closed;
+        } else if export {
+            let mut options = state.options;
+            options.plot_area = match state.area {
+                PdfPlotAreaKind::Extents => PdfPlotArea::Extents,
+                PdfPlotAreaKind::Window => match state.window {
+                    Some(window) => PdfPlotArea::Window(window),
+                    None => {
+                        self.pdf_plot = PdfPlotUi::Dialog(state);
+                        return;
+                    }
+                },
+            };
+            self.pdf_plot = PdfPlotUi::Closed;
+            self.write_pdf_export(options);
+        } else {
+            self.pdf_plot = PdfPlotUi::Dialog(state);
+        }
+    }
+
+    fn cancel_plot_window_pick(&mut self) {
+        if let PdfPlotUi::PickWindow(pick) =
+            std::mem::replace(&mut self.pdf_plot, PdfPlotUi::Closed)
+        {
+            self.status = "Export PDF".into();
+            self.pdf_plot = PdfPlotUi::Dialog(PdfPlotDialogState {
+                options: pick.options,
+                area: PdfPlotAreaKind::Window,
+                window: pick.last_window,
+            });
+        }
+    }
+
+    fn finish_plot_window_pick(&mut self, first: Point2, second: Point2) {
+        let PdfPlotUi::PickWindow(pick) = std::mem::replace(&mut self.pdf_plot, PdfPlotUi::Closed)
+        else {
+            return;
+        };
+        let window = Extents2::from_corners(first, second);
+        self.status = "Export PDF".into();
+        self.pdf_plot = PdfPlotUi::Dialog(PdfPlotDialogState {
+            options: pick.options,
+            area: PdfPlotAreaKind::Window,
+            window: Some(window),
+        });
+    }
+
+    fn plot_window_screen_rect(&self, viewport: Rect) -> Option<(egui::Pos2, egui::Pos2)> {
+        let PdfPlotUi::PickWindow(pick) = &self.pdf_plot else {
+            return None;
+        };
+        let first = pick.first?;
+        let current = self.cursor_world?;
+        let origin = Point2::new(viewport.min.x as f64, viewport.min.y as f64);
+        let size = Point2::new(viewport.width() as f64, viewport.height() as f64);
+        let a = self.camera.world_to_screen(first, origin, size);
+        let b = self.camera.world_to_screen(current, origin, size);
+        Some((
+            egui::pos2(a.x as f32, a.y as f32),
+            egui::pos2(b.x as f32, b.y as f32),
+        ))
     }
 
     fn show_lossy_save_dialog(&mut self, ctx: &egui::Context) {
@@ -1781,11 +1953,15 @@ impl eframe::App for MyCadApp {
             self.pending_discard = Some(PendingDiscard::Quit);
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.window_title()));
+        if self.pdf_plot.is_picking() && ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+            self.cancel_plot_window_pick();
+            self.input_consumed_escape = true;
+        }
         if self.capture.is_none()
             && !self.show_settings
             && self.pending_discard.is_none()
             && !self.pending_lossy_save
-            && self.pdf_plot.is_none()
+            && self.pdf_plot.is_closed()
         {
             let text_editing = crate::input::text_field_has_focus(ctx);
             if crate::input::erase_hotkey_allowed(
@@ -1804,7 +1980,7 @@ impl eframe::App for MyCadApp {
             && !self.show_settings
             && self.pending_discard.is_none()
             && !self.pending_lossy_save
-            && self.pdf_plot.is_none()
+            && self.pdf_plot.is_closed()
             && !crate::input::text_field_has_focus(ctx)
         {
             let keys = ctx.input(|input| {
@@ -2142,6 +2318,93 @@ impl eframe::App for MyCadApp {
     }
 }
 
+fn paint_pdf_preview(ui: &mut Ui, state: &PdfPlotDialogState) {
+    let (page_w, page_h) = state.options.page_size_pt();
+    let preview_h = 88.0_f32;
+    let preview_w = preview_h * (page_w / page_h.max(1.0)) as f32;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(preview_w, preview_h), egui::Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, 2.0, egui::Color32::from_rgb(248, 248, 248));
+    painter.rect_stroke(
+        rect,
+        0.0,
+        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(80, 80, 80)),
+        egui::StrokeKind::Inside,
+    );
+    let mx = (state.options.margin_pt() / page_w) as f32 * rect.width();
+    let my = (state.options.margin_pt() / page_h) as f32 * rect.height();
+    let inner = Rect::from_min_max(rect.min + egui::vec2(mx, my), rect.max - egui::vec2(mx, my));
+    if inner.width() < 2.0 || inner.height() < 2.0 {
+        return;
+    }
+    let (world_w, world_h) = match (state.area, state.window) {
+        (PdfPlotAreaKind::Window, Some(window)) => {
+            (window.width().max(1e-6), window.height().max(1e-6))
+        }
+        _ => (1.0, 1.0),
+    };
+    let scale = (inner.width() as f64 / world_w).min(inner.height() as f64 / world_h);
+    let mapped_w = (world_w * scale) as f32;
+    let mapped_h = (world_h * scale) as f32;
+    let ox = if state.options.center_plot {
+        inner.center().x - mapped_w * 0.5
+    } else {
+        inner.min.x
+    };
+    let oy = if state.options.center_plot {
+        inner.center().y - mapped_h * 0.5
+    } else {
+        inner.max.y - mapped_h
+    };
+    let plot = Rect::from_min_size(egui::pos2(ox, oy), egui::vec2(mapped_w, mapped_h));
+    painter.rect_filled(plot, 0.0, egui::Color32::from_rgb(210, 230, 210));
+}
+
+fn handle_plot_window_pick(
+    app: &mut MyCadApp,
+    ui: &Ui,
+    response: &egui::Response,
+    origin: Point2,
+    size: Point2,
+) {
+    if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+        app.cancel_plot_window_pick();
+        app.input_consumed_escape = true;
+        return;
+    }
+    if !response.clicked_by(PointerButton::Primary) {
+        return;
+    }
+    let Some(screen) = response
+        .interact_pointer_pos()
+        .or(ui.input(|i| i.pointer.latest_pos()))
+        .filter(|pos| rect_contains_pos(origin, size, *pos))
+    else {
+        return;
+    };
+    let world =
+        app.camera
+            .screen_to_world(Point2::new(screen.x as f64, screen.y as f64), origin, size);
+    let first = match &app.pdf_plot {
+        PdfPlotUi::PickWindow(pick) => pick.first,
+        _ => None,
+    };
+    if let Some(first) = first {
+        app.finish_plot_window_pick(first, world);
+        return;
+    }
+    if let PdfPlotUi::PickWindow(pick) = &mut app.pdf_plot {
+        pick.first = Some(world);
+        app.status = "Specify opposite corner".into();
+    }
+}
+
+fn rect_contains_pos(origin: Point2, size: Point2, pos: egui::Pos2) -> bool {
+    let x = pos.x as f64;
+    let y = pos.y as f64;
+    x >= origin.x && y >= origin.y && x <= origin.x + size.x && y <= origin.y + size.y
+}
+
 fn handle_viewport_input(app: &mut MyCadApp, ui: &Ui, response: &egui::Response, rect: Rect) {
     let origin = Point2::new(rect.min.x as f64, rect.min.y as f64);
     let size = Point2::new(rect.width() as f64, rect.height() as f64);
@@ -2189,6 +2452,12 @@ fn handle_viewport_input(app: &mut MyCadApp, ui: &Ui, response: &egui::Response,
     }
 
     if app.context_menu.is_some() {
+        app.last_pointer = ui.input(|i| i.pointer.latest_pos());
+        return;
+    }
+
+    if app.pdf_plot.is_picking() {
+        handle_plot_window_pick(app, ui, response, origin, size);
         app.last_pointer = ui.input(|i| i.pointer.latest_pos());
         return;
     }
@@ -3162,5 +3431,52 @@ mod interaction_tests {
             selection_op_for_pointer(&map, PointerButton::Primary, ctrl),
             Some(SelectionOp::Remove)
         );
+    }
+}
+
+#[cfg(test)]
+mod plot_window_tests {
+    use super::*;
+
+    #[test]
+    fn plot_window_pick_stores_normalized_window_from_either_direction() {
+        let mut app = MyCadApp::for_test();
+        app.pdf_plot = PdfPlotUi::PickWindow(PlotWindowPick {
+            options: PdfExportOptions::default(),
+            last_window: None,
+            first: Some(Point2::new(5.0, 1.0)),
+        });
+        app.finish_plot_window_pick(Point2::new(5.0, 1.0), Point2::new(2.0, -1.0));
+        let PdfPlotUi::Dialog(state) = &app.pdf_plot else {
+            panic!("expected dialog after pick");
+        };
+        assert_eq!(state.area, PdfPlotAreaKind::Window);
+        let window = state.window.expect("window");
+        assert!((window.min.x - 2.0).abs() < 1e-12);
+        assert!((window.min.y + 1.0).abs() < 1e-12);
+        assert!((window.max.x - 5.0).abs() < 1e-12);
+        assert!((window.max.y - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn escape_cancels_only_window_picking() {
+        let mut app = MyCadApp::for_test();
+        let mut options = PdfExportOptions::default();
+        options.paper = PdfPaperSize::A3;
+        app.pdf_plot = PdfPlotUi::PickWindow(PlotWindowPick {
+            options,
+            last_window: Some(Extents2::from_corners(
+                Point2::new(0.0, 0.0),
+                Point2::new(1.0, 1.0),
+            )),
+            first: Some(Point2::new(3.0, 3.0)),
+        });
+        app.cancel_plot_window_pick();
+        let PdfPlotUi::Dialog(state) = &app.pdf_plot else {
+            panic!("expected dialog after cancel");
+        };
+        assert_eq!(state.area, PdfPlotAreaKind::Window);
+        assert_eq!(state.options.paper, PdfPaperSize::A3);
+        assert!(state.window.is_some());
     }
 }

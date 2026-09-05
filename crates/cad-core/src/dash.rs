@@ -522,11 +522,7 @@ fn poly_vertex_seg(
 ) -> PathSeg {
     let to_world = |sample: Point2, elevation: f64| {
         transform.apply(
-            crate::ocs_to_wcs(
-                crate::Point3::new(sample.x, sample.y, elevation),
-                extrusion,
-            )
-            .xy(),
+            crate::ocs_to_wcs(crate::Point3::new(sample.x, sample.y, elevation), extrusion).xy(),
         )
     };
     let p1 = Point2::new(a.point.x, a.point.y);

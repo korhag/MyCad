@@ -6,24 +6,27 @@
 pub mod color;
 pub mod compare;
 pub mod curves;
+pub mod dash;
 pub mod document;
 pub mod entity;
 pub mod entity_transform;
 pub mod extents;
 pub mod fixtures;
 pub mod geom;
+pub mod hatch;
 pub mod linetype;
 pub mod measure;
 pub mod measure_index;
 pub mod snap;
 pub mod stroke_font;
 pub mod transform;
+pub mod vectorize;
 
 pub use color::{aci_rgb, CadColor, Rgb};
 pub use compare::{compare_documents, CompareTol, Mismatch};
 pub use curves::{
-    arc_points, bspline_points, bulge_arc, circle_points, ellipse_points, polyline_points,
-    CIRCLE_SEGMENTS, POLYLINE_BULGE_SEGMENTS,
+    arc_points, bspline_points, bulge_arc, circle_points, ellipse_arc_points, ellipse_points,
+    polyline_points, CIRCLE_SEGMENTS, POLYLINE_BULGE_SEGMENTS,
 };
 pub use document::{BlockDefinition, Document, DrawingUnits, ImportDiagnostics, Layer};
 pub use entity::{
@@ -40,6 +43,7 @@ pub use geom::{
     arc_from_three_points, ocs_to_wcs, ArcFromPointsError, Point2, Point3, ThreePointArc,
     GEOM_TOLERANCE,
 };
+pub use hatch::hatch_path_points;
 pub use linetype::{
     is_byblock_name, is_bylayer_name, is_continuous_name, normalize_linetype_name, LineType,
 };
@@ -56,3 +60,7 @@ pub use measure_index::{
 pub use snap::{SnapFeature, SnapIndex, SnapKind};
 pub use stroke_font::{measure_width, strip_mtext, stroke_text};
 pub use transform::Transform2;
+pub use vectorize::{
+    plot_geometry, vectorize_entity, PlotFill, PlotGeometry, PlotStroke, VectorSink,
+    VectorVisibility,
+};
