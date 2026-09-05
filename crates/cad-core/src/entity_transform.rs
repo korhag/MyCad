@@ -748,13 +748,13 @@ mod tests {
                 PolyVertex {
                     point: Point3::from_xy(0.0, 0.0),
                     bulge: 0.5,
-                vertex_id: Default::default(),
-        },
+                    vertex_id: Default::default(),
+                },
                 PolyVertex {
                     point: Point3::from_xy(2.0, 0.0),
                     bulge: -0.25,
-                vertex_id: Default::default(),
-        },
+                    vertex_id: Default::default(),
+                },
             ],
             closed: false,
             extrusion: default_extrusion(),

@@ -33,6 +33,15 @@ pub struct ConvertDialog {
     pub block_name: String,
     pub references: usize,
     pub mode: ConvertMode,
+    pub just_opened: bool,
+}
+
+impl ConvertDialog {
+    pub fn skip_open_frame(&mut self) -> bool {
+        let skip = self.just_opened;
+        self.just_opened = false;
+        skip
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,6 +206,7 @@ pub struct ConfigureDialog {
     pub drafts: BTreeMap<ParameterId, String>,
     pub errors: BTreeMap<ParameterId, String>,
     pub pending: Option<crate::config_form::PendingRelated>,
+    pub just_opened: bool,
 }
 
 impl ParameterDraft {
@@ -433,6 +443,7 @@ pub fn begin_create_dynamic(app: &mut MyCadApp) {
         block_name: name,
         references,
         mode: ConvertMode::Unique,
+        just_opened: true,
     });
 }
 
@@ -599,7 +610,11 @@ fn unique_parameter_name(dynamic: Option<&DynamicDefinition>, base: &str) -> Str
     let Some(dynamic) = dynamic else {
         return base.into();
     };
-    if !dynamic.parameters.iter().any(|parameter| parameter.name == base) {
+    if !dynamic
+        .parameters
+        .iter()
+        .any(|parameter| parameter.name == base)
+    {
         return base.into();
     }
     for index in 2..1000 {
@@ -834,14 +849,7 @@ pub fn attach_behavior_with_follow(
         follow_multiplier(anchor, follow)
     };
     attach_behavior(
-        document,
-        history,
-        block_name,
-        parameter,
-        kind,
-        targets,
-        direction,
-        multiplier,
+        document, history, block_name, parameter, kind, targets, direction, multiplier,
     )?;
     Ok(())
 }
@@ -875,7 +883,10 @@ pub fn attach_behavior(
     if let Some(existing) = dynamic.behaviors.iter().find(|behavior| {
         behavior.parameter == parameter
             && behavior.kind == kind
-            && behavior.targets.iter().any(|target| targets.contains(target))
+            && behavior
+                .targets
+                .iter()
+                .any(|target| targets.contains(target))
     }) {
         return Err(format!(
             "Those targets are already attached to {}",
@@ -888,9 +899,8 @@ pub fn attach_behavior(
             .iter()
             .find(|entity| entity.id == target.entity_id())
             .ok_or("Bound geometry is missing")?;
-        cad_core::capability_for(kind, &entity.geometry, *target).map_err(|reason| {
-            format!("Cannot {reason}")
-        })?;
+        cad_core::capability_for(kind, &entity.geometry, *target)
+            .map_err(|reason| format!("Cannot {reason}"))?;
     }
     let mut after = block.clone();
     let action = document.allocate_action_id();
@@ -911,11 +921,8 @@ pub fn attach_behavior(
             follow: follow_from_multiplier(multiplier),
             name: None,
         });
-    cad_core::validate_definition(
-        after.dynamic.as_ref().unwrap(),
-        &after.entities,
-    )
-    .map_err(|err| err.to_string())?;
+    cad_core::validate_definition(after.dynamic.as_ref().unwrap(), &after.entities)
+        .map_err(|err| err.to_string())?;
     document.replace_block_definition(after.clone());
     history.record(Edit::ReplaceBlockDefinition {
         name: block_name.to_string(),
@@ -1001,7 +1008,10 @@ pub fn apply_preset_to_instances(
     entity_ids: &[EntityId],
     preset_id: cad_core::PresetId,
 ) -> Result<(), String> {
-    let first = entity_ids.first().copied().ok_or("Select a block reference")?;
+    let first = entity_ids
+        .first()
+        .copied()
+        .ok_or("Select a block reference")?;
     let name = document
         .entity_by_id(first)
         .and_then(|entity| entity.geometry.insert_block_name().map(str::to_string))
@@ -1026,6 +1036,9 @@ pub enum ConvertDialogResult {
 }
 
 pub fn show_convert_dialog(ctx: &egui::Context, dialog: &mut ConvertDialog) -> ConvertDialogResult {
+    if dialog.skip_open_frame() {
+        return ConvertDialogResult::Open;
+    }
     let mut result = ConvertDialogResult::Open;
     let mut open = true;
     egui::Window::new("Create a Dynamic Block")
@@ -1084,7 +1097,10 @@ pub fn show_authoring(ui: &mut Ui, app: &mut MyCadApp) {
         AuthoringMode::Author => format!("Authoring definition — affects {references} references"),
         AuthoringMode::Test => "Testing configuration".to_string(),
     };
-    ui.colored_label(egui::Color32::from_rgb(180, 210, 255), RichText::new(mode_text).strong());
+    ui.colored_label(
+        egui::Color32::from_rgb(180, 210, 255),
+        RichText::new(mode_text).strong(),
+    );
     ui.label(RichText::new(&state.block_name).strong());
     if let Some(status) = &state.status {
         ui.colored_label(egui::Color32::from_rgb(220, 160, 80), status);
@@ -1134,7 +1150,12 @@ pub fn show_authoring(ui: &mut Ui, app: &mut MyCadApp) {
             }
         });
     });
-    if app.dynamic_authoring.as_ref().and_then(|s| s.size_wizard.as_ref()).is_some() {
+    if app
+        .dynamic_authoring
+        .as_ref()
+        .and_then(|s| s.size_wizard.as_ref())
+        .is_some()
+    {
         show_size_wizard(ui, app);
         show_save_discard(ui, app);
         return;
@@ -1156,7 +1177,10 @@ pub fn show_authoring(ui: &mut Ui, app: &mut MyCadApp) {
     ui.label(RichText::new("Parameters").small().weak());
     let mut selected = state.selected_parameter;
     for parameter in dynamic.sorted_parameters() {
-        if ui.selectable_label(selected == Some(parameter.id), &parameter.name).clicked() {
+        if ui
+            .selectable_label(selected == Some(parameter.id), &parameter.name)
+            .clicked()
+        {
             selected = Some(parameter.id);
         }
     }
@@ -1169,7 +1193,14 @@ pub fn show_authoring(ui: &mut Ui, app: &mut MyCadApp) {
         if let Some(parameter) = selected.and_then(|id| dynamic.parameter(id)).cloned() {
             match &parameter.kind {
                 ParameterKind::Number(numeric) => {
-                    show_parameter_editor(ui, app, &state.block_name, parameter.id, &parameter.name, numeric);
+                    show_parameter_editor(
+                        ui,
+                        app,
+                        &state.block_name,
+                        parameter.id,
+                        &parameter.name,
+                        numeric,
+                    );
                     show_behavior_list(ui, app, &dynamic, parameter.id);
                 }
                 ParameterKind::Choice(choice) => {
@@ -1231,11 +1262,14 @@ fn show_size_wizard(ui: &mut Ui, app: &mut MyCadApp) {
         return;
     };
     ui.add_space(6.0);
-    ui.label(RichText::new(if wizard.replace.is_some() {
-        "Change reference points"
-    } else {
-        "Add Size"
-    }).strong());
+    ui.label(
+        RichText::new(if wizard.replace.is_some() {
+            "Change reference points"
+        } else {
+            "Add Size"
+        })
+        .strong(),
+    );
     if let Some(error) = &wizard.error {
         ui.colored_label(egui::Color32::from_rgb(220, 90, 70), error);
     }
@@ -1254,14 +1288,30 @@ fn show_size_wizard(ui: &mut Ui, app: &mut MyCadApp) {
         ui.weak(stage);
         match wizard.stage {
             SizeWizardStage::Measure => {
-                ui.radio_value(&mut wizard.measure, MeasureMode::AlongPicked, "Along picked points");
+                ui.radio_value(
+                    &mut wizard.measure,
+                    MeasureMode::AlongPicked,
+                    "Along picked points",
+                );
                 ui.radio_value(&mut wizard.measure, MeasureMode::LocalX, "Local X");
                 ui.radio_value(&mut wizard.measure, MeasureMode::LocalY, "Local Y");
             }
             SizeWizardStage::Anchor => {
-                ui.radio_value(&mut wizard.anchor, AnchorPolicy::FirstFixed, "Keep first side fixed");
-                ui.radio_value(&mut wizard.anchor, AnchorPolicy::SecondFixed, "Keep second side fixed");
-                ui.radio_value(&mut wizard.anchor, AnchorPolicy::CenterFixed, "Keep center fixed");
+                ui.radio_value(
+                    &mut wizard.anchor,
+                    AnchorPolicy::FirstFixed,
+                    "Keep first side fixed",
+                );
+                ui.radio_value(
+                    &mut wizard.anchor,
+                    AnchorPolicy::SecondFixed,
+                    "Keep second side fixed",
+                );
+                ui.radio_value(
+                    &mut wizard.anchor,
+                    AnchorPolicy::CenterFixed,
+                    "Keep center fixed",
+                );
             }
             SizeWizardStage::Domain => {
                 ui.checkbox(&mut wizard.list_mode, "Choose from available sizes");
@@ -1342,7 +1392,12 @@ fn show_size_wizard(ui: &mut Ui, app: &mut MyCadApp) {
     }
 }
 
-fn start_retarget_wizard(app: &mut MyCadApp, id: ParameterId, name: &str, numeric: &NumericParameter) {
+fn start_retarget_wizard(
+    app: &mut MyCadApp,
+    id: ParameterId,
+    name: &str,
+    numeric: &NumericParameter,
+) {
     let Some(size) = numeric.size.clone() else {
         return;
     };
@@ -1396,7 +1451,10 @@ fn confirm_size_wizard(app: &mut MyCadApp, wizard: &SizeWizard) {
     if wizard.list_mode {
         match parse_allowed_value_list(&wizard.allowed_text) {
             Ok(values) => {
-                if !values.iter().any(|value| cad_core::numbers_equal(*value, reference)) {
+                if !values
+                    .iter()
+                    .any(|value| cad_core::numbers_equal(*value, reference))
+                {
                     if let Some(authoring) = app.dynamic_authoring.as_mut() {
                         if let Some(wizard) = authoring.size_wizard.as_mut() {
                             wizard.error = Some(format!(
@@ -1508,11 +1566,17 @@ fn show_choice_editor(
     let option_count = choice_draft.options.len();
     for index in 0..option_count {
         ui.horizontal(|ui| {
-            if ui.radio(choice_draft.default == choice_draft.options[index].id, "").clicked() {
+            if ui
+                .radio(choice_draft.default == choice_draft.options[index].id, "")
+                .clicked()
+            {
                 choice_draft.default = choice_draft.options[index].id;
                 dirty = true;
             }
-            if ui.text_edit_singleline(&mut choice_draft.options[index].label).changed() {
+            if ui
+                .text_edit_singleline(&mut choice_draft.options[index].label)
+                .changed()
+            {
                 dirty = true;
             }
             if ui.small_button("↑").clicked() && index > 0 {
@@ -1594,10 +1658,8 @@ fn begin_option_migration(
                 .map(|config| (entity.id, config))
         })
         .collect();
-    let refs: Vec<(EntityId, &InstanceConfiguration)> = instances
-        .iter()
-        .map(|(id, config)| (*id, config))
-        .collect();
+    let refs: Vec<(EntityId, &InstanceConfiguration)> =
+        instances.iter().map(|(id, config)| (*id, config)).collect();
     let usages = cad_core::option_usages(
         parameter,
         from,
@@ -1724,7 +1786,10 @@ fn show_text_editor(
     }
     if let Some(limit) = &mut text.max_length {
         let mut value = *limit as i32;
-        if ui.add(egui::DragValue::new(&mut value).range(1..=1000)).changed() {
+        if ui
+            .add(egui::DragValue::new(&mut value).range(1..=1000))
+            .changed()
+        {
             *limit = value.max(1) as u32;
             draft.dirty = true;
         }
@@ -1746,18 +1811,27 @@ fn show_text_editor(
 fn apply_kind_draft(app: &mut MyCadApp, block_name: &str, id: ParameterId, draft: &mut KindDraft) {
     draft.errors.clear();
     if draft.name.trim().is_empty() {
-        draft.errors.insert("name".into(), "Name is required".into());
+        draft
+            .errors
+            .insert("name".into(), "Name is required".into());
         return;
     }
     if let ParameterKind::Choice(choice) = &draft.kind {
         let mut labels = BTreeMap::new();
         for option in &choice.options {
             if option.label.trim().is_empty() {
-                draft.errors.insert("label".into(), "Option labels cannot be empty".into());
+                draft
+                    .errors
+                    .insert("label".into(), "Option labels cannot be empty".into());
                 return;
             }
-            if labels.insert(option.label.to_ascii_lowercase(), option.id).is_some() {
-                draft.errors.insert("label".into(), "Option labels must be unique".into());
+            if labels
+                .insert(option.label.to_ascii_lowercase(), option.id)
+                .is_some()
+            {
+                draft
+                    .errors
+                    .insert("label".into(), "Option labels must be unique".into());
                 return;
             }
         }
@@ -1943,7 +2017,9 @@ fn show_parameter_editor(
 fn apply_draft(app: &mut MyCadApp, block_name: &str, id: ParameterId, draft: &mut ParameterDraft) {
     draft.errors.clear();
     if draft.name.trim().is_empty() {
-        draft.errors.insert("name".into(), "Name is required".into());
+        draft
+            .errors
+            .insert("name".into(), "Name is required".into());
         return;
     }
     if draft.numeric.domain.is_list() {
@@ -2001,28 +2077,31 @@ fn apply_parameter_settings(
         });
     };
     let mut after = block.clone();
-    if after
-        .dynamic
-        .as_ref()
-        .is_some_and(|dynamic| dynamic.parameters.iter().any(|item| item.id != id && item.name == name))
-    {
+    if after.dynamic.as_ref().is_some_and(|dynamic| {
+        dynamic
+            .parameters
+            .iter()
+            .any(|item| item.id != id && item.name == name)
+    }) {
         return Err(SettingsError {
             field: "name".into(),
             message: "Another parameter already uses this name".into(),
         });
     }
-    let Some(parameter) = after
-        .dynamic
-        .as_mut()
-        .and_then(|dynamic| dynamic.parameters.iter_mut().find(|parameter| parameter.id == id))
-    else {
+    let Some(parameter) = after.dynamic.as_mut().and_then(|dynamic| {
+        dynamic
+            .parameters
+            .iter_mut()
+            .find(|parameter| parameter.id == id)
+    }) else {
         return Err(SettingsError {
             field: "name".into(),
             message: "Parameter was not found".into(),
         });
     };
     parameter.name = name;
-    if let (ParameterKind::Number(previous), Some(size)) = (&parameter.kind, numeric.size.as_ref()) {
+    if let (ParameterKind::Number(previous), Some(size)) = (&parameter.kind, numeric.size.as_ref())
+    {
         let prev_dir = previous.size.as_ref().map(|item| item.direction);
         let prev_anchor = previous.size.as_ref().map(|item| item.anchor);
         parameter.kind = ParameterKind::Number(numeric.clone());
@@ -2101,8 +2180,12 @@ fn affected_instance_values(
             .and_then(|config| config.get(parameter))
             .and_then(ParameterValue::as_number)
         {
-            if !allowed.iter().any(|item| cad_core::numbers_equal(*item, value))
-                && !affected.iter().any(|item| cad_core::numbers_equal(*item, value))
+            if !allowed
+                .iter()
+                .any(|item| cad_core::numbers_equal(*item, value))
+                && !affected
+                    .iter()
+                    .any(|item| cad_core::numbers_equal(*item, value))
             {
                 affected.push(value);
             }
@@ -2111,18 +2194,30 @@ fn affected_instance_values(
     affected
 }
 
-fn show_behavior_list(ui: &mut Ui, app: &mut MyCadApp, dynamic: &DynamicDefinition, parameter: ParameterId) {
+fn show_behavior_list(
+    ui: &mut Ui,
+    app: &mut MyCadApp,
+    dynamic: &DynamicDefinition,
+    parameter: ParameterId,
+) {
     ui.add_space(6.0);
     ui.label(RichText::new("Behaviors").small().weak());
     let mut remove = None;
     let mut select = None;
-    for behavior in dynamic.behaviors.iter().filter(|behavior| behavior.parameter == parameter) {
+    for behavior in dynamic
+        .behaviors
+        .iter()
+        .filter(|behavior| behavior.parameter == parameter)
+    {
         let selected = app
             .dynamic_authoring
             .as_ref()
             .is_some_and(|state| state.selected_behavior == Some(behavior.id));
         ui.vertical(|ui| {
-            if ui.selectable_label(selected, behavior.describe(dynamic)).clicked() {
+            if ui
+                .selectable_label(selected, behavior.describe(dynamic))
+                .clicked()
+            {
                 select = Some(behavior.id);
             }
             ui.horizontal(|ui| {
@@ -2148,7 +2243,8 @@ fn show_behavior_list(ui: &mut Ui, app: &mut MyCadApp, dynamic: &DynamicDefiniti
                         });
                         authoring.selected_behavior = Some(behavior.id);
                         authoring.highlight = behavior.targets.clone();
-                        authoring.status = Some("Correct targets, then confirm to update this behavior.".into());
+                        authoring.status =
+                            Some("Correct targets, then confirm to update this behavior.".into());
                     }
                 }
                 if ui.small_button("Remove").clicked() {
@@ -2197,7 +2293,12 @@ fn set_behavior_follow(app: &mut MyCadApp, id: ActionId, follow: FollowRole) {
     let Some(dynamic) = after.dynamic.as_mut() else {
         return;
     };
-    let Some(parameter) = dynamic.behaviors.iter().find(|item| item.id == id).map(|item| item.parameter) else {
+    let Some(parameter) = dynamic
+        .behaviors
+        .iter()
+        .find(|item| item.id == id)
+        .map(|item| item.parameter)
+    else {
         return;
     };
     let anchor = dynamic
@@ -2397,7 +2498,10 @@ fn show_test_controls(ui: &mut Ui, app: &mut MyCadApp, dynamic: &DynamicDefiniti
             .dynamic_authoring
             .as_ref()
             .is_some_and(|state| state.test_compare);
-        if ui.checkbox(&mut compare, "Compare with reference geometry").changed() {
+        if ui
+            .checkbox(&mut compare, "Compare with reference geometry")
+            .changed()
+        {
             if let Some(authoring) = app.dynamic_authoring.as_mut() {
                 authoring.test_compare = compare;
             }
@@ -2406,7 +2510,10 @@ fn show_test_controls(ui: &mut Ui, app: &mut MyCadApp, dynamic: &DynamicDefiniti
             .dynamic_authoring
             .as_ref()
             .is_some_and(|state| state.show_inactive);
-        if ui.checkbox(&mut show_inactive, "Show inactive parts").changed() {
+        if ui
+            .checkbox(&mut show_inactive, "Show inactive parts")
+            .changed()
+        {
             if let Some(authoring) = app.dynamic_authoring.as_mut() {
                 authoring.show_inactive = show_inactive;
             }
@@ -2439,9 +2546,14 @@ fn attach_move_from_selection(app: &mut MyCadApp, follow: FollowRole) {
                 let Some(entity) = block.entities.iter().find(|entity| entity.id == id) else {
                     continue;
                 };
-                match cad_core::capability_for(BehaviorKind::Move, &entity.geometry, GeometryTarget::Entity(id)) {
+                match cad_core::capability_for(
+                    BehaviorKind::Move,
+                    &entity.geometry,
+                    GeometryTarget::Entity(id),
+                ) {
                     Ok(()) => targets.push(GeometryTarget::Entity(id)),
-                    Err(reason) => unsupported.push(format!("{}: cannot {reason}", entity.geometry.type_name())),
+                    Err(reason) => unsupported
+                        .push(format!("{}: cannot {reason}", entity.geometry.type_name())),
                 }
             }
         }
@@ -2488,7 +2600,8 @@ fn begin_stretch_handles(app: &mut MyCadApp) {
             window: None,
             replace: None,
         });
-        authoring.status = Some("Click handles to add (Shift) or remove (Ctrl), then confirm.".into());
+        authoring.status =
+            Some("Click handles to add (Shift) or remove (Ctrl), then confirm.".into());
     }
 }
 
@@ -2537,7 +2650,9 @@ fn toggle_nearest_handle(
         for (point, target) in stretch_handles(entity) {
             let world = app.block_edit.world_from_local().apply(point);
             let handle_screen = app.camera.world_to_screen(world, origin, size);
-            let distance = ((handle_screen.x - screen.x).powi(2) + (handle_screen.y - screen.y).powi(2)).sqrt();
+            let distance = ((handle_screen.x - screen.x).powi(2)
+                + (handle_screen.y - screen.y).powi(2))
+            .sqrt();
             if best
                 .as_ref()
                 .is_none_or(|(best_distance, _, _)| distance < *best_distance)
@@ -2586,8 +2701,14 @@ fn toggle_nearest_handle(
 fn stretch_handles(entity: &Entity) -> Vec<(Point2, GeometryTarget)> {
     match &entity.geometry {
         Geometry::Line { start, end } => vec![
-            (Point2::new(start.x, start.y), GeometryTarget::LineStart(entity.id)),
-            (Point2::new(end.x, end.y), GeometryTarget::LineEnd(entity.id)),
+            (
+                Point2::new(start.x, start.y),
+                GeometryTarget::LineStart(entity.id),
+            ),
+            (
+                Point2::new(end.x, end.y),
+                GeometryTarget::LineEnd(entity.id),
+            ),
         ],
         Geometry::LwPolyline { vertices, .. } | Geometry::Polyline { vertices, .. } => {
             if entity.geometry.polyline_has_curves() {
@@ -2694,7 +2815,10 @@ fn commit_follow_targets(
                                 if let Some(existing) = dynamic.behaviors.iter().find(|behavior| {
                                     behavior.parameter == parameter
                                         && behavior.kind == kind
-                                        && behavior.targets.iter().any(|target| targets.contains(target))
+                                        && behavior
+                                            .targets
+                                            .iter()
+                                            .any(|target| targets.contains(target))
                                 }) {
                                     authoring.selected_behavior = Some(existing.id);
                                     authoring.highlight = existing.targets.clone();
@@ -2787,7 +2911,8 @@ pub fn handle_authoring_pick(
         }
         AuthoringPick::PlaceAttachment => {
             if let Some(authoring) = app.dynamic_authoring.as_mut() {
-                if let Some(BehaviorWizard::Position { attachment, .. }) = authoring.wizard.as_mut() {
+                if let Some(BehaviorWizard::Position { attachment, .. }) = authoring.wizard.as_mut()
+                {
                     *attachment = Some(local);
                 }
                 authoring.pick = AuthoringPick::Idle;
@@ -2812,7 +2937,10 @@ pub fn handle_authoring_pick(
 pub fn update_authoring_hover(app: &mut MyCadApp, local: Point2) {
     if let Some(authoring) = app.dynamic_authoring.as_mut() {
         if let Some(wizard) = authoring.size_wizard.as_mut() {
-            if matches!(authoring.pick, AuthoringPick::SizePointA | AuthoringPick::SizePointB) {
+            if matches!(
+                authoring.pick,
+                AuthoringPick::SizePointA | AuthoringPick::SizePointB
+            ) {
                 wizard.hover = Some(local);
             }
         }
@@ -2833,11 +2961,12 @@ fn apply_label_offset(app: &mut MyCadApp, local: Point2) {
         return;
     };
     let mut after = block.clone();
-    let Some(parameter) = after
-        .dynamic
-        .as_mut()
-        .and_then(|dynamic| dynamic.parameters.iter_mut().find(|item| item.id == parameter_id))
-    else {
+    let Some(parameter) = after.dynamic.as_mut().and_then(|dynamic| {
+        dynamic
+            .parameters
+            .iter_mut()
+            .find(|item| item.id == parameter_id)
+    }) else {
         return;
     };
     if let ParameterKind::Number(numeric) = &mut parameter.kind {
@@ -2902,7 +3031,8 @@ fn apply_stretch_window(app: &mut MyCadApp, local: Point2) {
         authoring.highlight = proposed;
         authoring.pick = AuthoringPick::Idle;
         authoring.direction_start = None;
-        authoring.status = Some("Window proposed handles. Correct individually, then confirm.".into());
+        authoring.status =
+            Some("Window proposed handles. Correct individually, then confirm.".into());
     }
 }
 
@@ -3055,7 +3185,12 @@ fn apply_test_values_as_defaults(app: &mut MyCadApp, _dynamic: &DynamicDefinitio
     app.request_preview();
 }
 
-fn show_repair_bindings(ui: &mut Ui, app: &mut MyCadApp, dynamic: &DynamicDefinition, entities: &[Entity]) {
+fn show_repair_bindings(
+    ui: &mut Ui,
+    app: &mut MyCadApp,
+    dynamic: &DynamicDefinition,
+    entities: &[Entity],
+) {
     let broken = collect_broken_bindings(dynamic, entities);
     if broken.is_empty() {
         return;
@@ -3112,9 +3247,12 @@ fn show_selection_bindings(ui: &mut Ui, app: &mut MyCadApp, dynamic: &DynamicDef
     }
 }
 
-
 fn show_behavior_wizard(ui: &mut Ui, app: &mut MyCadApp, dynamic: &DynamicDefinition) {
-    let Some(mut wizard) = app.dynamic_authoring.as_ref().and_then(|state| state.wizard.clone()) else {
+    let Some(mut wizard) = app
+        .dynamic_authoring
+        .as_ref()
+        .and_then(|state| state.wizard.clone())
+    else {
         return;
     };
     ui.add_space(8.0);
@@ -3142,7 +3280,10 @@ fn show_behavior_wizard(ui: &mut Ui, app: &mut MyCadApp, dynamic: &DynamicDefini
                 )
                 .show_ui(ui, |ui| {
                     for item in dynamic.sorted_parameters() {
-                        if ui.selectable_label(*parameter == item.id, &item.name).clicked() {
+                        if ui
+                            .selectable_label(*parameter == item.id, &item.name)
+                            .clicked()
+                        {
                             *parameter = item.id;
                         }
                     }
@@ -3151,9 +3292,13 @@ fn show_behavior_wizard(ui: &mut Ui, app: &mut MyCadApp, dynamic: &DynamicDefini
             ui.radio_value(mode, 1usize, "Text for each option");
             ui.radio_value(mode, 2usize, "Formatted text");
             if *mode == 1 {
-                if let Some(ParameterKind::Choice(choice)) = dynamic.parameter(*parameter).map(|item| &item.kind) {
+                if let Some(ParameterKind::Choice(choice)) =
+                    dynamic.parameter(*parameter).map(|item| &item.kind)
+                {
                     for option in &choice.options {
-                        let text = option_texts.entry(option.id).or_insert_with(|| option.label.clone());
+                        let text = option_texts
+                            .entry(option.id)
+                            .or_insert_with(|| option.label.clone());
                         ui.horizontal(|ui| {
                             ui.label(&option.label);
                             ui.text_edit_singleline(text);
@@ -3171,7 +3316,10 @@ fn show_behavior_wizard(ui: &mut Ui, app: &mut MyCadApp, dynamic: &DynamicDefini
                 }
                 ui.weak("Tokens are stored by parameter ID after confirm.");
             }
-            if matches!(dynamic.parameter(*parameter).map(|item| &item.kind), Some(ParameterKind::Boolean(_))) {
+            if matches!(
+                dynamic.parameter(*parameter).map(|item| &item.kind),
+                Some(ParameterKind::Boolean(_))
+            ) {
                 ui.label("On label");
                 ui.text_edit_singleline(boolean_true);
                 ui.label("Off label");
@@ -3223,8 +3371,12 @@ fn show_behavior_wizard(ui: &mut Ui, app: &mut MyCadApp, dynamic: &DynamicDefini
             parameter_picker(ui, dynamic, parameter);
             ui.label(format!(
                 "Axis: {} → {}",
-                axis_a.map(|p| format!("{:.2},{:.2}", p.x, p.y)).unwrap_or_else(|| "pick first".into()),
-                axis_b.map(|p| format!("{:.2},{:.2}", p.x, p.y)).unwrap_or_else(|| "pick second".into())
+                axis_a
+                    .map(|p| format!("{:.2},{:.2}", p.x, p.y))
+                    .unwrap_or_else(|| "pick first".into()),
+                axis_b
+                    .map(|p| format!("{:.2},{:.2}", p.x, p.y))
+                    .unwrap_or_else(|| "pick second".into())
             ));
             if ui.button("Pick mirror axis").clicked() {
                 if let Some(authoring) = app.dynamic_authoring.as_mut() {
@@ -3234,8 +3386,16 @@ fn show_behavior_wizard(ui: &mut Ui, app: &mut MyCadApp, dynamic: &DynamicDefini
             }
             ui.radio_value(use_visibility, false, "Mirror these parts");
             ui.radio_value(use_visibility, true, "Use different parts");
-            ui.radio_value(policy, cad_core::TextReflectPolicy::KeepReadable, "Keep text readable");
-            ui.radio_value(policy, cad_core::TextReflectPolicy::KeepUpright, "Keep upright");
+            ui.radio_value(
+                policy,
+                cad_core::TextReflectPolicy::KeepReadable,
+                "Keep text readable",
+            );
+            ui.radio_value(
+                policy,
+                cad_core::TextReflectPolicy::KeepUpright,
+                "Keep upright",
+            );
             ui.radio_value(policy, cad_core::TextReflectPolicy::Mirror, "Mirror glyphs");
         }
         BehaviorWizard::Position {
@@ -3247,7 +3407,9 @@ fn show_behavior_wizard(ui: &mut Ui, app: &mut MyCadApp, dynamic: &DynamicDefini
             parameter_picker(ui, dynamic, parameter);
             ui.label(format!(
                 "Attachment: {}",
-                attachment.map(|p| format!("{:.2},{:.2}", p.x, p.y)).unwrap_or_else(|| "pick point".into())
+                attachment
+                    .map(|p| format!("{:.2},{:.2}", p.x, p.y))
+                    .unwrap_or_else(|| "pick point".into())
             ));
             if ui.button("Pick attachment point").clicked() {
                 if let Some(authoring) = app.dynamic_authoring.as_mut() {
@@ -3266,7 +3428,9 @@ fn show_behavior_wizard(ui: &mut Ui, app: &mut MyCadApp, dynamic: &DynamicDefini
             parameter_picker(ui, dynamic, parameter);
             ui.label(format!(
                 "Pivot: {}",
-                pivot.map(|p| format!("{:.2},{:.2}", p.x, p.y)).unwrap_or_else(|| "pick pivot".into())
+                pivot
+                    .map(|p| format!("{:.2},{:.2}", p.x, p.y))
+                    .unwrap_or_else(|| "pick pivot".into())
             ));
             if ui.button("Pick pivot").clicked() {
                 if let Some(authoring) = app.dynamic_authoring.as_mut() {
@@ -3309,7 +3473,10 @@ fn parameter_picker(ui: &mut Ui, dynamic: &DynamicDefinition, parameter: &mut Pa
         )
         .show_ui(ui, |ui| {
             for item in dynamic.sorted_parameters() {
-                if ui.selectable_label(*parameter == item.id, &item.name).clicked() {
+                if ui
+                    .selectable_label(*parameter == item.id, &item.name)
+                    .clicked()
+                {
                     *parameter = item.id;
                 }
             }
@@ -3386,8 +3553,9 @@ fn confirm_behavior_wizard(app: &mut MyCadApp, _dynamic: &DynamicDefinition) {
     let Some(wizard) = state.wizard.clone() else {
         return;
     };
-    attach_named_behavior(app, |document, dynamic, _members, _parameter| {
-        match wizard {
+    attach_named_behavior(
+        app,
+        |document, dynamic, _members, _parameter| match wizard {
             BehaviorWizard::LinkText {
                 target,
                 parameter,
@@ -3397,7 +3565,9 @@ fn confirm_behavior_wizard(app: &mut MyCadApp, _dynamic: &DynamicDefinition) {
                 boolean_true,
                 boolean_false,
             } => {
-                dynamic.text_bindings.retain(|binding| binding.target != target);
+                dynamic
+                    .text_bindings
+                    .retain(|binding| binding.target != target);
                 let binding_mode = match mode {
                     1 => cad_core::TextBindingMode::OptionMap {
                         parameter,
@@ -3424,11 +3594,14 @@ fn confirm_behavior_wizard(app: &mut MyCadApp, _dynamic: &DynamicDefinition) {
                 options,
                 boolean,
             } => {
-                let condition = match &dynamic.parameter(parameter).ok_or("Select a parameter")?.kind {
-                    ParameterKind::Choice(_) => cad_core::ParameterCondition::Choice {
-                        parameter,
-                        options,
-                    },
+                let condition = match &dynamic
+                    .parameter(parameter)
+                    .ok_or("Select a parameter")?
+                    .kind
+                {
+                    ParameterKind::Choice(_) => {
+                        cad_core::ParameterCondition::Choice { parameter, options }
+                    }
                     ParameterKind::Boolean(_) => cad_core::ParameterCondition::Boolean {
                         parameter,
                         state: boolean,
@@ -3455,7 +3628,9 @@ fn confirm_behavior_wizard(app: &mut MyCadApp, _dynamic: &DynamicDefinition) {
                 policy,
             } => {
                 if use_visibility {
-                    return Err("Use Show When to assign different parts instead of mirroring".into());
+                    return Err(
+                        "Use Show When to assign different parts instead of mirroring".into(),
+                    );
                 }
                 let Some(a) = axis_a else {
                     return Err("Pick two axis points".into());
@@ -3533,8 +3708,8 @@ fn confirm_behavior_wizard(app: &mut MyCadApp, _dynamic: &DynamicDefinition) {
                 dynamic.transform_order.push(action);
                 Ok("Rotate by Parameter added".into())
             }
-        }
-    });
+        },
+    );
     if let Some(authoring) = app.dynamic_authoring.as_mut() {
         authoring.wizard = None;
         authoring.pick = AuthoringPick::Idle;
@@ -3542,7 +3717,11 @@ fn confirm_behavior_wizard(app: &mut MyCadApp, _dynamic: &DynamicDefinition) {
 }
 
 fn show_option_migration(ui: &mut Ui, app: &mut MyCadApp) {
-    let Some(mut migration) = app.dynamic_authoring.as_ref().and_then(|state| state.option_migration.clone()) else {
+    let Some(mut migration) = app
+        .dynamic_authoring
+        .as_ref()
+        .and_then(|state| state.option_migration.clone())
+    else {
         return;
     };
     ui.add_space(8.0);
@@ -3557,8 +3736,14 @@ fn show_option_migration(ui: &mut Ui, app: &mut MyCadApp) {
     }
     if let Some(document) = app.document.as_deref() {
         if let Some(authoring) = app.dynamic_authoring.as_ref() {
-            if let Some(dynamic) = document.block_by_name(&authoring.block_name).and_then(|block| block.dynamic.as_ref()) {
-                if let Some(ParameterKind::Choice(choice)) = dynamic.parameter(migration.parameter).map(|item| &item.kind) {
+            if let Some(dynamic) = document
+                .block_by_name(&authoring.block_name)
+                .and_then(|block| block.dynamic.as_ref())
+            {
+                if let Some(ParameterKind::Choice(choice)) = dynamic
+                    .parameter(migration.parameter)
+                    .map(|item| &item.kind)
+                {
                     ui.label("Replace with");
                     for option in &choice.options {
                         if option.id == migration.from {
@@ -3627,8 +3812,14 @@ fn show_option_migration(ui: &mut Ui, app: &mut MyCadApp) {
 
 fn show_phase3_authoring(ui: &mut Ui, app: &mut MyCadApp, dynamic: &DynamicDefinition) {
     ui.add_space(8.0);
-    let mut show_inactive = app.dynamic_authoring.as_ref().is_some_and(|state| state.show_inactive);
-    if ui.checkbox(&mut show_inactive, "Show inactive parts").changed() {
+    let mut show_inactive = app
+        .dynamic_authoring
+        .as_ref()
+        .is_some_and(|state| state.show_inactive);
+    if ui
+        .checkbox(&mut show_inactive, "Show inactive parts")
+        .changed()
+    {
         if let Some(authoring) = app.dynamic_authoring.as_mut() {
             authoring.show_inactive = show_inactive;
         }
@@ -3641,9 +3832,16 @@ fn show_phase3_authoring(ui: &mut Ui, app: &mut MyCadApp, dynamic: &DynamicDefin
     }
     if !dynamic.text_bindings.is_empty() {
         ui.label(RichText::new("Text bindings").small().weak());
-        ui.label(format!("{} linked text entities", dynamic.text_bindings.len()));
+        ui.label(format!(
+            "{} linked text entities",
+            dynamic.text_bindings.len()
+        ));
     }
-    if !dynamic.transform_order.is_empty() || !dynamic.reflections.is_empty() || !dynamic.rotations.is_empty() || !dynamic.placements.is_empty() {
+    if !dynamic.transform_order.is_empty()
+        || !dynamic.reflections.is_empty()
+        || !dynamic.rotations.is_empty()
+        || !dynamic.placements.is_empty()
+    {
         ui.label(RichText::new("Transform order").small().weak());
         ui.weak("Default: flip → rotate → place. Later pivots use the declared space.");
         let mut order = dynamic.transform_order.clone();
@@ -3702,9 +3900,10 @@ fn show_phase3_authoring(ui: &mut Ui, app: &mut MyCadApp, dynamic: &DynamicDefin
         ui.label(cad_core::rule_reason(rule, &dynamic.parameters));
     }
     let nested_selected = app.selection.ids().iter().copied().find(|id| {
-        app.document.as_deref().and_then(|document| document.entity_by_id(*id)).is_some_and(|entity| {
-            matches!(entity.geometry, Geometry::Insert { .. })
-        })
+        app.document
+            .as_deref()
+            .and_then(|document| document.entity_by_id(*id))
+            .is_some_and(|entity| matches!(entity.geometry, Geometry::Insert { .. }))
     });
     if let Some(nested) = nested_selected {
         if ui.button("Map selected nested parameter…").clicked() {
@@ -3813,21 +4012,23 @@ fn add_compatibility_rule(app: &mut MyCadApp) {
         let Some(dynamic) = after.dynamic.as_mut() else {
             return;
         };
-        let Some((when_id, when_option, target_id, kind)) = dynamic.parameters.iter().find_map(|left| {
-            let ParameterKind::Choice(choice) = &left.kind else {
-                return None;
-            };
-            let right = dynamic
-                .parameters
-                .iter()
-                .find(|item| matches!(item.kind, ParameterKind::Number(_)))?;
-            Some((
-                left.id,
-                choice.options.first()?.id,
-                right.id,
-                right.kind.clone(),
-            ))
-        }) else {
+        let Some((when_id, when_option, target_id, kind)) =
+            dynamic.parameters.iter().find_map(|left| {
+                let ParameterKind::Choice(choice) = &left.kind else {
+                    return None;
+                };
+                let right = dynamic
+                    .parameters
+                    .iter()
+                    .find(|item| matches!(item.kind, ParameterKind::Number(_)))?;
+                Some((
+                    left.id,
+                    choice.options.first()?.id,
+                    right.id,
+                    right.kind.clone(),
+                ))
+            })
+        else {
             app.history.commit_open();
             app.status = "Add a Choice and a numeric parameter first".into();
             return;
@@ -3839,15 +4040,17 @@ fn add_compatibility_rule(app: &mut MyCadApp) {
             NumericDomain::AllowedValues(values) => Some(values),
             NumericDomain::Continuous => None,
         };
-        dynamic.compatibility.push(cad_core::CompatibilityRule::ChoiceRestrictsNumeric {
-            id: document.allocate_action_id(),
-            when: when_id,
-            when_option,
-            target: target_id,
-            min: numeric.min,
-            max: numeric.max,
-            allowed,
-        });
+        dynamic
+            .compatibility
+            .push(cad_core::CompatibilityRule::ChoiceRestrictsNumeric {
+                id: document.allocate_action_id(),
+                when: when_id,
+                when_option,
+                target: target_id,
+                min: numeric.min,
+                max: numeric.max,
+                allowed,
+            });
         document.replace_block_definition(after.clone());
         app.history.record(Edit::ReplaceBlockDefinition {
             name: state.block_name,
@@ -3872,7 +4075,11 @@ fn add_nested_mapping(app: &mut MyCadApp, nested: EntityId) {
             .entity_by_id(nested)
             .and_then(|entity| entity.geometry.insert_block_name().map(str::to_string))
             .and_then(|name| document.block_by_name(&name).cloned())
-            .and_then(|block| block.dynamic.and_then(|dynamic| dynamic.parameters.first().map(|item| item.id)));
+            .and_then(|block| {
+                block
+                    .dynamic
+                    .and_then(|dynamic| dynamic.parameters.first().map(|item| item.id))
+            });
         let Some(child_param) = child_param else {
             app.status = "Nested block has no parameters".into();
             return;
@@ -3886,12 +4093,16 @@ fn add_nested_mapping(app: &mut MyCadApp, nested: EntityId) {
             dynamic.nested_inputs.push(cad_core::NestedInput {
                 id: document.allocate_action_id(),
                 source: parameter,
-                target_occurrence: cad_core::OccurrencePath { inserts: vec![nested] },
+                target_occurrence: cad_core::OccurrencePath {
+                    inserts: vec![nested],
+                },
                 target_parameter: child_param,
                 mapping: cad_core::NestedMapping::Direct,
             });
         }
-        if let Err(err) = cad_core::validate_definition(after.dynamic.as_ref().unwrap(), &after.entities) {
+        if let Err(err) =
+            cad_core::validate_definition(after.dynamic.as_ref().unwrap(), &after.entities)
+        {
             app.history.commit_open();
             app.status = err.to_string();
             return;
@@ -3917,9 +4128,10 @@ pub fn link_text_from_selection(app: &mut MyCadApp) {
         return;
     };
     let Some(target) = app.selection.ids().iter().copied().find(|id| {
-        app.document.as_deref().and_then(|document| document.entity_by_id(*id)).is_some_and(|entity| {
-            matches!(entity.geometry, Geometry::Text(_) | Geometry::MText(_))
-        })
+        app.document
+            .as_deref()
+            .and_then(|document| document.entity_by_id(*id))
+            .is_some_and(|entity| matches!(entity.geometry, Geometry::Text(_) | Geometry::MText(_)))
     }) else {
         app.status = "Select TEXT or MTEXT".into();
         return;
@@ -4061,7 +4273,11 @@ fn condition_for_parameter(
     dynamic: &DynamicDefinition,
     parameter: ParameterId,
 ) -> Result<cad_core::ParameterCondition, String> {
-    match &dynamic.parameter(parameter).ok_or("Select a parameter")?.kind {
+    match &dynamic
+        .parameter(parameter)
+        .ok_or("Select a parameter")?
+        .kind
+    {
         ParameterKind::Choice(choice) => Ok(cad_core::ParameterCondition::Choice {
             parameter,
             options: vec![choice.default],
@@ -4219,7 +4435,9 @@ pub fn numeric_field(
                     .show_ui(ui, |ui| {
                         for value in values {
                             let text = format_display_number(*value, numeric.display_precision);
-                            if ui.selectable_label(cad_core::numbers_equal(*value, current), text).clicked()
+                            if ui
+                                .selectable_label(cad_core::numbers_equal(*value, current), text)
+                                .clicked()
                             {
                                 *draft = format_display_number(*value, numeric.display_precision);
                                 outcome = NumericEdit::Commit(*value);
@@ -4227,7 +4445,11 @@ pub fn numeric_field(
                         }
                     });
             } else {
-                let response = ui.add(egui::TextEdit::singleline(draft).id_source(id).desired_width(88.0));
+                let response = ui.add(
+                    egui::TextEdit::singleline(draft)
+                        .id_source(id)
+                        .desired_width(88.0),
+                );
                 let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
                 if escape && (response.has_focus() || response.lost_focus()) {
                     *draft = committed
@@ -4271,7 +4493,10 @@ pub enum ParseOutcome {
     Exact(f64),
 }
 
-pub fn parse_numeric_draft(draft: &str, numeric: &NumericParameter) -> Result<ParseOutcome, String> {
+pub fn parse_numeric_draft(
+    draft: &str,
+    numeric: &NumericParameter,
+) -> Result<ParseOutcome, String> {
     let trimmed = draft.trim();
     if trimmed.is_empty() || trimmed == "-" || trimmed == "." || trimmed == "-." {
         return Err("incomplete".into());
@@ -4305,11 +4530,7 @@ pub fn parse_numeric_draft(draft: &str, numeric: &NumericParameter) -> Result<Pa
     }
 }
 
-pub fn paint_authoring_overlays(
-    painter: &egui::Painter,
-    app: &MyCadApp,
-    rect: egui::Rect,
-) {
+pub fn paint_authoring_overlays(painter: &egui::Painter, app: &MyCadApp, rect: egui::Rect) {
     let Some(state) = app.dynamic_authoring.as_ref() else {
         return;
     };
@@ -4330,7 +4551,10 @@ pub fn paint_authoring_overlays(
         if let (Some(a), Some(b)) = (wizard.point_a, wizard.point_b.or(wizard.hover)) {
             let pa = to_screen(a);
             let pb = to_screen(b);
-            painter.line_segment([pa, pb], egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(80, 180, 255)));
+            painter.line_segment(
+                [pa, pb],
+                egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(80, 180, 255)),
+            );
             painter.circle_filled(pa, 4.0, egui::Color32::from_rgb(240, 200, 80));
             painter.circle_filled(pb, 4.0, egui::Color32::from_rgb(80, 220, 140));
             if let Some((_, size)) = wizard.preview_measure() {
@@ -4392,12 +4616,20 @@ pub fn paint_authoring_overlays(
             }
             BehaviorWizard::Position { attachment, .. } => {
                 if let Some(point) = *attachment {
-                    painter.circle_filled(to_screen(point), 5.0, egui::Color32::from_rgb(80, 220, 140));
+                    painter.circle_filled(
+                        to_screen(point),
+                        5.0,
+                        egui::Color32::from_rgb(80, 220, 140),
+                    );
                 }
             }
             BehaviorWizard::Rotate { pivot, .. } => {
                 if let Some(point) = *pivot {
-                    painter.circle_filled(to_screen(point), 5.0, egui::Color32::from_rgb(240, 180, 80));
+                    painter.circle_filled(
+                        to_screen(point),
+                        5.0,
+                        egui::Color32::from_rgb(240, 180, 80),
+                    );
                 }
             }
             _ => {}
@@ -4412,7 +4644,10 @@ pub fn paint_authoring_overlays(
                     anchor.position.x + 12.0 * angle.cos(),
                     anchor.position.y + 12.0 * angle.sin(),
                 ));
-                painter.line_segment([p, tip], egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(80, 180, 255)));
+                painter.line_segment(
+                    [p, tip],
+                    egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(80, 180, 255)),
+                );
             }
         }
     }
@@ -4426,7 +4661,10 @@ pub fn paint_authoring_overlays(
             };
             let pa = to_screen(size.point_a + size.label_offset);
             let pb = to_screen(size.point_b + size.label_offset);
-            painter.line_segment([pa, pb], egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(120, 180, 255)));
+            painter.line_segment(
+                [pa, pb],
+                egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(120, 180, 255)),
+            );
             let fixed = match size.anchor {
                 AnchorPolicy::FirstFixed => pa,
                 AnchorPolicy::SecondFixed => pb,
@@ -4442,7 +4680,11 @@ pub fn paint_authoring_overlays(
         if let Some(id) = state.selected_behavior {
             if let Some(behavior) = dynamic.behaviors.iter().find(|item| item.id == id) {
                 for target in &behavior.targets {
-                    if let Some(entity) = block.entities.iter().find(|entity| entity.id == target.entity_id()) {
+                    if let Some(entity) = block
+                        .entities
+                        .iter()
+                        .find(|entity| entity.id == target.entity_id())
+                    {
                         for (point, handle) in stretch_handles(entity) {
                             if handle == *target {
                                 painter.circle_filled(
@@ -4459,7 +4701,11 @@ pub fn paint_authoring_overlays(
     }
     if let Some(attach) = &state.attach {
         for target in &attach.handles {
-            if let Some(entity) = block.entities.iter().find(|entity| entity.id == target.entity_id()) {
+            if let Some(entity) = block
+                .entities
+                .iter()
+                .find(|entity| entity.id == target.entity_id())
+            {
                 for (point, handle) in stretch_handles(entity) {
                     if handle == *target {
                         painter.circle_stroke(
@@ -4489,7 +4735,10 @@ pub fn paint_authoring_overlays(
                 let distance = ((screen.x as f64 - pointer.x as f64).powi(2)
                     + (screen.y as f64 - pointer.y as f64).powi(2))
                 .sqrt();
-                if best.as_ref().is_none_or(|(best_distance, _, _)| distance < *best_distance) {
+                if best
+                    .as_ref()
+                    .is_none_or(|(best_distance, _, _)| distance < *best_distance)
+                {
                     best = Some((distance, point, entity.geometry.type_name().to_string()));
                 }
             }
@@ -4652,7 +4901,13 @@ fn commit_patch(
         let result = if ids.len() == 1 {
             if let Some((parameter, value)) = patch.iter().next() {
                 if patch.len() == 1 {
-                    commit_instance_value(document, &mut app.history, ids[0], *parameter, value.clone())
+                    commit_instance_value(
+                        document,
+                        &mut app.history,
+                        ids[0],
+                        *parameter,
+                        value.clone(),
+                    )
                 } else {
                     commit_instance_values(document, &mut app.history, ids, patch)
                 }
@@ -4685,6 +4940,7 @@ pub fn begin_configure_block(app: &mut MyCadApp) {
         drafts: BTreeMap::new(),
         errors: BTreeMap::new(),
         pending: None,
+        just_opened: true,
     });
 }
 
@@ -4692,6 +4948,11 @@ pub fn show_configure_dialog(ctx: &egui::Context, app: &mut MyCadApp) {
     let Some(mut dialog) = app.configure_dialog.clone() else {
         return;
     };
+    if dialog.just_opened {
+        dialog.just_opened = false;
+        app.configure_dialog = Some(dialog);
+        return;
+    }
     let Some((dynamic, _, current, mixed)) = selected_same_definition_config(app) else {
         app.configure_dialog = None;
         return;
@@ -4776,7 +5037,14 @@ mod tests {
         let (mut document, entity_id, param) = offset_document();
         let mut history = History::default();
         history.begin();
-        commit_instance_value(&mut document, &mut history, entity_id, param, ParameterValue::Number(5.0)).unwrap();
+        commit_instance_value(
+            &mut document,
+            &mut history,
+            entity_id,
+            param,
+            ParameterValue::Number(5.0),
+        )
+        .unwrap();
         history.commit_open();
         let value = document
             .entity_by_id(entity_id)
@@ -4915,7 +5183,9 @@ mod tests {
         let second = document.add_entity(second).id;
         {
             let definition = document.block_by_name_mut("Offset").unwrap();
-            if let ParameterKind::Number(numeric) = &mut definition.dynamic.as_mut().unwrap().parameters[0].kind {
+            if let ParameterKind::Number(numeric) =
+                &mut definition.dynamic.as_mut().unwrap().parameters[0].kind
+            {
                 numeric.max = Some(10.0);
             }
         }
@@ -4923,7 +5193,8 @@ mod tests {
         history.begin();
         let mut patch = BTreeMap::new();
         patch.insert(param, ParameterValue::Number(25.0));
-        let err = commit_instance_values(&mut document, &mut history, &[first, second], &patch).unwrap_err();
+        let err = commit_instance_values(&mut document, &mut history, &[first, second], &patch)
+            .unwrap_err();
         assert!(!err.is_empty());
         history.commit_open();
         for id in [first, second] {
@@ -4947,11 +5218,16 @@ mod tests {
             let block = document.block_by_name_mut("Offset").unwrap();
             let mut values = BTreeMap::new();
             values.insert(param, ParameterValue::Number(5.0));
-            block.dynamic.as_mut().unwrap().presets.push(cad_core::Preset {
-                id: preset,
-                name: "Five".into(),
-                values,
-            });
+            block
+                .dynamic
+                .as_mut()
+                .unwrap()
+                .presets
+                .push(cad_core::Preset {
+                    id: preset,
+                    name: "Five".into(),
+                    values,
+                });
         }
         let mut history = History::default();
         history.begin();
@@ -4978,5 +5254,19 @@ mod tests {
             .and_then(ParameterValue::as_number)
             .unwrap_or(0.0);
         assert!((restored - 0.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn convert_dialog_skips_the_opening_frame() {
+        let mut dialog = ConvertDialog {
+            instance_id: EntityId(1),
+            block_name: "Door".into(),
+            references: 2,
+            mode: ConvertMode::Unique,
+            just_opened: true,
+        };
+        assert!(dialog.skip_open_frame());
+        assert!(!dialog.just_opened);
+        assert!(!dialog.skip_open_frame());
     }
 }

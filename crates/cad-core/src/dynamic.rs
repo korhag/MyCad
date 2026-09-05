@@ -8,14 +8,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use crate::document::DrawingUnits;
-use crate::entity::{Entity, EntityId, Geometry};
-use crate::geom::{Point2, Point3};
 use crate::dynamic_model::{
-    active_compatibility_rules, value_allowed_by_rules, AnchorDef, CompatibilityRule, GeometryGroup,
-    NestedInput, NestedMapping, ParameterCondition, PlacementBehavior, Preset,
+    active_compatibility_rules, value_allowed_by_rules, AnchorDef, CompatibilityRule,
+    GeometryGroup, NestedInput, NestedMapping, ParameterCondition, PlacementBehavior, Preset,
     ReflectionBehavior, RotationBehavior, RotationSource, TextBinding, TextBindingMode, TextToken,
     VisibilityGroup,
 };
+use crate::entity::{Entity, EntityId, Geometry};
+use crate::geom::{Point2, Point3};
 use crate::ids::{ActionId, AnchorId, OptionId, ParameterId, PresetId, VertexId};
 
 pub const EVALUATOR_VERSION: u32 = 2;
@@ -30,10 +30,7 @@ pub enum GeometryTarget {
     Entity(EntityId),
     LineStart(EntityId),
     LineEnd(EntityId),
-    Vertex {
-        entity: EntityId,
-        vertex: VertexId,
-    },
+    Vertex { entity: EntityId, vertex: VertexId },
 }
 
 impl GeometryTarget {
@@ -337,7 +334,11 @@ pub fn apply_size_axis(
 }
 
 /// Rebuild multipliers for non-custom follow roles after an anchor change.
-pub fn apply_anchor_policy(dynamic: &mut DynamicDefinition, parameter: ParameterId, anchor: AnchorPolicy) {
+pub fn apply_anchor_policy(
+    dynamic: &mut DynamicDefinition,
+    parameter: ParameterId,
+    anchor: AnchorPolicy,
+) {
     if let Some(def) = dynamic.parameter_mut(parameter) {
         if let ParameterKind::Number(numeric) = &mut def.kind {
             if let Some(size) = &mut numeric.size {
@@ -369,7 +370,10 @@ pub fn parse_allowed_value_list(text: &str) -> Result<Vec<f64>, String> {
             continue;
         }
         let parsed = parse_pasted_number(token)?;
-        if values.iter().any(|existing| numbers_equal(*existing, parsed)) {
+        if values
+            .iter()
+            .any(|existing| numbers_equal(*existing, parsed))
+        {
             return Err(format!("duplicate value {parsed}"));
         }
         values.push(parsed);
@@ -891,7 +895,15 @@ impl DynamicDefinition {
         entities: &BTreeMap<EntityId, EntityId>,
         vertices: &BTreeMap<VertexId, VertexId>,
     ) -> Result<(), DynamicError> {
-        self.remap_ids_with(parameters, options, actions, &BTreeMap::new(), &BTreeMap::new(), entities, vertices)
+        self.remap_ids_with(
+            parameters,
+            options,
+            actions,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            entities,
+            vertices,
+        )
     }
 
     pub fn remap_ids_with(
@@ -988,7 +1000,8 @@ impl DynamicDefinition {
                 option: from,
             });
         }
-        let Some(ParameterKind::Choice(choice)) = self.parameter(parameter).map(|item| &item.kind) else {
+        let Some(ParameterKind::Choice(choice)) = self.parameter(parameter).map(|item| &item.kind)
+        else {
             return Err(DynamicError::UnknownParameter {
                 action: ActionId::UNASSIGNED,
                 parameter,
@@ -1248,17 +1261,18 @@ fn remap_nested_input(
     if let Some(mapped) = parameters.get(&input.target_parameter) {
         input.target_parameter = *mapped;
     }
-    input.target_occurrence = input
-        .target_occurrence
-        .remap(entities)
-        .ok_or(DynamicError::MissingEntity {
-            target: GeometryTarget::Entity(
-                input
-                    .target_occurrence
-                    .leaf()
-                    .unwrap_or(EntityId::UNASSIGNED),
-            ),
-        })?;
+    input.target_occurrence =
+        input
+            .target_occurrence
+            .remap(entities)
+            .ok_or(DynamicError::MissingEntity {
+                target: GeometryTarget::Entity(
+                    input
+                        .target_occurrence
+                        .leaf()
+                        .unwrap_or(EntityId::UNASSIGNED),
+                ),
+            })?;
     if let NestedMapping::OptionMap(map) = &mut input.mapping {
         let mut remapped = BTreeMap::new();
         for (option, value) in std::mem::take(map) {
@@ -1539,7 +1553,10 @@ impl fmt::Display for DynamicError {
                 write!(f, "Parameter {parameter} has an empty option label")
             }
             Self::DuplicateLabel { parameter, label } => {
-                write!(f, "Parameter {parameter} has duplicate option label '{label}'")
+                write!(
+                    f,
+                    "Parameter {parameter} has duplicate option label '{label}'"
+                )
             }
             Self::IncompleteMapping {
                 action,
@@ -1565,7 +1582,10 @@ impl fmt::Display for DynamicError {
                 write!(f, "Action {action} duplicates {other}")
             }
             Self::TextTooLong { parameter, limit } => {
-                write!(f, "Parameter {parameter} exceeds the {limit} character limit")
+                write!(
+                    f,
+                    "Parameter {parameter} exceeds the {limit} character limit"
+                )
             }
             Self::NestedCycle { details } => write!(f, "Nested mapping cycle: {details}"),
             Self::Compatibility { parameter, reason } => {
@@ -1747,7 +1767,11 @@ fn validate_phase3(
         if !behavior.id.is_assigned() || !action_ids.insert(behavior.id) {
             return Err(DynamicError::DuplicateAction(behavior.id));
         }
-        validate_conditions(dynamic, behavior.id, std::slice::from_ref(&behavior.condition))?;
+        validate_conditions(
+            dynamic,
+            behavior.id,
+            std::slice::from_ref(&behavior.condition),
+        )?;
         for member in &behavior.members {
             if !entity_ids.contains(member) {
                 return Err(DynamicError::MissingEntity {
@@ -2202,7 +2226,10 @@ pub fn collect_broken_bindings(
     let mut broken = Vec::new();
     for behavior in &dynamic.behaviors {
         for target in &behavior.targets {
-            let Some(entity) = entities.iter().find(|entity| entity.id == target.entity_id()) else {
+            let Some(entity) = entities
+                .iter()
+                .find(|entity| entity.id == target.entity_id())
+            else {
                 broken.push((behavior.id, *target, "missing entity"));
                 continue;
             };
@@ -2502,9 +2529,7 @@ pub fn capability_for(
         (BehaviorKind::Move, GeometryTarget::LineStart(_) | GeometryTarget::LineEnd(_), _) => {
             Err("move a partial target; use Stretch")
         }
-        (BehaviorKind::Move, GeometryTarget::Vertex { .. }, _) => {
-            Err("move a vertex; use Stretch")
-        }
+        (BehaviorKind::Move, GeometryTarget::Vertex { .. }, _) => Err("move a vertex; use Stretch"),
         (
             BehaviorKind::Stretch,
             GeometryTarget::LineStart(_) | GeometryTarget::LineEnd(_),
@@ -2619,7 +2644,8 @@ pub fn validate_behavior_conflicts(dynamic: &DynamicDefinition) -> Result<(), Dy
                         reason: "duplicate equivalent behavior",
                     });
                 }
-                if left.parameter == right.parameter && directions_parallel(left.local_direction, right.local_direction)
+                if left.parameter == right.parameter
+                    && directions_parallel(left.local_direction, right.local_direction)
                 {
                     return Err(DynamicError::OverlappingContribution {
                         parameter: left.parameter,
@@ -2879,11 +2905,26 @@ mod tests {
 
     #[test]
     fn follow_center_depends_on_anchor_policy() {
-        assert_eq!(follow_multiplier(AnchorPolicy::FirstFixed, FollowRole::Center), 0.5);
-        assert_eq!(follow_multiplier(AnchorPolicy::SecondFixed, FollowRole::Center), -0.5);
-        assert_eq!(follow_multiplier(AnchorPolicy::CenterFixed, FollowRole::Center), 0.0);
-        assert_eq!(follow_multiplier(AnchorPolicy::CenterFixed, FollowRole::First), -0.5);
-        assert_eq!(follow_multiplier(AnchorPolicy::CenterFixed, FollowRole::Second), 0.5);
+        assert_eq!(
+            follow_multiplier(AnchorPolicy::FirstFixed, FollowRole::Center),
+            0.5
+        );
+        assert_eq!(
+            follow_multiplier(AnchorPolicy::SecondFixed, FollowRole::Center),
+            -0.5
+        );
+        assert_eq!(
+            follow_multiplier(AnchorPolicy::CenterFixed, FollowRole::Center),
+            0.0
+        );
+        assert_eq!(
+            follow_multiplier(AnchorPolicy::CenterFixed, FollowRole::First),
+            -0.5
+        );
+        assert_eq!(
+            follow_multiplier(AnchorPolicy::CenterFixed, FollowRole::Second),
+            0.5
+        );
     }
 
     #[test]

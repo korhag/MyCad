@@ -2,7 +2,10 @@
 
 use std::collections::HashSet;
 
-use cad_core::{is_user_editable_block_name, validate_block_rename, BlockTreeIndex};
+use cad_core::{
+    insert_instance_ids_in_space, is_user_editable_block_name, validate_block_rename,
+    BlockTreeIndex, Document, EntityId, EntitySpace, Extents2, Geometry, Transform2,
+};
 use eframe::egui::{self, text::CCursorRange, Color32, RichText, TextEdit, Ui};
 use egui::text::CCursor;
 use egui_phosphor::regular::{
@@ -38,6 +41,7 @@ pub struct BlocksPanel {
     expanded: HashSet<String>,
     search: String,
     renaming: Option<InlineRename>,
+    reveal: Option<String>,
 }
 
 impl Default for BlocksPanel {
@@ -50,6 +54,7 @@ impl Default for BlocksPanel {
             expanded,
             search: String::new(),
             renaming: None,
+            reveal: None,
         }
     }
 }
@@ -84,11 +89,42 @@ impl BlocksPanel {
                 renaming.name = to.to_string();
             }
         }
+        if self
+            .reveal
+            .as_ref()
+            .is_some_and(|name| name.eq_ignore_ascii_case(from))
+        {
+            self.reveal = Some(to.to_string());
+        }
+    }
+
+    pub(crate) fn reveal_definition(&mut self, name: String, tree: &BlockTreeIndex) {
+        if self.renaming.is_some() {
+            return;
+        }
+        self.selected = Some(name.clone());
+        self.expand(MODEL_KEY);
+        expand_paths_to(tree, &name, MODEL_KEY, &mut Vec::new(), &mut self.expanded);
+        self.reveal = Some(name);
+    }
+
+    fn take_reveal_if(&mut self, name: &str) -> bool {
+        if self
+            .reveal
+            .as_ref()
+            .is_some_and(|pending| pending.eq_ignore_ascii_case(name))
+        {
+            self.reveal = None;
+            true
+        } else {
+            false
+        }
     }
 }
 
 enum TreeAction {
     Select(Option<String>),
+    ZoomTo(String),
     Toggle(String),
     StartRename(String),
     CommitRename,
@@ -101,6 +137,7 @@ enum TreeAction {
 
 pub fn show(ui: &mut Ui, app: &mut MyCadApp) {
     expand_active_edit_path(app);
+    expand_reveal_path(app);
     ui.heading("BLOCKS");
     ui.separator();
     if app.document.is_none() {
@@ -168,6 +205,20 @@ pub fn show(ui: &mut Ui, app: &mut MyCadApp) {
     }
 
     apply_action(app, action);
+}
+
+fn expand_reveal_path(app: &mut MyCadApp) {
+    let Some(target) = app.blocks_panel.reveal.clone() else {
+        return;
+    };
+    app.blocks_panel.expand(MODEL_KEY);
+    expand_paths_to(
+        &app.block_tree,
+        &target,
+        MODEL_KEY,
+        &mut Vec::new(),
+        &mut app.blocks_panel.expanded,
+    );
 }
 
 fn expand_active_edit_path(app: &mut MyCadApp) {
@@ -327,7 +378,18 @@ fn show_block_row(
                 label = label.strong();
             }
             let response = ui.selectable_label(selected && !is_active, label);
-            if response.clicked() {
+            let hint = if editable {
+                "F2 or pencil to rename; double-click to zoom"
+            } else {
+                "Double-click to zoom"
+            };
+            let response = response.on_hover_text(hint);
+            if app.blocks_panel.take_reveal_if(name) {
+                response.scroll_to_me(Some(egui::Align::Center));
+            }
+            if response.double_clicked() {
+                *action = Some(TreeAction::ZoomTo(name.to_string()));
+            } else if response.clicked() {
                 *action = Some(TreeAction::Select(Some(name.to_string())));
             }
             response.context_menu(|ui| {
@@ -370,6 +432,7 @@ fn show_block_row(
             if editable {
                 let pencil =
                     ui.add(egui::Button::new(RichText::new(PENCIL_SIMPLE).size(13.0)).frame(false));
+                let pencil = pencil.on_hover_text("Rename (F2)");
                 if pencil.clicked() {
                     *action = Some(TreeAction::StartRename(name.to_string()));
                 }
@@ -487,10 +550,12 @@ fn start_rename(app: &mut MyCadApp, name: String) {
 
 fn apply_action(app: &mut MyCadApp, action: Option<TreeAction>) {
     match action {
-        Some(TreeAction::Select(name)) => {
-            app.blocks_panel.selected = name;
+        Some(TreeAction::Select(None)) => {
+            app.blocks_panel.selected = None;
             app.blocks_panel.error = None;
         }
+        Some(TreeAction::Select(Some(name))) => app.select_named_block_instances(&name),
+        Some(TreeAction::ZoomTo(name)) => app.zoom_to_named_block(&name),
         Some(TreeAction::Toggle(name)) => app.blocks_panel.toggle(&name),
         Some(TreeAction::StartRename(name)) => start_rename(app, name),
         Some(TreeAction::CommitRename) => commit_inline_rename(app),
@@ -504,6 +569,41 @@ fn apply_action(app: &mut MyCadApp, action: Option<TreeAction>) {
         Some(TreeAction::Duplicate(name)) => app.duplicate_named_block(&name),
         None => {}
     }
+}
+
+fn first_insert_definition_name(document: &Document, ids: &[EntityId]) -> Option<String> {
+    ids.iter().find_map(|id| {
+        document.entity_by_id(*id).and_then(|entity| {
+            matches!(entity.geometry, Geometry::Insert { .. })
+                .then(|| entity.geometry.insert_block_name().map(str::to_string))
+                .flatten()
+        })
+    })
+}
+
+pub(crate) fn reveal_selected_insert(app: &mut MyCadApp) {
+    if app.blocks_panel.is_renaming() {
+        return;
+    }
+    let Some(document) = app.document.as_ref() else {
+        return;
+    };
+    let Some(name) = first_insert_definition_name(document, app.selection.ids()) else {
+        return;
+    };
+    app.blocks_panel.reveal_definition(name, &app.block_tree);
+}
+
+pub(crate) fn world_extents_of_named_inserts(
+    document: &Document,
+    name: &str,
+    space: &EntitySpace,
+    world_from_local: Transform2,
+) -> Option<Extents2> {
+    let ids = insert_instance_ids_in_space(document, name, space);
+    document
+        .entities_extents(space, &ids)
+        .map(|local| local.transformed(world_from_local))
 }
 
 fn commit_inline_rename(app: &mut MyCadApp) {
@@ -560,7 +660,8 @@ fn node_matches(
 mod tests {
     use super::*;
     use cad_core::{
-        validate_block_rename, BlockDefinition, BlockError, Document, Entity, Geometry, Point3,
+        validate_block_rename, BlockDefinition, BlockError, Document, Entity, EntitySpace,
+        Geometry, Point3, Transform2,
     };
 
     fn insert(name: &str) -> Entity {
@@ -712,5 +813,75 @@ mod tests {
         assert!(validate_block_rename(&document, "Motor", "MOTOR")
             .unwrap()
             .is_some());
+    }
+
+    #[test]
+    fn first_insert_name_skips_plain_geometry() {
+        let mut document = Document::default();
+        document.replace_block_definition(BlockDefinition {
+            name: "Door".into(),
+            base_pt: Point3::from_xy(0.0, 0.0),
+            entities: Vec::new(),
+            ..Default::default()
+        });
+        let line = document.add_entity(Entity::new(Geometry::Line {
+            start: Point3::from_xy(0.0, 0.0),
+            end: Point3::from_xy(1.0, 0.0),
+        }));
+        let insert = document.add_entity(insert("Door"));
+        assert_eq!(
+            first_insert_definition_name(&document, &[line.id, insert.id]).as_deref(),
+            Some("Door")
+        );
+        assert_eq!(first_insert_definition_name(&document, &[line.id]), None);
+    }
+
+    #[test]
+    fn world_extents_use_current_space_inserts() {
+        let mut document = Document::default();
+        document.replace_block_definition(BlockDefinition {
+            name: "Leaf".into(),
+            base_pt: Point3::from_xy(0.0, 0.0),
+            entities: vec![Entity::new(Geometry::Line {
+                start: Point3::from_xy(0.0, 0.0),
+                end: Point3::from_xy(2.0, 0.0),
+            })],
+            ..Default::default()
+        });
+        document.replace_block_definition(BlockDefinition {
+            name: "Holder".into(),
+            base_pt: Point3::from_xy(0.0, 0.0),
+            entities: vec![insert("Leaf")],
+            ..Default::default()
+        });
+        document.add_entity(insert("Leaf"));
+        let model = world_extents_of_named_inserts(
+            &document,
+            "Leaf",
+            &EntitySpace::ModelSpace,
+            Transform2::identity(),
+        )
+        .expect("model extents");
+        assert!(model.width() > 0.0);
+        let nested = world_extents_of_named_inserts(
+            &document,
+            "Leaf",
+            &EntitySpace::Block("Holder".into()),
+            Transform2::translate(100.0, 0.0),
+        )
+        .expect("nested extents");
+        assert!((nested.min.x - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn zoom_and_select_actions_are_not_edit() {
+        assert!(!matches!(
+            TreeAction::Select(Some("Door".into())),
+            TreeAction::Edit(_)
+        ));
+        assert!(!matches!(
+            TreeAction::ZoomTo("Door".into()),
+            TreeAction::Edit(_)
+        ));
     }
 }

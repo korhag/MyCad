@@ -31,12 +31,13 @@ pub mod vectorize;
 
 pub use block::{
     block_depends_on, count_block_references, create_block_from_entities,
-    duplicate_block_definition, identity_insert, insert_instance_ids, insert_transform,
-    is_system_block_name, is_user_editable_block_name, make_unique_block, membership_matrix,
-    next_user_block_name, purge_unused_user_blocks, rename_block, resolve_block_name,
-    transfer_entity, user_block_list, validate_block_rename, validate_user_block_name,
-    would_create_block_cycle, BlockError, BlockListEntry, BlockTreeChild, BlockTreeIndex,
-    CreateBlockResult, MakeUniqueResult, TransferResult, NON_UNIFORM_MEMBERSHIP_MESSAGE,
+    duplicate_block_definition, identity_insert, insert_instance_ids, insert_instance_ids_in_space,
+    insert_transform, is_system_block_name, is_user_editable_block_name, make_unique_block,
+    membership_matrix, next_user_block_name, purge_unused_user_blocks, rename_block,
+    resolve_block_name, transfer_entity, user_block_list, validate_block_rename,
+    validate_user_block_name, would_create_block_cycle, BlockError, BlockListEntry, BlockTreeChild,
+    BlockTreeIndex, CreateBlockResult, MakeUniqueResult, TransferResult,
+    NON_UNIFORM_MEMBERSHIP_MESSAGE,
 };
 pub use color::{aci_rgb, CadColor, Rgb};
 pub use compare::{compare_documents, CompareTol, Mismatch};
@@ -49,14 +50,15 @@ pub use document::{
 };
 pub use dynamic::{
     apply_anchor_policy, apply_size_axis, capability_for, collect_broken_bindings, dedupe_targets,
-    follow_multiplier, format_display_number, increment_numeric, measure_size, migrate_choice_option,
-    nearest_allowed_values, nearest_step_values, normalize_direction, numbers_equal, parse_allowed_value_list,
-    proposed_configuration, resolve_values, snap_numeric, validate_behavior_conflicts,
-    validate_configuration, validate_definition, validate_numeric_value, validate_parameter_def,
-    validate_parameter_value, AnchorPolicy, BehaviorKind, BooleanParameter, ChoiceOption,
-    ChoiceParameter, CompositionRule, DynamicBehavior, DynamicDefinition, DynamicError, FollowRole,
-    GeometryTarget, InstanceConfiguration, MeasureMode, NumericDomain, NumericParameter,
-    NumericQuantity, ParameterDef, ParameterKind, ParameterUnit, ParameterValue, ProposedConfiguration,
+    follow_multiplier, format_display_number, increment_numeric, measure_size,
+    migrate_choice_option, nearest_allowed_values, nearest_step_values, normalize_direction,
+    numbers_equal, parse_allowed_value_list, proposed_configuration, resolve_values, snap_numeric,
+    validate_behavior_conflicts, validate_configuration, validate_definition,
+    validate_numeric_value, validate_parameter_def, validate_parameter_value, AnchorPolicy,
+    BehaviorKind, BooleanParameter, ChoiceOption, ChoiceParameter, CompositionRule,
+    DynamicBehavior, DynamicDefinition, DynamicError, FollowRole, GeometryTarget,
+    InstanceConfiguration, MeasureMode, NumericDomain, NumericParameter, NumericQuantity,
+    ParameterDef, ParameterKind, ParameterUnit, ParameterValue, ProposedConfiguration,
     SizeAuthoring, StepOrigin, StepPolicy, TextParameter, EVALUATOR_VERSION,
 };
 pub use dynamic_model::{
@@ -77,8 +79,8 @@ pub use entity_transform::{
     validate_entities, EntityTransform, TransformError,
 };
 pub use evaluate::{
-    check_generation, document_has_dynamic_content, evaluate_definition, export_materialized,
-    apply_definition_preview, generated_block_name, is_generated_block_name, materialize_evaluated,
+    apply_definition_preview, check_generation, document_has_dynamic_content, evaluate_definition,
+    export_materialized, generated_block_name, is_generated_block_name, materialize_evaluated,
     materialize_evaluated_with, EvalKey, EvaluatedBlock, EvaluationCache, EvaluationRequest,
     GENERATED_BLOCK_PREFIX,
 };

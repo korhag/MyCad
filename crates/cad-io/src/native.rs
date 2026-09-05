@@ -4,16 +4,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use cad_core::{
-    validate_definition, ActionId, AnchorDef, AnchorFollow, AnchorId, AnchorPolicy, BlockDefinition,
-    BlockDefinitionId, BooleanParameter, CadColor, ChoiceOption, ChoiceParameter, CompatibilityRule,
-    CompositionRule, Document, DrawingUnits, DynamicBehavior, DynamicDefinition, Entity, EntityId,
-    FollowRole, Geometry, GeometryGroup, GeometryTarget, HatchData, HatchEdge, HatchPath,
-    HatchPatternLine, InstanceConfiguration, Layer, LineType, MeasureMode, MTextData, NestedInput,
-    NestedMapping, NumericDomain, NumericParameter, NumericQuantity, OccurrencePath, OptionId,
-    ParameterCondition, ParameterDef, ParameterId, ParameterKind, ParameterUnit, ParameterValue,
-    PlacementBehavior, Point2, Point3, PolyVertex, Preset, PresetId, ReflectionBehavior, RotationBehavior,
-    RotationSource, SizeAuthoring, StepOrigin, StepPolicy, TextBinding, TextBindingMode, TextData,
-    TextParameter, TextReflectPolicy, TextToken, VertexId, VisibilityGroup,
+    validate_definition, ActionId, AnchorDef, AnchorFollow, AnchorId, AnchorPolicy,
+    BlockDefinition, BlockDefinitionId, BooleanParameter, CadColor, ChoiceOption, ChoiceParameter,
+    CompatibilityRule, CompositionRule, Document, DrawingUnits, DynamicBehavior, DynamicDefinition,
+    Entity, EntityId, FollowRole, Geometry, GeometryGroup, GeometryTarget, HatchData, HatchEdge,
+    HatchPath, HatchPatternLine, InstanceConfiguration, Layer, LineType, MTextData, MeasureMode,
+    NestedInput, NestedMapping, NumericDomain, NumericParameter, NumericQuantity, OccurrencePath,
+    OptionId, ParameterCondition, ParameterDef, ParameterId, ParameterKind, ParameterUnit,
+    ParameterValue, PlacementBehavior, Point2, Point3, PolyVertex, Preset, PresetId,
+    ReflectionBehavior, RotationBehavior, RotationSource, SizeAuthoring, StepOrigin, StepPolicy,
+    TextBinding, TextBindingMode, TextData, TextParameter, TextReflectPolicy, TextToken, VertexId,
+    VisibilityGroup,
 };
 use serde::{Deserialize, Serialize};
 
@@ -482,9 +483,16 @@ struct WireTextBinding {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 enum WireTextMode {
-    ShowValue { parameter: u64 },
-    OptionMap { parameter: u64, texts: Vec<WireOptionText> },
-    Formatted { tokens: Vec<WireTextToken> },
+    ShowValue {
+        parameter: u64,
+    },
+    OptionMap {
+        parameter: u64,
+        texts: Vec<WireOptionText>,
+    },
+    Formatted {
+        tokens: Vec<WireTextToken>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -524,8 +532,13 @@ struct WireRotation {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 enum WireRotationSource {
-    Angle { parameter: u64 },
-    OptionMap { parameter: u64, angles: Vec<WireOptionAngle> },
+    Angle {
+        parameter: u64,
+    },
+    OptionMap {
+        parameter: u64,
+        angles: Vec<WireOptionAngle>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1780,9 +1793,9 @@ fn to_nested_input(input: &NestedInput) -> WireNestedInput {
         target_parameter: input.target_parameter.raw(),
         mapping: match &input.mapping {
             NestedMapping::Direct => WireNestedMapping::Direct,
-            NestedMapping::NumericScale { factor } => WireNestedMapping::NumericScale {
-                factor: *factor,
-            },
+            NestedMapping::NumericScale { factor } => {
+                WireNestedMapping::NumericScale { factor: *factor }
+            }
             NestedMapping::OptionMap(map) => WireNestedMapping::OptionMap {
                 values: map
                     .iter()
@@ -2132,11 +2145,7 @@ fn from_size(size: WireSizeAuthoring) -> Result<SizeAuthoring, ExportError> {
             "first" => AnchorPolicy::FirstFixed,
             "second" => AnchorPolicy::SecondFixed,
             "center" => AnchorPolicy::CenterFixed,
-            other => {
-                return Err(ExportError::Validation(format!(
-                    "unknown anchor '{other}'"
-                )))
-            }
+            other => return Err(ExportError::Validation(format!("unknown anchor '{other}'"))),
         },
         label_offset: cad_core::Point2::new(size.label_offset[0], size.label_offset[1]),
         bound_anchor: size.bound_anchor.map(from_target),
@@ -2434,9 +2443,9 @@ fn from_pt(point: [f64; 3]) -> Point3 {
 mod tests {
     use super::*;
     use cad_core::{
-        identity_insert, primitives_document, AnchorPolicy, BehaviorKind, FollowRole, GeometryTarget,
-        MeasureMode, NumericDomain, NumericParameter, ParameterDef, ParameterKind, Point2,
-        SizeAuthoring,
+        identity_insert, primitives_document, AnchorPolicy, BehaviorKind, FollowRole,
+        GeometryTarget, MeasureMode, NumericDomain, NumericParameter, ParameterDef, ParameterKind,
+        Point2, SizeAuthoring,
     };
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -2598,7 +2607,10 @@ mod tests {
             ..Default::default()
         });
         document.replace_block_definition(definition);
-        let mut insert = Entity::new(identity_insert("Assembly".into(), Point3::from_xy(0.0, 0.0)));
+        let mut insert = Entity::new(identity_insert(
+            "Assembly".into(),
+            Point3::from_xy(0.0, 0.0),
+        ));
         let mut config = InstanceConfiguration::default();
         config.set(style, ParameterValue::Choice(second));
         insert.geometry.set_insert_configuration(Some(config));
@@ -2607,7 +2619,12 @@ mod tests {
         write_mycad(&document, &path).expect("write");
         let loaded = read_mycad(&path).expect("read");
         let _ = std::fs::remove_file(&path);
-        let def = loaded.block_by_name("Assembly").unwrap().dynamic.as_ref().unwrap();
+        let def = loaded
+            .block_by_name("Assembly")
+            .unwrap()
+            .dynamic
+            .as_ref()
+            .unwrap();
         assert_eq!(def.parameters[0].id, style);
         match &def.parameters[0].kind {
             ParameterKind::Choice(choice) => {
@@ -2699,7 +2716,9 @@ mod tests {
             ParameterKind::Number(numeric) => numeric,
             _ => panic!("number"),
         };
-        assert!(matches!(numeric.domain, NumericDomain::AllowedValues(ref values) if values.len() == 3));
+        assert!(
+            matches!(numeric.domain, NumericDomain::AllowedValues(ref values) if values.len() == 3)
+        );
         let size = numeric.size.as_ref().expect("size metadata");
         assert_eq!(size.measure, MeasureMode::LocalX);
         assert_eq!(size.anchor, AnchorPolicy::FirstFixed);
@@ -2770,8 +2789,14 @@ mod tests {
         let imported = host.block_by_name(&name).unwrap();
         assert_ne!(imported.id, original_id);
         assert_ne!(name, "OffsetSymbol");
-        assert_eq!(imported.dynamic.as_ref().unwrap().parameters[0].name, "Offset");
-        assert_ne!(imported.dynamic.as_ref().unwrap().parameters[0].id, original_param);
+        assert_eq!(
+            imported.dynamic.as_ref().unwrap().parameters[0].name,
+            "Offset"
+        );
+        assert_ne!(
+            imported.dynamic.as_ref().unwrap().parameters[0].id,
+            original_param
+        );
         assert_ne!(imported.entities[0].id, original_entity);
         assert_eq!(
             imported.dynamic.as_ref().unwrap().behaviors[0].targets[0].entity_id(),
@@ -2790,7 +2815,10 @@ mod tests {
         };
         assert!(matches!(numeric.domain, NumericDomain::Continuous));
         assert!(numeric.size.is_none());
-        assert_eq!(def.dynamic.as_ref().unwrap().behaviors[0].follow, FollowRole::Custom);
+        assert_eq!(
+            def.dynamic.as_ref().unwrap().behaviors[0].follow,
+            FollowRole::Custom
+        );
     }
 
     #[test]

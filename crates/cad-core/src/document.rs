@@ -9,7 +9,9 @@ use crate::dynamic::DynamicDefinition;
 use crate::entity::{Entity, EntityId, Geometry};
 use crate::extents::Extents2;
 use crate::geom::{Point2, Point3};
-use crate::ids::{ActionId, AnchorId, BlockDefinitionId, OptionId, ParameterId, PresetId, VertexId};
+use crate::ids::{
+    ActionId, AnchorId, BlockDefinitionId, OptionId, ParameterId, PresetId, VertexId,
+};
 use crate::linetype::{is_byblock_name, is_bylayer_name, normalize_linetype_name, LineType};
 use crate::transform::Transform2;
 
@@ -1455,13 +1457,13 @@ mod tests {
                 PolyVertex {
                     point: Point3::from_xy(0.0, 0.0),
                     bulge: 0.0,
-                vertex_id: Default::default(),
-        },
+                    vertex_id: Default::default(),
+                },
                 PolyVertex {
                     point: Point3::from_xy(8.0, 2.0),
                     bulge: 0.0,
-                vertex_id: Default::default(),
-        },
+                    vertex_id: Default::default(),
+                },
             ],
             closed: false,
             extrusion: Point3::new(0.0, 0.0, 1.0),

@@ -39,8 +39,8 @@ pub fn hatch_path_points(path: &HatchPath, extrusion: Point3, elevation: f64) ->
                 .map(|vertex| PolyVertex {
                     point: ocs_point(vertex.point, elevation),
                     bulge: vertex.bulge,
-                vertex_id: Default::default(),
-        })
+                    vertex_id: Default::default(),
+                })
                 .collect();
             polyline_points(&verts, *closed, extrusion)
         }
@@ -269,13 +269,13 @@ mod tests {
                 PolyVertex {
                     point: Point3::from_xy(0.0, 0.0),
                     bulge: 1.0,
-                vertex_id: Default::default(),
-        },
+                    vertex_id: Default::default(),
+                },
                 PolyVertex {
                     point: Point3::from_xy(2.0, 0.0),
                     bulge: 0.0,
-                vertex_id: Default::default(),
-        },
+                    vertex_id: Default::default(),
+                },
             ],
             closed: false,
         };

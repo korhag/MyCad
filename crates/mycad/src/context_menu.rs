@@ -132,7 +132,7 @@ pub struct BlockMenuState {
     pub can_bind_text: bool,
     pub can_visibility: bool,
     pub can_transform: bool,
-    pub     can_preset: bool,
+    pub can_preset: bool,
     pub can_configure: bool,
 }
 

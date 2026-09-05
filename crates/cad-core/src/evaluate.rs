@@ -264,12 +264,11 @@ fn apply_nested_inputs(
             continue;
         };
         let mapped = map_nested_value(dynamic, input, source_value)?;
-        let entity = entities
-            .iter_mut()
-            .find(|entity| entity.id == leaf)
-            .ok_or(DynamicError::MissingEntity {
+        let entity = entities.iter_mut().find(|entity| entity.id == leaf).ok_or(
+            DynamicError::MissingEntity {
                 target: GeometryTarget::Entity(leaf),
-            })?;
+            },
+        )?;
         let config = entity
             .geometry
             .insert_configuration_mut()
@@ -534,7 +533,12 @@ fn apply_reflection(
     .map_err(|err| DynamicError::UnsupportedCombination {
         details: err.to_string(),
     })?;
-    transform_members(entities, &behavior.members, matrix, Some(behavior.text_policy))
+    transform_members(
+        entities,
+        &behavior.members,
+        matrix,
+        Some(behavior.text_policy),
+    )
 }
 
 fn apply_rotation(
@@ -546,12 +550,13 @@ fn apply_rotation(
     let radians = match &behavior.source {
         RotationSource::AngleParameter(parameter) => angle_radians(dynamic, values, *parameter)?,
         RotationSource::OptionMap { parameter, angles } => {
-            let ParameterValue::Choice(option) = values.get(parameter).ok_or(
-                DynamicError::UnknownParameter {
-                    action: behavior.id,
-                    parameter: *parameter,
-                },
-            )?
+            let ParameterValue::Choice(option) =
+                values
+                    .get(parameter)
+                    .ok_or(DynamicError::UnknownParameter {
+                        action: behavior.id,
+                        parameter: *parameter,
+                    })?
             else {
                 return Err(DynamicError::ValueType {
                     parameter: *parameter,
@@ -612,13 +617,16 @@ fn apply_placement(
     values: &BTreeMap<ParameterId, ParameterValue>,
 ) -> Result<(), DynamicError> {
     let dest_id = match values.get(&behavior.parameter) {
-        Some(ParameterValue::Choice(option)) => *behavior.destinations.get(option).ok_or(
-            DynamicError::IncompleteMapping {
-                action: behavior.id,
-                parameter: behavior.parameter,
-                option: *option,
-            },
-        )?,
+        Some(ParameterValue::Choice(option)) => {
+            *behavior
+                .destinations
+                .get(option)
+                .ok_or(DynamicError::IncompleteMapping {
+                    action: behavior.id,
+                    parameter: behavior.parameter,
+                    option: *option,
+                })?
+        }
         Some(ParameterValue::Boolean(flag)) => {
             let Some((off, on)) = behavior.boolean_destinations else {
                 return Err(DynamicError::IncompleteMapping {
@@ -735,7 +743,9 @@ fn apply_text_policy(entity: &mut Entity, policy: TextReflectPolicy) {
     match &mut entity.geometry {
         Geometry::Text(data) => data.rotation = upright(data.rotation),
         Geometry::MText(data) => data.rotation = upright(data.rotation),
-        Geometry::Insert { rotation, attribs, .. } => {
+        Geometry::Insert {
+            rotation, attribs, ..
+        } => {
             *rotation = upright(*rotation);
             for attrib in attribs {
                 attrib.rotation = upright(attrib.rotation);
@@ -888,7 +898,9 @@ fn apply_overrides(
 ) {
     for entity in entities {
         if let Some(config) = overrides.get(&entity.id) {
-            entity.geometry.set_insert_configuration(Some(config.clone()));
+            entity
+                .geometry
+                .set_insert_configuration(Some(config.clone()));
         }
     }
 }
@@ -1282,7 +1294,9 @@ mod tests {
             &mut found,
         );
         assert!(
-            found.iter().any(|snap| (snap.point.x).abs() < 1e-6 && (snap.point.y - 1200.0).abs() < 1e-6),
+            found
+                .iter()
+                .any(|snap| (snap.point.x).abs() < 1e-6 && (snap.point.y - 1200.0).abs() < 1e-6),
             "expected local +X stretch at world (0,1200), got {found:?}"
         );
     }
@@ -1292,11 +1306,7 @@ mod tests {
         let (mut document, _, param) = span_frame();
         let child = insert_with_span(&mut document, 0.0, 1200.0, param);
         document.remove_model_entity(child.id);
-        let mut nested = BlockDefinition::plain(
-            "Assembly",
-            Point3::from_xy(0.0, 0.0),
-            vec![child],
-        );
+        let mut nested = BlockDefinition::plain("Assembly", Point3::from_xy(0.0, 0.0), vec![child]);
         nested.entities[0].id = document.allocate_id();
         document.replace_block_definition(nested);
         let parent = Entity::new(identity_insert(
@@ -1338,7 +1348,9 @@ mod tests {
             ),
             &mut found,
         );
-        assert!(found.iter().any(|snap| (snap.point.x - 1200.0).abs() < 1e-6));
+        assert!(found
+            .iter()
+            .any(|snap| (snap.point.x - 1200.0).abs() < 1e-6));
         assert!(!measures.is_empty());
     }
 
@@ -1397,8 +1409,8 @@ mod tests {
         let definition = document.block_by_name("AdjustableFrame").unwrap().clone();
         let mut broken = definition.clone();
         let removed = broken.entities.remove(1);
-        let err = validate_definition(broken.dynamic.as_ref().unwrap(), &broken.entities)
-            .unwrap_err();
+        let err =
+            validate_definition(broken.dynamic.as_ref().unwrap(), &broken.entities).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -1588,11 +1600,8 @@ mod tests {
         span_num.reference = 800.0;
         let mut depth_num = NumericParameter::length(10.0);
         depth_num.reference = 10.0;
-        let mut definition = BlockDefinition::plain(
-            "Frame",
-            Point3::from_xy(0.0, 0.0),
-            vec![line.clone()],
-        );
+        let mut definition =
+            BlockDefinition::plain("Frame", Point3::from_xy(0.0, 0.0), vec![line.clone()]);
         definition.dynamic = Some(DynamicDefinition {
             parameters: vec![
                 ParameterDef::number(span, "Span", span_num),
@@ -1756,7 +1765,11 @@ mod tests {
             vec![child_line.clone(), child_text.clone()],
         );
         child.dynamic = Some(DynamicDefinition {
-            parameters: vec![ParameterDef::number(child_param, "ChildSpan", child_numeric)],
+            parameters: vec![ParameterDef::number(
+                child_param,
+                "ChildSpan",
+                child_numeric,
+            )],
             behaviors: vec![DynamicBehavior {
                 id: document.allocate_action_id(),
                 kind: BehaviorKind::Stretch,
@@ -1824,12 +1837,20 @@ mod tests {
                 ParameterDef::number(span, "Span", span_numeric),
                 ParameterDef::number(depth, "Depth", depth_numeric),
                 ParameterDef::choice(style, "Style", choice),
-                ParameterDef::boolean(accessory, "Accessory", crate::dynamic::BooleanParameter::default()),
-                ParameterDef::text(description, "Description", crate::dynamic::TextParameter {
-                    default: "Assembly".into(),
-                    multiline: false,
-                    max_length: None,
-                }),
+                ParameterDef::boolean(
+                    accessory,
+                    "Accessory",
+                    crate::dynamic::BooleanParameter::default(),
+                ),
+                ParameterDef::text(
+                    description,
+                    "Description",
+                    crate::dynamic::TextParameter {
+                        default: "Assembly".into(),
+                        multiline: false,
+                        max_length: None,
+                    },
+                ),
             ],
             behaviors: vec![DynamicBehavior {
                 id: document.allocate_action_id(),
@@ -1929,12 +1950,9 @@ mod tests {
                 attachment: Point2::new(0.0, 60.0),
                 attachment_angle: 0.0,
                 parameter: style,
-                destinations: [
-                    (standard, dest_a),
-                    (reinforced, dest_b),
-                ]
-                .into_iter()
-                .collect(),
+                destinations: [(standard, dest_a), (reinforced, dest_b)]
+                    .into_iter()
+                    .collect(),
                 boolean_destinations: None,
             }],
             nested_inputs: vec![NestedInput {
@@ -2011,7 +2029,15 @@ mod tests {
     #[test]
     fn choice_visibility_hides_inactive_geometry() {
         let (document, _, _, style, accessory, _, _, _, _, _) = phase3_assembly();
-        let standard = match &document.block_by_name("Assembly").unwrap().dynamic.as_ref().unwrap().parameters[2].kind {
+        let standard = match &document
+            .block_by_name("Assembly")
+            .unwrap()
+            .dynamic
+            .as_ref()
+            .unwrap()
+            .parameters[2]
+            .kind
+        {
             crate::dynamic::ParameterKind::Choice(choice) => choice.options[0].id,
             _ => panic!("choice"),
         };
@@ -2098,7 +2124,9 @@ mod tests {
                 .entities
                 .iter()
                 .find_map(|entity| match &entity.geometry {
-                    Geometry::Line { start, end } if (start.y - 50.0).abs() < 1.0 || (start.y + 50.0).abs() < 60.0 => {
+                    Geometry::Line { start, end }
+                        if (start.y - 50.0).abs() < 1.0 || (start.y + 50.0).abs() < 60.0 =>
+                    {
                         Some((*start, *end))
                     }
                     _ => None,
@@ -2113,7 +2141,15 @@ mod tests {
     #[test]
     fn placement_follows_size_without_stretching() {
         let (document, span, _, style, _, _, _, _, _, _) = phase3_assembly();
-        let reinforced = match &document.block_by_name("Assembly").unwrap().dynamic.as_ref().unwrap().parameters[2].kind {
+        let reinforced = match &document
+            .block_by_name("Assembly")
+            .unwrap()
+            .dynamic
+            .as_ref()
+            .unwrap()
+            .parameters[2]
+            .kind
+        {
             crate::dynamic::ParameterKind::Choice(choice) => choice.options[1].id,
             _ => panic!("choice"),
         };
@@ -2125,7 +2161,9 @@ mod tests {
             .entities
             .iter()
             .find_map(|entity| match &entity.geometry {
-                Geometry::Line { start, end } if (start.y - 60.0).abs() < 1e-6 => Some((*start, *end)),
+                Geometry::Line { start, end } if (start.y - 60.0).abs() < 1e-6 => {
+                    Some((*start, *end))
+                }
                 _ => None,
             })
             .unwrap();
@@ -2158,7 +2196,12 @@ mod tests {
         };
         let mapped = cfg(nested).unwrap();
         let sibling = cfg(nested_b);
-        assert!(mapped.get(span).is_none() || mapped.values.values().any(|value| matches!(value, ParameterValue::Number(n) if (n - 12.0).abs() < 1e-9)));
+        assert!(
+            mapped.get(span).is_none()
+                || mapped.values.values().any(
+                    |value| matches!(value, ParameterValue::Number(n) if (n - 12.0).abs() < 1e-9)
+                )
+        );
         if let Some(sibling) = sibling {
             assert!(sibling.values.is_empty() || sibling.get(span).is_none());
         }
@@ -2168,7 +2211,12 @@ mod tests {
     #[test]
     fn matching_preset_detects_custom() {
         let (document, span, _, _, _, _, preset_std, _, _, _) = phase3_assembly();
-        let dynamic = document.block_by_name("Assembly").unwrap().dynamic.as_ref().unwrap();
+        let dynamic = document
+            .block_by_name("Assembly")
+            .unwrap()
+            .dynamic
+            .as_ref()
+            .unwrap();
         let mut values = crate::dynamic::resolve_values(dynamic, None).unwrap();
         assert_eq!(
             crate::dynamic_model::matching_preset(&dynamic.presets, &values, &dynamic.parameters),
@@ -2202,7 +2250,12 @@ mod tests {
         let mut config = InstanceConfiguration::default();
         config.set(style, ParameterValue::Choice(id));
         validate_definition(
-            document.block_by_name("Assembly").unwrap().dynamic.as_ref().unwrap(),
+            document
+                .block_by_name("Assembly")
+                .unwrap()
+                .dynamic
+                .as_ref()
+                .unwrap(),
             &document.block_by_name("Assembly").unwrap().entities,
         )
         .unwrap();
@@ -2213,11 +2266,18 @@ mod tests {
     fn anchor_cycle_is_rejected() {
         let (mut document, _, _, _, _, _, _, _, _, _) = phase3_assembly();
         let entities = document.block_by_name("Assembly").unwrap().entities.clone();
-        let dynamic = document.block_by_name_mut("Assembly").unwrap().dynamic.as_mut().unwrap();
+        let dynamic = document
+            .block_by_name_mut("Assembly")
+            .unwrap()
+            .dynamic
+            .as_mut()
+            .unwrap();
         let member = dynamic.placements[0].members[0];
         let dest = *dynamic.placements[0].destinations.values().next().unwrap();
         if let Some(anchor) = dynamic.anchors.iter_mut().find(|anchor| anchor.id == dest) {
-            anchor.follow = Some(crate::dynamic_model::AnchorFollow::Geometry(GeometryTarget::Entity(member)));
+            anchor.follow = Some(crate::dynamic_model::AnchorFollow::Geometry(
+                GeometryTarget::Entity(member),
+            ));
         }
         let err = validate_definition(dynamic, &entities).unwrap_err();
         assert!(matches!(err, DynamicError::DependencyCycle { .. }));
@@ -2226,7 +2286,12 @@ mod tests {
     #[test]
     fn remap_choice_values_follow_option_ids() {
         let (document, _, _, style, _, _, _, _, _, _) = phase3_assembly();
-        let dynamic = document.block_by_name("Assembly").unwrap().dynamic.clone().unwrap();
+        let dynamic = document
+            .block_by_name("Assembly")
+            .unwrap()
+            .dynamic
+            .clone()
+            .unwrap();
         let old = match &dynamic.parameters[2].kind {
             crate::dynamic::ParameterKind::Choice(choice) => choice.options[0].id,
             _ => panic!("choice"),
@@ -2243,11 +2308,22 @@ mod tests {
     #[test]
     fn inactive_geometry_is_omitted_from_extents_snaps_and_plot() {
         let (mut document, _, _, style, accessory, _, _, _, _, _) = phase3_assembly();
-        let standard = match &document.block_by_name("Assembly").unwrap().dynamic.as_ref().unwrap().parameters[2].kind {
+        let standard = match &document
+            .block_by_name("Assembly")
+            .unwrap()
+            .dynamic
+            .as_ref()
+            .unwrap()
+            .parameters[2]
+            .kind
+        {
             crate::dynamic::ParameterKind::Choice(choice) => choice.options[0].id,
             _ => panic!("choice"),
         };
-        let mut insert = Entity::new(identity_insert("Assembly".into(), Point3::from_xy(0.0, 0.0)));
+        let mut insert = Entity::new(identity_insert(
+            "Assembly".into(),
+            Point3::from_xy(0.0, 0.0),
+        ));
         let mut config = InstanceConfiguration::default();
         config.set(style, ParameterValue::Choice(standard));
         config.set(accessory, ParameterValue::Boolean(false));
@@ -2304,14 +2380,18 @@ mod tests {
         numeric.unit = crate::dynamic::ParameterUnit::Degrees;
         numeric.reference = 0.0;
         numeric.default = 90.0;
-        let mut definition = BlockDefinition::plain(
-            "Ordered",
-            Point3::from_xy(0.0, 0.0),
-            vec![line.clone()],
-        );
+        let mut definition =
+            BlockDefinition::plain("Ordered", Point3::from_xy(0.0, 0.0), vec![line.clone()]);
         definition.dynamic = Some(DynamicDefinition {
             parameters: vec![
-                ParameterDef::boolean(flag, "Flip", crate::dynamic::BooleanParameter { default: true, ..Default::default() }),
+                ParameterDef::boolean(
+                    flag,
+                    "Flip",
+                    crate::dynamic::BooleanParameter {
+                        default: true,
+                        ..Default::default()
+                    },
+                ),
                 ParameterDef::number(angle, "Angle", numeric),
                 ParameterDef::choice(
                     choice,
@@ -2417,15 +2497,21 @@ mod tests {
             .unwrap();
         match &insert.geometry {
             Geometry::Insert { scale, .. } => {
-                assert!(scale.y < 0.0, "mirrored nested INSERT should reverse orientation");
+                assert!(
+                    scale.y < 0.0,
+                    "mirrored nested INSERT should reverse orientation"
+                );
             }
             other => panic!("{other:?}"),
         }
         let child = document.block_by_name("ChildDyn").unwrap();
-        match &child.entities.iter().find_map(|entity| match &entity.geometry {
-            Geometry::Text(data) => Some(data),
-            _ => None,
-        }) {
+        match &child
+            .entities
+            .iter()
+            .find_map(|entity| match &entity.geometry {
+                Geometry::Text(data) => Some(data),
+                _ => None,
+            }) {
             Some(data) => {
                 assert!((data.height - 1.0).abs() < 1e-12);
                 assert_eq!(data.value, "N");
@@ -2434,8 +2520,13 @@ mod tests {
         }
         let plot = crate::vectorize::plot_geometry(&{
             let mut host = document.clone();
-            let mut insert = Entity::new(identity_insert("Assembly".into(), Point3::from_xy(0.0, 0.0)));
-            insert.geometry.set_insert_configuration(Some(config.clone()));
+            let mut insert = Entity::new(identity_insert(
+                "Assembly".into(),
+                Point3::from_xy(0.0, 0.0),
+            ));
+            insert
+                .geometry
+                .set_insert_configuration(Some(config.clone()));
             host.add_entity(insert);
             crate::evaluate::materialize_evaluated(
                 &host,
@@ -2452,17 +2543,35 @@ mod tests {
     #[test]
     fn migrate_option_rewrites_presets_and_instances() {
         let (mut document, _, _, style, _, _, _, _, _, _) = phase3_assembly();
-        let (from, to) = match &document.block_by_name("Assembly").unwrap().dynamic.as_ref().unwrap().parameters[2].kind {
-            crate::dynamic::ParameterKind::Choice(choice) => (choice.options[0].id, choice.options[1].id),
+        let (from, to) = match &document
+            .block_by_name("Assembly")
+            .unwrap()
+            .dynamic
+            .as_ref()
+            .unwrap()
+            .parameters[2]
+            .kind
+        {
+            crate::dynamic::ParameterKind::Choice(choice) => {
+                (choice.options[0].id, choice.options[1].id)
+            }
             _ => panic!("choice"),
         };
-        let mut insert = Entity::new(identity_insert("Assembly".into(), Point3::from_xy(0.0, 0.0)));
+        let mut insert = Entity::new(identity_insert(
+            "Assembly".into(),
+            Point3::from_xy(0.0, 0.0),
+        ));
         let mut config = InstanceConfiguration::default();
         config.set(style, ParameterValue::Choice(from));
         insert.geometry.set_insert_configuration(Some(config));
         document.add_entity(insert);
         crate::dynamic::migrate_choice_option(&mut document, "Assembly", style, from, to).unwrap();
-        let dynamic = document.block_by_name("Assembly").unwrap().dynamic.as_ref().unwrap();
+        let dynamic = document
+            .block_by_name("Assembly")
+            .unwrap()
+            .dynamic
+            .as_ref()
+            .unwrap();
         match &dynamic.parameters[2].kind {
             crate::dynamic::ParameterKind::Choice(choice) => {
                 assert!(choice.options.iter().all(|option| option.id != from));

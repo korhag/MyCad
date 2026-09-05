@@ -1,6 +1,7 @@
 //! Axis-aligned world-space extents.
 
 use crate::geom::Point2;
+use crate::transform::Transform2;
 
 // ------------------------------------------------------------
 // Type: Extents2
@@ -37,6 +38,16 @@ impl Extents2 {
             min: Point2::new(a.x.min(b.x), a.y.min(b.y)),
             max: Point2::new(a.x.max(b.x), a.y.max(b.y)),
         }
+    }
+
+    pub fn transformed(self, transform: Transform2) -> Self {
+        Self::from_points([
+            transform.apply(Point2::new(self.min.x, self.min.y)),
+            transform.apply(Point2::new(self.max.x, self.min.y)),
+            transform.apply(Point2::new(self.max.x, self.max.y)),
+            transform.apply(Point2::new(self.min.x, self.max.y)),
+        ])
+        .unwrap_or(self)
     }
 
     pub fn include(&mut self, p: Point2) {
@@ -181,5 +192,13 @@ mod tests {
             Point2::new(20.0, 20.0),
             Point2::new(21.0, 21.0)
         )));
+    }
+
+    #[test]
+    fn transformed_maps_corners_through_translation() {
+        let local = Extents2::from_corners(Point2::new(0.0, 0.0), Point2::new(2.0, 1.0));
+        let world = local.transformed(crate::transform::Transform2::translate(10.0, 20.0));
+        assert_eq!(world.min, Point2::new(10.0, 20.0));
+        assert_eq!(world.max, Point2::new(12.0, 21.0));
     }
 }

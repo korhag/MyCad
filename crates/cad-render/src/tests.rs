@@ -102,18 +102,18 @@ fn picks_a_polyline_along_a_segment() {
             PolyVertex {
                 point: Point3::from_xy(0.0, 0.0),
                 bulge: 0.0,
-            vertex_id: Default::default(),
-        },
+                vertex_id: Default::default(),
+            },
             PolyVertex {
                 point: Point3::from_xy(8.0, 0.0),
                 bulge: 0.0,
-            vertex_id: Default::default(),
-        },
+                vertex_id: Default::default(),
+            },
             PolyVertex {
                 point: Point3::from_xy(8.0, 6.0),
                 bulge: 0.0,
-            vertex_id: Default::default(),
-        },
+                vertex_id: Default::default(),
+            },
         ],
         closed: false,
         extrusion: Point3::new(0.0, 0.0, 1.0),
@@ -365,18 +365,18 @@ fn dashed_polyline_remains_pickable_in_gaps() {
             PolyVertex {
                 point: Point3::from_xy(0.0, 0.0),
                 bulge: 0.0,
-            vertex_id: Default::default(),
-        },
+                vertex_id: Default::default(),
+            },
             PolyVertex {
                 point: Point3::from_xy(8.0, 0.0),
                 bulge: 0.0,
-            vertex_id: Default::default(),
-        },
+                vertex_id: Default::default(),
+            },
             PolyVertex {
                 point: Point3::from_xy(8.0, 6.0),
                 bulge: 0.0,
-            vertex_id: Default::default(),
-        },
+                vertex_id: Default::default(),
+            },
         ],
         closed: false,
         extrusion: Point3::new(0.0, 0.0, 1.0),
@@ -885,7 +885,7 @@ fn overlay_batches_merge_adjacent_ranges_not_edge_count() {
         .map(|i| PolyVertex {
             point: Point3::from_xy(i as f64, 20.0),
             bulge: 0.0,
-        vertex_id: Default::default(),
+            vertex_id: Default::default(),
         })
         .collect();
     document.model_space.push(Entity::new(Geometry::LwPolyline {

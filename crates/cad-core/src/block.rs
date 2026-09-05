@@ -258,6 +258,19 @@ pub fn insert_instance_ids(document: &Document, name: &str) -> Vec<EntityId> {
     ids
 }
 
+pub fn insert_instance_ids_in_space(
+    document: &Document,
+    name: &str,
+    space: &EntitySpace,
+) -> Vec<EntityId> {
+    let Some(entities) = document.entities(space) else {
+        return Vec::new();
+    };
+    let mut ids = Vec::new();
+    collect_insert_ids(entities, name, &mut ids);
+    ids
+}
+
 fn collect_insert_ids(entities: &[Entity], name: &str, ids: &mut Vec<EntityId>) {
     for entity in entities {
         if let Geometry::Insert { block_name, .. } = &entity.geometry {
@@ -914,6 +927,32 @@ mod tests {
         extents_close(before, after);
         assert_eq!(result.name, "TestBlock");
         assert!(result.insert.is_some());
+    }
+
+    #[test]
+    fn insert_instance_ids_in_space_excludes_nested_references() {
+        let mut document = Document::default();
+        document.replace_block_definition(BlockDefinition {
+            name: "Leaf".into(),
+            base_pt: Point3::from_xy(0.0, 0.0),
+            entities: Vec::new(),
+            ..Default::default()
+        });
+        document.replace_block_definition(BlockDefinition {
+            name: "Holder".into(),
+            base_pt: Point3::from_xy(0.0, 0.0),
+            entities: vec![insert_at("Leaf", 1.0, 0.0)],
+            ..Default::default()
+        });
+        let model = document.add_entity(insert_at("Leaf", 5.0, 0.0));
+        document.add_entity(insert_at("Holder", 0.0, 0.0));
+        let model_ids = insert_instance_ids_in_space(&document, "Leaf", &EntitySpace::ModelSpace);
+        assert_eq!(model_ids, vec![model.id]);
+        let nested =
+            insert_instance_ids_in_space(&document, "Leaf", &EntitySpace::Block("Holder".into()));
+        assert_eq!(nested.len(), 1);
+        assert_ne!(nested[0], model.id);
+        assert_eq!(insert_instance_ids(&document, "Leaf").len(), 2);
     }
 
     #[test]

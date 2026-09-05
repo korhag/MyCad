@@ -185,11 +185,9 @@ impl AnchorDef {
                     }
                 }
                 AnchorFollow::Geometry(target) => {
-                    *target = target.remap(entities, vertices).ok_or(
-                        DynamicError::MissingEntity {
-                            target: *target,
-                        },
-                    )?;
+                    *target = target
+                        .remap(entities, vertices)
+                        .ok_or(DynamicError::MissingEntity { target: *target })?;
                 }
             }
         }
@@ -344,9 +342,11 @@ impl TextBinding {
         if let Some(mapped) = actions.get(&self.id) {
             self.id = *mapped;
         }
-        self.target = *entities.get(&self.target).ok_or(DynamicError::MissingEntity {
-            target: GeometryTarget::Entity(self.target),
-        })?;
+        self.target = *entities
+            .get(&self.target)
+            .ok_or(DynamicError::MissingEntity {
+                target: GeometryTarget::Entity(self.target),
+            })?;
         match &mut self.mode {
             TextBindingMode::ShowValue { parameter } => {
                 if let Some(mapped) = parameters.get(parameter) {
@@ -397,7 +397,9 @@ pub fn format_parameter_display(
 ) -> Result<String, DynamicError> {
     match (&parameter.kind, value) {
         (ParameterKind::Number(numeric), ParameterValue::Number(number)) => {
-            let precision = binding.number_precision.unwrap_or(numeric.display_precision);
+            let precision = binding
+                .number_precision
+                .unwrap_or(numeric.display_precision);
             Ok(crate::dynamic::format_display_number(*number, precision))
         }
         (ParameterKind::Choice(choice), ParameterValue::Choice(option)) => choice
@@ -441,17 +443,21 @@ pub fn evaluate_text_binding(
     let raw = match &binding.mode {
         TextBindingMode::ShowValue { parameter } => {
             let def = lookup(*parameter)?;
-            let value = values.get(parameter).ok_or(DynamicError::UnknownParameter {
-                action: binding.id,
-                parameter: *parameter,
-            })?;
+            let value = values
+                .get(parameter)
+                .ok_or(DynamicError::UnknownParameter {
+                    action: binding.id,
+                    parameter: *parameter,
+                })?;
             format_parameter_display(def, value, binding)?
         }
         TextBindingMode::OptionMap { parameter, texts } => {
-            let value = values.get(parameter).ok_or(DynamicError::UnknownParameter {
-                action: binding.id,
-                parameter: *parameter,
-            })?;
+            let value = values
+                .get(parameter)
+                .ok_or(DynamicError::UnknownParameter {
+                    action: binding.id,
+                    parameter: *parameter,
+                })?;
             let ParameterValue::Choice(option) = value else {
                 return Err(DynamicError::ValueType {
                     parameter: *parameter,
@@ -475,10 +481,13 @@ pub fn evaluate_text_binding(
                     TextToken::Literal(text) => out.push_str(text),
                     TextToken::Parameter(parameter) => {
                         let def = lookup(*parameter)?;
-                        let value = values.get(parameter).ok_or(DynamicError::UnknownParameter {
-                            action: binding.id,
-                            parameter: *parameter,
-                        })?;
+                        let value =
+                            values
+                                .get(parameter)
+                                .ok_or(DynamicError::UnknownParameter {
+                                    action: binding.id,
+                                    parameter: *parameter,
+                                })?;
                         out.push_str(&format_parameter_display(def, value, binding)?);
                     }
                 }
@@ -563,9 +572,7 @@ impl TransformKind {
 pub enum NestedMapping {
     Direct,
     OptionMap(BTreeMap<OptionId, ParameterValue>),
-    NumericScale {
-        factor: f64,
-    },
+    NumericScale { factor: f64 },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -697,15 +704,15 @@ pub fn rule_reason(rule: &CompatibilityRule, parameters: &[ParameterDef]) -> Str
             .unwrap_or_else(|| id.to_string())
     };
     match rule {
-        CompatibilityRule::ChoiceAllowsChoice {
-            when, target, ..
-        } => format!("{} restricts {}", name(*when), name(*target)),
-        CompatibilityRule::ChoiceRestrictsNumeric {
-            when, target, ..
-        } => format!("{} restricts {}", name(*when), name(*target)),
-        CompatibilityRule::BooleanPermits {
-            when, target, ..
-        } => format!("{} restricts {}", name(*when), name(*target)),
+        CompatibilityRule::ChoiceAllowsChoice { when, target, .. } => {
+            format!("{} restricts {}", name(*when), name(*target))
+        }
+        CompatibilityRule::ChoiceRestrictsNumeric { when, target, .. } => {
+            format!("{} restricts {}", name(*when), name(*target))
+        }
+        CompatibilityRule::BooleanPermits { when, target, .. } => {
+            format!("{} restricts {}", name(*when), name(*target))
+        }
     }
 }
 
@@ -935,12 +942,7 @@ pub fn option_usages(
         } = &behavior.condition
         {
             if *pid == parameter && options.contains(&option) {
-                uses.push(
-                    behavior
-                        .name
-                        .clone()
-                        .unwrap_or_else(|| "flip".into()),
-                );
+                uses.push(behavior.name.clone().unwrap_or_else(|| "flip".into()));
             }
         }
     }
@@ -951,23 +953,13 @@ pub fn option_usages(
         } = &behavior.source
         {
             if *pid == parameter && angles.contains_key(&option) {
-                uses.push(
-                    behavior
-                        .name
-                        .clone()
-                        .unwrap_or_else(|| "rotation".into()),
-                );
+                uses.push(behavior.name.clone().unwrap_or_else(|| "rotation".into()));
             }
         }
     }
     for behavior in placements {
         if behavior.parameter == parameter && behavior.destinations.contains_key(&option) {
-            uses.push(
-                behavior
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| "placement".into()),
-            );
+            uses.push(behavior.name.clone().unwrap_or_else(|| "placement".into()));
         }
     }
     for input in nested_inputs {

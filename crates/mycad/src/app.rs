@@ -10,13 +10,13 @@ use std::time::Instant;
 use cad_core::{
     apply_definition_preview, create_block_from_entities, document_has_dynamic_content,
     duplicate_block_definition, export_materialized, identity_insert, insert_instance_ids,
-    make_unique_block, materialize_evaluated, materialize_evaluated_with, membership_matrix,
-    purge_unused_user_blocks, reference_radius, transfer_entity, transform_entity_matrix,
-    transform_geometry, validate_block_rename, validate_entities, would_create_block_cycle,
-    BlockTreeIndex, Document, Entity, EntityId, EntitySpace, EntityTransform, EvaluationCache,
-    EvaluationRequest, Extents2, Geometry, InstanceConfiguration, MeasureIndex, MeasureRole,
-    MeasurementResult, ParameterId, Point2, Point3, SnapFeature, SnapIndex, Transform2,
-    TransformError, GEOM_TOLERANCE,
+    insert_instance_ids_in_space, make_unique_block, materialize_evaluated,
+    materialize_evaluated_with, membership_matrix, purge_unused_user_blocks, reference_radius,
+    transfer_entity, transform_entity_matrix, transform_geometry, validate_block_rename,
+    validate_entities, would_create_block_cycle, BlockTreeIndex, Document, Entity, EntityId,
+    EntitySpace, EntityTransform, EvaluationCache, EvaluationRequest, Extents2, Geometry,
+    InstanceConfiguration, MeasureIndex, MeasureRole, MeasurementResult, ParameterId, Point2,
+    Point3, SnapFeature, SnapIndex, Transform2, TransformError, GEOM_TOLERANCE,
 };
 use cad_io::{
     export_pdf, read_mycad, write_dxf, write_mycad, CadFileFormat, DxfExportOptions,
@@ -228,7 +228,7 @@ pub struct MyCadApp {
     measures: Arc<MeasureIndex>,
     measurement: Option<MeasurementOverlay>,
     measure_card_hovered: bool,
-    viewport_height: f64,
+    viewport_size: Point2,
     cursor_world: Option<Point2>,
     pub(crate) input_consumed_escape: bool,
     pending_open: Option<PathBuf>,
@@ -310,7 +310,7 @@ impl MyCadApp {
             measures: Arc::new(MeasureIndex::default()),
             measurement: None,
             measure_card_hovered: false,
-            viewport_height: 600.0,
+            viewport_size: Point2::new(800.0, 600.0),
             cursor_world: None,
             input_consumed_escape: false,
             pending_open: initial_path,
@@ -2200,7 +2200,7 @@ impl MyCadApp {
     }
 
     fn accept_measure_click(&mut self, point: Point2) {
-        let aperture = measurement::world_aperture(&self.camera, self.viewport_height);
+        let aperture = measurement::world_aperture(&self.camera, self.viewport_size.y);
         let kind = self.command.kind();
         let angle_three = matches!(
             self.command,
@@ -2418,6 +2418,7 @@ impl MyCadApp {
             ids,
             space,
             error: None,
+            just_opened: true,
         });
     }
 
@@ -2889,6 +2890,38 @@ impl MyCadApp {
         self.status = format!("Inserted {name}");
     }
 
+    pub(crate) fn select_named_block_instances(&mut self, name: &str) {
+        self.blocks_panel.selected = Some(name.to_string());
+        self.blocks_panel.error = None;
+        let space = self.block_edit.active_space();
+        let ids = self
+            .document
+            .as_ref()
+            .map(|document| insert_instance_ids_in_space(document, name, &space))
+            .unwrap_or_default();
+        if ids.is_empty() {
+            self.status = format!("No instances of {name} in the current space");
+            return;
+        }
+        self.selection.replace_all(ids);
+    }
+
+    pub(crate) fn zoom_to_named_block(&mut self, name: &str) {
+        self.select_named_block_instances(name);
+        let space = self.block_edit.active_space();
+        let world_from_local = self.block_edit.world_from_local();
+        let Some(extents) = self.document.as_ref().and_then(|document| {
+            if insert_instance_ids_in_space(document, name, &space).is_empty() {
+                return None;
+            }
+            crate::blocks::world_extents_of_named_inserts(document, name, &space, world_from_local)
+        }) else {
+            return;
+        };
+        self.camera
+            .zoom_extents(extents, self.viewport_size.x, self.viewport_size.y);
+    }
+
     pub(crate) fn edit_named_block(&mut self, name: &str) {
         let selected = self.selection.ids().first().copied();
         let ids = self
@@ -3103,15 +3136,21 @@ impl MyCadApp {
     fn show_block_ui(&mut self, ctx: &egui::Context) {
         match std::mem::replace(&mut self.block_edit.ui, BlockUi::None) {
             BlockUi::None => {}
-            BlockUi::Create(mut dialog) => match block_edit::show_create_dialog(ctx, &mut dialog) {
-                CreateDialogResult::Open => self.block_edit.ui = BlockUi::Create(dialog),
-                CreateDialogResult::Cancel => {}
-                CreateDialogResult::PickPoint => {
-                    self.status = "Specify base point".into();
-                    self.block_edit.ui = BlockUi::PickBase(dialog);
+            BlockUi::Create(mut dialog) => {
+                if dialog.skip_open_frame() {
+                    self.block_edit.ui = BlockUi::Create(dialog);
+                } else {
+                    match block_edit::show_create_dialog(ctx, &mut dialog) {
+                        CreateDialogResult::Open => self.block_edit.ui = BlockUi::Create(dialog),
+                        CreateDialogResult::Cancel => {}
+                        CreateDialogResult::PickPoint => {
+                            self.status = "Specify base point".into();
+                            self.block_edit.ui = BlockUi::PickBase(dialog);
+                        }
+                        CreateDialogResult::Create => self.commit_create_block(dialog),
+                    }
                 }
-                CreateDialogResult::Create => self.commit_create_block(dialog),
-            },
+            }
             BlockUi::PickBase(dialog) => {
                 self.block_edit.ui = BlockUi::PickBase(dialog);
             }
@@ -3190,7 +3229,7 @@ impl MyCadApp {
             self.apply_toolbar_action(toolbar_action);
         }
         let rect = ui.available_rect_before_wrap();
-        self.viewport_height = rect.height() as f64;
+        self.viewport_size = Point2::new(rect.width() as f64, rect.height() as f64);
         self.poll_load(rect);
         let units = self
             .document
@@ -3426,6 +3465,7 @@ impl MyCadApp {
             if !self.selection.contains(id) {
                 self.selection.replace(id);
             }
+            crate::blocks::reveal_selected_insert(self);
             self.context_menu = Some(ViewportMenu::new(pos, ContextKind::Entity));
         } else {
             self.context_menu = Some(ViewportMenu::new(pos, ContextKind::Empty));
@@ -3477,8 +3517,7 @@ impl MyCadApp {
                     && self.block_edit.is_active()
                     && !self.selection.is_empty(),
                 can_preset: self.dynamic_authoring.is_some(),
-                can_configure: self.can_edit_selected_block()
-                    && self.selected_insert_is_dynamic(),
+                can_configure: self.can_edit_selected_block() && self.selected_insert_is_dynamic(),
             },
         );
         match result {
@@ -3529,7 +3568,11 @@ impl MyCadApp {
             }
             ContextAction::AttachMoveTo(id) => {
                 crate::dynamic_block::select_authoring_parameter(self, id);
-                crate::dynamic_block::attach_from_selection(self, cad_core::BehaviorKind::Move, 1.0);
+                crate::dynamic_block::attach_from_selection(
+                    self,
+                    cad_core::BehaviorKind::Move,
+                    1.0,
+                );
             }
             ContextAction::AttachStretchTo(id) => {
                 crate::dynamic_block::select_authoring_parameter(self, id);
@@ -3538,7 +3581,9 @@ impl MyCadApp {
             ContextAction::NewSize => crate::dynamic_block::begin_new_size_from_menu(self),
             ContextAction::LinkText => crate::dynamic_block::link_text_from_selection(self),
             ContextAction::ShowWhen => crate::dynamic_block::show_when_from_selection(self),
-            ContextAction::AlwaysVisible => crate::dynamic_block::always_visible_from_selection(self),
+            ContextAction::AlwaysVisible => {
+                crate::dynamic_block::always_visible_from_selection(self)
+            }
             ContextAction::MirrorForOption => crate::dynamic_block::mirror_from_selection(self),
             ContextAction::PositionByOption => crate::dynamic_block::position_from_selection(self),
             ContextAction::RotateByParameter => crate::dynamic_block::rotate_from_selection(self),
@@ -3944,9 +3989,10 @@ impl eframe::App for MyCadApp {
                 self.blocks_panel.cancel_rename();
                 self.input_consumed_escape = true;
             } else if keys.escape && matches!(self.block_edit.ui, BlockUi::PickBase(_)) {
-                if let BlockUi::PickBase(dialog) =
+                if let BlockUi::PickBase(mut dialog) =
                     std::mem::replace(&mut self.block_edit.ui, BlockUi::None)
                 {
+                    dialog.just_opened = true;
                     self.block_edit.ui = BlockUi::Create(dialog);
                 }
                 self.input_consumed_escape = true;
@@ -4018,7 +4064,11 @@ impl eframe::App for MyCadApp {
                 }
             }
         }
-        if self.load_rx.is_some() || self.io_rx.is_some() || self.preview_rx.is_some() || self.capture.is_some() {
+        if self.load_rx.is_some()
+            || self.io_rx.is_some()
+            || self.preview_rx.is_some()
+            || self.capture.is_some()
+        {
             ctx.request_repaint();
         }
 
@@ -4424,6 +4474,7 @@ fn handle_viewport_input(app: &mut MyCadApp, ui: &Ui, response: &egui::Response,
             }) {
                 dialog.base_x = format!("{:.4}", point.x);
                 dialog.base_y = format!("{:.4}", point.y);
+                dialog.just_opened = true;
                 app.block_edit.ui = BlockUi::Create(dialog);
                 app.status = "Base point picked".into();
                 app.last_pointer = ui.input(|i| i.pointer.latest_pos());
@@ -4437,9 +4488,10 @@ fn handle_viewport_input(app: &mut MyCadApp, ui: &Ui, response: &egui::Response,
         }
     }
 
-    let authoring_picks = app.dynamic_authoring.as_ref().is_some_and(|state| {
-        state.pick != AuthoringPick::Idle || state.attach.is_some()
-    });
+    let authoring_picks = app
+        .dynamic_authoring
+        .as_ref()
+        .is_some_and(|state| state.pick != AuthoringPick::Idle || state.attach.is_some());
     if authoring_picks {
         if let Some(world) = app.cursor_world {
             let local = app.block_edit.local_from_world().apply(world);
@@ -4580,6 +4632,7 @@ fn handle_viewport_input(app: &mut MyCadApp, ui: &Ui, response: &egui::Response,
                 }
             } else if let Some(op) = selection_op_for_click(&bindings, button, modifiers) {
                 app.selection.apply_click(hit, op);
+                crate::blocks::reveal_selected_insert(app);
             }
         }
     }
@@ -4697,6 +4750,7 @@ fn update_box_select(
                 app.erase_ids(&drag.candidates, true);
             } else {
                 app.selection.commit_box(&drag.candidates, drag.op);
+                crate::blocks::reveal_selected_insert(app);
             }
         }
     }

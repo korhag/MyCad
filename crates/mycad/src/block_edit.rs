@@ -61,6 +61,15 @@ pub struct CreateBlockDialog {
     pub ids: Vec<EntityId>,
     pub space: EntitySpace,
     pub error: Option<String>,
+    pub just_opened: bool,
+}
+
+impl CreateBlockDialog {
+    pub fn skip_open_frame(&mut self) -> bool {
+        let skip = self.just_opened;
+        self.just_opened = false;
+        skip
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -269,7 +278,8 @@ impl BlockEditSession {
             .cloned()
             .ok_or_else(|| format!("Block '{name}' was not found"))?;
         if let Some(dynamic) = after.dynamic.as_ref() {
-            cad_core::validate_definition(dynamic, &after.entities).map_err(|err| err.to_string())?;
+            cad_core::validate_definition(dynamic, &after.entities)
+                .map_err(|err| err.to_string())?;
         }
         history.collapse_since(mark);
         if let Some(frame) = self.current_mut() {
@@ -544,7 +554,10 @@ pub fn show_save_drawing_dialog(ctx: &egui::Context) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cad_core::{create_block_from_entities, default_extrusion, Entity, Point2, Point3};
+    use cad_core::{
+        create_block_from_entities, default_extrusion, Document, Entity, EntitySpace, Point2,
+        Point3,
+    };
 
     fn line(x0: f64, y0: f64, x1: f64, y1: f64) -> Entity {
         Entity::new(Geometry::Line {
@@ -745,5 +758,22 @@ mod tests {
             &entity.geometry,
             Geometry::Insert { block_name, .. } if block_name == "Motor Drive"
         )));
+    }
+
+    #[test]
+    fn create_dialog_skips_the_opening_frame() {
+        let mut dialog = CreateBlockDialog {
+            name: String::new(),
+            base_x: "0".into(),
+            base_y: "0".into(),
+            replace: true,
+            ids: Vec::new(),
+            space: EntitySpace::ModelSpace,
+            error: None,
+            just_opened: true,
+        };
+        assert!(dialog.skip_open_frame());
+        assert!(!dialog.just_opened);
+        assert!(!dialog.skip_open_frame());
     }
 }

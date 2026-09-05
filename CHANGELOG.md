@@ -5,9 +5,24 @@ All notable changes to MyCad are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project versions with [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Workspace version is `0.24.0` (`Cargo.toml`).
+Workspace version is `0.25.0` (`Cargo.toml`).
 
 ## [Unreleased]
+
+## [0.25.0] - 2026-09-05
+
+### Added
+
+- Clicking a block in the Blocks tree selects its INSERT instances in the drawing, and double-clicking zooms to fit those instances without entering Block Edit.
+- Picking a block in the drawing highlights the matching Blocks-tree row and scrolls it into view.
+
+### Changed
+
+- Hover hints on Blocks-tree names document F2/pencil rename and double-click zoom so rename stays on the tree while Block Edit stays on drawing double-click.
+
+### Fixed
+
+- Create Block, Create a Dynamic Block, and Configure Block no longer close on the same click that opened them from the viewport menu.
 
 ## [0.24.0] - 2026-09-05
 

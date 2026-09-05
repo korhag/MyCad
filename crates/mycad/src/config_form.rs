@@ -86,12 +86,16 @@ pub fn show_configuration_form(
     });
     if !dynamic.presets.is_empty() {
         egui::ComboBox::from_id_salt(format!("{id_salt}-preset"))
-            .selected_text(matched.map(|id| {
-                dynamic
-                    .preset(id)
-                    .map(|preset| preset.name.clone())
-                    .unwrap_or_else(|| "Custom".into())
-            }).unwrap_or_else(|| "Custom".into()))
+            .selected_text(
+                matched
+                    .map(|id| {
+                        dynamic
+                            .preset(id)
+                            .map(|preset| preset.name.clone())
+                            .unwrap_or_else(|| "Custom".into())
+                    })
+                    .unwrap_or_else(|| "Custom".into()),
+            )
             .show_ui(ui, |ui| {
                 if ui.selectable_label(matched.is_none(), "Custom").clicked() {
                     // Keep current values; do not apply a preset.
@@ -196,7 +200,9 @@ pub fn show_configuration_form(
                                         .iter()
                                         .map(|rule| rule_reason(rule, &dynamic.parameters))
                                         .next()
-                                        .unwrap_or_else(|| "Not allowed by a compatibility rule".into()),
+                                        .unwrap_or_else(|| {
+                                            "Not allowed by a compatibility rule".into()
+                                        }),
                                 );
                             }
                             if response.clicked() {
@@ -239,20 +245,24 @@ pub fn show_configuration_form(
                 }
             }
             ParameterKind::Text(text) => {
-                let mut draft = drafts.remove(&parameter.id).unwrap_or_else(|| {
-                    match &current_value {
-                        ParameterValue::Text(value) if !mixed.contains(&parameter.id) => {
-                            value.clone()
-                        }
-                        _ => String::new(),
-                    }
-                });
+                let mut draft =
+                    drafts
+                        .remove(&parameter.id)
+                        .unwrap_or_else(|| match &current_value {
+                            ParameterValue::Text(value) if !mixed.contains(&parameter.id) => {
+                                value.clone()
+                            }
+                            _ => String::new(),
+                        });
                 let response = if text.multiline {
                     ui.text_edit_multiline(&mut draft)
                 } else {
                     ui.text_edit_singleline(&mut draft)
                 };
-                if response.lost_focus() || (response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && !text.multiline)
+                if response.lost_focus()
+                    || (response.has_focus()
+                        && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                        && !text.multiline)
                 {
                     propose(
                         dynamic,
