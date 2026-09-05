@@ -75,24 +75,68 @@ pub fn ellipse_points(
     extrusion: Point3,
     segments: usize,
 ) -> Vec<Point2> {
+    ellipse_arc_points(
+        center,
+        major_axis,
+        axis_ratio,
+        start_param,
+        end_param,
+        true,
+        extrusion,
+        segments,
+    )
+}
+
+// ------------------------------------------------------------
+// Function: ellipse_arc_points
+// Purpose: Sample an elliptic arc in the same parameter space as
+//          DXF ELLIPSE / HATCH ellipse edges. `ccw` selects the
+//          short increasing-parameter sweep versus the opposite
+//          clockwise sweep. ELLIPSE entities are WCS; hatch edges
+//          should be sampled in OCS then mapped with `ocs_to_wcs`.
+// ------------------------------------------------------------
+pub fn ellipse_arc_points(
+    center: Point3,
+    major_axis: Point3,
+    axis_ratio: f64,
+    start_param: f64,
+    end_param: f64,
+    ccw: bool,
+    extrusion: Point3,
+    segments: usize,
+) -> Vec<Point2> {
     let major_len = major_axis.length().max(1e-15);
     let major_dir = major_axis.normalized();
     let minor_dir = extrusion.normalized().cross(major_dir).normalized();
     let minor_len = major_len * axis_ratio.abs().max(1e-15);
-    let mut sweep = end_param - start_param;
+    let mut sweep = if ccw {
+        end_param - start_param
+    } else {
+        start_param - end_param
+    };
     if sweep.abs() < 1e-15 {
         sweep = std::f64::consts::TAU;
     }
     while sweep <= 0.0 {
         sweep += std::f64::consts::TAU;
     }
+    while sweep > std::f64::consts::TAU + 1e-12 {
+        sweep -= std::f64::consts::TAU;
+    }
     let n = ((segments as f64) * (sweep / std::f64::consts::TAU))
         .ceil()
         .max(2.0) as usize;
     let mut pts = Vec::with_capacity(n + 1);
     for i in 0..=n {
-        let t = start_param + sweep * (i as f64 / n as f64);
-        let p = center + major_dir * (major_len * t.cos()) + minor_dir * (minor_len * t.sin());
+        let t = i as f64 / n as f64;
+        let param = if ccw {
+            start_param + sweep * t
+        } else {
+            start_param - sweep * t
+        };
+        let p = center
+            + major_dir * (major_len * param.cos())
+            + minor_dir * (minor_len * param.sin());
         // ELLIPSE center and major axis are already WCS; only project to XY.
         pts.push(p.xy());
     }
