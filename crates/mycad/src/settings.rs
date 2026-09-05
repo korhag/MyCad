@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use crate::drafting::DraftingPreferences;
 use crate::input::InputMap;
 use crate::workspace::{
-    decode_dock_layout, default_dock_state, encode_dock_layout, migrate_home_tab,
-    recover_home_split_once, sanitize_dock_state, WorkspaceTab,
+    decode_dock_layout, default_dock_state, encode_dock_layout, migrate_blocks_tab,
+    migrate_home_tab, recover_home_split_once, sanitize_dock_state, WorkspaceTab,
 };
 
 pub const STORAGE_KEY: &str = "mycad_settings";
@@ -115,6 +115,8 @@ pub struct AppSettings {
     #[serde(default)]
     pub home_layout_migrated: bool,
     #[serde(default)]
+    pub blocks_tab_migrated: bool,
+    #[serde(default)]
     pub responsive_ribbon_recovered: bool,
     #[serde(default)]
     pub compact_home_height_applied: bool,
@@ -129,6 +131,7 @@ impl Default for AppSettings {
             display: DisplaySettings::default(),
             drafting: DraftingPreferences::default(),
             home_layout_migrated: false,
+            blocks_tab_migrated: false,
             responsive_ribbon_recovered: false,
             compact_home_height_applied: false,
         }
@@ -155,6 +158,7 @@ impl AppSettings {
         self.bindings.sanitize();
         let mut state = decode_dock_layout(self.dock_layout.as_ref());
         self.home_layout_migrated = migrate_home_tab(&mut state, self.home_layout_migrated);
+        self.blocks_tab_migrated = migrate_blocks_tab(&mut state, self.blocks_tab_migrated);
         self.responsive_ribbon_recovered =
             recover_home_split_once(&mut state, self.responsive_ribbon_recovered);
         self.dock_layout = Some(encode_dock_layout(&state));
@@ -494,5 +498,51 @@ mod tests {
             "users can still close Home after the one-time migration"
         );
         assert!(settings.home_layout_migrated);
+    }
+
+    #[test]
+    fn old_layout_gains_blocks_beside_properties_once() {
+        let mut old = egui_dock::DockState::new(vec![WorkspaceTab::Viewport]);
+        let [viewport, _home] = old.main_surface_mut().split_above(
+            egui_dock::NodeIndex::root(),
+            crate::workspace::home_split_fraction(800.0),
+            vec![WorkspaceTab::Home],
+        );
+        let [viewport, _props] =
+            old.main_surface_mut()
+                .split_left(viewport, 0.24, vec![WorkspaceTab::Properties]);
+        let _ = old
+            .main_surface_mut()
+            .split_right(viewport, 0.76, vec![WorkspaceTab::Diagnostics]);
+        let mut settings = AppSettings {
+            dock_layout: Some(encode_dock_layout(&old)),
+            home_layout_migrated: true,
+            blocks_tab_migrated: false,
+            ..AppSettings::default()
+        };
+        settings.sanitize();
+        assert!(settings.blocks_tab_migrated);
+        let state = settings.dock_state();
+        let (p_surface, p_node, _) = state
+            .find_tab(&WorkspaceTab::Properties)
+            .expect("Properties");
+        let (b_surface, b_node, _) = state.find_tab(&WorkspaceTab::Blocks).expect("Blocks");
+        assert_eq!(p_surface, b_surface);
+        assert_eq!(p_node, b_node);
+
+        let mut closed = settings.dock_state();
+        if let Some(tab) = closed.find_tab(&WorkspaceTab::Blocks) {
+            closed.remove_tab(tab);
+        }
+        settings.set_dock_state(&closed);
+        settings.sanitize();
+        assert!(
+            settings
+                .dock_state()
+                .find_tab(&WorkspaceTab::Blocks)
+                .is_none(),
+            "users can still close Blocks after the one-time migration"
+        );
+        assert!(settings.blocks_tab_migrated);
     }
 }

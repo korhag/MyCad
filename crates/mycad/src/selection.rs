@@ -1,4 +1,4 @@
-//! Top-level entity selection scoped to the loaded document.
+//! Entity selection for model space and in-place block editing.
 
 use std::collections::HashSet;
 
@@ -19,7 +19,8 @@ pub enum SelectionOp {
 
 // ------------------------------------------------------------
 // Type: Selection
-// Purpose: Ordered set of top-level model-space entity IDs.
+// Purpose: Ordered set of selected entity IDs, including active block
+//          members and gray reference objects during Block Edit.
 // ------------------------------------------------------------
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Selection {

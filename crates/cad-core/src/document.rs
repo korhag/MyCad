@@ -30,11 +30,48 @@ impl Layer {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BlockDefinition {
     pub name: String,
     pub base_pt: Point3,
     pub entities: Vec<Entity>,
+}
+
+// ------------------------------------------------------------
+// Enum: EntitySpace
+// Purpose: Editable container for entities: model space or a named block.
+// ------------------------------------------------------------
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum EntitySpace {
+    ModelSpace,
+    Block(String),
+}
+
+impl EntitySpace {
+    pub fn is_model(&self) -> bool {
+        matches!(self, Self::ModelSpace)
+    }
+
+    pub fn block_name(&self) -> Option<&str> {
+        match self {
+            Self::ModelSpace => None,
+            Self::Block(name) => Some(name.as_str()),
+        }
+    }
+
+    pub fn label(&self) -> String {
+        match self {
+            Self::ModelSpace => "Model".into(),
+            Self::Block(name) => name.clone(),
+        }
+    }
+
+    pub fn same_block(&self, name: &str) -> bool {
+        match self {
+            Self::ModelSpace => false,
+            Self::Block(existing) => existing.eq_ignore_ascii_case(name),
+        }
+    }
 }
 
 // ------------------------------------------------------------
@@ -289,45 +326,188 @@ impl Document {
         entity
     }
 
-    pub fn insert_model_entity(&mut self, index: usize, mut entity: Entity) -> Entity {
+    pub fn insert_model_entity(&mut self, index: usize, entity: Entity) -> Entity {
+        self.insert_entity(&EntitySpace::ModelSpace, index, entity)
+            .expect("model space is always present")
+    }
+
+    pub fn add_entity(&mut self, entity: Entity) -> Entity {
+        self.add_entity_to(&EntitySpace::ModelSpace, entity)
+            .expect("model space is always present")
+    }
+
+    pub fn remove_model_entity(&mut self, id: EntityId) -> Option<(usize, Entity)> {
+        self.remove_entity_from(&EntitySpace::ModelSpace, id)
+    }
+
+    pub fn replace_model_entity(&mut self, id: EntityId, entity: Entity) -> Option<Entity> {
+        self.replace_entity_in(&EntitySpace::ModelSpace, id, entity)
+    }
+
+    pub fn entities(&self, space: &EntitySpace) -> Option<&[Entity]> {
+        match space {
+            EntitySpace::ModelSpace => Some(&self.model_space),
+            EntitySpace::Block(name) => self
+                .block_by_name(name)
+                .map(|block| block.entities.as_slice()),
+        }
+    }
+
+    pub fn entities_mut(&mut self, space: &EntitySpace) -> Option<&mut Vec<Entity>> {
+        match space {
+            EntitySpace::ModelSpace => Some(&mut self.model_space),
+            EntitySpace::Block(name) => {
+                let key = self.block_key(name)?;
+                self.blocks.get_mut(&key).map(|block| &mut block.entities)
+            }
+        }
+    }
+
+    pub fn insert_entity(
+        &mut self,
+        space: &EntitySpace,
+        index: usize,
+        mut entity: Entity,
+    ) -> Option<Entity> {
         if entity.id.is_assigned() {
             self.next_entity_id = self.next_entity_id.max(entity.id.raw() + 1);
         } else {
             entity.id = self.allocate_id();
         }
-        let index = index.min(self.model_space.len());
-        self.model_space.insert(index, entity.clone());
-        entity
+        let entities = self.entities_mut(space)?;
+        let index = index.min(entities.len());
+        entities.insert(index, entity.clone());
+        Some(entity)
     }
 
-    pub fn add_entity(&mut self, entity: Entity) -> Entity {
-        let index = self.model_space.len();
-        self.insert_model_entity(index, entity)
+    pub fn add_entity_to(&mut self, space: &EntitySpace, entity: Entity) -> Option<Entity> {
+        let index = self.entities(space)?.len();
+        self.insert_entity(space, index, entity)
     }
 
-    pub fn remove_model_entity(&mut self, id: EntityId) -> Option<(usize, Entity)> {
-        let index = self.model_space.iter().position(|entity| entity.id == id)?;
-        let entity = self.model_space.remove(index);
+    pub fn remove_entity_from(
+        &mut self,
+        space: &EntitySpace,
+        id: EntityId,
+    ) -> Option<(usize, Entity)> {
+        let index = self.entity_index_in(space, id)?;
+        let entity = self.entities_mut(space)?.remove(index);
         Some((index, entity))
     }
 
-    pub fn replace_model_entity(&mut self, id: EntityId, mut entity: Entity) -> Option<Entity> {
-        let index = self
-            .model_space
-            .iter()
-            .position(|existing| existing.id == id)?;
+    pub fn replace_entity_in(
+        &mut self,
+        space: &EntitySpace,
+        id: EntityId,
+        mut entity: Entity,
+    ) -> Option<Entity> {
+        let index = self.entity_index_in(space, id)?;
         if !entity.id.is_assigned() {
             entity.id = id;
         }
-        Some(std::mem::replace(&mut self.model_space[index], entity))
+        Some(std::mem::replace(
+            &mut self.entities_mut(space)?[index],
+            entity,
+        ))
+    }
+
+    pub fn entity_by_id_in(&self, space: &EntitySpace, id: EntityId) -> Option<&Entity> {
+        self.entities(space)?.iter().find(|entity| entity.id == id)
+    }
+
+    pub fn entity_index_in(&self, space: &EntitySpace, id: EntityId) -> Option<usize> {
+        self.entities(space)?
+            .iter()
+            .position(|entity| entity.id == id)
+    }
+
+    pub fn find_entity_location(&self, id: EntityId) -> Option<(EntitySpace, usize)> {
+        if let Some(index) = self.entity_index_in(&EntitySpace::ModelSpace, id) {
+            return Some((EntitySpace::ModelSpace, index));
+        }
+        for name in self.blocks.keys() {
+            let space = EntitySpace::Block(name.clone());
+            if let Some(index) = self.entity_index_in(&space, id) {
+                return Some((space, index));
+            }
+        }
+        None
     }
 
     pub fn entity_by_id(&self, id: EntityId) -> Option<&Entity> {
-        self.model_space.iter().find(|entity| entity.id == id)
+        let (space, _) = self.find_entity_location(id)?;
+        self.entity_by_id_in(&space, id)
     }
 
     pub fn entity_index(&self, id: EntityId) -> Option<usize> {
-        self.model_space.iter().position(|entity| entity.id == id)
+        self.entity_index_in(&EntitySpace::ModelSpace, id)
+    }
+
+    pub fn block_key(&self, name: &str) -> Option<String> {
+        if self.blocks.contains_key(name) {
+            return Some(name.to_string());
+        }
+        self.blocks
+            .keys()
+            .find(|key| key.eq_ignore_ascii_case(name))
+            .cloned()
+    }
+
+    pub fn block_by_name(&self, name: &str) -> Option<&BlockDefinition> {
+        let key = self.block_key(name)?;
+        self.blocks.get(&key)
+    }
+
+    pub fn block_by_name_mut(&mut self, name: &str) -> Option<&mut BlockDefinition> {
+        let key = self.block_key(name)?;
+        self.blocks.get_mut(&key)
+    }
+
+    pub fn replace_block_definition(
+        &mut self,
+        definition: BlockDefinition,
+    ) -> Option<BlockDefinition> {
+        if let Some(key) = self.block_key(&definition.name) {
+            if key != definition.name {
+                let previous = self.blocks.remove(&key);
+                self.blocks.insert(definition.name.clone(), definition);
+                return previous;
+            }
+        }
+        self.blocks.insert(definition.name.clone(), definition)
+    }
+
+    pub fn remove_block_definition(&mut self, name: &str) -> Option<BlockDefinition> {
+        let key = self.block_key(name)?;
+        self.blocks.remove(&key)
+    }
+
+    pub fn entity_world_extents(&self, entity: &Entity, transform: Transform2) -> Option<Extents2> {
+        let mut extents = Extents2::empty();
+        let mut any = false;
+        let mut stack = Vec::new();
+        collect_entity_points(self, entity, transform, &mut stack, &mut |p| {
+            if p.is_finite() {
+                extents.include(p);
+                any = true;
+            }
+        });
+        any.then_some(extents)
+    }
+
+    pub fn entities_extents(&self, space: &EntitySpace, ids: &[EntityId]) -> Option<Extents2> {
+        let mut extents = Extents2::empty();
+        let mut any = false;
+        for id in ids {
+            let Some(entity) = self.entity_by_id_in(space, *id) else {
+                continue;
+            };
+            if let Some(extra) = self.entity_world_extents(entity, Transform2::identity()) {
+                extents.union(extra);
+                any = true;
+            }
+        }
+        any.then_some(extents)
     }
 
     pub fn layer_can_be_current(&self, name: &str) -> bool {

@@ -199,6 +199,29 @@ impl Transform2 {
             ty: (self.m10 * self.tx - self.m00 * self.ty) / det,
         })
     }
+
+    pub fn compose(self, inner: Self) -> Self {
+        self.then(inner)
+    }
+
+    pub fn inverse(self) -> Option<Self> {
+        self.try_inverse()
+    }
+
+    pub fn transform_point(self, p: Point2) -> Point2 {
+        self.apply(p)
+    }
+
+    pub fn transform_vector(self, v: Point2) -> Point2 {
+        self.apply_vector(v)
+    }
+
+    pub fn is_translation(self) -> bool {
+        (self.m00 - 1.0).abs() <= crate::geom::GEOM_TOLERANCE
+            && self.m01.abs() <= crate::geom::GEOM_TOLERANCE
+            && self.m10.abs() <= crate::geom::GEOM_TOLERANCE
+            && (self.m11 - 1.0).abs() <= crate::geom::GEOM_TOLERANCE
+    }
 }
 
 impl Default for Transform2 {

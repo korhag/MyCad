@@ -175,6 +175,7 @@ pub fn merge_vertex_ranges(ranges: &mut Vec<std::ops::Range<u32>>) {
 struct TessSink<'a> {
     list: &'a mut DisplayList,
     pick: Option<&'a mut EntityPick>,
+    dim: bool,
 }
 
 impl VectorSink for TessSink<'_> {
@@ -191,6 +192,11 @@ impl VectorSink for TessSink<'_> {
         if let Some(pick) = self.pick.as_mut() {
             pick.add_stroke(pick_pts, closed);
         }
+        let rgb = if self.dim {
+            rgb.dim_for_block_context()
+        } else {
+            rgb
+        };
         if linetype.is_continuous() {
             emit_solid_polyline(self.list, pick_pts, closed, rgb);
             return;
@@ -205,6 +211,11 @@ impl VectorSink for TessSink<'_> {
         if let Some(pick) = self.pick.as_mut() {
             pick.add_fill(pts);
         }
+        let rgb = if self.dim {
+            rgb.dim_for_block_context()
+        } else {
+            rgb
+        };
         emit_fan(self.list, pts, rgb);
     }
 }
@@ -238,6 +249,184 @@ pub fn tessellate_document(document: &Document) -> DisplayList {
     list
 }
 
+// ------------------------------------------------------------
+// Type: BlockEditView
+// Purpose: Nested INSERT path currently being edited in place.
+// ------------------------------------------------------------
+#[derive(Debug, Clone)]
+pub struct BlockEditViewFrame {
+    pub instance_id: EntityId,
+    pub block_name: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct BlockEditView {
+    pub frames: Vec<BlockEditViewFrame>,
+}
+
+pub fn tessellate_document_for_block_edit(
+    document: &Document,
+    view: &BlockEditView,
+) -> DisplayList {
+    let origin = document
+        .diagnostics
+        .extents
+        .or_else(|| document.compute_extents())
+        .map(|e| e.center())
+        .unwrap_or(Point2::new(0.0, 0.0));
+    let mut list = DisplayList {
+        origin,
+        line_vertices: Vec::with_capacity(64 * 1024),
+        triangle_vertices: Vec::new(),
+        picks: Vec::with_capacity(document.model_space.len() + 16),
+        draw_ranges: Vec::with_capacity(document.model_space.len() + 16),
+        pick_of: HashMap::with_capacity(document.model_space.len() + 16),
+        spatial: SpatialIndex::empty(),
+    };
+    let mut stack = Vec::new();
+    emit_block_edit_space(
+        document,
+        &document.model_space,
+        Transform2::identity(),
+        0,
+        view,
+        &mut list,
+        &mut stack,
+    );
+    list.spatial = SpatialIndex::build(
+        list.picks
+            .iter()
+            .enumerate()
+            .map(|(slot, pick)| (slot as u32, pick.bounds)),
+    );
+    list
+}
+
+fn emit_block_edit_space(
+    document: &Document,
+    entities: &[cad_core::Entity],
+    transform: Transform2,
+    depth: usize,
+    view: &BlockEditView,
+    list: &mut DisplayList,
+    stack: &mut Vec<String>,
+) {
+    let next = view.frames.get(depth);
+    for entity in entities {
+        if next.is_some_and(|frame| entity.id == frame.instance_id) {
+            if let cad_core::Geometry::Insert {
+                block_name,
+                insertion,
+                scale,
+                rotation,
+                extrusion,
+                column_count,
+                row_count,
+                column_spacing,
+                row_spacing,
+                ..
+            } = &entity.geometry
+            {
+                if stack.iter().any(|n| n.eq_ignore_ascii_case(block_name)) {
+                    continue;
+                }
+                let Some(block) = document.block_by_name(block_name) else {
+                    continue;
+                };
+                stack.push(block_name.clone());
+                let local = Transform2::block_insert(
+                    *insertion,
+                    *scale,
+                    *rotation,
+                    *extrusion,
+                    block.base_pt,
+                );
+                let nested = transform.then(local);
+                let cols = (*column_count).max(1);
+                let rows = (*row_count).max(1);
+                for col in 0..cols {
+                    for row in 0..rows {
+                        let extra = Transform2::translate(
+                            col as f64 * *column_spacing,
+                            row as f64 * *row_spacing,
+                        );
+                        let instance = nested.then(extra);
+                        if depth + 1 == view.frames.len() {
+                            for child in &block.entities {
+                                emit_pickable_entity(
+                                    document, child, instance, child.id, false, list, stack,
+                                );
+                            }
+                        } else {
+                            emit_block_edit_space(
+                                document,
+                                &block.entities,
+                                instance,
+                                depth + 1,
+                                view,
+                                list,
+                                stack,
+                            );
+                        }
+                    }
+                }
+                stack.pop();
+                continue;
+            }
+        }
+        let dim = true;
+        emit_pickable_entity(document, entity, transform, entity.id, dim, list, stack);
+    }
+}
+
+fn emit_pickable_entity(
+    document: &Document,
+    entity: &cad_core::Entity,
+    transform: Transform2,
+    pick_id: EntityId,
+    dim: bool,
+    list: &mut DisplayList,
+    stack: &mut Vec<String>,
+) {
+    let pick_id = if pick_id.is_assigned() {
+        pick_id
+    } else {
+        EntityId(list.picks.len() as u64 + 1)
+    };
+    let line_start = list.line_vertices.len() as u32;
+    let fill_start = list.triangle_vertices.len() as u32;
+    let mut pick = EntityPick::new(pick_id);
+    {
+        let mut sink = TessSink {
+            list,
+            pick: Some(&mut pick),
+            dim,
+        };
+        vectorize_entity(
+            document,
+            entity,
+            transform,
+            CadColor::Aci(7),
+            "CONTINUOUS",
+            stack,
+            VectorVisibility::Viewport,
+            &mut sink,
+        );
+    }
+    if pick.is_empty() {
+        return;
+    }
+    pick.finalize();
+    list.pick_of.insert(pick_id, list.picks.len() as u32);
+    list.picks.push(pick);
+    list.draw_ranges.push(EntityDrawRange {
+        line_start,
+        line_end: list.line_vertices.len() as u32,
+        fill_start,
+        fill_end: list.triangle_vertices.len() as u32,
+    });
+}
+
 fn emit_top_level_entity(
     document: &Document,
     entity: &Entity,
@@ -257,6 +446,7 @@ fn emit_top_level_entity(
         let mut sink = TessSink {
             list,
             pick: Some(&mut pick),
+            dim: false,
         };
         vectorize_entity(
             document,

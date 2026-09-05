@@ -12,8 +12,9 @@ pub use pick::{
     SelectBoxMode, SpatialIndex, DEFAULT_PICK_TOLERANCE_PX,
 };
 pub use tessellate::{
-    merge_vertex_ranges, overlay_batches, tessellate_document, AppendedGeometry, DisplayList,
-    EntityDrawRange, GpuVertex, OverlayBatches,
+    merge_vertex_ranges, overlay_batches, tessellate_document, tessellate_document_for_block_edit,
+    AppendedGeometry, BlockEditView, BlockEditViewFrame, DisplayList, EntityDrawRange, GpuVertex,
+    OverlayBatches,
 };
 
 #[cfg(test)]

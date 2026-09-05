@@ -9,28 +9,52 @@ use cad_core::{
 use eframe::egui::{self, RichText, Ui};
 
 use crate::app::MyCadApp;
+use crate::block_edit::insert_is_editable;
 
-pub fn show(ui: &mut Ui, app: &MyCadApp) {
+pub fn show(ui: &mut Ui, app: &mut MyCadApp) {
     ui.heading("Properties");
     ui.separator();
-    let Some(document) = app.document.as_ref() else {
-        ui.weak("Open a drawing, then click an entity.");
-        return;
-    };
-    let selection = app.selection.ids();
-    if selection.is_empty() {
-        ui.weak("Click a line, circle, polyline, or block.");
-        ui.add_space(8.0);
-        ui.weak("Esc clears the selection.");
-        return;
-    }
-    if selection.len() == 1 {
-        if let Some(entity) = document.entity_by_id(selection[0]) {
-            show_single(ui, document, entity);
+    let edit_block = {
+        let Some(document) = app.document.as_ref() else {
+            ui.weak("Open a drawing, then click an entity.");
+            return;
+        };
+        let selection = app.selection.ids();
+        if selection.is_empty() {
+            ui.weak("Click a line, circle, polyline, or block.");
+            ui.add_space(8.0);
+            ui.weak("Esc clears the selection.");
             return;
         }
+        let edit_block = if selection.len() == 1 {
+            document.entity_by_id(selection[0]).and_then(|entity| {
+                if insert_is_editable(entity) {
+                    match &entity.geometry {
+                        Geometry::Insert { block_name, .. } => Some(block_name.clone()),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        };
+        if selection.len() == 1 {
+            if let Some(entity) = document.entity_by_id(selection[0]) {
+                show_single(ui, document, entity);
+            }
+        } else {
+            show_multiple(ui, document, selection);
+        }
+        edit_block
+    };
+    if let Some(name) = edit_block {
+        ui.add_space(8.0);
+        if ui.button("Edit Block").clicked() {
+            app.edit_named_block(&name);
+        }
     }
-    show_multiple(ui, document, selection);
 }
 
 fn show_single(ui: &mut Ui, document: &Document, entity: &Entity) {
@@ -197,6 +221,14 @@ fn geometry_rows(ui: &mut Ui, document: &Document, geometry: &Geometry) {
             ..
         } => {
             kv(ui, "Block", block_name.clone());
+            kv(
+                ui,
+                "References",
+                document
+                    .block_by_name(block_name)
+                    .map(|_| cad_core::count_block_references(document, block_name).to_string())
+                    .unwrap_or_else(|| "missing".into()),
+            );
             kv(ui, "Insertion", point_label(*insertion));
             kv(ui, "Scale", format!("{:.4}, {:.4}", scale.x, scale.y));
             kv(ui, "Rotation", format_angle_deg(*rotation));

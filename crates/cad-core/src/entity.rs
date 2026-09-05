@@ -27,7 +27,7 @@ impl EntityId {
 // Type: Entity
 // Purpose: One drawable object in the native document model.
 // ------------------------------------------------------------
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Entity {
     pub id: EntityId,
     pub layer: String,
@@ -52,7 +52,7 @@ impl Entity {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Geometry {
     Line {
         start: Point3,
@@ -164,7 +164,7 @@ pub struct PolyVertex {
     pub bulge: f64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TextData {
     pub insertion: Point3,
     pub height: f64,
@@ -174,7 +174,7 @@ pub struct TextData {
     pub is_attrib_def: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MTextData {
     pub insertion: Point3,
     pub height: f64,
@@ -184,7 +184,7 @@ pub struct MTextData {
     pub extrusion: Point3,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct HatchData {
     pub extrusion: Point3,
     pub elevation: f64,
@@ -193,7 +193,7 @@ pub struct HatchData {
     pub pattern_lines: Vec<HatchPatternLine>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum HatchPath {
     Polyline {
         vertices: Vec<PolyVertex>,
@@ -202,7 +202,7 @@ pub enum HatchPath {
     Edges(Vec<HatchEdge>),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum HatchEdge {
     Line {
         start: Point3,
@@ -228,7 +228,7 @@ pub enum HatchEdge {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct HatchPatternLine {
     pub angle: f64,
     pub base: Point3,

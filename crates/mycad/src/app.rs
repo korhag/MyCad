@@ -7,22 +7,31 @@ use std::thread;
 use std::time::Instant;
 
 use cad_core::{
-    reference_radius, transform_entity, validate_entities, Document, Entity, EntityTransform,
-    Extents2, Geometry, MeasureIndex, MeasureRole, MeasurementResult, Point2, SnapFeature,
-    SnapIndex, Transform2, TransformError, GEOM_TOLERANCE,
+    create_block_from_entities, duplicate_block_definition, identity_insert, insert_instance_ids,
+    make_unique_block, membership_matrix, purge_unused_user_blocks, reference_radius,
+    transfer_entity, transform_entity_matrix, transform_geometry, validate_block_rename,
+    validate_entities, would_create_block_cycle, BlockTreeIndex, Document, Entity, EntityId,
+    EntitySpace, EntityTransform, Extents2, Geometry, MeasureIndex, MeasureRole, MeasurementResult,
+    Point2, Point3, SnapFeature, SnapIndex, Transform2, TransformError, GEOM_TOLERANCE,
 };
 use cad_io::{
     export_pdf, write_dxf, CadFileFormat, DxfExportOptions, PdfExportOptions, PdfOrientation,
     PdfPaperSize, PdfPlotArea, PdfPlotStyle, SaveReport, PDF_MARGIN_MM, PDF_STROKE_WEIGHTS,
 };
 use cad_render::{
-    tessellate_document, CadFrame, CadGpu, DisplayList, GpuUpload, OverlayBatches, SelectBoxMode,
+    tessellate_document, tessellate_document_for_block_edit, CadFrame, CadGpu, DisplayList,
+    GpuUpload, OverlayBatches, SelectBoxMode,
 };
 use cad_viewport::Camera2;
 use dwg_import::{write_dwg, DwgWriteError, ExportError as DwgExportError, ImportError};
 use eframe::egui::{self, PointerButton, Rect, Ui};
 use egui_phosphor::regular::FLOPPY_DISK;
 
+use crate::block_edit::{
+    self, insert_is_editable, BlockEditSession, BlockUi, CreateBlockDialog, CreateDialogResult,
+    LeaveChoice, LeaveIntent, ToolbarAction,
+};
+use crate::blocks::BlocksPanel;
 use crate::commands::{
     AngleState, AreaState, CommandKind, CommandOutput, CommandState, ModifyKind,
 };
@@ -164,7 +173,7 @@ pub struct MyCadApp {
     measure_card_hovered: bool,
     viewport_height: f64,
     cursor_world: Option<Point2>,
-    input_consumed_escape: bool,
+    pub(crate) input_consumed_escape: bool,
     pending_open: Option<PathBuf>,
     pending_discard: Option<PendingDiscard>,
     pending_lossy_save: bool,
@@ -174,6 +183,9 @@ pub struct MyCadApp {
     last_pointer: Option<egui::Pos2>,
     box_select: Option<BoxSelectDrag>,
     command_snaps: Vec<SnapFeature>,
+    pub(crate) block_edit: BlockEditSession,
+    pub(crate) blocks_panel: BlocksPanel,
+    pub(crate) block_tree: BlockTreeIndex,
 }
 
 impl MyCadApp {
@@ -237,6 +249,9 @@ impl MyCadApp {
             last_pointer: None,
             box_select: None,
             command_snaps: Vec::new(),
+            block_edit: BlockEditSession::default(),
+            blocks_panel: BlocksPanel::default(),
+            block_tree: BlockTreeIndex::default(),
         }
     }
 
@@ -245,14 +260,6 @@ impl MyCadApp {
         let mut app = Self::from_settings(AppSettings::default(), None);
         workspace::sanitize_dock_state(&mut app.dock_state);
         app
-    }
-
-    fn start_load(&mut self, path: PathBuf) {
-        if self.is_dirty() {
-            self.pending_discard = Some(PendingDiscard::Open(path));
-            return;
-        }
-        self.start_load_now(path);
     }
 
     fn start_load_now(&mut self, path: PathBuf) {
@@ -268,6 +275,7 @@ impl MyCadApp {
         self.dynamic_input.set_layout(DynamicLayout::Hidden);
         self.context_menu = None;
         self.drafting.clear_acquisition();
+        self.block_edit.clear();
         self.history.commit_open();
         self.loading_path = Some(path.clone());
         self.status = format!("Loading {}…", file_name(&path));
@@ -337,6 +345,7 @@ impl MyCadApp {
                 self.history.clear();
                 self.source_written_by_mycad = false;
                 self.document = Some(document);
+                self.rebuild_block_tree();
                 self.display = Arc::new(display);
                 self.snaps = Arc::new(*snaps);
                 self.measures = Arc::new(*measures);
@@ -371,6 +380,9 @@ impl MyCadApp {
     }
 
     fn open_dialog(&mut self) {
+        if !self.close_block_edit_for_document_action(LeaveIntent::OpenDrawing) {
+            return;
+        }
         if self.is_dirty() {
             self.pending_discard = Some(PendingDiscard::OpenDialog);
             return;
@@ -378,9 +390,45 @@ impl MyCadApp {
         self.open_dialog_now();
     }
 
+    fn start_load(&mut self, path: PathBuf) {
+        if !self.close_block_edit_for_document_action(LeaveIntent::OpenDrawing) {
+            self.pending_open = Some(path);
+            return;
+        }
+        if self.is_dirty() {
+            self.pending_discard = Some(PendingDiscard::Open(path));
+            return;
+        }
+        self.start_load_now(path);
+    }
+
+    fn close_block_edit_for_document_action(&mut self, intent: LeaveIntent) -> bool {
+        while self.block_edit.is_active() {
+            if self.block_edit.current_is_dirty() {
+                self.block_edit.ui = BlockUi::LeaveDirty {
+                    name: self
+                        .block_edit
+                        .current()
+                        .map(|frame| frame.block_name.clone())
+                        .unwrap_or_default(),
+                    intent,
+                };
+                return false;
+            }
+            self.block_edit.pop();
+            self.selection.clear();
+            self.refresh_derived();
+        }
+        true
+    }
+
     fn save_drawing(&mut self) -> bool {
         if self.document.is_none() {
             self.status = "No drawing is open".into();
+            return false;
+        }
+        if self.block_edit.current_is_dirty() {
+            self.block_edit.ui = BlockUi::SaveDrawing;
             return false;
         }
         if self.request_lossy_save_warning() {
@@ -401,6 +449,10 @@ impl MyCadApp {
     fn save_as_drawing(&mut self) -> bool {
         if self.document.is_none() {
             self.status = "No drawing is open".into();
+            return false;
+        }
+        if self.block_edit.current_is_dirty() {
+            self.block_edit.ui = BlockUi::SaveDrawing;
             return false;
         }
         if self.request_lossy_save_warning() {
@@ -877,13 +929,35 @@ impl MyCadApp {
         self.dynamic_input.set_layout(DynamicLayout::Hidden);
         self.context_menu = None;
         self.drafting.clear_acquisition();
-        let Some(document) = self.document.as_mut() else {
-            return;
+        let (undone, rename_only, rename_edits) = {
+            let Some(document) = self.document.as_mut() else {
+                return;
+            };
+            let peek = self.history.peek_undo();
+            let rename_only = peek.is_some_and(|tx| tx.is_rename_only());
+            let rename_edits = peek.map(|tx| tx.rename_edits()).unwrap_or_default();
+            let undone = if self.block_edit.is_active() {
+                self.history
+                    .undo_beyond(document, self.block_edit.undo_mark())
+            } else {
+                self.history.undo(document)
+            };
+            (undone, rename_only, rename_edits)
         };
-        if self.history.undo(document) {
-            self.refresh_derived();
-            self.status = "Undo".into();
+        if !undone {
+            return;
         }
+        if let Some(document) = self.document.as_ref() {
+            self.block_edit.refresh_dirty(document);
+        }
+        if rename_only {
+            for (before, after) in rename_edits.into_iter().rev() {
+                self.sync_after_block_rename(&after, &before);
+            }
+        } else {
+            self.refresh_derived();
+        }
+        self.status = "Undo".into();
     }
 
     pub(crate) fn redo(&mut self) {
@@ -893,13 +967,30 @@ impl MyCadApp {
         self.dynamic_input.set_layout(DynamicLayout::Hidden);
         self.context_menu = None;
         self.drafting.clear_acquisition();
-        let Some(document) = self.document.as_mut() else {
-            return;
+        let (redone, rename_only, rename_edits) = {
+            let Some(document) = self.document.as_mut() else {
+                return;
+            };
+            let peek = self.history.peek_redo();
+            let rename_only = peek.is_some_and(|tx| tx.is_rename_only());
+            let rename_edits = peek.map(|tx| tx.rename_edits()).unwrap_or_default();
+            let redone = self.history.redo(document);
+            (redone, rename_only, rename_edits)
         };
-        if self.history.redo(document) {
-            self.refresh_derived();
-            self.status = "Redo".into();
+        if !redone {
+            return;
         }
+        if let Some(document) = self.document.as_ref() {
+            self.block_edit.refresh_dirty(document);
+        }
+        if rename_only {
+            for (before, after) in rename_edits {
+                self.sync_after_block_rename(&before, &after);
+            }
+        } else {
+            self.refresh_derived();
+        }
+        self.status = "Redo".into();
     }
 
     pub(crate) fn set_current_layer(&mut self, name: &str) {
@@ -928,6 +1019,7 @@ impl MyCadApp {
     }
 
     fn refresh_derived(&mut self) {
+        self.rebuild_block_tree();
         let Some(document) = self.document.as_mut() else {
             self.display = Arc::new(DisplayList::default());
             self.snaps = Arc::new(SnapIndex::default());
@@ -939,7 +1031,11 @@ impl MyCadApp {
             return;
         };
         document.diagnostics.extents = document.compute_extents();
-        self.display = Arc::new(tessellate_document(document));
+        self.display = Arc::new(if let Some(view) = self.block_edit.tess_view() {
+            tessellate_document_for_block_edit(document, &view)
+        } else {
+            tessellate_document(document)
+        });
         self.snaps = Arc::new(SnapIndex::build(document));
         self.measures = Arc::new(MeasureIndex::build(document));
         self.measurement = None;
@@ -948,22 +1044,61 @@ impl MyCadApp {
         self.selection.retain_valid(document);
     }
 
+    fn rebuild_block_tree(&mut self) {
+        self.block_tree = self
+            .document
+            .as_ref()
+            .map(BlockTreeIndex::build)
+            .unwrap_or_default();
+    }
+
+    fn sync_after_block_rename(&mut self, from: &str, to: &str) {
+        self.block_tree.rename(from, to);
+        self.block_edit.on_block_renamed(from, to);
+        if self
+            .blocks_panel
+            .selected
+            .as_ref()
+            .is_some_and(|name| name.eq_ignore_ascii_case(from))
+        {
+            self.blocks_panel.selected = Some(to.to_string());
+        }
+        self.blocks_panel.retarget_rename(from, to);
+        self.blocks_panel.error = None;
+    }
+
     fn commit_geometry(&mut self, geometry: Geometry) {
         let type_name = geometry.type_name();
+        let space = self.block_edit.active_space();
+        let to_local = self.block_edit.local_from_world();
+        let geometry = match transform_geometry(&geometry, to_local) {
+            Ok(geometry) => geometry,
+            Err(err) => {
+                self.status = err.to_string();
+                return;
+            }
+        };
         let (edit, entity) = {
             let Some(document) = self.ensure_document() else {
                 return;
             };
-            let index = document.model_space.len();
             let entity = document.new_entity(geometry);
-            let entity = document.insert_model_entity(index, entity);
-            document
-                .diagnostics
-                .bump_entity(entity.geometry.type_name());
-            document.diagnostics.object_count = document.diagnostics.object_count.saturating_add(1);
+            let Some(entity) = document.add_entity_to(&space, entity) else {
+                self.status = "Cannot add geometry to this block".into();
+                return;
+            };
+            if space.is_model() {
+                document
+                    .diagnostics
+                    .bump_entity(entity.geometry.type_name());
+                document.diagnostics.object_count =
+                    document.diagnostics.object_count.saturating_add(1);
+            }
             document.expand_extents_for(&entity);
+            let index = document.entity_index_in(&space, entity.id).unwrap_or(0);
             (
-                Edit::Insert {
+                Edit::InsertEntity {
+                    space: space.clone(),
                     index,
                     entity: entity.clone(),
                 },
@@ -971,6 +1106,13 @@ impl MyCadApp {
             )
         };
         self.history.record(edit);
+        self.block_edit
+            .refresh_dirty(self.document.as_ref().unwrap());
+        if self.block_edit.is_active() {
+            self.refresh_derived();
+            self.status = format!("{type_name} added");
+            return;
+        }
         let Some(document) = self.document.as_ref() else {
             return;
         };
@@ -1032,9 +1174,14 @@ impl MyCadApp {
         if !self.command.is_selecting_objects() {
             return;
         }
-        let ids = self.selection.ids().to_vec();
+        let ids = self.editable_selection_ids();
         if ids.is_empty() {
-            self.status = "Select objects first".into();
+            self.status = if self.selection.is_empty() {
+                "Select objects first"
+            } else {
+                "Cannot modify reference objects. Use Add to Block, or select objects in the active block."
+            }
+            .into();
             return;
         }
         if self.command.kind() == CommandKind::Erase {
@@ -1065,29 +1212,52 @@ impl MyCadApp {
 
     fn commit_modify(&mut self, transform: EntityTransform, copies: bool) {
         let kind = self.command.kind();
-        let targets = self.command.modify_targets().to_vec();
+        let targets = self.editable_ids(self.command.modify_targets());
         let Some(document) = self.document.as_ref() else {
             self.cancel_command();
             self.status = "No drawing is open".into();
             return;
         };
-        let originals: Vec<Entity> = targets
-            .iter()
-            .filter_map(|id| document.entity_by_id(*id).cloned())
-            .collect();
+        let mut originals = Vec::new();
+        for id in &targets {
+            let Some((space, _)) = document.find_entity_location(*id) else {
+                continue;
+            };
+            let Some(entity) = document.entity_by_id(*id).cloned() else {
+                continue;
+            };
+            originals.push((space, entity));
+        }
         if originals.is_empty() || originals.len() != targets.len() {
             self.cancel_command();
             self.status = "Select objects first".into();
             return;
         }
-        if let Err(err) = validate_entities(&originals) {
+        let entities: Vec<_> = originals.iter().map(|(_, entity)| entity.clone()).collect();
+        if let Err(err) = validate_entities(&entities) {
             self.cancel_command();
             self.status = err.to_string();
             return;
         }
+        let world_matrix = match transform.to_matrix() {
+            Ok(matrix) => matrix,
+            Err(TransformError::NoOp) => {
+                self.cancel_command();
+                self.status = "Nothing to transform".into();
+                return;
+            }
+            Err(err) => {
+                self.cancel_command();
+                self.status = err.to_string();
+                return;
+            }
+        };
+        let world_from_local = self.block_edit.world_from_local();
+        let local_from_world = self.block_edit.local_from_world();
+        let local_matrix = local_from_world.then(world_matrix).then(world_from_local);
         let mut transformed = Vec::new();
-        for entity in &originals {
-            match transform_entity(entity, transform) {
+        for (_, entity) in &originals {
+            match transform_entity_matrix(entity, local_matrix) {
                 Ok(after) => transformed.push(after),
                 Err(TransformError::NoOp) => {
                     self.cancel_command();
@@ -1107,17 +1277,22 @@ impl MyCadApp {
             };
             if copies {
                 let mut created = Vec::new();
-                for entity in transformed {
+                for ((space, _), entity) in originals.iter().zip(transformed) {
                     let mut entity = entity;
-                    entity.id = cad_core::EntityId::UNASSIGNED;
-                    let index = document.model_space.len();
-                    let entity = document.insert_model_entity(index, entity);
-                    document
-                        .diagnostics
-                        .bump_entity(entity.geometry.type_name());
-                    document.diagnostics.object_count =
-                        document.diagnostics.object_count.saturating_add(1);
-                    self.history.record(Edit::Insert {
+                    entity.id = EntityId::UNASSIGNED;
+                    let Some(entity) = document.add_entity_to(space, entity) else {
+                        continue;
+                    };
+                    if space.is_model() {
+                        document
+                            .diagnostics
+                            .bump_entity(entity.geometry.type_name());
+                        document.diagnostics.object_count =
+                            document.diagnostics.object_count.saturating_add(1);
+                    }
+                    let index = document.entity_index_in(space, entity.id).unwrap_or(0);
+                    self.history.record(Edit::InsertEntity {
+                        space: space.clone(),
                         index,
                         entity: entity.clone(),
                     });
@@ -1125,12 +1300,13 @@ impl MyCadApp {
                 }
                 self.selection.replace_all(created);
             } else {
-                for (before, after) in originals.iter().zip(transformed) {
-                    let Some(index) = document.entity_index(before.id) else {
+                for ((space, before), after) in originals.iter().zip(transformed) {
+                    let Some(index) = document.entity_index_in(space, before.id) else {
                         continue;
                     };
-                    let _ = document.replace_model_entity(before.id, after.clone());
-                    self.history.record(Edit::Replace {
+                    let _ = document.replace_entity_in(space, before.id, after.clone());
+                    self.history.record(Edit::ReplaceEntity {
+                        space: space.clone(),
                         index,
                         before: before.clone(),
                         after,
@@ -1138,6 +1314,9 @@ impl MyCadApp {
                 }
                 self.selection.replace_all(targets);
             }
+        }
+        if let Some(document) = self.document.as_ref() {
+            self.block_edit.refresh_dirty(document);
         }
         self.remember_completed(kind);
         self.finish_active_transaction();
@@ -1152,8 +1331,16 @@ impl MyCadApp {
         if !self.command.is_idle() && !self.command.is_erase_picking() {
             return;
         }
-        let ids = self.selection.ids().to_vec();
+        let ids = self.editable_selection_ids();
         let stay = self.command.is_erase_picking();
+        if ids.is_empty() {
+            if !self.selection.is_empty() {
+                self.status =
+                    "Cannot erase reference objects. Use Add to Block, or select objects in the active block."
+                        .into();
+            }
+            return;
+        }
         self.erase_ids(&ids, stay);
     }
 
@@ -1161,33 +1348,43 @@ impl MyCadApp {
         if ids.is_empty() {
             return;
         }
+        let ids = self.editable_ids(ids);
+        if ids.is_empty() {
+            return;
+        }
         let Some(document) = self.document.as_ref() else {
             return;
         };
-        let mut removals: Vec<(usize, Entity)> = ids
+        let mut removals: Vec<(EntitySpace, usize, Entity)> = ids
             .iter()
             .filter_map(|id| {
-                document
-                    .entity_by_id(*id)
-                    .cloned()
-                    .and_then(|entity| document.entity_index(*id).map(|index| (index, entity)))
+                let (space, index) = document.find_entity_location(*id)?;
+                let entity = document.entity_by_id(*id).cloned()?;
+                Some((space, index, entity))
             })
             .collect();
         if removals.is_empty() {
             return;
         }
-        removals.sort_by_key(|(index, _)| std::cmp::Reverse(*index));
+        removals.sort_by_key(|(_, index, _)| std::cmp::Reverse(*index));
         self.history.commit_open();
         self.history.begin();
         {
             let Some(document) = self.document.as_mut() else {
                 return;
             };
-            for (index, entity) in removals {
-                let edit = Edit::Remove { index, entity };
+            for (space, index, entity) in removals {
+                let edit = Edit::RemoveEntity {
+                    space,
+                    index,
+                    entity,
+                };
                 edit.apply(document);
                 self.history.record(edit);
             }
+        }
+        if let Some(document) = self.document.as_ref() {
+            self.block_edit.refresh_dirty(document);
         }
         self.remember_completed(CommandKind::Erase);
         self.finish_active_transaction();
@@ -1359,7 +1556,850 @@ impl MyCadApp {
         }
     }
 
+    fn editable_ids(&self, ids: &[EntityId]) -> Vec<EntityId> {
+        let active = self.block_edit.active_space();
+        let Some(document) = self.document.as_ref() else {
+            return Vec::new();
+        };
+        ids.iter()
+            .copied()
+            .filter(|id| {
+                document
+                    .find_entity_location(*id)
+                    .is_some_and(|(space, _)| space == active)
+            })
+            .collect()
+    }
+
+    fn editable_selection_ids(&self) -> Vec<EntityId> {
+        self.editable_ids(self.selection.ids())
+    }
+
+    fn reference_selection_ids(&self) -> Vec<EntityId> {
+        let active = self.block_edit.active_space();
+        let Some(document) = self.document.as_ref() else {
+            return Vec::new();
+        };
+        self.selection
+            .ids()
+            .iter()
+            .copied()
+            .filter(|id| {
+                document
+                    .find_entity_location(*id)
+                    .is_some_and(|(space, _)| space != active)
+            })
+            .collect()
+    }
+
+    fn can_create_block(&self) -> bool {
+        if self.command.is_active() || self.selection.is_empty() {
+            return false;
+        }
+        let active = self.block_edit.active_space();
+        let Some(document) = self.document.as_ref() else {
+            return false;
+        };
+        self.selection.ids().iter().all(|id| {
+            document
+                .find_entity_location(*id)
+                .is_some_and(|(space, _)| space == active)
+        })
+    }
+
+    fn can_edit_selected_block(&self) -> bool {
+        if self.command.is_active() || self.selection.len() != 1 {
+            return false;
+        }
+        let Some(document) = self.document.as_ref() else {
+            return false;
+        };
+        document
+            .entity_by_id(self.selection.ids()[0])
+            .is_some_and(insert_is_editable)
+    }
+
+    fn can_add_to_block(&self) -> bool {
+        self.block_edit.is_active()
+            && !self.command.is_active()
+            && !self.reference_selection_ids().is_empty()
+    }
+
+    fn can_remove_from_block(&self) -> bool {
+        self.block_edit.is_active()
+            && !self.command.is_active()
+            && !self.editable_selection_ids().is_empty()
+    }
+
+    fn can_make_unique(&self) -> bool {
+        self.can_edit_selected_block()
+    }
+
+    fn open_create_block_dialog(&mut self) {
+        if !self.can_create_block() {
+            self.status = "Select objects in the current space to create a block".into();
+            return;
+        }
+        let space = self.block_edit.active_space();
+        let ids = self.selection.ids().to_vec();
+        let world_from_local = self.block_edit.world_from_local();
+        let base = self
+            .document
+            .as_ref()
+            .and_then(|document| document.entities_extents(&space, &ids))
+            .map(|extents| world_from_local.apply(extents.center()))
+            .unwrap_or(Point2::new(0.0, 0.0));
+        self.block_edit.ui = BlockUi::Create(CreateBlockDialog {
+            name: String::new(),
+            base_x: format!("{:.4}", base.x),
+            base_y: format!("{:.4}", base.y),
+            replace: true,
+            ids,
+            space,
+            error: None,
+        });
+    }
+
+    fn commit_create_block(&mut self, mut dialog: CreateBlockDialog) {
+        let Ok(x) = dialog.base_x.trim().parse::<f64>() else {
+            dialog.error = Some("Base point X is not a number".into());
+            self.block_edit.ui = BlockUi::Create(dialog);
+            return;
+        };
+        let Ok(y) = dialog.base_y.trim().parse::<f64>() else {
+            dialog.error = Some("Base point Y is not a number".into());
+            self.block_edit.ui = BlockUi::Create(dialog);
+            return;
+        };
+        let world = Point2::new(x, y);
+        let local = self.block_edit.local_from_world().apply(world);
+        self.history.begin();
+        let created = {
+            let Some(document) = self.document.as_mut() else {
+                return;
+            };
+            create_block_from_entities(
+                document,
+                &dialog.space,
+                &dialog.ids,
+                &dialog.name,
+                local,
+                dialog.replace,
+            )
+        };
+        match created {
+            Ok(result) => {
+                let name = result.name.clone();
+                for (space, index, entity) in result.removed {
+                    self.history.record(Edit::RemoveEntity {
+                        space,
+                        index,
+                        entity,
+                    });
+                }
+                self.history.record(Edit::ReplaceBlockDefinition {
+                    name: result.name,
+                    before: None,
+                    after: Some(result.definition),
+                });
+                let insert_id = result.insert.as_ref().map(|(_, _, entity)| entity.id);
+                if let Some((space, index, entity)) = result.insert {
+                    self.history.record(Edit::InsertEntity {
+                        space,
+                        index,
+                        entity,
+                    });
+                }
+                self.history.commit_open();
+                self.block_edit.ui = BlockUi::None;
+                if let Some(id) = insert_id {
+                    self.selection.replace(id);
+                } else {
+                    self.selection.clear();
+                }
+                if let Some(document) = self.document.as_ref() {
+                    self.block_edit.refresh_dirty(document);
+                }
+                self.refresh_derived();
+                self.status = format!("Block {name} created");
+            }
+            Err(err) => {
+                self.history.commit_open();
+                dialog.error = Some(err.to_string());
+                self.block_edit.ui = BlockUi::Create(dialog);
+            }
+        }
+    }
+
+    fn enter_block_edit(&mut self, instance_id: EntityId) {
+        let entered = {
+            let Some(document) = self.document.as_ref() else {
+                return;
+            };
+            match self.block_edit.enter(document, &self.history, instance_id) {
+                Ok(()) => {
+                    let name = self
+                        .block_edit
+                        .current()
+                        .map(|frame| frame.block_name.clone())
+                        .unwrap_or_default();
+                    let refs = cad_core::count_block_references(document, &name);
+                    Ok(format!("Editing: {name}    •    {refs} references"))
+                }
+                Err(err) => Err(err),
+            }
+        };
+        match entered {
+            Ok(status) => {
+                self.selection.clear();
+                self.command.cancel();
+                self.refresh_derived();
+                self.status = status;
+            }
+            Err(err) => self.status = err,
+        }
+    }
+
+    fn try_enter_block_from_hit(&mut self, hit: Option<EntityId>) -> bool {
+        let Some(id) = hit else {
+            return false;
+        };
+        let Some(document) = self.document.as_ref() else {
+            return false;
+        };
+        let Some(entity) = document.entity_by_id(id) else {
+            return false;
+        };
+        if !insert_is_editable(entity) {
+            return false;
+        }
+        if self.block_edit.current_is_dirty() {
+            self.block_edit.ui = BlockUi::LeaveDirty {
+                name: self
+                    .block_edit
+                    .current()
+                    .map(|frame| frame.block_name.clone())
+                    .unwrap_or_default(),
+                intent: LeaveIntent::EnterNested { instance_id: id },
+            };
+            return true;
+        }
+        self.enter_block_edit(id);
+        true
+    }
+
+    fn save_active_block(&mut self) {
+        let Some(document) = self.document.as_ref() else {
+            return;
+        };
+        match self.block_edit.save_current(document, &mut self.history) {
+            Ok(()) => {
+                self.status = format!(
+                    "Block {} saved",
+                    self.block_edit
+                        .current()
+                        .map(|frame| frame.block_name.as_str())
+                        .unwrap_or("block")
+                );
+            }
+            Err(err) => self.status = err,
+        }
+    }
+
+    fn close_block_level(&mut self, discard: bool) {
+        if discard {
+            if let Some(document) = self.document.as_mut() {
+                self.block_edit.discard_current(document, &mut self.history);
+            }
+        } else if self.block_edit.current_is_dirty() {
+            self.save_active_block();
+        }
+        self.block_edit.pop();
+        self.selection.clear();
+        self.refresh_derived();
+        if let Some(frame) = self.block_edit.current() {
+            let refs = self
+                .document
+                .as_ref()
+                .map(|document| cad_core::count_block_references(document, &frame.block_name))
+                .unwrap_or(0);
+            self.status = format!("Editing: {}    •    {refs} references", frame.block_name);
+        } else {
+            self.status = "Block edit closed".into();
+        }
+    }
+
+    fn leave_to_breadcrumb(&mut self, index: usize) {
+        while self.block_edit.stack.len() > index {
+            if self.block_edit.current_is_dirty() {
+                self.block_edit.ui = BlockUi::LeaveDirty {
+                    name: self
+                        .block_edit
+                        .current()
+                        .map(|frame| frame.block_name.clone())
+                        .unwrap_or_default(),
+                    intent: LeaveIntent::CloseTo(index),
+                };
+                return;
+            }
+            self.block_edit.pop();
+        }
+        self.selection.clear();
+        self.refresh_derived();
+    }
+
+    fn request_leave_block(&mut self, intent: LeaveIntent) {
+        if self.block_edit.request_leave(intent.clone()) {
+            self.apply_leave_intent(intent);
+        }
+    }
+
+    fn apply_leave_intent(&mut self, intent: LeaveIntent) {
+        match intent {
+            LeaveIntent::CloseOne => self.close_block_level(false),
+            LeaveIntent::CloseTo(index) => self.leave_to_breadcrumb(index),
+            LeaveIntent::EnterNested { instance_id } => self.enter_block_edit(instance_id),
+            LeaveIntent::OpenDrawing => {
+                if let Some(path) = self.pending_open.take() {
+                    self.start_load(path);
+                } else {
+                    self.open_dialog();
+                }
+            }
+            LeaveIntent::Quit => {
+                if self.close_block_edit_for_document_action(LeaveIntent::Quit) {
+                    self.pending_discard = Some(PendingDiscard::Quit);
+                }
+            }
+        }
+    }
+
+    fn add_selected_to_block(&mut self) {
+        let ids = self.reference_selection_ids();
+        if ids.is_empty() {
+            self.status = "Select reference objects to add".into();
+            return;
+        }
+        let Some(frame) = self.block_edit.current() else {
+            return;
+        };
+        let name = frame.block_name.clone();
+        let references = self
+            .document
+            .as_ref()
+            .map(|document| cad_core::count_block_references(document, &name))
+            .unwrap_or(0);
+        if references > 1 {
+            self.block_edit.ui = BlockUi::AddConfirm {
+                name,
+                references,
+                ids,
+            };
+            return;
+        }
+        self.commit_add_to_block(&ids);
+    }
+
+    fn commit_add_to_block(&mut self, ids: &[EntityId]) {
+        let dest = self.block_edit.active_space();
+        let dest_world = self.block_edit.world_from_local();
+        let Some(document) = self.document.as_ref() else {
+            return;
+        };
+        let mut plans = Vec::new();
+        for id in ids {
+            let Some((source, _)) = document.find_entity_location(*id) else {
+                continue;
+            };
+            let source_world = self.block_edit.space_world_from_local(document, &source);
+            match membership_matrix(source_world, dest_world) {
+                Ok(matrix) => plans.push((*id, matrix)),
+                Err(err) => {
+                    self.status = err.to_string();
+                    return;
+                }
+            }
+        }
+        self.history.begin();
+        let mut error = None;
+        {
+            let Some(document) = self.document.as_mut() else {
+                return;
+            };
+            for (id, matrix) in plans {
+                match transfer_entity(document, id, &dest, matrix) {
+                    Ok(result) => {
+                        self.history.record(Edit::RemoveEntity {
+                            space: result.source,
+                            index: result.source_index,
+                            entity: result.before,
+                        });
+                        self.history.record(Edit::InsertEntity {
+                            space: result.dest,
+                            index: result.dest_index,
+                            entity: result.after,
+                        });
+                    }
+                    Err(err) => {
+                        error = Some(err);
+                        break;
+                    }
+                }
+            }
+        }
+        self.history.commit_open();
+        if let Some(err) = error {
+            self.status = err.to_string();
+            self.refresh_derived();
+            return;
+        }
+        if let Some(document) = self.document.as_ref() {
+            self.block_edit.refresh_dirty(document);
+        }
+        self.refresh_derived();
+        self.status = "Added to block".into();
+    }
+
+    fn remove_selected_from_block(&mut self) {
+        let ids = self.editable_selection_ids();
+        if ids.is_empty() {
+            self.status = "Select objects in the active block to remove".into();
+            return;
+        }
+        let dest = self
+            .block_edit
+            .current()
+            .map(|frame| frame.parent_space.clone())
+            .unwrap_or(EntitySpace::ModelSpace);
+        let dest_world = self
+            .document
+            .as_ref()
+            .map(|document| self.block_edit.space_world_from_local(document, &dest))
+            .unwrap_or_else(Transform2::identity);
+        let source_world = self.block_edit.world_from_local();
+        let matrix = match membership_matrix(source_world, dest_world) {
+            Ok(matrix) => matrix,
+            Err(err) => {
+                self.status = err.to_string();
+                return;
+            }
+        };
+        self.history.begin();
+        let mut error = None;
+        {
+            let Some(document) = self.document.as_mut() else {
+                return;
+            };
+            for id in ids {
+                match transfer_entity(document, id, &dest, matrix) {
+                    Ok(result) => {
+                        self.history.record(Edit::RemoveEntity {
+                            space: result.source,
+                            index: result.source_index,
+                            entity: result.before,
+                        });
+                        self.history.record(Edit::InsertEntity {
+                            space: result.dest,
+                            index: result.dest_index,
+                            entity: result.after,
+                        });
+                    }
+                    Err(err) => {
+                        error = Some(err);
+                        break;
+                    }
+                }
+            }
+        }
+        self.history.commit_open();
+        if let Some(err) = error {
+            self.status = err.to_string();
+            self.refresh_derived();
+            return;
+        }
+        if let Some(document) = self.document.as_ref() {
+            self.block_edit.refresh_dirty(document);
+        }
+        self.refresh_derived();
+        self.status = "Removed from block".into();
+    }
+
+    fn make_selected_unique(&mut self) {
+        if self.selection.len() != 1 {
+            self.status = "Select one block reference".into();
+            return;
+        }
+        let id = self.selection.ids()[0];
+        self.history.begin();
+        let made = {
+            let Some(document) = self.document.as_mut() else {
+                return;
+            };
+            make_unique_block(document, id)
+        };
+        match made {
+            Ok(result) => {
+                let name = result.new_name.clone();
+                self.history.record(Edit::ReplaceBlockDefinition {
+                    name: result.new_name,
+                    before: None,
+                    after: Some(result.definition),
+                });
+                self.history.record(Edit::ReplaceEntity {
+                    space: result.insert_space,
+                    index: result.insert_index,
+                    before: result.insert_before,
+                    after: result.insert_after,
+                });
+                self.history.commit_open();
+                self.refresh_derived();
+                self.status = format!("Block {name} created");
+            }
+            Err(err) => {
+                self.history.commit_open();
+                self.status = err.to_string();
+            }
+        }
+    }
+
+    pub(crate) fn insert_named_block(&mut self, name: &str) {
+        let space = self.block_edit.active_space();
+        let local = self.block_edit.local_from_world().apply(self.camera.center);
+        if let EntitySpace::Block(dest) = &space {
+            let Some(document) = self.document.as_ref() else {
+                return;
+            };
+            if would_create_block_cycle(document, dest, name) {
+                self.blocks_panel.error = Some("Cannot create a circular block reference".into());
+                self.status = "Cannot create a circular block reference".into();
+                return;
+            }
+        }
+        self.history.begin();
+        let inserted = {
+            let Some(document) = self.ensure_document() else {
+                return;
+            };
+            if document.block_by_name(name).is_none() {
+                None
+            } else {
+                let entity = document.new_entity(identity_insert(
+                    name.to_string(),
+                    Point3::from_xy(local.x, local.y),
+                ));
+                document.add_entity_to(&space, entity)
+            }
+        };
+        let Some(entity) = inserted else {
+            self.history.commit_open();
+            self.blocks_panel.error = Some("Block definition was not found".into());
+            return;
+        };
+        let index = self
+            .document
+            .as_ref()
+            .and_then(|document| document.entity_index_in(&space, entity.id))
+            .unwrap_or(0);
+        self.history.record(Edit::InsertEntity {
+            space,
+            index,
+            entity: entity.clone(),
+        });
+        self.history.commit_open();
+        self.selection.replace(entity.id);
+        if let Some(document) = self.document.as_ref() {
+            self.block_edit.refresh_dirty(document);
+        }
+        self.refresh_derived();
+        self.blocks_panel.error = None;
+        self.status = format!("Inserted {name}");
+    }
+
+    pub(crate) fn edit_named_block(&mut self, name: &str) {
+        let selected = self.selection.ids().first().copied();
+        let ids = self
+            .document
+            .as_ref()
+            .map(|document| insert_instance_ids(document, name))
+            .unwrap_or_default();
+        let id = selected
+            .filter(|id| ids.contains(id))
+            .or_else(|| ids.first().copied());
+        let Some(id) = id else {
+            self.blocks_panel.error = Some("Insert the block first to edit it in place.".into());
+            self.status = "Insert the block first to edit it in place.".into();
+            return;
+        };
+        self.blocks_panel.error = None;
+        self.try_enter_block_from_hit(Some(id));
+    }
+
+    pub(crate) fn edit_named_block_from_tree(&mut self, name: &str) {
+        let ids = self
+            .document
+            .as_ref()
+            .map(|document| insert_instance_ids(document, name))
+            .unwrap_or_default();
+        match ids.as_slice() {
+            [] => {
+                self.blocks_panel.error =
+                    Some("Insert the block first to edit it in place.".into());
+                self.status = "Insert the block first to edit it in place.".into();
+            }
+            [id] => {
+                self.blocks_panel.error = None;
+                self.try_enter_block_from_hit(Some(*id));
+            }
+            ids => {
+                let message = format!("{} references; double-click an instance", ids.len());
+                self.blocks_panel.error = Some(message.clone());
+                self.status = message;
+            }
+        }
+    }
+
+    pub(crate) fn make_named_block_unique(&mut self, name: &str) {
+        let ids = self
+            .document
+            .as_ref()
+            .map(|document| insert_instance_ids(document, name))
+            .unwrap_or_default();
+        match ids.as_slice() {
+            [] => {
+                self.status = "Insert the block first to make it unique.".into();
+            }
+            [id] => {
+                self.selection.replace(*id);
+                self.make_selected_unique();
+            }
+            ids => {
+                self.status = format!(
+                    "{} references; select one instance to make unique",
+                    ids.len()
+                );
+            }
+        }
+    }
+
+    pub(crate) fn duplicate_named_block(&mut self, name: &str) {
+        self.history.begin();
+        let duplicated = {
+            let Some(document) = self.document.as_mut() else {
+                return;
+            };
+            duplicate_block_definition(document, name)
+        };
+        match duplicated {
+            Ok(definition) => {
+                let new_name = definition.name.clone();
+                self.history.record(Edit::ReplaceBlockDefinition {
+                    name: new_name.clone(),
+                    before: None,
+                    after: Some(definition),
+                });
+                self.history.commit_open();
+                self.blocks_panel.selected = Some(new_name.clone());
+                self.blocks_panel.error = None;
+                self.refresh_derived();
+                self.status = format!("Duplicated as {new_name}");
+            }
+            Err(err) => {
+                self.history.commit_open();
+                self.blocks_panel.error = Some(err.to_string());
+                self.status = err.to_string();
+            }
+        }
+    }
+
+    pub(crate) fn rename_named_block(&mut self, from: &str, to: &str) {
+        let Some(document) = self.document.as_ref() else {
+            return;
+        };
+        match validate_block_rename(document, from, to) {
+            Ok(None) => {
+                self.blocks_panel.error = None;
+                return;
+            }
+            Ok(Some(_)) => {}
+            Err(err) => {
+                self.blocks_panel.error = Some(err.to_string());
+                self.status = err.to_string();
+                return;
+            }
+        }
+        let before = document.block_key(from).unwrap_or_else(|| from.to_string());
+        self.history.begin();
+        let renamed = {
+            let Some(document) = self.document.as_mut() else {
+                return;
+            };
+            document.rename_block(&before, to)
+        };
+        match renamed {
+            Ok(()) => {
+                let after = self
+                    .document
+                    .as_ref()
+                    .and_then(|document| document.block_key(to))
+                    .unwrap_or_else(|| to.trim().to_string());
+                self.history.record(Edit::RenameBlock {
+                    before: before.clone(),
+                    after: after.clone(),
+                });
+                self.history.commit_open();
+                self.sync_after_block_rename(&before, &after);
+                self.status = format!("Renamed to {after}");
+            }
+            Err(err) => {
+                self.history.commit_open();
+                self.blocks_panel.error = Some(err.to_string());
+                self.status = err.to_string();
+            }
+        }
+    }
+
+    pub(crate) fn purge_unused_blocks(&mut self) {
+        let skip: Vec<String> = self
+            .block_edit
+            .stack
+            .iter()
+            .map(|frame| frame.block_name.clone())
+            .collect();
+        self.history.begin();
+        let removed = {
+            let Some(document) = self.document.as_mut() else {
+                return;
+            };
+            let mut removed = purge_unused_user_blocks(document);
+            removed.retain(|definition| {
+                let keep = skip
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(&definition.name));
+                if keep {
+                    document.replace_block_definition(definition.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            removed
+        };
+        if removed.is_empty() {
+            self.history.commit_open();
+            self.status = "No unused blocks to purge".into();
+            return;
+        }
+        let count = removed.len();
+        for definition in removed {
+            self.history.record(Edit::ReplaceBlockDefinition {
+                name: definition.name.clone(),
+                before: Some(definition),
+                after: None,
+            });
+        }
+        self.history.commit_open();
+        self.blocks_panel.error = None;
+        self.refresh_derived();
+        self.status = format!("Purged {count} unused block(s)");
+    }
+
+    fn apply_toolbar_action(&mut self, action: ToolbarAction) {
+        match action {
+            ToolbarAction::None => {}
+            ToolbarAction::AddToBlock => self.add_selected_to_block(),
+            ToolbarAction::RemoveFromBlock => self.remove_selected_from_block(),
+            ToolbarAction::Save => self.save_active_block(),
+            ToolbarAction::SaveAndClose => {
+                if self.block_edit.current_is_dirty() {
+                    self.save_active_block();
+                }
+                self.close_block_level(false);
+            }
+            ToolbarAction::DiscardAndClose => {
+                if self.block_edit.current_is_dirty() {
+                    self.close_block_level(true);
+                } else {
+                    self.close_block_level(false);
+                }
+            }
+            ToolbarAction::Breadcrumb(index) => self.leave_to_breadcrumb(index),
+        }
+    }
+
+    fn show_block_ui(&mut self, ctx: &egui::Context) {
+        match std::mem::replace(&mut self.block_edit.ui, BlockUi::None) {
+            BlockUi::None => {}
+            BlockUi::Create(mut dialog) => match block_edit::show_create_dialog(ctx, &mut dialog) {
+                CreateDialogResult::Open => self.block_edit.ui = BlockUi::Create(dialog),
+                CreateDialogResult::Cancel => {}
+                CreateDialogResult::PickPoint => {
+                    self.status = "Specify base point".into();
+                    self.block_edit.ui = BlockUi::PickBase(dialog);
+                }
+                CreateDialogResult::Create => self.commit_create_block(dialog),
+            },
+            BlockUi::PickBase(dialog) => {
+                self.block_edit.ui = BlockUi::PickBase(dialog);
+            }
+            BlockUi::LeaveDirty { name, intent } => {
+                match block_edit::show_leave_dialog(ctx, &name) {
+                    Some(LeaveChoice::Save) => {
+                        self.save_active_block();
+                        self.apply_leave_intent(intent);
+                    }
+                    Some(LeaveChoice::Discard) => {
+                        if let Some(document) = self.document.as_mut() {
+                            self.block_edit.discard_current(document, &mut self.history);
+                        }
+                        self.apply_leave_intent(intent);
+                    }
+                    Some(LeaveChoice::Cancel) | None => {
+                        self.block_edit.ui = BlockUi::LeaveDirty { name, intent };
+                    }
+                }
+            }
+            BlockUi::AddConfirm {
+                name,
+                references,
+                ids,
+            } => match block_edit::show_add_confirm_dialog(ctx, &name, references) {
+                Some(true) => self.commit_add_to_block(&ids),
+                Some(false) => {}
+                None => {
+                    self.block_edit.ui = BlockUi::AddConfirm {
+                        name,
+                        references,
+                        ids,
+                    };
+                }
+            },
+            BlockUi::SaveDrawing => match block_edit::show_save_drawing_dialog(ctx) {
+                Some(true) => {
+                    self.save_active_block();
+                    let _ = self.save_drawing();
+                }
+                Some(false) => {}
+                None => self.block_edit.ui = BlockUi::SaveDrawing,
+            },
+        }
+    }
+
     pub(crate) fn show_viewport(&mut self, ui: &mut Ui) {
+        let toolbar_action = if self.block_edit.is_active() {
+            let can_add = self.can_add_to_block();
+            let can_remove = self.can_remove_from_block();
+            self.document
+                .as_ref()
+                .map(|document| {
+                    block_edit::show_toolbar(ui, &self.block_edit, document, can_add, can_remove)
+                })
+                .unwrap_or(ToolbarAction::None)
+        } else {
+            ToolbarAction::None
+        };
+        if toolbar_action != ToolbarAction::None {
+            self.apply_toolbar_action(toolbar_action);
+        }
         let rect = ui.available_rect_before_wrap();
         self.viewport_height = rect.height() as f64;
         self.poll_load(rect);
@@ -1612,6 +2652,13 @@ impl MyCadApp {
             self.last_command.is_some() && !self.command.is_active(),
             self.selection.len(),
             self.last_command,
+            context_menu::BlockMenuState {
+                can_create: self.can_create_block(),
+                can_edit: self.can_edit_selected_block(),
+                can_add: self.can_add_to_block(),
+                can_remove: self.can_remove_from_block(),
+                can_make_unique: self.can_make_unique(),
+            },
         );
         match result {
             MenuResult::StayOpen => self.context_menu = Some(menu),
@@ -1647,6 +2694,15 @@ impl MyCadApp {
             ContextAction::Mirror => self.start_mirror_command(),
             ContextAction::Scale => self.start_scale_command(),
             ContextAction::Erase => self.start_erase_command(),
+            ContextAction::CreateBlock => self.open_create_block_dialog(),
+            ContextAction::EditBlock => {
+                if let Some(id) = self.selection.ids().first().copied() {
+                    self.enter_block_edit(id);
+                }
+            }
+            ContextAction::AddToBlock => self.add_selected_to_block(),
+            ContextAction::RemoveFromBlock => self.remove_selected_from_block(),
+            ContextAction::MakeUnique => self.make_selected_unique(),
         }
     }
 
@@ -1885,6 +2941,13 @@ impl MyCadApp {
         if self.pending_lossy_save {
             return;
         }
+        if matches!(self.pending_discard, Some(PendingDiscard::Quit))
+            && !self.is_dirty()
+            && !self.block_edit.is_active()
+        {
+            self.continue_pending_discard(ctx);
+            return;
+        }
         let Some(pending) = self.pending_discard.as_ref() else {
             return;
         };
@@ -1948,9 +3011,15 @@ impl MyCadApp {
 impl eframe::App for MyCadApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.input_consumed_escape = false;
-        if ctx.input(|input| input.viewport().close_requested()) && self.is_dirty() {
+        if ctx.input(|input| input.viewport().close_requested())
+            && (self.is_dirty() || self.block_edit.is_active())
+        {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.pending_discard = Some(PendingDiscard::Quit);
+            if !self.close_block_edit_for_document_action(LeaveIntent::Quit) {
+                // wait for save/discard
+            } else {
+                self.pending_discard = Some(PendingDiscard::Quit);
+            }
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.window_title()));
         if self.pdf_plot.is_picking() && ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
@@ -2024,10 +3093,26 @@ impl eframe::App for MyCadApp {
                 let _ = self.save_as_drawing();
             } else if keys.escape && self.context_menu.take().is_some() {
                 self.input_consumed_escape = true;
+            } else if keys.escape && self.blocks_panel.is_renaming() {
+                self.blocks_panel.cancel_rename();
+                self.input_consumed_escape = true;
+            } else if keys.escape && matches!(self.block_edit.ui, BlockUi::PickBase(_)) {
+                if let BlockUi::PickBase(dialog) =
+                    std::mem::replace(&mut self.block_edit.ui, BlockUi::None)
+                {
+                    self.block_edit.ui = BlockUi::Create(dialog);
+                }
+                self.input_consumed_escape = true;
             } else if keys.escape && self.command.is_active() {
                 self.cancel_command();
                 self.input_consumed_escape = true;
             } else if keys.escape && self.measurement.take().is_some() {
+                self.input_consumed_escape = true;
+            } else if keys.escape
+                && self.block_edit.is_active()
+                && matches!(self.block_edit.ui, BlockUi::None)
+            {
+                self.request_leave_block(LeaveIntent::CloseOne);
                 self.input_consumed_escape = true;
             } else if self.context_menu.is_none() {
                 let live =
@@ -2237,6 +3322,10 @@ impl eframe::App for MyCadApp {
                         ui.close();
                         workspace::ensure_tab(&mut self.dock_state, WorkspaceTab::Diagnostics);
                     }
+                    if ui.button("Show Blocks").clicked() {
+                        ui.close();
+                        workspace::ensure_tab(&mut self.dock_state, WorkspaceTab::Blocks);
+                    }
                     if ui.button("Reset layout").clicked() {
                         ui.close();
                         self.dock_state = workspace::default_dock_state();
@@ -2304,6 +3393,7 @@ impl eframe::App for MyCadApp {
         self.show_pdf_plot_dialog(ctx);
         self.show_lossy_save_dialog(ctx);
         self.show_discard_dialog(ctx);
+        self.show_block_ui(ctx);
 
         match settings_ui::show(ctx, self) {
             SettingsAction::Apply => self.apply_settings(frame.storage_mut()),
@@ -2462,6 +3552,33 @@ fn handle_viewport_input(app: &mut MyCadApp, ui: &Ui, response: &egui::Response,
         return;
     }
 
+    if let BlockUi::PickBase(mut dialog) = std::mem::replace(&mut app.block_edit.ui, BlockUi::None)
+    {
+        if response.clicked_by(PointerButton::Primary) {
+            if let Some(point) = app.cursor_world.or_else(|| {
+                ui.input(|i| i.pointer.latest_pos()).map(|pos| {
+                    app.camera.screen_to_world(
+                        Point2::new(pos.x as f64, pos.y as f64),
+                        origin,
+                        size,
+                    )
+                })
+            }) {
+                dialog.base_x = format!("{:.4}", point.x);
+                dialog.base_y = format!("{:.4}", point.y);
+                app.block_edit.ui = BlockUi::Create(dialog);
+                app.status = "Base point picked".into();
+                app.last_pointer = ui.input(|i| i.pointer.latest_pos());
+                return;
+            }
+        }
+        app.block_edit.ui = BlockUi::PickBase(dialog);
+        app.last_pointer = ui.input(|i| i.pointer.latest_pos());
+        if response.clicked_by(PointerButton::Primary) {
+            return;
+        }
+    }
+
     if !typing
         && !app.input_consumed_escape
         && ui.input(|i| bindings.key_pressed(InputAction::SelectClear, i))
@@ -2544,6 +3661,18 @@ fn handle_viewport_input(app: &mut MyCadApp, ui: &Ui, response: &egui::Response,
             if response.double_clicked_by(button)
                 && bindings.double_clicked(InputAction::ZoomExtents, button, modifiers)
             {
+                let hit = response.interact_pointer_pos().and_then(|pos| {
+                    pick_entity(
+                        &app.display,
+                        &app.camera,
+                        Point2::new(pos.x as f64, pos.y as f64),
+                        origin,
+                        size,
+                    )
+                });
+                if !app.command.is_active() && app.try_enter_block_from_hit(hit) {
+                    continue;
+                }
                 app.zoom_extents(size.x, size.y);
                 continue;
             }

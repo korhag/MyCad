@@ -1409,4 +1409,107 @@ mod tests {
         let (_, text) = write_to_string(&document);
         assert_eq!(text.matches("AcDbHatch").count(), 1);
     }
+
+    #[test]
+    fn create_block_writes_definition_and_insert() {
+        use cad_core::{create_block_from_entities, EntitySpace, Point2};
+        let mut document = Document::default();
+        let a = document.add_entity(Entity::new(Geometry::Line {
+            start: Point3::from_xy(0.0, 0.0),
+            end: Point3::from_xy(10.0, 0.0),
+        }));
+        let b = document.add_entity(Entity::new(Geometry::Circle {
+            center: Point3::from_xy(5.0, 0.0),
+            radius: 2.0,
+            extrusion: cad_core::default_extrusion(),
+        }));
+        create_block_from_entities(
+            &mut document,
+            &EntitySpace::ModelSpace,
+            &[a.id, b.id],
+            "TestBlock",
+            Point2::new(5.0, 0.0),
+            true,
+        )
+        .unwrap();
+        let (_, text) = write_to_string(&document);
+        assert!(text.contains("TestBlock"));
+        assert!(text.contains("  0\nBLOCK"));
+        assert!(text.contains("  0\nINSERT"));
+        let entities = entities_section(&text);
+        assert!(entities.contains("INSERT"));
+        assert!(!entities.contains("  0\nLINE"));
+        assert!(!entities.contains("  0\nCIRCLE"));
+        assert!(text.contains("  0\nLINE"));
+        assert!(text.contains("  0\nCIRCLE"));
+    }
+
+    #[test]
+    fn nested_block_writes_both_definitions() {
+        use cad_core::{create_block_from_entities, EntitySpace, Point2};
+        let mut document = Document::default();
+        let inner = document.add_entity(Entity::new(Geometry::Circle {
+            center: Point3::from_xy(0.0, 0.0),
+            radius: 1.0,
+            extrusion: cad_core::default_extrusion(),
+        }));
+        create_block_from_entities(
+            &mut document,
+            &EntitySpace::ModelSpace,
+            &[inner.id],
+            "B",
+            Point2::new(0.0, 0.0),
+            true,
+        )
+        .unwrap();
+        let outer = document.add_entity(Entity::new(Geometry::Line {
+            start: Point3::from_xy(8.0, 0.0),
+            end: Point3::from_xy(10.0, 0.0),
+        }));
+        let b_id = document.model_space[0].id;
+        create_block_from_entities(
+            &mut document,
+            &EntitySpace::ModelSpace,
+            &[outer.id, b_id],
+            "A",
+            Point2::new(0.0, 0.0),
+            true,
+        )
+        .unwrap();
+        let (_, text) = write_to_string(&document);
+        assert!(text.contains("  2\nA\n"));
+        assert!(text.contains("  2\nB\n"));
+        assert!(text.contains("  0\nINSERT"));
+        let entities = entities_section(&text);
+        assert!(entities.contains("INSERT"));
+        assert!(!entities.contains("  0\nLINE"));
+        assert!(!entities.contains("  0\nCIRCLE"));
+    }
+
+    #[test]
+    fn renamed_block_writes_new_definition_and_insert_name() {
+        use cad_core::{create_block_from_entities, EntitySpace, Point2};
+        let mut document = Document::default();
+        let line = document.add_entity(Entity::new(Geometry::Line {
+            start: Point3::from_xy(0.0, 0.0),
+            end: Point3::from_xy(10.0, 0.0),
+        }));
+        create_block_from_entities(
+            &mut document,
+            &EntitySpace::ModelSpace,
+            &[line.id],
+            "Motor",
+            Point2::new(0.0, 0.0),
+            true,
+        )
+        .unwrap();
+        document.rename_block("Motor", "Motor Drive").unwrap();
+        let (_, text) = write_to_string(&document);
+        assert!(text.contains("Motor Drive"));
+        assert!(!text.contains("  2\nMotor\n"));
+        match &document.model_space[0].geometry {
+            Geometry::Insert { block_name, .. } => assert_eq!(block_name, "Motor Drive"),
+            other => panic!("{other:?}"),
+        }
+    }
 }

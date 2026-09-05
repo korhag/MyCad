@@ -5,14 +5,21 @@ All notable changes to MyCad are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project versions with [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Workspace version is `0.19.0` (`Cargo.toml`).
+Workspace version is `0.20.0` (`Cargo.toml`).
 
 ## [Unreleased]
 
-## [0.19.0] - 2026-09-05
+## [0.20.0] - 2026-09-05
 
 ### Added
 
+- Create Block from the viewport menu turns selected objects into a reusable definition and INSERT, including while already editing another block.
+- Double-click a block reference to edit its definition in place. Nested references open as a stack with a Model > parent > child breadcrumb. Empty-space double-click still zooms extents.
+- Block Edit dims the rest of the drawing, lets drawing and modify commands edit the active definition, and supports Add/Remove membership without moving geometry on screen.
+- Save, Save & Close, and Discard & Close keep block-definition edits explicit. Unsaved block changes must be resolved before saving the drawing.
+- Make Unique clones one INSERT onto its own definition so later edits do not affect other references.
+- Blocks navigator sits beside Properties in the left dock. Nested INSERTs expand as a definition tree with grouped reference counts, search, and inline pencil rename.
+- Renaming a block definition updates every INSERT reference in one undoable command, keeps Block Edit breadcrumbs in sync, and does not retessellate unchanged geometry.
 - Plot Area can be Extents or a picked Window. Pick Window hides the PDF dialog, captures two corners in a dedicated viewport mode with a live rectangle, and restores the dialog. Esc cancels only window picking.
 - Window plots clip to the selected world rectangle (`re W n`) so geometry is cut at the boundary rather than filtered by entity bounds.
 - PDF plot bounds come from the same vector stream used for output, including TEXT, MTEXT, ATTRIB, bulge and ellipse samples, and hatch boundaries, so text-only drawings fit the page.
@@ -20,10 +27,12 @@ Workspace version is `0.19.0` (`Cargo.toml`).
 
 ### Changed
 
+- Undo, entity containers, and selection are scoped to model space or the active block definition instead of only `model_space`.
 - Viewport tessellation and PDF export share one cad-core vectorization path for visibility, INSERT attribs, ATTDEF skipping, hatch OCS sampling, and linetype resolution so on-screen and exported geometry stay aligned.
 
 ### Fixed
 
+- Circular block references are rejected, and non-uniform INSERT transforms refuse membership moves that would corrupt circles and arcs.
 - INSERT attribute values export instead of disappearing, and ATTDEF placeholders inside blocks are not duplicated.
 - HATCH circular and elliptic arcs use the hatch extrusion, elevation, and CW/CCW flags instead of a separate PDF interpretation.
 - Non-finite coordinates are skipped with a SaveReport warning instead of writing `NaN` or `inf` into the PDF stream.

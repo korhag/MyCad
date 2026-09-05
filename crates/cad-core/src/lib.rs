@@ -3,6 +3,7 @@
 //! This crate must stay independent of LibreDWG so future DXF import and
 //! editing can share the same types.
 
+pub mod block;
 pub mod color;
 pub mod compare;
 pub mod curves;
@@ -22,20 +23,31 @@ pub mod stroke_font;
 pub mod transform;
 pub mod vectorize;
 
+pub use block::{
+    block_depends_on, count_block_references, create_block_from_entities,
+    duplicate_block_definition, identity_insert, insert_instance_ids, insert_transform,
+    is_system_block_name, is_user_editable_block_name, make_unique_block, membership_matrix,
+    next_user_block_name, purge_unused_user_blocks, rename_block, resolve_block_name,
+    transfer_entity, user_block_list, validate_block_rename, validate_user_block_name,
+    would_create_block_cycle, BlockError, BlockListEntry, BlockTreeChild, BlockTreeIndex,
+    CreateBlockResult, MakeUniqueResult, TransferResult, NON_UNIFORM_MEMBERSHIP_MESSAGE,
+};
 pub use color::{aci_rgb, CadColor, Rgb};
 pub use compare::{compare_documents, CompareTol, Mismatch};
 pub use curves::{
     arc_points, bspline_points, bulge_arc, circle_points, ellipse_arc_points, ellipse_points,
     polyline_points, CIRCLE_SEGMENTS, POLYLINE_BULGE_SEGMENTS,
 };
-pub use document::{BlockDefinition, Document, DrawingUnits, ImportDiagnostics, Layer};
+pub use document::{
+    BlockDefinition, Document, DrawingUnits, EntitySpace, ImportDiagnostics, Layer,
+};
 pub use entity::{
     default_extrusion, Entity, EntityId, Geometry, HatchData, HatchEdge, HatchPath,
     HatchPatternLine, MTextData, PolyVertex, TextData,
 };
 pub use entity_transform::{
-    reference_radius, transform_entity, transform_geometry, validate_entities, EntityTransform,
-    TransformError,
+    reference_radius, transform_entity, transform_entity_matrix, transform_geometry,
+    validate_entities, EntityTransform, TransformError,
 };
 pub use extents::Extents2;
 pub use fixtures::primitives_document;

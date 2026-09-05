@@ -1,4 +1,4 @@
-//! Persistent dockable workspace: Home, Properties, Viewport, Diagnostics.
+//! Persistent dockable workspace: Home, Properties, Viewport, Diagnostics, Blocks.
 
 use eframe::egui::{self, Color32, Margin, Pos2, Rect, Stroke, StrokeKind, Ui};
 use egui_dock::{DockArea, DockState, Node, NodeIndex, Split, Style, TabStyle, TabViewer};
@@ -19,6 +19,7 @@ pub enum WorkspaceTab {
     Viewport,
     Properties,
     Diagnostics,
+    Blocks,
 }
 
 impl WorkspaceTab {
@@ -28,6 +29,7 @@ impl WorkspaceTab {
             Self::Viewport => "Viewport",
             Self::Properties => "Properties",
             Self::Diagnostics => "Diagnostics",
+            Self::Blocks => "Blocks",
         }
     }
 }
@@ -56,10 +58,11 @@ pub fn default_dock_state() -> DockState<WorkspaceTab> {
         default_home_fraction(),
         vec![WorkspaceTab::Home],
     );
-    let [viewport, _props] =
-        state
-            .main_surface_mut()
-            .split_left(viewport, 0.24, vec![WorkspaceTab::Properties]);
+    let [viewport, _props] = state.main_surface_mut().split_left(
+        viewport,
+        0.24,
+        vec![WorkspaceTab::Properties, WorkspaceTab::Blocks],
+    );
     let _ = state
         .main_surface_mut()
         .split_right(viewport, 0.76, vec![WorkspaceTab::Diagnostics]);
@@ -80,6 +83,25 @@ pub fn sanitize_dock_state(state: &mut DockState<WorkspaceTab>) {
     if !tabs.contains(&WorkspaceTab::Viewport) || !unique {
         *state = default_dock_state();
     }
+}
+
+pub fn migrate_blocks_tab(state: &mut DockState<WorkspaceTab>, already_migrated: bool) -> bool {
+    if already_migrated {
+        return true;
+    }
+    if state.find_tab(&WorkspaceTab::Blocks).is_some() {
+        return true;
+    }
+    if let Some((surface, node, _)) = state.find_tab(&WorkspaceTab::Properties) {
+        if let Some(leaf) = state[surface][node].get_leaf_mut() {
+            leaf.tabs.push(WorkspaceTab::Blocks);
+        } else {
+            state.push_to_focused_leaf(WorkspaceTab::Blocks);
+        }
+    } else {
+        state.push_to_focused_leaf(WorkspaceTab::Blocks);
+    }
+    true
 }
 
 pub fn migrate_home_tab(state: &mut DockState<WorkspaceTab>, already_migrated: bool) -> bool {
@@ -199,9 +221,16 @@ fn dock_style(ui: &Ui) -> Style {
 }
 
 pub fn ensure_tab(state: &mut DockState<WorkspaceTab>, tab: WorkspaceTab) {
-    if state.find_tab(&tab).is_none() {
-        state.push_to_focused_leaf(tab);
+    if state.find_tab(&tab).is_some() {
+        return;
     }
+    if tab == WorkspaceTab::Blocks {
+        if let Some((surface, node, _)) = state.find_tab(&WorkspaceTab::Properties) {
+            state[surface][node].append_tab(tab);
+            return;
+        }
+    }
+    state.push_to_focused_leaf(tab);
 }
 
 pub fn encode_dock_layout(state: &DockState<WorkspaceTab>) -> serde_json::Value {
@@ -291,6 +320,7 @@ impl TabViewer for WorkspaceViewer<'_> {
             WorkspaceTab::Viewport => self.app.show_viewport(ui),
             WorkspaceTab::Properties => properties::show(ui, self.app),
             WorkspaceTab::Diagnostics => crate::diagnostics::show(ui, self.app),
+            WorkspaceTab::Blocks => crate::blocks::show(ui, self.app),
         }
     }
 
@@ -351,7 +381,73 @@ mod layout_tests {
         assert!(tabs.contains(&WorkspaceTab::Home));
         assert!(tabs.contains(&WorkspaceTab::Viewport));
         assert!(tabs.contains(&WorkspaceTab::Properties));
+        assert!(tabs.contains(&WorkspaceTab::Blocks));
         assert!(tabs.contains(&WorkspaceTab::Diagnostics));
+    }
+
+    #[test]
+    fn default_blocks_shares_the_properties_leaf() {
+        let state = default_dock_state();
+        let (p_surface, p_node, _) = state
+            .find_tab(&WorkspaceTab::Properties)
+            .expect("Properties");
+        let (b_surface, b_node, _) = state.find_tab(&WorkspaceTab::Blocks).expect("Blocks");
+        assert_eq!(p_surface, b_surface);
+        assert_eq!(p_node, b_node);
+        let tabs = state[p_surface][p_node].tabs().expect("left leaf");
+        assert!(tabs.contains(&WorkspaceTab::Properties));
+        assert!(tabs.contains(&WorkspaceTab::Blocks));
+        assert_eq!(tabs.len(), 2);
+    }
+
+    #[test]
+    fn blocks_tab_migrates_once_beside_properties() {
+        let mut state = DockState::new(vec![WorkspaceTab::Viewport]);
+        let [viewport, _home] = state.main_surface_mut().split_above(
+            NodeIndex::root(),
+            default_home_fraction(),
+            vec![WorkspaceTab::Home],
+        );
+        let [viewport, _props] =
+            state
+                .main_surface_mut()
+                .split_left(viewport, 0.24, vec![WorkspaceTab::Properties]);
+        let _ =
+            state
+                .main_surface_mut()
+                .split_right(viewport, 0.76, vec![WorkspaceTab::Diagnostics]);
+        assert!(state.find_tab(&WorkspaceTab::Blocks).is_none());
+        assert!(migrate_blocks_tab(&mut state, false));
+        let (p_surface, p_node, _) = state
+            .find_tab(&WorkspaceTab::Properties)
+            .expect("Properties");
+        let (b_surface, b_node, _) = state.find_tab(&WorkspaceTab::Blocks).expect("Blocks");
+        assert_eq!(p_surface, b_surface);
+        assert_eq!(p_node, b_node);
+        if let Some(tab) = state.find_tab(&WorkspaceTab::Blocks) {
+            state.remove_tab(tab);
+        }
+        assert!(state.find_tab(&WorkspaceTab::Blocks).is_none());
+        assert!(migrate_blocks_tab(&mut state, true));
+        assert!(
+            state.find_tab(&WorkspaceTab::Blocks).is_none(),
+            "closing Blocks must not re-open on every launch"
+        );
+    }
+
+    #[test]
+    fn ensure_blocks_appends_beside_properties() {
+        let mut state = default_dock_state();
+        if let Some(tab) = state.find_tab(&WorkspaceTab::Blocks) {
+            state.remove_tab(tab);
+        }
+        ensure_tab(&mut state, WorkspaceTab::Blocks);
+        let (p_surface, p_node, _) = state
+            .find_tab(&WorkspaceTab::Properties)
+            .expect("Properties");
+        let (b_surface, b_node, _) = state.find_tab(&WorkspaceTab::Blocks).expect("Blocks");
+        assert_eq!(p_surface, b_surface);
+        assert_eq!(p_node, b_node);
     }
 
     #[test]

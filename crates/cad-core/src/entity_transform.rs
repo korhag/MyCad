@@ -2,7 +2,10 @@
 
 use std::fmt;
 
-use crate::entity::{Entity, Geometry, MTextData, PolyVertex, TextData};
+use crate::entity::{
+    Entity, Geometry, HatchData, HatchEdge, HatchPath, HatchPatternLine, MTextData, PolyVertex,
+    TextData,
+};
 use crate::geom::{is_world_extrusion, Point2, Point3, GEOM_TOLERANCE};
 use crate::transform::Transform2;
 
@@ -133,8 +136,14 @@ pub fn validate_entities<'a>(
 }
 
 pub fn transform_entity(entity: &Entity, xform: EntityTransform) -> Result<Entity, TransformError> {
-    geometry_supported(&entity.geometry)?;
     let matrix = xform.to_matrix()?;
+    transform_entity_matrix(entity, matrix)
+}
+
+pub fn transform_entity_matrix(
+    entity: &Entity,
+    matrix: Transform2,
+) -> Result<Entity, TransformError> {
     Ok(Entity {
         geometry: transform_geometry(&entity.geometry, matrix)?,
         ..entity.clone()
@@ -146,6 +155,9 @@ pub fn transform_geometry(
     matrix: Transform2,
 ) -> Result<Geometry, TransformError> {
     geometry_supported(geometry)?;
+    if needs_uniform_scale(geometry) && !matrix.is_uniform_scale() {
+        return Err(TransformError::Unsupported(vec![geometry.type_name()]));
+    }
     Ok(match geometry {
         Geometry::Line { start, end } => Geometry::Line {
             start: matrix.apply3(*start),
@@ -283,7 +295,8 @@ pub fn transform_geometry(
             vertices: vertices.iter().map(|p| matrix.apply3(*p)).collect(),
             closed: *closed,
         },
-        Geometry::Hatch(_) | Geometry::Dimension { .. } => {
+        Geometry::Hatch(hatch) => Geometry::Hatch(transform_hatch(hatch, matrix)?),
+        Geometry::Dimension { .. } => {
             return Err(TransformError::Unsupported(vec![geometry.type_name()]));
         }
     })
@@ -301,15 +314,16 @@ pub fn reference_radius<'a>(entities: impl IntoIterator<Item = &'a Entity>, base
 
 fn geometry_supported(geometry: &Geometry) -> Result<(), TransformError> {
     match geometry {
-        Geometry::Hatch(_) | Geometry::Dimension { .. } => {
-            Err(TransformError::Unsupported(vec![geometry.type_name()]))
-        }
+        Geometry::Dimension { .. } => Err(TransformError::Unsupported(vec![geometry.type_name()])),
         Geometry::Circle { extrusion, .. }
         | Geometry::Arc { extrusion, .. }
         | Geometry::Ellipse { extrusion, .. }
         | Geometry::LwPolyline { extrusion, .. }
         | Geometry::Insert { extrusion, .. }
-        | Geometry::Solid { extrusion, .. } => require_world_ocs(*extrusion, geometry.type_name()),
+        | Geometry::Solid { extrusion, .. }
+        | Geometry::Hatch(crate::entity::HatchData { extrusion, .. }) => {
+            require_world_ocs(*extrusion, geometry.type_name())
+        }
         Geometry::Text(data) => require_world_ocs(data.extrusion, geometry.type_name()),
         Geometry::MText(data) => require_world_ocs(data.extrusion, geometry.type_name()),
         Geometry::Line { .. }
@@ -319,6 +333,13 @@ fn geometry_supported(geometry: &Geometry) -> Result<(), TransformError> {
         | Geometry::Leader { .. }
         | Geometry::MLine { .. } => Ok(()),
     }
+}
+
+fn needs_uniform_scale(geometry: &Geometry) -> bool {
+    matches!(
+        geometry,
+        Geometry::Circle { .. } | Geometry::Arc { .. } | Geometry::Hatch(_)
+    )
 }
 
 fn require_world_ocs(extrusion: Point3, type_name: &'static str) -> Result<(), TransformError> {
@@ -402,6 +423,112 @@ fn transform_mtext(data: &MTextData, matrix: Transform2) -> MTextData {
         width: data.width.abs() * matrix.scale_x(),
         value: data.value.clone(),
         extrusion: data.extrusion,
+    }
+}
+
+fn transform_hatch(hatch: &HatchData, matrix: Transform2) -> Result<HatchData, TransformError> {
+    let mut paths = Vec::with_capacity(hatch.paths.len());
+    for path in &hatch.paths {
+        paths.push(match path {
+            HatchPath::Polyline { vertices, closed } => HatchPath::Polyline {
+                vertices: transform_poly_vertices(vertices, matrix),
+                closed: *closed,
+            },
+            HatchPath::Edges(edges) => {
+                let mut out = Vec::with_capacity(edges.len());
+                for edge in edges {
+                    out.push(transform_hatch_edge(edge, matrix)?);
+                }
+                HatchPath::Edges(out)
+            }
+        });
+    }
+    let pattern_lines = hatch
+        .pattern_lines
+        .iter()
+        .map(|line| transform_pattern_line(line, matrix))
+        .collect();
+    Ok(HatchData {
+        extrusion: hatch.extrusion,
+        elevation: hatch.elevation,
+        solid_fill: hatch.solid_fill,
+        paths,
+        pattern_lines,
+    })
+}
+
+fn transform_hatch_edge(edge: &HatchEdge, matrix: Transform2) -> Result<HatchEdge, TransformError> {
+    Ok(match edge {
+        HatchEdge::Line { start, end } => HatchEdge::Line {
+            start: matrix.apply3(*start),
+            end: matrix.apply3(*end),
+        },
+        HatchEdge::Arc {
+            center,
+            radius,
+            start_angle,
+            end_angle,
+            is_ccw,
+        } => match transform_arc(
+            *center,
+            *radius,
+            *start_angle,
+            *end_angle,
+            crate::entity::default_extrusion(),
+            matrix,
+        ) {
+            Geometry::Arc {
+                center,
+                radius,
+                start_angle,
+                end_angle,
+                ..
+            } => HatchEdge::Arc {
+                center,
+                radius,
+                start_angle,
+                end_angle,
+                is_ccw: if matrix.reverses_orientation() {
+                    !*is_ccw
+                } else {
+                    *is_ccw
+                },
+            },
+            _ => return Err(TransformError::Unsupported(vec!["Hatch"])),
+        },
+        HatchEdge::Ellipse {
+            center,
+            major_endpoint,
+            axis_ratio,
+            start_angle,
+            end_angle,
+            is_ccw,
+        } => HatchEdge::Ellipse {
+            center: matrix.apply3(*center),
+            major_endpoint: matrix.apply3(*major_endpoint),
+            axis_ratio: *axis_ratio,
+            start_angle: *start_angle,
+            end_angle: *end_angle,
+            is_ccw: if matrix.reverses_orientation() {
+                !*is_ccw
+            } else {
+                *is_ccw
+            },
+        },
+        HatchEdge::Spline { control_points } => HatchEdge::Spline {
+            control_points: control_points.iter().map(|p| matrix.apply3(*p)).collect(),
+        },
+    })
+}
+
+fn transform_pattern_line(line: &HatchPatternLine, matrix: Transform2) -> HatchPatternLine {
+    let axis = Point2::new(line.angle.cos(), line.angle.sin());
+    let new_axis = matrix.apply_vector(axis);
+    HatchPatternLine {
+        angle: new_axis.y.atan2(new_axis.x),
+        base: matrix.apply3(line.base),
+        offset: apply_vector3(matrix, line.offset),
+        dashes: line.dashes.clone(),
     }
 }
 
@@ -725,8 +852,8 @@ mod tests {
             block_name: "*D1".into(),
         });
         let err = validate_entities([&ok, &hatch, &dimension]).unwrap_err();
-        assert_eq!(err, TransformError::Unsupported(vec!["Hatch", "Dimension"]));
-        assert_eq!(err.to_string(), "Cannot transform Hatch, Dimension");
+        assert_eq!(err, TransformError::Unsupported(vec!["Dimension"]));
+        assert_eq!(err.to_string(), "Cannot transform Dimension");
     }
 
     #[test]

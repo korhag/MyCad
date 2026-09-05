@@ -71,6 +71,26 @@ impl Rgb {
             1.0,
         ]
     }
+
+    /// View-only dim used while a block is edited in place.
+    /// Desaturates and keeps about 30% intensity so context stays snappable.
+    pub fn dim_for_block_context(self) -> Self {
+        let r = self.r as f32 / 255.0;
+        let g = self.g as f32 / 255.0;
+        let b = self.b as f32 / 255.0;
+        let gray = 0.299 * r + 0.587 * g + 0.114 * b;
+        let mix = 0.22;
+        let intensity = 0.32;
+        let to_u8 = |channel: f32| {
+            let desat = channel * mix + gray * (1.0 - mix);
+            (desat * intensity * 255.0).round().clamp(0.0, 255.0) as u8
+        };
+        Self {
+            r: to_u8(r).max(36),
+            g: to_u8(g).max(36),
+            b: to_u8(b).max(36),
+        }
+    }
 }
 
 // Standard AutoCAD ACI palette (indices 1..=255). Index 0 is unused here.

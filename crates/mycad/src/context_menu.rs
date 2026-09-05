@@ -38,6 +38,11 @@ pub enum ContextAction {
     Mirror,
     Scale,
     Erase,
+    CreateBlock,
+    EditBlock,
+    AddToBlock,
+    RemoveFromBlock,
+    MakeUnique,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,6 +105,15 @@ pub fn kind_for_command(kind: CommandKind) -> Option<ContextKind> {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BlockMenuState {
+    pub can_create: bool,
+    pub can_edit: bool,
+    pub can_add: bool,
+    pub can_remove: bool,
+    pub can_make_unique: bool,
+}
+
 pub enum MenuResult {
     StayOpen,
     Dismissed,
@@ -117,6 +131,7 @@ pub fn show(
     can_repeat: bool,
     selection_count: usize,
     last_command: Option<CommandKind>,
+    block_menu: BlockMenuState,
 ) -> MenuResult {
     let mut action = None;
     let screen = ctx.screen_rect();
@@ -322,6 +337,7 @@ pub fn show(
                                 can_repeat,
                                 selection_count,
                                 last_command,
+                                block_menu,
                             );
                         }
                     }
@@ -348,6 +364,7 @@ fn idle_menu(
     can_repeat: bool,
     selection_count: usize,
     last_command: Option<CommandKind>,
+    block_menu: BlockMenuState,
 ) {
     if selection_count > 0 {
         ui.add_space(2.0);
@@ -389,6 +406,69 @@ fn idle_menu(
             action,
             ContextAction::Deselect,
         );
+        separator(ui);
+    }
+    if block_menu.can_create {
+        row(
+            ui,
+            None,
+            "Create Block…",
+            None,
+            true,
+            action,
+            ContextAction::CreateBlock,
+        );
+    }
+    if block_menu.can_edit {
+        row(
+            ui,
+            None,
+            "Edit Block",
+            None,
+            true,
+            action,
+            ContextAction::EditBlock,
+        );
+    }
+    if block_menu.can_make_unique {
+        row(
+            ui,
+            None,
+            "Make Unique…",
+            None,
+            true,
+            action,
+            ContextAction::MakeUnique,
+        );
+    }
+    if block_menu.can_add {
+        row(
+            ui,
+            None,
+            "Add Selected to Block",
+            None,
+            true,
+            action,
+            ContextAction::AddToBlock,
+        );
+    }
+    if block_menu.can_remove {
+        row(
+            ui,
+            None,
+            "Remove Selected from Block",
+            None,
+            true,
+            action,
+            ContextAction::RemoveFromBlock,
+        );
+    }
+    if block_menu.can_create
+        || block_menu.can_edit
+        || block_menu.can_make_unique
+        || block_menu.can_add
+        || block_menu.can_remove
+    {
         separator(ui);
     }
     let repeat = last_command

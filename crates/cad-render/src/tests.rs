@@ -1,6 +1,6 @@
 use crate::{
-    box_select, hit_test, tessellate_document, DisplayList, SelectBoxMode,
-    DEFAULT_PICK_TOLERANCE_PX,
+    box_select, hit_test, tessellate_document, tessellate_document_for_block_edit, BlockEditView,
+    BlockEditViewFrame, DisplayList, SelectBoxMode, DEFAULT_PICK_TOLERANCE_PX,
 };
 use cad_core::Point2;
 use cad_core::{
@@ -1008,4 +1008,53 @@ fn append_line_matches_full_rebuild_for_pick_and_vertices() {
     list.box_select_into(region, SelectBoxMode::Crossing, &mut indexed);
     assert_eq!(brute, indexed);
     assert!(indexed.contains(&second.id));
+}
+
+#[test]
+fn block_edit_tessellation_picks_definition_members() {
+    use cad_core::{create_block_from_entities, EntitySpace};
+    let mut document = Document::default();
+    layer0(&mut document);
+    let line = document.add_entity(Entity::new(Geometry::Line {
+        start: Point3::from_xy(10.0, 0.0),
+        end: Point3::from_xy(20.0, 0.0),
+    }));
+    let member_id = line.id;
+    create_block_from_entities(
+        &mut document,
+        &EntitySpace::ModelSpace,
+        &[member_id],
+        "Leg",
+        cad_core::Point2::new(15.0, 0.0),
+        true,
+    )
+    .unwrap();
+    let insert_id = document.model_space[0].id;
+    let context = document.add_entity(Entity::new(Geometry::Line {
+        start: Point3::from_xy(0.0, 10.0),
+        end: Point3::from_xy(5.0, 10.0),
+    }));
+    let normal = tessellate_document(&document);
+    assert!(normal.pick_for(insert_id).is_some());
+    assert!(normal.pick_for(member_id).is_none());
+
+    let edit = tessellate_document_for_block_edit(
+        &document,
+        &BlockEditView {
+            frames: vec![BlockEditViewFrame {
+                instance_id: insert_id,
+                block_name: "Leg".into(),
+            }],
+        },
+    );
+    assert!(edit.pick_for(member_id).is_some());
+    assert!(edit.pick_for(context.id).is_some());
+    let member_range = edit.draw_range_for(member_id).expect("member draw");
+    let context_range = edit.draw_range_for(context.id).expect("context draw");
+    let member_color = edit.line_vertices[member_range.line_start as usize].color[0];
+    let context_color = edit.line_vertices[context_range.line_start as usize].color[0];
+    assert!(
+        member_color > context_color + 0.2,
+        "active members stay full color, context is dimmed ({member_color} vs {context_color})"
+    );
 }
