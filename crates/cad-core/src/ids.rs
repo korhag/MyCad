@@ -133,6 +133,56 @@ impl fmt::Display for VertexId {
     }
 }
 
+// ------------------------------------------------------------
+// Type: AnchorId
+// Purpose: Stable destination for option-driven placement.
+// ------------------------------------------------------------
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct AnchorId(pub u64);
+
+impl AnchorId {
+    pub const UNASSIGNED: Self = Self(0);
+
+    pub fn is_assigned(self) -> bool {
+        self.0 != 0
+    }
+
+    pub fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for AnchorId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "anchor:{}", self.0)
+    }
+}
+
+// ------------------------------------------------------------
+// Type: PresetId
+// Purpose: Named complete configuration within one definition.
+// ------------------------------------------------------------
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct PresetId(pub u64);
+
+impl PresetId {
+    pub const UNASSIGNED: Self = Self(0);
+
+    pub fn is_assigned(self) -> bool {
+        self.0 != 0
+    }
+
+    pub fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for PresetId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "preset:{}", self.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,6 +194,8 @@ mod tests {
         assert!(!OptionId::UNASSIGNED.is_assigned());
         assert!(!ActionId::UNASSIGNED.is_assigned());
         assert!(!VertexId::UNASSIGNED.is_assigned());
+        assert!(!AnchorId::UNASSIGNED.is_assigned());
+        assert!(!PresetId::UNASSIGNED.is_assigned());
     }
 
     #[test]

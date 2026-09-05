@@ -10,9 +10,15 @@ use std::fmt;
 use crate::document::DrawingUnits;
 use crate::entity::{Entity, EntityId, Geometry};
 use crate::geom::{Point2, Point3};
-use crate::ids::{ActionId, OptionId, ParameterId, VertexId};
+use crate::dynamic_model::{
+    active_compatibility_rules, value_allowed_by_rules, AnchorDef, CompatibilityRule, GeometryGroup,
+    NestedInput, NestedMapping, ParameterCondition, PlacementBehavior, Preset,
+    ReflectionBehavior, RotationBehavior, RotationSource, TextBinding, TextBindingMode, TextToken,
+    VisibilityGroup,
+};
+use crate::ids::{ActionId, AnchorId, OptionId, ParameterId, PresetId, VertexId};
 
-pub const EVALUATOR_VERSION: u32 = 1;
+pub const EVALUATOR_VERSION: u32 = 2;
 
 // ------------------------------------------------------------
 // Enum: GeometryTarget
@@ -515,11 +521,35 @@ pub struct ChoiceParameter {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BooleanParameter {
     pub default: bool,
+    pub true_label: String,
+    pub false_label: String,
+}
+
+impl Default for BooleanParameter {
+    fn default() -> Self {
+        Self {
+            default: false,
+            true_label: "On".into(),
+            false_label: "Off".into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextParameter {
     pub default: String,
+    pub multiline: bool,
+    pub max_length: Option<u32>,
+}
+
+impl Default for TextParameter {
+    fn default() -> Self {
+        Self {
+            default: String::new(),
+            multiline: false,
+            max_length: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -550,6 +580,8 @@ pub struct ParameterDef {
     pub id: ParameterId,
     pub name: String,
     pub description: Option<String>,
+    /// Author-defined presentation order shared by every parameter type.
+    pub display_order: i32,
     pub kind: ParameterKind,
 }
 
@@ -559,7 +591,48 @@ impl ParameterDef {
             id,
             name: name.into(),
             description: None,
+            display_order: numeric.display_order,
             kind: ParameterKind::Number(numeric),
+        }
+    }
+
+    pub fn choice(id: ParameterId, name: impl Into<String>, choice: ChoiceParameter) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            description: None,
+            display_order: 0,
+            kind: ParameterKind::Choice(choice),
+        }
+    }
+
+    pub fn boolean(id: ParameterId, name: impl Into<String>, flag: BooleanParameter) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            description: None,
+            display_order: 0,
+            kind: ParameterKind::Boolean(flag),
+        }
+    }
+
+    pub fn text(id: ParameterId, name: impl Into<String>, text: TextParameter) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            description: None,
+            display_order: 0,
+            kind: ParameterKind::Text(text),
+        }
+    }
+
+    pub fn presentation_order(&self) -> i32 {
+        if self.display_order != 0 {
+            return self.display_order;
+        }
+        match &self.kind {
+            ParameterKind::Number(numeric) => numeric.display_order,
+            _ => 0,
         }
     }
 
@@ -639,13 +712,21 @@ impl InstanceConfiguration {
     }
 
     pub fn remap_parameters(&mut self, parameters: &BTreeMap<ParameterId, ParameterId>) {
+        self.remap_identities(parameters, &BTreeMap::new());
+    }
+
+    pub fn remap_identities(
+        &mut self,
+        parameters: &BTreeMap<ParameterId, ParameterId>,
+        options: &BTreeMap<OptionId, OptionId>,
+    ) {
         let mut remapped = BTreeMap::new();
         for (id, value) in std::mem::take(&mut self.values) {
-            if let Some(new_id) = parameters.get(&id) {
-                remapped.insert(*new_id, value);
-            } else {
-                remapped.insert(id, value);
-            }
+            let mapped_id = parameters.get(&id).copied().unwrap_or(id);
+            remapped.insert(
+                mapped_id,
+                crate::dynamic_model::remap_choice_value(value, options),
+            );
         }
         self.values = remapped;
     }
@@ -759,6 +840,17 @@ impl DynamicBehavior {
 pub struct DynamicDefinition {
     pub parameters: Vec<ParameterDef>,
     pub behaviors: Vec<DynamicBehavior>,
+    pub groups: Vec<GeometryGroup>,
+    pub anchors: Vec<AnchorDef>,
+    pub visibility: Vec<VisibilityGroup>,
+    pub text_bindings: Vec<TextBinding>,
+    pub reflections: Vec<ReflectionBehavior>,
+    pub rotations: Vec<RotationBehavior>,
+    pub placements: Vec<PlacementBehavior>,
+    pub nested_inputs: Vec<NestedInput>,
+    pub compatibility: Vec<CompatibilityRule>,
+    pub presets: Vec<Preset>,
+    pub transform_order: Vec<ActionId>,
 }
 
 impl DynamicDefinition {
@@ -779,16 +871,8 @@ impl DynamicDefinition {
     pub fn sorted_parameters(&self) -> Vec<&ParameterDef> {
         let mut parameters: Vec<&ParameterDef> = self.parameters.iter().collect();
         parameters.sort_by(|left, right| {
-            let left_order = match &left.kind {
-                ParameterKind::Number(numeric) => numeric.display_order,
-                _ => 0,
-            };
-            let right_order = match &right.kind {
-                ParameterKind::Number(numeric) => numeric.display_order,
-                _ => 0,
-            };
-            left_order
-                .cmp(&right_order)
+            left.presentation_order()
+                .cmp(&right.presentation_order())
                 .then_with(|| {
                     left.name
                         .to_ascii_lowercase()
@@ -804,6 +888,19 @@ impl DynamicDefinition {
         parameters: &BTreeMap<ParameterId, ParameterId>,
         options: &BTreeMap<OptionId, OptionId>,
         actions: &BTreeMap<ActionId, ActionId>,
+        entities: &BTreeMap<EntityId, EntityId>,
+        vertices: &BTreeMap<VertexId, VertexId>,
+    ) -> Result<(), DynamicError> {
+        self.remap_ids_with(parameters, options, actions, &BTreeMap::new(), &BTreeMap::new(), entities, vertices)
+    }
+
+    pub fn remap_ids_with(
+        &mut self,
+        parameters: &BTreeMap<ParameterId, ParameterId>,
+        options: &BTreeMap<OptionId, OptionId>,
+        actions: &BTreeMap<ActionId, ActionId>,
+        anchors: &BTreeMap<AnchorId, AnchorId>,
+        presets: &BTreeMap<PresetId, PresetId>,
         entities: &BTreeMap<EntityId, EntityId>,
         vertices: &BTreeMap<VertexId, VertexId>,
     ) -> Result<(), DynamicError> {
@@ -832,8 +929,347 @@ impl DynamicDefinition {
         for behavior in &mut self.behaviors {
             behavior.remap(parameters, actions, entities, vertices)?;
         }
+        for group in &mut self.groups {
+            group.remap(actions, entities)?;
+        }
+        for anchor in &mut self.anchors {
+            anchor.remap(parameters, anchors, entities, vertices)?;
+        }
+        for group in &mut self.visibility {
+            group.remap(parameters, options, actions, entities)?;
+        }
+        for binding in &mut self.text_bindings {
+            binding.remap(parameters, options, actions, entities)?;
+        }
+        for behavior in &mut self.reflections {
+            remap_reflection(behavior, parameters, options, actions, entities)?;
+        }
+        for behavior in &mut self.rotations {
+            remap_rotation(behavior, parameters, options, actions, entities)?;
+        }
+        for behavior in &mut self.placements {
+            remap_placement(behavior, parameters, options, actions, anchors, entities)?;
+        }
+        for input in &mut self.nested_inputs {
+            remap_nested_input(input, parameters, options, actions, entities)?;
+        }
+        for rule in &mut self.compatibility {
+            rule.remap(parameters, options, actions);
+        }
+        for preset in &mut self.presets {
+            preset.remap(parameters, options, presets);
+        }
+        for id in &mut self.transform_order {
+            if let Some(mapped) = actions.get(id) {
+                *id = *mapped;
+            }
+        }
         Ok(())
     }
+
+    pub fn anchor(&self, id: AnchorId) -> Option<&AnchorDef> {
+        self.anchors.iter().find(|anchor| anchor.id == id)
+    }
+
+    pub fn preset(&self, id: PresetId) -> Option<&Preset> {
+        self.presets.iter().find(|preset| preset.id == id)
+    }
+
+    pub fn migrate_option(
+        &mut self,
+        parameter: ParameterId,
+        from: OptionId,
+        to: OptionId,
+    ) -> Result<(), DynamicError> {
+        if from == to {
+            return Err(DynamicError::IncompleteMapping {
+                action: ActionId::UNASSIGNED,
+                parameter,
+                option: from,
+            });
+        }
+        let Some(ParameterKind::Choice(choice)) = self.parameter(parameter).map(|item| &item.kind) else {
+            return Err(DynamicError::UnknownParameter {
+                action: ActionId::UNASSIGNED,
+                parameter,
+            });
+        };
+        if !choice.options.iter().any(|option| option.id == from)
+            || !choice.options.iter().any(|option| option.id == to)
+        {
+            return Err(DynamicError::IncompleteMapping {
+                action: ActionId::UNASSIGNED,
+                parameter,
+                option: from,
+            });
+        }
+        for parameter_def in &mut self.parameters {
+            if parameter_def.id != parameter {
+                continue;
+            }
+            let ParameterKind::Choice(choice) = &mut parameter_def.kind else {
+                continue;
+            };
+            if choice.default == from {
+                choice.default = to;
+            }
+            choice.options.retain(|option| option.id != from);
+        }
+        for group in &mut self.visibility {
+            for condition in &mut group.conditions {
+                if let ParameterCondition::Choice {
+                    parameter: pid,
+                    options,
+                } = condition
+                {
+                    if *pid == parameter {
+                        crate::dynamic_model::replace_option_list(options, from, to);
+                    }
+                }
+            }
+        }
+        for binding in &mut self.text_bindings {
+            if let TextBindingMode::OptionMap {
+                parameter: pid,
+                texts,
+            } = &mut binding.mode
+            {
+                if *pid == parameter {
+                    crate::dynamic_model::replace_option_key(texts, from, to);
+                }
+            }
+        }
+        for behavior in &mut self.reflections {
+            if let ParameterCondition::Choice {
+                parameter: pid,
+                options,
+            } = &mut behavior.condition
+            {
+                if *pid == parameter {
+                    crate::dynamic_model::replace_option_list(options, from, to);
+                }
+            }
+        }
+        for behavior in &mut self.rotations {
+            if let RotationSource::OptionMap {
+                parameter: pid,
+                angles,
+            } = &mut behavior.source
+            {
+                if *pid == parameter {
+                    crate::dynamic_model::replace_option_key(angles, from, to);
+                }
+            }
+        }
+        for behavior in &mut self.placements {
+            if behavior.parameter == parameter {
+                crate::dynamic_model::replace_option_key(&mut behavior.destinations, from, to);
+            }
+        }
+        for input in &mut self.nested_inputs {
+            if input.source == parameter {
+                if let NestedMapping::OptionMap(map) = &mut input.mapping {
+                    crate::dynamic_model::replace_option_key(map, from, to);
+                }
+            }
+            if let NestedMapping::OptionMap(map) = &mut input.mapping {
+                for value in map.values_mut() {
+                    crate::dynamic_model::migrate_option_value(value, parameter, from, to);
+                }
+            }
+        }
+        for rule in &mut self.compatibility {
+            migrate_rule_option(rule, parameter, from, to);
+        }
+        for preset in &mut self.presets {
+            if let Some(value) = preset.values.get_mut(&parameter) {
+                crate::dynamic_model::migrate_option_value(value, parameter, from, to);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn collect_action_ids(&self) -> Vec<ActionId> {
+        let mut ids: Vec<ActionId> = self.behaviors.iter().map(|item| item.id).collect();
+        ids.extend(self.groups.iter().map(|item| item.id));
+        ids.extend(self.visibility.iter().map(|item| item.id));
+        ids.extend(self.text_bindings.iter().map(|item| item.id));
+        ids.extend(self.reflections.iter().map(|item| item.id));
+        ids.extend(self.rotations.iter().map(|item| item.id));
+        ids.extend(self.placements.iter().map(|item| item.id));
+        ids.extend(self.nested_inputs.iter().map(|item| item.id));
+        ids.extend(self.compatibility.iter().map(CompatibilityRule::id));
+        ids
+    }
+}
+
+fn remap_members(
+    members: &mut Vec<EntityId>,
+    entities: &BTreeMap<EntityId, EntityId>,
+) -> Result<(), DynamicError> {
+    let mut remapped = Vec::with_capacity(members.len());
+    for id in members.iter() {
+        remapped.push(*entities.get(id).ok_or(DynamicError::MissingEntity {
+            target: GeometryTarget::Entity(*id),
+        })?);
+    }
+    *members = remapped;
+    Ok(())
+}
+
+fn migrate_rule_option(
+    rule: &mut CompatibilityRule,
+    parameter: ParameterId,
+    from: OptionId,
+    to: OptionId,
+) {
+    match rule {
+        CompatibilityRule::ChoiceAllowsChoice {
+            when,
+            when_option,
+            target,
+            allowed,
+            ..
+        } => {
+            if *when == parameter {
+                crate::dynamic_model::replace_option_id(when_option, from, to);
+            }
+            if *target == parameter {
+                crate::dynamic_model::replace_option_list(allowed, from, to);
+            }
+        }
+        CompatibilityRule::ChoiceRestrictsNumeric {
+            when, when_option, ..
+        } => {
+            if *when == parameter {
+                crate::dynamic_model::replace_option_id(when_option, from, to);
+            }
+        }
+        CompatibilityRule::BooleanPermits {
+            target,
+            allowed_options,
+            ..
+        } => {
+            if *target == parameter {
+                if let Some(allowed) = allowed_options {
+                    crate::dynamic_model::replace_option_list(allowed, from, to);
+                }
+            }
+        }
+    }
+}
+
+fn remap_reflection(
+    behavior: &mut ReflectionBehavior,
+    parameters: &BTreeMap<ParameterId, ParameterId>,
+    options: &BTreeMap<OptionId, OptionId>,
+    actions: &BTreeMap<ActionId, ActionId>,
+    entities: &BTreeMap<EntityId, EntityId>,
+) -> Result<(), DynamicError> {
+    if let Some(mapped) = actions.get(&behavior.id) {
+        behavior.id = *mapped;
+    }
+    behavior.condition.remap(parameters, options);
+    remap_members(&mut behavior.members, entities)
+}
+
+fn remap_rotation(
+    behavior: &mut RotationBehavior,
+    parameters: &BTreeMap<ParameterId, ParameterId>,
+    options: &BTreeMap<OptionId, OptionId>,
+    actions: &BTreeMap<ActionId, ActionId>,
+    entities: &BTreeMap<EntityId, EntityId>,
+) -> Result<(), DynamicError> {
+    if let Some(mapped) = actions.get(&behavior.id) {
+        behavior.id = *mapped;
+    }
+    match &mut behavior.source {
+        RotationSource::AngleParameter(parameter) => {
+            if let Some(mapped) = parameters.get(parameter) {
+                *parameter = *mapped;
+            }
+        }
+        RotationSource::OptionMap { parameter, angles } => {
+            if let Some(mapped) = parameters.get(parameter) {
+                *parameter = *mapped;
+            }
+            let mut remapped = BTreeMap::new();
+            for (id, angle) in std::mem::take(angles) {
+                remapped.insert(options.get(&id).copied().unwrap_or(id), angle);
+            }
+            *angles = remapped;
+        }
+    }
+    remap_members(&mut behavior.members, entities)
+}
+
+fn remap_placement(
+    behavior: &mut PlacementBehavior,
+    parameters: &BTreeMap<ParameterId, ParameterId>,
+    options: &BTreeMap<OptionId, OptionId>,
+    actions: &BTreeMap<ActionId, ActionId>,
+    anchors: &BTreeMap<AnchorId, AnchorId>,
+    entities: &BTreeMap<EntityId, EntityId>,
+) -> Result<(), DynamicError> {
+    if let Some(mapped) = actions.get(&behavior.id) {
+        behavior.id = *mapped;
+    }
+    if let Some(mapped) = parameters.get(&behavior.parameter) {
+        behavior.parameter = *mapped;
+    }
+    let mut destinations = BTreeMap::new();
+    for (option, anchor) in std::mem::take(&mut behavior.destinations) {
+        destinations.insert(
+            options.get(&option).copied().unwrap_or(option),
+            anchors.get(&anchor).copied().unwrap_or(anchor),
+        );
+    }
+    behavior.destinations = destinations;
+    if let Some((off, on)) = &mut behavior.boolean_destinations {
+        *off = anchors.get(off).copied().unwrap_or(*off);
+        *on = anchors.get(on).copied().unwrap_or(*on);
+    }
+    remap_members(&mut behavior.members, entities)
+}
+
+fn remap_nested_input(
+    input: &mut NestedInput,
+    parameters: &BTreeMap<ParameterId, ParameterId>,
+    options: &BTreeMap<OptionId, OptionId>,
+    actions: &BTreeMap<ActionId, ActionId>,
+    entities: &BTreeMap<EntityId, EntityId>,
+) -> Result<(), DynamicError> {
+    if let Some(mapped) = actions.get(&input.id) {
+        input.id = *mapped;
+    }
+    if let Some(mapped) = parameters.get(&input.source) {
+        input.source = *mapped;
+    }
+    if let Some(mapped) = parameters.get(&input.target_parameter) {
+        input.target_parameter = *mapped;
+    }
+    input.target_occurrence = input
+        .target_occurrence
+        .remap(entities)
+        .ok_or(DynamicError::MissingEntity {
+            target: GeometryTarget::Entity(
+                input
+                    .target_occurrence
+                    .leaf()
+                    .unwrap_or(EntityId::UNASSIGNED),
+            ),
+        })?;
+    if let NestedMapping::OptionMap(map) = &mut input.mapping {
+        let mut remapped = BTreeMap::new();
+        for (option, value) in std::mem::take(map) {
+            remapped.insert(
+                options.get(&option).copied().unwrap_or(option),
+                crate::dynamic_model::remap_choice_value(value, options),
+            );
+        }
+        *map = remapped;
+    }
+    Ok(())
 }
 
 // ------------------------------------------------------------
@@ -923,6 +1359,50 @@ pub enum DynamicError {
         actual: u64,
     },
     NestedEditUnsupported,
+    EmptyLabel {
+        parameter: ParameterId,
+    },
+    DuplicateLabel {
+        parameter: ParameterId,
+        label: String,
+    },
+    IncompleteMapping {
+        action: ActionId,
+        parameter: ParameterId,
+        option: OptionId,
+    },
+    CompetingBinding {
+        target: GeometryTarget,
+        actions: Vec<ActionId>,
+    },
+    CompetingPlacement {
+        members: Vec<EntityId>,
+        actions: Vec<ActionId>,
+    },
+    DependencyCycle {
+        details: String,
+    },
+    AmbiguousTransform {
+        details: String,
+    },
+    DuplicateEquivalent {
+        action: ActionId,
+        other: ActionId,
+    },
+    TextTooLong {
+        parameter: ParameterId,
+        limit: u32,
+    },
+    NestedCycle {
+        details: String,
+    },
+    Compatibility {
+        parameter: ParameterId,
+        reason: String,
+    },
+    UnsupportedCombination {
+        details: String,
+    },
 }
 
 impl fmt::Display for DynamicError {
@@ -1055,6 +1535,45 @@ impl fmt::Display for DynamicError {
             Self::NestedEditUnsupported => {
                 f.write_str("Editing a nested dynamic reference independently is not supported yet")
             }
+            Self::EmptyLabel { parameter } => {
+                write!(f, "Parameter {parameter} has an empty option label")
+            }
+            Self::DuplicateLabel { parameter, label } => {
+                write!(f, "Parameter {parameter} has duplicate option label '{label}'")
+            }
+            Self::IncompleteMapping {
+                action,
+                parameter,
+                option,
+            } => write!(
+                f,
+                "Action {action} is missing a mapping for {parameter} option {option}"
+            ),
+            Self::CompetingBinding { target, actions } => write!(
+                f,
+                "Competing bindings to {} #{} from actions {:?}",
+                target.label(),
+                target.entity_id().raw(),
+                actions
+            ),
+            Self::CompetingPlacement { actions, .. } => {
+                write!(f, "Competing final placements from actions {actions:?}")
+            }
+            Self::DependencyCycle { details } => write!(f, "Dependency cycle: {details}"),
+            Self::AmbiguousTransform { details } => write!(f, "Ambiguous transform: {details}"),
+            Self::DuplicateEquivalent { action, other } => {
+                write!(f, "Action {action} duplicates {other}")
+            }
+            Self::TextTooLong { parameter, limit } => {
+                write!(f, "Parameter {parameter} exceeds the {limit} character limit")
+            }
+            Self::NestedCycle { details } => write!(f, "Nested mapping cycle: {details}"),
+            Self::Compatibility { parameter, reason } => {
+                write!(f, "Parameter {parameter}: {reason}")
+            }
+            Self::UnsupportedCombination { details } => {
+                write!(f, "Unsupported transform combination: {details}")
+            }
         }
     }
 }
@@ -1158,7 +1677,522 @@ pub fn validate_definition(
         }
     }
     validate_behavior_conflicts(dynamic)?;
+    validate_phase3(dynamic, &entity_ids)?;
     Ok(())
+}
+
+fn validate_phase3(
+    dynamic: &DynamicDefinition,
+    entity_ids: &BTreeSet<EntityId>,
+) -> Result<(), DynamicError> {
+    let mut action_ids: BTreeSet<ActionId> = dynamic.behaviors.iter().map(|item| item.id).collect();
+    let mut text_targets: BTreeMap<EntityId, ActionId> = BTreeMap::new();
+    for binding in &dynamic.text_bindings {
+        if !binding.id.is_assigned() || !action_ids.insert(binding.id) {
+            return Err(DynamicError::DuplicateAction(binding.id));
+        }
+        if !entity_ids.contains(&binding.target) {
+            return Err(DynamicError::MissingEntity {
+                target: GeometryTarget::Entity(binding.target),
+            });
+        }
+        if let Some(other) = text_targets.insert(binding.target, binding.id) {
+            return Err(DynamicError::CompetingBinding {
+                target: GeometryTarget::Entity(binding.target),
+                actions: vec![other, binding.id],
+            });
+        }
+        validate_text_binding(dynamic, binding)?;
+    }
+    for group in &dynamic.visibility {
+        if !group.id.is_assigned() || !action_ids.insert(group.id) {
+            return Err(DynamicError::DuplicateAction(group.id));
+        }
+        validate_conditions(dynamic, group.id, &group.conditions)?;
+        for member in &group.members {
+            if !entity_ids.contains(member) {
+                return Err(DynamicError::MissingEntity {
+                    target: GeometryTarget::Entity(*member),
+                });
+            }
+        }
+    }
+    for group in &dynamic.groups {
+        if !group.id.is_assigned() || !action_ids.insert(group.id) {
+            return Err(DynamicError::DuplicateAction(group.id));
+        }
+        for member in &group.members {
+            if !entity_ids.contains(member) {
+                return Err(DynamicError::MissingEntity {
+                    target: GeometryTarget::Entity(*member),
+                });
+            }
+        }
+    }
+    let mut anchor_ids = BTreeSet::new();
+    for anchor in &dynamic.anchors {
+        if !anchor.id.is_assigned() || !anchor_ids.insert(anchor.id) {
+            return Err(DynamicError::DuplicateAction(ActionId(anchor.id.raw())));
+        }
+        if let Some(crate::dynamic_model::AnchorFollow::Size { parameter, .. }) = &anchor.follow {
+            if dynamic.parameter(*parameter).is_none() {
+                return Err(DynamicError::UnknownParameter {
+                    action: ActionId::UNASSIGNED,
+                    parameter: *parameter,
+                });
+            }
+        }
+    }
+    for behavior in &dynamic.reflections {
+        if !behavior.id.is_assigned() || !action_ids.insert(behavior.id) {
+            return Err(DynamicError::DuplicateAction(behavior.id));
+        }
+        validate_conditions(dynamic, behavior.id, std::slice::from_ref(&behavior.condition))?;
+        for member in &behavior.members {
+            if !entity_ids.contains(member) {
+                return Err(DynamicError::MissingEntity {
+                    target: GeometryTarget::Entity(*member),
+                });
+            }
+        }
+        if behavior.axis_a.distance(behavior.axis_b) <= 1e-12 {
+            return Err(DynamicError::ZeroDirection {
+                action: behavior.id,
+            });
+        }
+    }
+    for behavior in &dynamic.rotations {
+        if !behavior.id.is_assigned() || !action_ids.insert(behavior.id) {
+            return Err(DynamicError::DuplicateAction(behavior.id));
+        }
+        match &behavior.source {
+            RotationSource::AngleParameter(parameter)
+            | RotationSource::OptionMap { parameter, .. } => {
+                if dynamic.parameter(*parameter).is_none() {
+                    return Err(DynamicError::UnknownParameter {
+                        action: behavior.id,
+                        parameter: *parameter,
+                    });
+                }
+            }
+        }
+        if let RotationSource::OptionMap { angles, .. } = &behavior.source {
+            if angles.values().any(|angle| !angle.is_finite()) {
+                return Err(DynamicError::NonFinite {
+                    parameter: match &behavior.source {
+                        RotationSource::OptionMap { parameter, .. } => *parameter,
+                        RotationSource::AngleParameter(parameter) => *parameter,
+                    },
+                });
+            }
+        }
+        for member in &behavior.members {
+            if !entity_ids.contains(member) {
+                return Err(DynamicError::MissingEntity {
+                    target: GeometryTarget::Entity(*member),
+                });
+            }
+        }
+    }
+    let mut placement_members: BTreeMap<EntityId, ActionId> = BTreeMap::new();
+    for behavior in &dynamic.placements {
+        if !behavior.id.is_assigned() || !action_ids.insert(behavior.id) {
+            return Err(DynamicError::DuplicateAction(behavior.id));
+        }
+        if dynamic.parameter(behavior.parameter).is_none() {
+            return Err(DynamicError::UnknownParameter {
+                action: behavior.id,
+                parameter: behavior.parameter,
+            });
+        }
+        for member in &behavior.members {
+            if !entity_ids.contains(member) {
+                return Err(DynamicError::MissingEntity {
+                    target: GeometryTarget::Entity(*member),
+                });
+            }
+            if let Some(other) = placement_members.insert(*member, behavior.id) {
+                return Err(DynamicError::CompetingPlacement {
+                    members: vec![*member],
+                    actions: vec![other, behavior.id],
+                });
+            }
+        }
+        for anchor in behavior.destinations.values() {
+            if dynamic.anchor(*anchor).is_none() {
+                return Err(DynamicError::MissingEntity {
+                    target: GeometryTarget::Entity(EntityId::UNASSIGNED),
+                });
+            }
+        }
+    }
+    validate_transform_order(dynamic)?;
+    validate_anchor_cycles(dynamic)?;
+    for input in &dynamic.nested_inputs {
+        if !input.id.is_assigned() || !action_ids.insert(input.id) {
+            return Err(DynamicError::DuplicateAction(input.id));
+        }
+        if dynamic.parameter(input.source).is_none() {
+            return Err(DynamicError::UnknownParameter {
+                action: input.id,
+                parameter: input.source,
+            });
+        }
+        if input.target_occurrence.inserts.is_empty() {
+            return Err(DynamicError::NestedCycle {
+                details: format!("nested input {} has no target occurrence", input.id),
+            });
+        }
+        for id in &input.target_occurrence.inserts {
+            if !entity_ids.contains(id) {
+                return Err(DynamicError::MissingEntity {
+                    target: GeometryTarget::Entity(*id),
+                });
+            }
+        }
+    }
+    for preset in &dynamic.presets {
+        if !preset.id.is_assigned() {
+            return Err(DynamicError::DuplicateAction(ActionId(preset.id.raw())));
+        }
+        for (id, value) in &preset.values {
+            let Some(parameter) = dynamic.parameter(*id) else {
+                return Err(DynamicError::UnknownParameter {
+                    action: ActionId::UNASSIGNED,
+                    parameter: *id,
+                });
+            };
+            validate_parameter_value(parameter, value)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_conditions(
+    dynamic: &DynamicDefinition,
+    action: ActionId,
+    conditions: &[ParameterCondition],
+) -> Result<(), DynamicError> {
+    for condition in conditions {
+        let Some(parameter) = dynamic.parameter(condition.parameter()) else {
+            return Err(DynamicError::UnknownParameter {
+                action,
+                parameter: condition.parameter(),
+            });
+        };
+        match condition {
+            ParameterCondition::Choice { options, .. } => {
+                let ParameterKind::Choice(choice) = &parameter.kind else {
+                    return Err(DynamicError::ValueType {
+                        parameter: parameter.id,
+                        expected: "choice",
+                        actual: parameter.kind.type_name(),
+                    });
+                };
+                for option in options {
+                    if !choice.options.iter().any(|item| item.id == *option) {
+                        return Err(DynamicError::UnknownChoice {
+                            parameter: parameter.id,
+                            option: *option,
+                        });
+                    }
+                }
+            }
+            ParameterCondition::Boolean { .. } => {
+                if !matches!(parameter.kind, ParameterKind::Boolean(_)) {
+                    return Err(DynamicError::ValueType {
+                        parameter: parameter.id,
+                        expected: "boolean",
+                        actual: parameter.kind.type_name(),
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_text_binding(
+    dynamic: &DynamicDefinition,
+    binding: &TextBinding,
+) -> Result<(), DynamicError> {
+    match &binding.mode {
+        TextBindingMode::ShowValue { parameter } => {
+            if dynamic.parameter(*parameter).is_none() {
+                return Err(DynamicError::UnknownParameter {
+                    action: binding.id,
+                    parameter: *parameter,
+                });
+            }
+        }
+        TextBindingMode::OptionMap { parameter, texts } => {
+            let Some(def) = dynamic.parameter(*parameter) else {
+                return Err(DynamicError::UnknownParameter {
+                    action: binding.id,
+                    parameter: *parameter,
+                });
+            };
+            let ParameterKind::Choice(choice) = &def.kind else {
+                return Err(DynamicError::ValueType {
+                    parameter: *parameter,
+                    expected: "choice",
+                    actual: def.kind.type_name(),
+                });
+            };
+            for option in &choice.options {
+                if !texts.contains_key(&option.id) {
+                    return Err(DynamicError::IncompleteMapping {
+                        action: binding.id,
+                        parameter: *parameter,
+                        option: option.id,
+                    });
+                }
+            }
+        }
+        TextBindingMode::Formatted { tokens } => {
+            for token in tokens {
+                if let TextToken::Parameter(parameter) = token {
+                    if dynamic.parameter(*parameter).is_none() {
+                        return Err(DynamicError::UnknownParameter {
+                            action: binding.id,
+                            parameter: *parameter,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_transform_order(dynamic: &DynamicDefinition) -> Result<(), DynamicError> {
+    let known: BTreeSet<ActionId> = dynamic
+        .reflections
+        .iter()
+        .map(|item| item.id)
+        .chain(dynamic.rotations.iter().map(|item| item.id))
+        .chain(dynamic.placements.iter().map(|item| item.id))
+        .collect();
+    let mut seen = BTreeSet::new();
+    for id in &dynamic.transform_order {
+        if !known.contains(id) {
+            return Err(DynamicError::UnknownParameter {
+                action: *id,
+                parameter: ParameterId::UNASSIGNED,
+            });
+        }
+        if !seen.insert(*id) {
+            return Err(DynamicError::DuplicateAction(*id));
+        }
+    }
+    Ok(())
+}
+
+fn validate_anchor_cycles(dynamic: &DynamicDefinition) -> Result<(), DynamicError> {
+    for placement in &dynamic.placements {
+        for member in &placement.members {
+            for anchor in &dynamic.anchors {
+                if let Some(crate::dynamic_model::AnchorFollow::Geometry(target)) = &anchor.follow {
+                    if target.entity_id() == *member
+                        && placement.destinations.values().any(|id| *id == anchor.id)
+                    {
+                        return Err(DynamicError::DependencyCycle {
+                            details: format!(
+                                "anchor '{}' depends on geometry placed by {}",
+                                anchor.name, placement.id
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_configuration(
+    dynamic: &DynamicDefinition,
+    values: &BTreeMap<ParameterId, ParameterValue>,
+) -> Result<(), DynamicError> {
+    let resolved = resolve_values(
+        dynamic,
+        Some(&InstanceConfiguration {
+            values: values.clone(),
+        }),
+    )?;
+    let active = active_compatibility_rules(&dynamic.compatibility, &resolved);
+    for parameter in &dynamic.parameters {
+        let Some(value) = resolved.get(&parameter.id) else {
+            continue;
+        };
+        if let Err(reason) = value_allowed_by_rules(parameter, value, &active) {
+            return Err(DynamicError::Compatibility {
+                parameter: parameter.id,
+                reason,
+            });
+        }
+    }
+    Ok(())
+}
+
+pub fn migrate_choice_option(
+    document: &mut crate::document::Document,
+    block_name: &str,
+    parameter: ParameterId,
+    from: OptionId,
+    to: OptionId,
+) -> Result<(), DynamicError> {
+    {
+        let block = document
+            .block_by_name_mut(block_name)
+            .ok_or(DynamicError::MissingDefinition)?;
+        let dynamic = block
+            .dynamic
+            .as_mut()
+            .ok_or(DynamicError::MissingDefinition)?;
+        dynamic.migrate_option(parameter, from, to)?;
+    }
+    let migrate_entity = |entity: &mut Entity| {
+        if entity.geometry.insert_block_name() != Some(block_name) {
+            return;
+        }
+        if let Some(config) = entity.geometry.insert_configuration_mut() {
+            if let Some(values) = config.as_mut() {
+                if let Some(value) = values.values.get_mut(&parameter) {
+                    crate::dynamic_model::migrate_option_value(value, parameter, from, to);
+                }
+            }
+        }
+    };
+    for entity in &mut document.model_space {
+        migrate_entity(entity);
+    }
+    for block in document.blocks.values_mut() {
+        for entity in &mut block.entities {
+            migrate_entity(entity);
+        }
+    }
+    Ok(())
+}
+
+pub fn proposed_configuration(
+    dynamic: &DynamicDefinition,
+    current: &BTreeMap<ParameterId, ParameterValue>,
+    patch: &BTreeMap<ParameterId, ParameterValue>,
+) -> Result<ProposedConfiguration, DynamicError> {
+    let mut values = current.clone();
+    for (id, value) in patch {
+        values.insert(*id, value.clone());
+    }
+    if validate_configuration(dynamic, &values).is_ok() {
+        return Ok(ProposedConfiguration {
+            values,
+            related: Vec::new(),
+        });
+    }
+    let mut related = Vec::new();
+    let resolved = resolve_values(
+        dynamic,
+        Some(&InstanceConfiguration {
+            values: values.clone(),
+        }),
+    )?;
+    let active = active_compatibility_rules(&dynamic.compatibility, &resolved);
+    for parameter in &dynamic.parameters {
+        if patch.contains_key(&parameter.id) {
+            continue;
+        }
+        let Some(value) = resolved.get(&parameter.id) else {
+            continue;
+        };
+        if value_allowed_by_rules(parameter, value, &active).is_ok() {
+            continue;
+        }
+        if let Some(fixed) = compatible_replacement(parameter, value, &active) {
+            values.insert(parameter.id, fixed.clone());
+            related.push((parameter.id, fixed));
+        }
+    }
+    validate_configuration(dynamic, &values)?;
+    Ok(ProposedConfiguration { values, related })
+}
+
+fn compatible_replacement(
+    parameter: &ParameterDef,
+    value: &ParameterValue,
+    rules: &[&CompatibilityRule],
+) -> Option<ParameterValue> {
+    for rule in rules {
+        match rule {
+            CompatibilityRule::ChoiceAllowsChoice {
+                target, allowed, ..
+            } if *target == parameter.id => {
+                let ParameterValue::Choice(option) = value else {
+                    continue;
+                };
+                if !allowed.contains(option) {
+                    return allowed.first().copied().map(ParameterValue::Choice);
+                }
+            }
+            CompatibilityRule::ChoiceRestrictsNumeric {
+                target,
+                min,
+                max,
+                allowed,
+                ..
+            } if *target == parameter.id => {
+                let ParameterValue::Number(number) = value else {
+                    continue;
+                };
+                if let Some(list) = allowed {
+                    if !list.iter().any(|item| numbers_equal(*item, *number)) {
+                        let nearest = list.iter().copied().min_by(|a, b| {
+                            (*a - *number)
+                                .abs()
+                                .partial_cmp(&(*b - *number).abs())
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        })?;
+                        return Some(ParameterValue::Number(nearest));
+                    }
+                }
+                let mut next = *number;
+                if let Some(min) = min {
+                    next = next.max(*min);
+                }
+                if let Some(max) = max {
+                    next = next.min(*max);
+                }
+                if (next - *number).abs() > 1e-12 {
+                    return Some(ParameterValue::Number(next));
+                }
+            }
+            CompatibilityRule::BooleanPermits {
+                target,
+                allowed_options,
+                required_boolean,
+                ..
+            } if *target == parameter.id => {
+                if let (Some(allowed), ParameterValue::Choice(option)) = (allowed_options, value) {
+                    if !allowed.contains(option) {
+                        return allowed.first().copied().map(ParameterValue::Choice);
+                    }
+                }
+                if let (Some(required), ParameterValue::Boolean(flag)) = (required_boolean, value) {
+                    if flag != required {
+                        return Some(ParameterValue::Boolean(*required));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProposedConfiguration {
+    pub values: BTreeMap<ParameterId, ParameterValue>,
+    pub related: Vec<(ParameterId, ParameterValue)>,
 }
 
 pub fn collect_broken_bindings(
@@ -1212,9 +2246,35 @@ pub fn validate_parameter_def(parameter: &ParameterDef) -> Result<(), DynamicErr
                     option: choice.default,
                 });
             }
+            let mut labels = BTreeSet::new();
+            for option in &choice.options {
+                let label = option.label.trim();
+                if label.is_empty() {
+                    return Err(DynamicError::EmptyLabel {
+                        parameter: parameter.id,
+                    });
+                }
+                if !labels.insert(label.to_ascii_lowercase()) {
+                    return Err(DynamicError::DuplicateLabel {
+                        parameter: parameter.id,
+                        label: option.label.clone(),
+                    });
+                }
+            }
             Ok(())
         }
-        ParameterKind::Boolean(_) | ParameterKind::Text(_) => Ok(()),
+        ParameterKind::Boolean(_) => Ok(()),
+        ParameterKind::Text(text) => {
+            if let Some(limit) = text.max_length {
+                if text.default.chars().count() > limit as usize {
+                    return Err(DynamicError::TextTooLong {
+                        parameter: parameter.id,
+                        limit,
+                    });
+                }
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1277,7 +2337,17 @@ pub fn validate_parameter_value(
             }
         }
         (ParameterKind::Boolean(_), ParameterValue::Boolean(_)) => Ok(()),
-        (ParameterKind::Text(_), ParameterValue::Text(_)) => Ok(()),
+        (ParameterKind::Text(text), ParameterValue::Text(value)) => {
+            if let Some(limit) = text.max_length {
+                if value.chars().count() > limit as usize {
+                    return Err(DynamicError::TextTooLong {
+                        parameter: parameter.id,
+                        limit,
+                    });
+                }
+            }
+            Ok(())
+        }
         (expected, actual) => Err(DynamicError::ValueType {
             parameter: parameter.id,
             expected: expected.type_name(),
@@ -1740,6 +2810,7 @@ mod tests {
                 follow: FollowRole::Second,
                 name: None,
             }],
+            ..Default::default()
         };
         let err =
             validate_definition(&dynamic, &[line_entity(1, 0.0, 0.0, 10.0, 0.0)]).unwrap_err();
@@ -1752,6 +2823,7 @@ mod tests {
             id: ParameterId(1),
             name: "Side".into(),
             description: None,
+            display_order: 0,
             kind: ParameterKind::Choice(ChoiceParameter {
                 options: vec![ChoiceOption {
                     id: OptionId(2),
@@ -1845,6 +2917,7 @@ mod tests {
                     name: None,
                 },
             ],
+            ..Default::default()
         };
         let err =
             validate_definition(&dynamic, &[line_entity(1, 0.0, 0.0, 10.0, 0.0)]).unwrap_err();
@@ -1886,6 +2959,7 @@ mod tests {
                     name: None,
                 },
             ],
+            ..Default::default()
         };
         validate_definition(&dynamic, &[line_entity(1, 0.0, 0.0, 800.0, 10.0)]).unwrap();
     }
@@ -1911,6 +2985,7 @@ mod tests {
                 follow: FollowRole::Second,
                 name: None,
             }],
+            ..Default::default()
         };
         let mut entity = Entity::new(Geometry::LwPolyline {
             vertices: vec![

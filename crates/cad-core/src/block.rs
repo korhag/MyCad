@@ -658,7 +658,7 @@ pub fn make_unique_block(
                         .collect()
                 })
                 .unwrap_or_default();
-            config.remap_parameters(&parameters);
+            config.remap_identities(&parameters, &BTreeMap::new());
         }
     }
     let _ = document.replace_entity_in(&space, insert_id, insert_after.clone());
@@ -694,22 +694,47 @@ fn clone_definition_with_new_ids(
         }
     }
     let vertex_map = document.remap_entity_vertex_ids(&mut definition.entities);
+    let mut parameter_map = std::collections::BTreeMap::new();
+    let mut option_map = std::collections::BTreeMap::new();
     if let Some(dynamic) = definition.dynamic.as_mut() {
-        let mut parameters = std::collections::BTreeMap::new();
-        let mut options = std::collections::BTreeMap::new();
         let mut actions = std::collections::BTreeMap::new();
+        let mut anchors = std::collections::BTreeMap::new();
+        let mut presets = std::collections::BTreeMap::new();
         for parameter in &dynamic.parameters {
-            parameters.insert(parameter.id, document.allocate_parameter_id());
+            parameter_map.insert(parameter.id, document.allocate_parameter_id());
             if let crate::dynamic::ParameterKind::Choice(choice) = &parameter.kind {
                 for option in &choice.options {
-                    options.insert(option.id, document.allocate_option_id());
+                    option_map.insert(option.id, document.allocate_option_id());
                 }
             }
         }
-        for behavior in &dynamic.behaviors {
-            actions.insert(behavior.id, document.allocate_action_id());
+        for id in dynamic.collect_action_ids() {
+            actions.insert(id, document.allocate_action_id());
         }
-        let _ = dynamic.remap_ids(&parameters, &options, &actions, &entity_map, &vertex_map);
+        for anchor in &dynamic.anchors {
+            anchors.insert(anchor.id, document.allocate_anchor_id());
+        }
+        for preset in &dynamic.presets {
+            presets.insert(preset.id, document.allocate_preset_id());
+        }
+        let _ = dynamic.remap_ids_with(
+            &parameter_map,
+            &option_map,
+            &actions,
+            &anchors,
+            &presets,
+            &entity_map,
+            &vertex_map,
+        );
+    }
+    if !parameter_map.is_empty() || !option_map.is_empty() {
+        for entity in &mut definition.entities {
+            if let Some(config) = entity.geometry.insert_configuration_mut() {
+                if let Some(values) = config.as_mut() {
+                    values.remap_identities(&parameter_map, &option_map);
+                }
+            }
+        }
     }
     (definition, entity_map)
 }

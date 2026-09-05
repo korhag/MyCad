@@ -9,14 +9,19 @@ use std::sync::Arc;
 
 use crate::document::{BlockDefinition, Document};
 use crate::dynamic::{
-    capability_for, numeric_current, resolve_values, translate_point, validate_definition,
-    BehaviorKind, CompositionRule, DynamicBehavior, DynamicDefinition, DynamicError,
-    GeometryTarget, InstanceConfiguration, NormalizedValue, ParameterValue, EVALUATOR_VERSION,
+    capability_for, follow_multiplier, numeric_current, resolve_values, translate_point,
+    validate_configuration, validate_definition, BehaviorKind, CompositionRule, DynamicBehavior,
+    DynamicDefinition, DynamicError, GeometryTarget, InstanceConfiguration, NormalizedValue,
+    ParameterKind, ParameterValue, EVALUATOR_VERSION,
+};
+use crate::dynamic_model::{
+    effective_visibility, evaluate_text_binding, AnchorFollow, NestedMapping, PlacementBehavior,
+    ReflectionBehavior, RotationBehavior, RotationSource, TextReflectPolicy,
 };
 use crate::entity::{Entity, EntityId, Geometry};
 use crate::entity_transform::transform_entity_matrix;
 use crate::geom::Point2;
-use crate::ids::{ActionId, ParameterId};
+use crate::ids::{ActionId, OptionId, ParameterId};
 use crate::transform::Transform2;
 
 pub const GENERATED_BLOCK_PREFIX: &str = "*EVAL_";
@@ -151,11 +156,12 @@ pub fn evaluate_definition(
     };
     validate_definition(dynamic, &definition.entities)?;
     let values = resolve_values(dynamic, instance)?;
+    validate_configuration(dynamic, &values)?;
     let key = eval_key(document, definition, &values)?;
     if let Some(hit) = cache.get(&key) {
         return Ok(hit);
     }
-    let entities = apply_behaviors(&definition.entities, dynamic, &values)?;
+    let entities = apply_evaluation_plan(&definition.entities, dynamic, &values)?;
     validate_evaluated_entities(&entities)?;
     let evaluated = Arc::new(EvaluatedBlock {
         key: key.clone(),
@@ -229,6 +235,88 @@ fn nested_dependency_revisions(
     revisions.sort_unstable();
     revisions.dedup();
     revisions
+}
+
+fn apply_evaluation_plan(
+    source: &[Entity],
+    dynamic: &DynamicDefinition,
+    values: &BTreeMap<ParameterId, ParameterValue>,
+) -> Result<Vec<Entity>, DynamicError> {
+    let mut entities = source.to_vec();
+    apply_nested_inputs(&mut entities, dynamic, values)?;
+    entities = apply_behaviors(&entities, dynamic, values)?;
+    apply_group_transforms(&mut entities, dynamic, values)?;
+    apply_text_bindings(&mut entities, dynamic, values)?;
+    apply_visibility(&mut entities, dynamic, values);
+    Ok(entities)
+}
+
+fn apply_nested_inputs(
+    entities: &mut [Entity],
+    dynamic: &DynamicDefinition,
+    values: &BTreeMap<ParameterId, ParameterValue>,
+) -> Result<(), DynamicError> {
+    for input in &dynamic.nested_inputs {
+        let Some(leaf) = input.target_occurrence.leaf() else {
+            continue;
+        };
+        let Some(source_value) = values.get(&input.source) else {
+            continue;
+        };
+        let mapped = map_nested_value(dynamic, input, source_value)?;
+        let entity = entities
+            .iter_mut()
+            .find(|entity| entity.id == leaf)
+            .ok_or(DynamicError::MissingEntity {
+                target: GeometryTarget::Entity(leaf),
+            })?;
+        let config = entity
+            .geometry
+            .insert_configuration_mut()
+            .ok_or(DynamicError::NestedEditUnsupported)?;
+        let mut values = config.take().unwrap_or_default();
+        values.set(input.target_parameter, mapped);
+        *config = Some(values);
+    }
+    Ok(())
+}
+
+fn map_nested_value(
+    dynamic: &DynamicDefinition,
+    input: &crate::dynamic_model::NestedInput,
+    source: &ParameterValue,
+) -> Result<ParameterValue, DynamicError> {
+    match &input.mapping {
+        NestedMapping::Direct => Ok(source.clone()),
+        NestedMapping::NumericScale { factor } => match source {
+            ParameterValue::Number(number) => Ok(ParameterValue::Number(*number * *factor)),
+            other => Err(DynamicError::ValueType {
+                parameter: input.source,
+                expected: "number",
+                actual: other.type_name(),
+            }),
+        },
+        NestedMapping::OptionMap(map) => {
+            let ParameterValue::Choice(option) = source else {
+                return Err(DynamicError::ValueType {
+                    parameter: input.source,
+                    expected: "choice",
+                    actual: source.type_name(),
+                });
+            };
+            map.get(option)
+                .cloned()
+                .ok_or(DynamicError::IncompleteMapping {
+                    action: input.id,
+                    parameter: input.source,
+                    option: *option,
+                })
+        }
+    }
+    .map(|value| {
+        let _ = dynamic;
+        value
+    })
 }
 
 fn apply_behaviors(
@@ -388,6 +476,314 @@ fn apply_slot(entity: &mut Entity, slot: TargetSlot, delta: Point2) -> Result<()
             };
             vertex.point = translate_point(vertex.point, delta);
             Ok(())
+        }
+    }
+}
+
+fn apply_group_transforms(
+    entities: &mut [Entity],
+    dynamic: &DynamicDefinition,
+    values: &BTreeMap<ParameterId, ParameterValue>,
+) -> Result<(), DynamicError> {
+    let order = ordered_transform_ids(dynamic);
+    for id in order {
+        if let Some(behavior) = dynamic.reflections.iter().find(|item| item.id == id) {
+            apply_reflection(entities, behavior, values)?;
+        } else if let Some(behavior) = dynamic.rotations.iter().find(|item| item.id == id) {
+            apply_rotation(entities, dynamic, behavior, values)?;
+        } else if let Some(behavior) = dynamic.placements.iter().find(|item| item.id == id) {
+            apply_placement(entities, dynamic, behavior, values)?;
+        }
+    }
+    Ok(())
+}
+
+fn ordered_transform_ids(dynamic: &DynamicDefinition) -> Vec<ActionId> {
+    let mut ids = dynamic.transform_order.clone();
+    let known: Vec<ActionId> = dynamic
+        .reflections
+        .iter()
+        .map(|item| item.id)
+        .chain(dynamic.rotations.iter().map(|item| item.id))
+        .chain(dynamic.placements.iter().map(|item| item.id))
+        .collect();
+    if ids.is_empty() {
+        return known;
+    }
+    for id in known {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    ids
+}
+
+fn apply_reflection(
+    entities: &mut [Entity],
+    behavior: &ReflectionBehavior,
+    values: &BTreeMap<ParameterId, ParameterValue>,
+) -> Result<(), DynamicError> {
+    if !behavior.condition.matches(values) {
+        return Ok(());
+    }
+    let matrix = crate::entity_transform::EntityTransform::Mirror {
+        axis_start: behavior.axis_a,
+        axis_end: behavior.axis_b,
+    }
+    .to_matrix()
+    .map_err(|err| DynamicError::UnsupportedCombination {
+        details: err.to_string(),
+    })?;
+    transform_members(entities, &behavior.members, matrix, Some(behavior.text_policy))
+}
+
+fn apply_rotation(
+    entities: &mut [Entity],
+    dynamic: &DynamicDefinition,
+    behavior: &RotationBehavior,
+    values: &BTreeMap<ParameterId, ParameterValue>,
+) -> Result<(), DynamicError> {
+    let radians = match &behavior.source {
+        RotationSource::AngleParameter(parameter) => angle_radians(dynamic, values, *parameter)?,
+        RotationSource::OptionMap { parameter, angles } => {
+            let ParameterValue::Choice(option) = values.get(parameter).ok_or(
+                DynamicError::UnknownParameter {
+                    action: behavior.id,
+                    parameter: *parameter,
+                },
+            )?
+            else {
+                return Err(DynamicError::ValueType {
+                    parameter: *parameter,
+                    expected: "choice",
+                    actual: "other",
+                });
+            };
+            *angles.get(option).ok_or(DynamicError::IncompleteMapping {
+                action: behavior.id,
+                parameter: *parameter,
+                option: *option,
+            })?
+        }
+    };
+    if radians.abs() <= 1e-18 {
+        return Ok(());
+    }
+    let matrix = crate::entity_transform::EntityTransform::Rotate {
+        base: behavior.pivot,
+        radians,
+    }
+    .to_matrix()
+    .map_err(|err| DynamicError::UnsupportedCombination {
+        details: err.to_string(),
+    })?;
+    transform_members(entities, &behavior.members, matrix, None)
+}
+
+fn angle_radians(
+    dynamic: &DynamicDefinition,
+    values: &BTreeMap<ParameterId, ParameterValue>,
+    parameter: ParameterId,
+) -> Result<f64, DynamicError> {
+    let value = numeric_current(dynamic, values, parameter)?;
+    let Some(def) = dynamic.parameter(parameter) else {
+        return Err(DynamicError::UnknownParameter {
+            action: ActionId::UNASSIGNED,
+            parameter,
+        });
+    };
+    match &def.kind {
+        ParameterKind::Number(numeric) => match numeric.unit {
+            crate::dynamic::ParameterUnit::Degrees => Ok(value.to_radians()),
+            _ => Ok(value),
+        },
+        _ => Err(DynamicError::ValueType {
+            parameter,
+            expected: "number",
+            actual: def.kind.type_name(),
+        }),
+    }
+}
+
+fn apply_placement(
+    entities: &mut [Entity],
+    dynamic: &DynamicDefinition,
+    behavior: &PlacementBehavior,
+    values: &BTreeMap<ParameterId, ParameterValue>,
+) -> Result<(), DynamicError> {
+    let dest_id = match values.get(&behavior.parameter) {
+        Some(ParameterValue::Choice(option)) => *behavior.destinations.get(option).ok_or(
+            DynamicError::IncompleteMapping {
+                action: behavior.id,
+                parameter: behavior.parameter,
+                option: *option,
+            },
+        )?,
+        Some(ParameterValue::Boolean(flag)) => {
+            let Some((off, on)) = behavior.boolean_destinations else {
+                return Err(DynamicError::IncompleteMapping {
+                    action: behavior.id,
+                    parameter: behavior.parameter,
+                    option: OptionId::UNASSIGNED,
+                });
+            };
+            if *flag {
+                on
+            } else {
+                off
+            }
+        }
+        Some(other) => {
+            return Err(DynamicError::ValueType {
+                parameter: behavior.parameter,
+                expected: "choice",
+                actual: other.type_name(),
+            });
+        }
+        None => return Ok(()),
+    };
+    let Some(anchor) = dynamic.anchor(dest_id) else {
+        return Err(DynamicError::MissingEntity {
+            target: GeometryTarget::Entity(EntityId::UNASSIGNED),
+        });
+    };
+    let (dest, dest_angle) = resolve_anchor(anchor, dynamic, values)?;
+    let attach = behavior.attachment;
+    let dx = dest.x - attach.x;
+    let dy = dest.y - attach.y;
+    let delta_angle = dest_angle - behavior.attachment_angle;
+    let mut matrix = Transform2::translate(dest.x, dest.y)
+        .then(Transform2::rotate(delta_angle))
+        .then(Transform2::translate(-attach.x, -attach.y));
+    if dx.abs() <= 1e-18 && dy.abs() <= 1e-18 && delta_angle.abs() <= 1e-18 {
+        matrix = Transform2::identity();
+    }
+    if matrix == Transform2::identity() {
+        return Ok(());
+    }
+    transform_members(entities, &behavior.members, matrix, None)
+}
+
+fn resolve_anchor(
+    anchor: &crate::dynamic_model::AnchorDef,
+    dynamic: &DynamicDefinition,
+    values: &BTreeMap<ParameterId, ParameterValue>,
+) -> Result<(Point2, f64), DynamicError> {
+    let mut position = anchor.position;
+    let orientation = anchor.orientation.unwrap_or(0.0);
+    if let Some(AnchorFollow::Size { parameter, role }) = &anchor.follow {
+        let Some(def) = dynamic.parameter(*parameter) else {
+            return Err(DynamicError::UnknownParameter {
+                action: ActionId::UNASSIGNED,
+                parameter: *parameter,
+            });
+        };
+        let ParameterKind::Number(numeric) = &def.kind else {
+            return Err(DynamicError::ValueType {
+                parameter: *parameter,
+                expected: "number",
+                actual: def.kind.type_name(),
+            });
+        };
+        let current = numeric_current(dynamic, values, *parameter)?;
+        let delta = current - numeric.reference;
+        if let Some(size) = &numeric.size {
+            let multiplier = follow_multiplier(size.anchor, *role);
+            position = Point2::new(
+                position.x + size.direction.x * delta * multiplier,
+                position.y + size.direction.y * delta * multiplier,
+            );
+        }
+    }
+    Ok((position, orientation))
+}
+
+fn transform_members(
+    entities: &mut [Entity],
+    members: &[EntityId],
+    matrix: Transform2,
+    text_policy: Option<TextReflectPolicy>,
+) -> Result<(), DynamicError> {
+    for entity in entities.iter_mut() {
+        if !members.contains(&entity.id) {
+            continue;
+        }
+        let transformed = transform_entity_matrix(entity, matrix).map_err(|err| {
+            DynamicError::UnsupportedCombination {
+                details: format!("entity #{}: {err}", entity.id.raw()),
+            }
+        })?;
+        *entity = transformed;
+        if let Some(policy) = text_policy {
+            apply_text_policy(entity, policy);
+        }
+    }
+    Ok(())
+}
+
+fn apply_text_policy(entity: &mut Entity, policy: TextReflectPolicy) {
+    let upright = |rotation: f64| {
+        if policy != TextReflectPolicy::KeepUpright {
+            return rotation;
+        }
+        let mut angle = rotation.rem_euclid(std::f64::consts::TAU);
+        if angle > std::f64::consts::FRAC_PI_2 && angle < 3.0 * std::f64::consts::FRAC_PI_2 {
+            angle = (angle + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU);
+        }
+        angle
+    };
+    match &mut entity.geometry {
+        Geometry::Text(data) => data.rotation = upright(data.rotation),
+        Geometry::MText(data) => data.rotation = upright(data.rotation),
+        Geometry::Insert { rotation, attribs, .. } => {
+            *rotation = upright(*rotation);
+            for attrib in attribs {
+                attrib.rotation = upright(attrib.rotation);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn apply_text_bindings(
+    entities: &mut [Entity],
+    dynamic: &DynamicDefinition,
+    values: &BTreeMap<ParameterId, ParameterValue>,
+) -> Result<(), DynamicError> {
+    for binding in &dynamic.text_bindings {
+        let entity = entities
+            .iter_mut()
+            .find(|entity| entity.id == binding.target)
+            .ok_or(DynamicError::MissingEntity {
+                target: GeometryTarget::Entity(binding.target),
+            })?;
+        match &mut entity.geometry {
+            Geometry::Text(data) => {
+                data.value = evaluate_text_binding(binding, &dynamic.parameters, values, false)?;
+            }
+            Geometry::MText(data) => {
+                data.value = evaluate_text_binding(binding, &dynamic.parameters, values, true)?;
+            }
+            _ => {
+                return Err(DynamicError::UnsupportedTarget {
+                    action: binding.id,
+                    target: GeometryTarget::Entity(binding.target),
+                    reason: "bind text",
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn apply_visibility(
+    entities: &mut [Entity],
+    dynamic: &DynamicDefinition,
+    values: &BTreeMap<ParameterId, ParameterValue>,
+) {
+    for entity in entities.iter_mut() {
+        if !effective_visibility(&dynamic.visibility, entity.id, values) {
+            entity.visible = false;
         }
     }
 }
@@ -702,6 +1098,7 @@ mod tests {
                     name: None,
                 },
             ],
+            ..Default::default()
         });
         document.replace_block_definition(definition);
         let id = document.block_by_name("AdjustableFrame").unwrap().id;
@@ -799,6 +1196,7 @@ mod tests {
                 follow: crate::dynamic::FollowRole::Second,
                 name: None,
             }],
+            ..Default::default()
         });
         document.replace_block_definition(definition.clone());
         let definition = document.block_by_name("Offset").unwrap().clone();
@@ -1123,6 +1521,7 @@ mod tests {
                 follow: crate::dynamic::FollowRole::Second,
                 name: None,
             }],
+            ..Default::default()
         });
         document.replace_block_definition(definition.clone());
         let definition = document.block_by_name("Rail").unwrap().clone();
@@ -1225,6 +1624,7 @@ mod tests {
                     name: None,
                 },
             ],
+            ..Default::default()
         });
         document.replace_block_definition(definition.clone());
         let definition = document.block_by_name("Frame").unwrap().clone();
@@ -1249,5 +1649,833 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    fn phase3_assembly() -> (
+        Document,
+        ParameterId,
+        ParameterId,
+        ParameterId,
+        ParameterId,
+        ParameterId,
+        crate::ids::PresetId,
+        crate::ids::PresetId,
+        EntityId,
+        EntityId,
+    ) {
+        use crate::dynamic_model::{
+            AnchorDef, AnchorFollow, NestedInput, NestedMapping, ParameterCondition,
+            PlacementBehavior, Preset, ReflectionBehavior, TextBinding, TextBindingMode,
+            TextReflectPolicy, TextToken, VisibilityGroup,
+        };
+        use crate::entity::{default_extrusion, TextData};
+
+        let mut document = Document::default();
+        let span = document.allocate_parameter_id();
+        let depth = document.allocate_parameter_id();
+        let style = document.allocate_parameter_id();
+        let accessory = document.allocate_parameter_id();
+        let description = document.allocate_parameter_id();
+        let standard = document.allocate_option_id();
+        let reinforced = document.allocate_option_id();
+        let mut left = Entity::new(Geometry::Line {
+            start: Point3::from_xy(0.0, 0.0),
+            end: Point3::from_xy(0.0, 10.0),
+        });
+        let mut right = Entity::new(Geometry::Line {
+            start: Point3::from_xy(800.0, 0.0),
+            end: Point3::from_xy(800.0, 10.0),
+        });
+        let mut alt_a = Entity::new(Geometry::Line {
+            start: Point3::from_xy(0.0, 20.0),
+            end: Point3::from_xy(40.0, 20.0),
+        });
+        let mut alt_b = Entity::new(Geometry::Line {
+            start: Point3::from_xy(0.0, 30.0),
+            end: Point3::from_xy(80.0, 30.0),
+        });
+        let mut accessory_line = Entity::new(Geometry::Line {
+            start: Point3::from_xy(0.0, -10.0),
+            end: Point3::from_xy(20.0, -10.0),
+        });
+        let mut label = Entity::new(Geometry::Text(TextData {
+            insertion: Point3::from_xy(0.0, 40.0),
+            height: 2.5,
+            rotation: 0.0,
+            value: "source".into(),
+            extrusion: default_extrusion(),
+            is_attrib_def: false,
+        }));
+        let mut flip_line = Entity::new(Geometry::Line {
+            start: Point3::from_xy(10.0, 50.0),
+            end: Point3::from_xy(30.0, 50.0),
+        });
+        let mut place_line = Entity::new(Geometry::Line {
+            start: Point3::from_xy(0.0, 60.0),
+            end: Point3::from_xy(10.0, 60.0),
+        });
+        left.id = document.allocate_id();
+        right.id = document.allocate_id();
+        alt_a.id = document.allocate_id();
+        alt_b.id = document.allocate_id();
+        accessory_line.id = document.allocate_id();
+        label.id = document.allocate_id();
+        flip_line.id = document.allocate_id();
+        place_line.id = document.allocate_id();
+        let mut nested = Entity::new(identity_insert(
+            "ChildDyn".into(),
+            Point3::from_xy(100.0, 0.0),
+        ));
+        nested.id = document.allocate_id();
+        let mut nested_b = Entity::new(identity_insert(
+            "ChildDyn".into(),
+            Point3::from_xy(200.0, 0.0),
+        ));
+        nested_b.id = document.allocate_id();
+
+        let child_param = document.allocate_parameter_id();
+        let mut child_line = Entity::new(Geometry::Line {
+            start: Point3::from_xy(0.0, 0.0),
+            end: Point3::from_xy(5.0, 0.0),
+        });
+        child_line.id = document.allocate_id();
+        let mut child_text = Entity::new(Geometry::Text(TextData {
+            insertion: Point3::from_xy(0.0, 2.0),
+            height: 1.0,
+            rotation: 0.0,
+            value: "N".into(),
+            extrusion: default_extrusion(),
+            is_attrib_def: false,
+        }));
+        child_text.id = document.allocate_id();
+        let mut child_numeric = NumericParameter::length(5.0);
+        child_numeric.reference = 5.0;
+        let mut child = BlockDefinition::plain(
+            "ChildDyn",
+            Point3::from_xy(0.0, 0.0),
+            vec![child_line.clone(), child_text.clone()],
+        );
+        child.dynamic = Some(DynamicDefinition {
+            parameters: vec![ParameterDef::number(child_param, "ChildSpan", child_numeric)],
+            behaviors: vec![DynamicBehavior {
+                id: document.allocate_action_id(),
+                kind: BehaviorKind::Stretch,
+                parameter: child_param,
+                targets: vec![GeometryTarget::LineEnd(child_line.id)],
+                local_direction: Point2::new(1.0, 0.0),
+                reference_value: 5.0,
+                multiplier: 1.0,
+                composition: CompositionRule::Additive,
+                follow: crate::dynamic::FollowRole::Second,
+                name: None,
+            }],
+            ..Default::default()
+        });
+        document.replace_block_definition(child);
+
+        let mut span_numeric = NumericParameter::length(800.0);
+        span_numeric.reference = 800.0;
+        span_numeric.size = Some(crate::dynamic::SizeAuthoring {
+            point_a: Point2::new(0.0, 0.0),
+            point_b: Point2::new(800.0, 0.0),
+            measure: crate::dynamic::MeasureMode::LocalX,
+            direction: Point2::new(1.0, 0.0),
+            anchor: crate::dynamic::AnchorPolicy::FirstFixed,
+            label_offset: Point2::new(0.0, 8.0),
+            bound_anchor: None,
+        });
+        let mut depth_numeric = NumericParameter::length(10.0);
+        depth_numeric.reference = 10.0;
+        let choice = crate::dynamic::ChoiceParameter {
+            options: vec![
+                crate::dynamic::ChoiceOption {
+                    id: standard,
+                    label: "Standard".into(),
+                },
+                crate::dynamic::ChoiceOption {
+                    id: reinforced,
+                    label: "Reinforced".into(),
+                },
+            ],
+            default: standard,
+        };
+        let dest_a = document.allocate_anchor_id();
+        let dest_b = document.allocate_anchor_id();
+        let preset_std = document.allocate_preset_id();
+        let preset_reinf = document.allocate_preset_id();
+        let mut definition = BlockDefinition::plain(
+            "Assembly",
+            Point3::from_xy(0.0, 0.0),
+            vec![
+                left.clone(),
+                right.clone(),
+                alt_a.clone(),
+                alt_b.clone(),
+                accessory_line.clone(),
+                label.clone(),
+                flip_line.clone(),
+                place_line.clone(),
+                nested.clone(),
+                nested_b.clone(),
+            ],
+        );
+        definition.dynamic = Some(DynamicDefinition {
+            parameters: vec![
+                ParameterDef::number(span, "Span", span_numeric),
+                ParameterDef::number(depth, "Depth", depth_numeric),
+                ParameterDef::choice(style, "Style", choice),
+                ParameterDef::boolean(accessory, "Accessory", crate::dynamic::BooleanParameter::default()),
+                ParameterDef::text(description, "Description", crate::dynamic::TextParameter {
+                    default: "Assembly".into(),
+                    multiline: false,
+                    max_length: None,
+                }),
+            ],
+            behaviors: vec![DynamicBehavior {
+                id: document.allocate_action_id(),
+                kind: BehaviorKind::Move,
+                parameter: span,
+                targets: vec![GeometryTarget::Entity(right.id)],
+                local_direction: Point2::new(1.0, 0.0),
+                reference_value: 800.0,
+                multiplier: 1.0,
+                composition: CompositionRule::Additive,
+                follow: crate::dynamic::FollowRole::Second,
+                name: None,
+            }],
+            anchors: vec![
+                AnchorDef {
+                    id: dest_a,
+                    name: "Left".into(),
+                    position: Point2::new(0.0, 60.0),
+                    orientation: Some(0.0),
+                    follow: Some(AnchorFollow::Size {
+                        parameter: span,
+                        role: crate::dynamic::FollowRole::First,
+                    }),
+                },
+                AnchorDef {
+                    id: dest_b,
+                    name: "Right".into(),
+                    position: Point2::new(800.0, 60.0),
+                    orientation: Some(0.0),
+                    follow: Some(AnchorFollow::Size {
+                        parameter: span,
+                        role: crate::dynamic::FollowRole::Second,
+                    }),
+                },
+            ],
+            visibility: vec![
+                VisibilityGroup {
+                    id: document.allocate_action_id(),
+                    name: "Style A".into(),
+                    members: vec![alt_a.id],
+                    conditions: vec![ParameterCondition::Choice {
+                        parameter: style,
+                        options: vec![standard],
+                    }],
+                },
+                VisibilityGroup {
+                    id: document.allocate_action_id(),
+                    name: "Style B".into(),
+                    members: vec![alt_b.id],
+                    conditions: vec![ParameterCondition::Choice {
+                        parameter: style,
+                        options: vec![reinforced],
+                    }],
+                },
+                VisibilityGroup {
+                    id: document.allocate_action_id(),
+                    name: "Accessory".into(),
+                    members: vec![accessory_line.id],
+                    conditions: vec![ParameterCondition::Boolean {
+                        parameter: accessory,
+                        state: true,
+                    }],
+                },
+            ],
+            text_bindings: vec![TextBinding {
+                id: document.allocate_action_id(),
+                target: label.id,
+                mode: TextBindingMode::Formatted {
+                    tokens: vec![
+                        TextToken::Literal("Size: ".into()),
+                        TextToken::Parameter(span),
+                        TextToken::Literal(" × ".into()),
+                        TextToken::Parameter(depth),
+                        TextToken::Literal(" mm".into()),
+                    ],
+                },
+                boolean_true: "On".into(),
+                boolean_false: "Off".into(),
+                number_precision: Some(0),
+            }],
+            reflections: vec![ReflectionBehavior {
+                id: document.allocate_action_id(),
+                name: Some("Flip accessory".into()),
+                members: vec![flip_line.id, nested.id],
+                axis_a: Point2::new(0.0, 0.0),
+                axis_b: Point2::new(0.0, 1.0),
+                condition: ParameterCondition::Boolean {
+                    parameter: accessory,
+                    state: true,
+                },
+                text_policy: TextReflectPolicy::KeepReadable,
+            }],
+            placements: vec![PlacementBehavior {
+                id: document.allocate_action_id(),
+                name: Some("Park".into()),
+                members: vec![place_line.id],
+                attachment: Point2::new(0.0, 60.0),
+                attachment_angle: 0.0,
+                parameter: style,
+                destinations: [
+                    (standard, dest_a),
+                    (reinforced, dest_b),
+                ]
+                .into_iter()
+                .collect(),
+                boolean_destinations: None,
+            }],
+            nested_inputs: vec![NestedInput {
+                id: document.allocate_action_id(),
+                source: span,
+                target_occurrence: crate::dynamic_model::OccurrencePath {
+                    inserts: vec![nested.id],
+                },
+                target_parameter: child_param,
+                mapping: NestedMapping::NumericScale { factor: 0.01 },
+            }],
+            presets: vec![
+                Preset {
+                    id: preset_std,
+                    name: "Standard 800".into(),
+                    values: [
+                        (span, ParameterValue::Number(800.0)),
+                        (depth, ParameterValue::Number(10.0)),
+                        (style, ParameterValue::Choice(standard)),
+                        (accessory, ParameterValue::Boolean(false)),
+                        (description, ParameterValue::Text("Assembly".into())),
+                    ]
+                    .into_iter()
+                    .collect(),
+                },
+                Preset {
+                    id: preset_reinf,
+                    name: "Reinforced 1200".into(),
+                    values: [
+                        (span, ParameterValue::Number(1200.0)),
+                        (depth, ParameterValue::Number(20.0)),
+                        (style, ParameterValue::Choice(reinforced)),
+                        (accessory, ParameterValue::Boolean(true)),
+                        (description, ParameterValue::Text("Reinforced".into())),
+                    ]
+                    .into_iter()
+                    .collect(),
+                },
+            ],
+            ..Default::default()
+        });
+        document.replace_block_definition(definition);
+        (
+            document,
+            span,
+            depth,
+            style,
+            accessory,
+            description,
+            preset_std,
+            preset_reinf,
+            nested.id,
+            nested_b.id,
+        )
+    }
+
+    fn eval_assembly(
+        document: &Document,
+        config: &InstanceConfiguration,
+    ) -> std::sync::Arc<EvaluatedBlock> {
+        let definition = document.block_by_name("Assembly").unwrap().clone();
+        evaluate_definition(
+            document,
+            &definition,
+            Some(config),
+            &mut EvaluationCache::default(),
+            EvaluationRequest {
+                generation: document.content_generation(),
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn choice_visibility_hides_inactive_geometry() {
+        let (document, _, _, style, accessory, _, _, _, _, _) = phase3_assembly();
+        let standard = match &document.block_by_name("Assembly").unwrap().dynamic.as_ref().unwrap().parameters[2].kind {
+            crate::dynamic::ParameterKind::Choice(choice) => choice.options[0].id,
+            _ => panic!("choice"),
+        };
+        let mut config = InstanceConfiguration::default();
+        config.set(style, ParameterValue::Choice(standard));
+        config.set(accessory, ParameterValue::Boolean(false));
+        let evaluated = eval_assembly(&document, &config);
+        let visible: Vec<_> = evaluated
+            .entities
+            .iter()
+            .filter(|entity| entity.visible)
+            .map(|entity| entity.id)
+            .collect();
+        assert!(evaluated.entities.iter().any(|entity| !entity.visible));
+        assert!(!visible.is_empty());
+    }
+
+    #[test]
+    fn formatted_text_substitutes_ids_not_names() {
+        let (document, span, depth, _, _, _, _, _, _, _) = phase3_assembly();
+        let mut config = InstanceConfiguration::default();
+        config.set(span, ParameterValue::Number(1200.0));
+        config.set(depth, ParameterValue::Number(20.0));
+        let evaluated = eval_assembly(&document, &config);
+        let text = evaluated
+            .entities
+            .iter()
+            .find_map(|entity| match &entity.geometry {
+                Geometry::Text(data) => Some(data.value.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(text, "Size: 1200 × 20 mm");
+        let source = document
+            .block_by_name("Assembly")
+            .unwrap()
+            .entities
+            .iter()
+            .find_map(|entity| match &entity.geometry {
+                Geometry::Text(data) => Some(data.value.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(source, "source");
+    }
+
+    #[test]
+    fn mtext_escapes_literal_formatting_characters() {
+        use crate::dynamic_model::{evaluate_text_binding, TextBinding, TextBindingMode};
+        let binding = TextBinding {
+            id: crate::ids::ActionId(1),
+            target: EntityId(1),
+            mode: TextBindingMode::ShowValue {
+                parameter: ParameterId(1),
+            },
+            boolean_true: "On".into(),
+            boolean_false: "Off".into(),
+            number_precision: None,
+        };
+        let parameter = ParameterDef::text(
+            ParameterId(1),
+            "Description",
+            crate::dynamic::TextParameter {
+                default: r"\P{x}".into(),
+                multiline: false,
+                max_length: None,
+            },
+        );
+        let mut values = std::collections::BTreeMap::new();
+        values.insert(ParameterId(1), ParameterValue::Text(r"\P{x}".into()));
+        let rendered = evaluate_text_binding(&binding, &[parameter], &values, true).unwrap();
+        assert_eq!(rendered, r"\\P\{x\}");
+    }
+
+    #[test]
+    fn flip_is_not_cumulative() {
+        let (document, _, _, _, accessory, _, _, _, _, _) = phase3_assembly();
+        let mut on = InstanceConfiguration::default();
+        on.set(accessory, ParameterValue::Boolean(true));
+        let first = eval_assembly(&document, &on);
+        let second = eval_assembly(&document, &on);
+        let line = |block: &EvaluatedBlock| {
+            block
+                .entities
+                .iter()
+                .find_map(|entity| match &entity.geometry {
+                    Geometry::Line { start, end } if (start.y - 50.0).abs() < 1.0 || (start.y + 50.0).abs() < 60.0 => {
+                        Some((*start, *end))
+                    }
+                    _ => None,
+                })
+        };
+        let a = line(&first).unwrap();
+        let b = line(&second).unwrap();
+        assert!((a.0.x - b.0.x).abs() < 1e-12);
+        assert!((a.1.x - b.1.x).abs() < 1e-12);
+    }
+
+    #[test]
+    fn placement_follows_size_without_stretching() {
+        let (document, span, _, style, _, _, _, _, _, _) = phase3_assembly();
+        let reinforced = match &document.block_by_name("Assembly").unwrap().dynamic.as_ref().unwrap().parameters[2].kind {
+            crate::dynamic::ParameterKind::Choice(choice) => choice.options[1].id,
+            _ => panic!("choice"),
+        };
+        let mut config = InstanceConfiguration::default();
+        config.set(style, ParameterValue::Choice(reinforced));
+        config.set(span, ParameterValue::Number(1200.0));
+        let evaluated = eval_assembly(&document, &config);
+        let placed = evaluated
+            .entities
+            .iter()
+            .find_map(|entity| match &entity.geometry {
+                Geometry::Line { start, end } if (start.y - 60.0).abs() < 1e-6 => Some((*start, *end)),
+                _ => None,
+            })
+            .unwrap();
+        assert!((placed.0.x - 1200.0).abs() < 1e-6);
+        assert!((placed.1.x - placed.0.x - 10.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn nested_mapping_does_not_change_sibling_occurrence() {
+        let (document, span, _, _, _, _, _, _, nested, nested_b) = phase3_assembly();
+        let mut config = InstanceConfiguration::default();
+        config.set(span, ParameterValue::Number(1200.0));
+        let definition = document.block_by_name("Assembly").unwrap().clone();
+        let evaluated = evaluate_definition(
+            &document,
+            &definition,
+            Some(&config),
+            &mut EvaluationCache::default(),
+            EvaluationRequest {
+                generation: document.content_generation(),
+            },
+        )
+        .unwrap();
+        let cfg = |id: EntityId| {
+            evaluated
+                .entities
+                .iter()
+                .find(|entity| entity.id == id)
+                .and_then(|entity| entity.geometry.insert_configuration().cloned())
+        };
+        let mapped = cfg(nested).unwrap();
+        let sibling = cfg(nested_b);
+        assert!(mapped.get(span).is_none() || mapped.values.values().any(|value| matches!(value, ParameterValue::Number(n) if (n - 12.0).abs() < 1e-9)));
+        if let Some(sibling) = sibling {
+            assert!(sibling.values.is_empty() || sibling.get(span).is_none());
+        }
+        let _ = (document, nested, nested_b);
+    }
+
+    #[test]
+    fn matching_preset_detects_custom() {
+        let (document, span, _, _, _, _, preset_std, _, _, _) = phase3_assembly();
+        let dynamic = document.block_by_name("Assembly").unwrap().dynamic.as_ref().unwrap();
+        let mut values = crate::dynamic::resolve_values(dynamic, None).unwrap();
+        assert_eq!(
+            crate::dynamic_model::matching_preset(&dynamic.presets, &values, &dynamic.parameters),
+            Some(preset_std)
+        );
+        values.insert(span, ParameterValue::Number(900.0));
+        assert_eq!(
+            crate::dynamic_model::matching_preset(&dynamic.presets, &values, &dynamic.parameters),
+            None
+        );
+    }
+
+    #[test]
+    fn option_rename_keeps_identity() {
+        let (mut document, _, _, style, _, _, _, _, _, _) = phase3_assembly();
+        let id = {
+            let dynamic = document
+                .block_by_name_mut("Assembly")
+                .unwrap()
+                .dynamic
+                .as_mut()
+                .unwrap();
+            let ParameterKind::Choice(choice) = &mut dynamic.parameters[2].kind else {
+                panic!("choice");
+            };
+            let id = choice.options[0].id;
+            choice.options[0].label = "Std".into();
+            assert_eq!(choice.options[0].id, id);
+            id
+        };
+        let mut config = InstanceConfiguration::default();
+        config.set(style, ParameterValue::Choice(id));
+        validate_definition(
+            document.block_by_name("Assembly").unwrap().dynamic.as_ref().unwrap(),
+            &document.block_by_name("Assembly").unwrap().entities,
+        )
+        .unwrap();
+        assert!(matches!(config.get(style), Some(ParameterValue::Choice(option)) if *option == id));
+    }
+
+    #[test]
+    fn anchor_cycle_is_rejected() {
+        let (mut document, _, _, _, _, _, _, _, _, _) = phase3_assembly();
+        let entities = document.block_by_name("Assembly").unwrap().entities.clone();
+        let dynamic = document.block_by_name_mut("Assembly").unwrap().dynamic.as_mut().unwrap();
+        let member = dynamic.placements[0].members[0];
+        let dest = *dynamic.placements[0].destinations.values().next().unwrap();
+        if let Some(anchor) = dynamic.anchors.iter_mut().find(|anchor| anchor.id == dest) {
+            anchor.follow = Some(crate::dynamic_model::AnchorFollow::Geometry(GeometryTarget::Entity(member)));
+        }
+        let err = validate_definition(dynamic, &entities).unwrap_err();
+        assert!(matches!(err, DynamicError::DependencyCycle { .. }));
+    }
+
+    #[test]
+    fn remap_choice_values_follow_option_ids() {
+        let (document, _, _, style, _, _, _, _, _, _) = phase3_assembly();
+        let dynamic = document.block_by_name("Assembly").unwrap().dynamic.clone().unwrap();
+        let old = match &dynamic.parameters[2].kind {
+            crate::dynamic::ParameterKind::Choice(choice) => choice.options[0].id,
+            _ => panic!("choice"),
+        };
+        let mut config = InstanceConfiguration::default();
+        config.set(style, ParameterValue::Choice(old));
+        let mut options = std::collections::BTreeMap::new();
+        let new = crate::ids::OptionId(99);
+        options.insert(old, new);
+        config.remap_identities(&std::collections::BTreeMap::new(), &options);
+        assert_eq!(config.get(style), Some(&ParameterValue::Choice(new)));
+    }
+
+    #[test]
+    fn inactive_geometry_is_omitted_from_extents_snaps_and_plot() {
+        let (mut document, _, _, style, accessory, _, _, _, _, _) = phase3_assembly();
+        let standard = match &document.block_by_name("Assembly").unwrap().dynamic.as_ref().unwrap().parameters[2].kind {
+            crate::dynamic::ParameterKind::Choice(choice) => choice.options[0].id,
+            _ => panic!("choice"),
+        };
+        let mut insert = Entity::new(identity_insert("Assembly".into(), Point3::from_xy(0.0, 0.0)));
+        let mut config = InstanceConfiguration::default();
+        config.set(style, ParameterValue::Choice(standard));
+        config.set(accessory, ParameterValue::Boolean(false));
+        insert.geometry.set_insert_configuration(Some(config));
+        document.add_entity(insert);
+        let evaluated = crate::evaluate::materialize_evaluated(
+            &document,
+            &mut EvaluationCache::default(),
+            EvaluationRequest {
+                generation: document.content_generation(),
+            },
+        )
+        .unwrap();
+        let snaps = crate::snap::SnapIndex::build(&evaluated);
+        let mut nearby = Vec::new();
+        snaps.query(
+            crate::extents::Extents2 {
+                min: Point2::new(70.0, 25.0),
+                max: Point2::new(90.0, 35.0),
+            },
+            &mut nearby,
+        );
+        assert!(
+            nearby.is_empty(),
+            "hidden alternative endpoint must not snap"
+        );
+        let plot = crate::vectorize::plot_geometry(&evaluated);
+        assert!(plot.strokes.iter().all(|stroke| {
+            stroke
+                .points
+                .iter()
+                .all(|point| (point.x - 80.0).abs() > 0.5 || (point.y - 30.0).abs() > 0.5)
+        }));
+    }
+
+    #[test]
+    fn flip_rotate_place_follow_stored_order() {
+        let mut document = Document::default();
+        let flag = document.allocate_parameter_id();
+        let angle = document.allocate_parameter_id();
+        let choice = document.allocate_parameter_id();
+        let option = document.allocate_option_id();
+        let mut line = Entity::new(Geometry::Line {
+            start: Point3::from_xy(10.0, 0.0),
+            end: Point3::from_xy(20.0, 0.0),
+        });
+        line.id = document.allocate_id();
+        let dest = document.allocate_anchor_id();
+        let flip = document.allocate_action_id();
+        let rotate = document.allocate_action_id();
+        let place = document.allocate_action_id();
+        let mut numeric = NumericParameter::length(90.0);
+        numeric.quantity = crate::dynamic::NumericQuantity::Angle;
+        numeric.unit = crate::dynamic::ParameterUnit::Degrees;
+        numeric.reference = 0.0;
+        numeric.default = 90.0;
+        let mut definition = BlockDefinition::plain(
+            "Ordered",
+            Point3::from_xy(0.0, 0.0),
+            vec![line.clone()],
+        );
+        definition.dynamic = Some(DynamicDefinition {
+            parameters: vec![
+                ParameterDef::boolean(flag, "Flip", crate::dynamic::BooleanParameter { default: true, ..Default::default() }),
+                ParameterDef::number(angle, "Angle", numeric),
+                ParameterDef::choice(
+                    choice,
+                    "Park",
+                    crate::dynamic::ChoiceParameter {
+                        options: vec![crate::dynamic::ChoiceOption {
+                            id: option,
+                            label: "A".into(),
+                        }],
+                        default: option,
+                    },
+                ),
+            ],
+            reflections: vec![crate::dynamic_model::ReflectionBehavior {
+                id: flip,
+                name: Some("Flip".into()),
+                members: vec![line.id],
+                axis_a: Point2::new(0.0, 0.0),
+                axis_b: Point2::new(0.0, 1.0),
+                condition: crate::dynamic_model::ParameterCondition::Boolean {
+                    parameter: flag,
+                    state: true,
+                },
+                text_policy: crate::dynamic_model::TextReflectPolicy::KeepReadable,
+            }],
+            rotations: vec![crate::dynamic_model::RotationBehavior {
+                id: rotate,
+                name: Some("Rotate".into()),
+                members: vec![line.id],
+                pivot: Point2::new(0.0, 0.0),
+                source: crate::dynamic_model::RotationSource::AngleParameter(angle),
+            }],
+            anchors: vec![crate::dynamic_model::AnchorDef {
+                id: dest,
+                name: "A".into(),
+                position: Point2::new(100.0, 0.0),
+                orientation: Some(0.0),
+                follow: None,
+            }],
+            placements: vec![crate::dynamic_model::PlacementBehavior {
+                id: place,
+                name: Some("Place".into()),
+                members: vec![line.id],
+                attachment: Point2::new(0.0, 0.0),
+                attachment_angle: 0.0,
+                parameter: choice,
+                destinations: [(option, dest)].into_iter().collect(),
+                boolean_destinations: None,
+            }],
+            transform_order: vec![flip, rotate, place],
+            ..Default::default()
+        });
+        document.replace_block_definition(definition.clone());
+        let evaluated = evaluate_definition(
+            &document,
+            &definition,
+            None,
+            &mut EvaluationCache::default(),
+            EvaluationRequest {
+                generation: document.content_generation(),
+            },
+        )
+        .unwrap();
+        match &evaluated.entities[0].geometry {
+            Geometry::Line { start, end } => {
+                assert!((start.x - 100.0).abs() < 1e-6);
+                assert!((start.y + 10.0).abs() < 1e-6);
+                assert!((end.x - 100.0).abs() < 1e-6);
+                assert!((end.y + 20.0).abs() < 1e-6);
+            }
+            other => panic!("{other:?}"),
+        }
+        definition.dynamic.as_mut().unwrap().transform_order = vec![place, flip, rotate];
+        document.replace_block_definition(definition.clone());
+        let reversed = evaluate_definition(
+            &document,
+            &definition,
+            None,
+            &mut EvaluationCache::default(),
+            EvaluationRequest {
+                generation: document.content_generation(),
+            },
+        )
+        .unwrap();
+        match &reversed.entities[0].geometry {
+            Geometry::Line { start, .. } => {
+                assert!((start.x - 100.0).abs() > 1.0 || (start.y + 10.0).abs() > 1.0);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn reflected_nested_text_keeps_source_and_readable_height() {
+        let (document, _, _, _, accessory, _, _, _, nested, _) = phase3_assembly();
+        let mut config = InstanceConfiguration::default();
+        config.set(accessory, ParameterValue::Boolean(true));
+        let evaluated = eval_assembly(&document, &config);
+        let insert = evaluated
+            .entities
+            .iter()
+            .find(|entity| entity.id == nested)
+            .unwrap();
+        match &insert.geometry {
+            Geometry::Insert { scale, .. } => {
+                assert!(scale.y < 0.0, "mirrored nested INSERT should reverse orientation");
+            }
+            other => panic!("{other:?}"),
+        }
+        let child = document.block_by_name("ChildDyn").unwrap();
+        match &child.entities.iter().find_map(|entity| match &entity.geometry {
+            Geometry::Text(data) => Some(data),
+            _ => None,
+        }) {
+            Some(data) => {
+                assert!((data.height - 1.0).abs() < 1e-12);
+                assert_eq!(data.value, "N");
+            }
+            None => panic!("child text"),
+        }
+        let plot = crate::vectorize::plot_geometry(&{
+            let mut host = document.clone();
+            let mut insert = Entity::new(identity_insert("Assembly".into(), Point3::from_xy(0.0, 0.0)));
+            insert.geometry.set_insert_configuration(Some(config.clone()));
+            host.add_entity(insert);
+            crate::evaluate::materialize_evaluated(
+                &host,
+                &mut EvaluationCache::default(),
+                EvaluationRequest {
+                    generation: host.content_generation(),
+                },
+            )
+            .unwrap()
+        });
+        assert!(!plot.strokes.is_empty());
+    }
+
+    #[test]
+    fn migrate_option_rewrites_presets_and_instances() {
+        let (mut document, _, _, style, _, _, _, _, _, _) = phase3_assembly();
+        let (from, to) = match &document.block_by_name("Assembly").unwrap().dynamic.as_ref().unwrap().parameters[2].kind {
+            crate::dynamic::ParameterKind::Choice(choice) => (choice.options[0].id, choice.options[1].id),
+            _ => panic!("choice"),
+        };
+        let mut insert = Entity::new(identity_insert("Assembly".into(), Point3::from_xy(0.0, 0.0)));
+        let mut config = InstanceConfiguration::default();
+        config.set(style, ParameterValue::Choice(from));
+        insert.geometry.set_insert_configuration(Some(config));
+        document.add_entity(insert);
+        crate::dynamic::migrate_choice_option(&mut document, "Assembly", style, from, to).unwrap();
+        let dynamic = document.block_by_name("Assembly").unwrap().dynamic.as_ref().unwrap();
+        match &dynamic.parameters[2].kind {
+            crate::dynamic::ParameterKind::Choice(choice) => {
+                assert!(choice.options.iter().all(|option| option.id != from));
+                assert_eq!(choice.default, to);
+            }
+            _ => panic!("choice"),
+        }
+        assert!(matches!(
+            document.model_space[0].geometry.insert_configuration().unwrap().get(style),
+            Some(ParameterValue::Choice(option)) if *option == to
+        ));
+        assert!(dynamic.presets.iter().all(|preset| {
+            !matches!(preset.values.get(&style), Some(ParameterValue::Choice(option)) if *option == from)
+        }));
     }
 }

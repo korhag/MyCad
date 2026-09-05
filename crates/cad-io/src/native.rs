@@ -4,13 +4,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use cad_core::{
-    validate_definition, ActionId, AnchorPolicy, BlockDefinition, BlockDefinitionId,
-    BooleanParameter, CadColor, ChoiceOption, ChoiceParameter, CompositionRule, Document,
-    DrawingUnits, DynamicBehavior, DynamicDefinition, Entity, EntityId, FollowRole, Geometry,
-    GeometryTarget, HatchData, HatchEdge, HatchPath, HatchPatternLine, InstanceConfiguration,
-    Layer, LineType, MeasureMode, MTextData, NumericDomain, NumericParameter, NumericQuantity,
-    OptionId, ParameterDef, ParameterId, ParameterKind, ParameterUnit, ParameterValue, Point3,
-    PolyVertex, SizeAuthoring, StepOrigin, StepPolicy, TextData, TextParameter, VertexId,
+    validate_definition, ActionId, AnchorDef, AnchorFollow, AnchorId, AnchorPolicy, BlockDefinition,
+    BlockDefinitionId, BooleanParameter, CadColor, ChoiceOption, ChoiceParameter, CompatibilityRule,
+    CompositionRule, Document, DrawingUnits, DynamicBehavior, DynamicDefinition, Entity, EntityId,
+    FollowRole, Geometry, GeometryGroup, GeometryTarget, HatchData, HatchEdge, HatchPath,
+    HatchPatternLine, InstanceConfiguration, Layer, LineType, MeasureMode, MTextData, NestedInput,
+    NestedMapping, NumericDomain, NumericParameter, NumericQuantity, OccurrencePath, OptionId,
+    ParameterCondition, ParameterDef, ParameterId, ParameterKind, ParameterUnit, ParameterValue,
+    PlacementBehavior, Point2, Point3, PolyVertex, Preset, PresetId, ReflectionBehavior, RotationBehavior,
+    RotationSource, SizeAuthoring, StepOrigin, StepPolicy, TextBinding, TextBindingMode, TextData,
+    TextParameter, TextReflectPolicy, TextToken, VertexId, VisibilityGroup,
 };
 use serde::{Deserialize, Serialize};
 
@@ -50,6 +53,10 @@ struct WireDocument {
     next_action_id: u64,
     #[serde(default)]
     next_vertex_id: u64,
+    #[serde(default)]
+    next_anchor_id: u64,
+    #[serde(default)]
+    next_preset_id: u64,
     content_generation: u64,
     saved_revision: u64,
     layers: Vec<WireLayer>,
@@ -286,6 +293,28 @@ enum WireValue {
 struct WireDynamic {
     parameters: Vec<WireParameter>,
     behaviors: Vec<WireBehavior>,
+    #[serde(default)]
+    groups: Vec<WireGroup>,
+    #[serde(default)]
+    anchors: Vec<WireAnchor>,
+    #[serde(default)]
+    visibility: Vec<WireVisibility>,
+    #[serde(default)]
+    text_bindings: Vec<WireTextBinding>,
+    #[serde(default)]
+    reflections: Vec<WireReflection>,
+    #[serde(default)]
+    rotations: Vec<WireRotation>,
+    #[serde(default)]
+    placements: Vec<WirePlacement>,
+    #[serde(default)]
+    nested_inputs: Vec<WireNestedInput>,
+    #[serde(default)]
+    compatibility: Vec<WireCompatRule>,
+    #[serde(default)]
+    presets: Vec<WirePreset>,
+    #[serde(default)]
+    transform_order: Vec<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -293,6 +322,8 @@ struct WireParameter {
     id: u64,
     name: String,
     description: Option<String>,
+    #[serde(default)]
+    display_order: i32,
     kind: WireParameterKind,
 }
 
@@ -322,9 +353,17 @@ enum WireParameterKind {
     },
     Boolean {
         default: bool,
+        #[serde(default)]
+        true_label: Option<String>,
+        #[serde(default)]
+        false_label: Option<String>,
     },
     Text {
         default: String,
+        #[serde(default)]
+        multiline: bool,
+        #[serde(default)]
+        max_length: Option<u32>,
     },
 }
 
@@ -386,6 +425,191 @@ struct WireSizeAuthoring {
     label_offset: [f64; 2],
     #[serde(default)]
     bound_anchor: Option<WireTarget>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WireGroup {
+    id: u64,
+    name: String,
+    members: Vec<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WireAnchor {
+    id: u64,
+    name: String,
+    position: [f64; 2],
+    orientation: Option<f64>,
+    #[serde(default)]
+    follow: Option<WireAnchorFollow>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+enum WireAnchorFollow {
+    Size { parameter: u64, role: String },
+    Geometry { target: WireTarget },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+enum WireConditionInner {
+    Choice { parameter: u64, options: Vec<u64> },
+    Boolean { parameter: u64, state: bool },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WireVisibility {
+    id: u64,
+    name: String,
+    members: Vec<u64>,
+    conditions: Vec<WireConditionInner>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WireTextBinding {
+    id: u64,
+    target: u64,
+    mode: WireTextMode,
+    #[serde(default)]
+    boolean_true: Option<String>,
+    #[serde(default)]
+    boolean_false: Option<String>,
+    #[serde(default)]
+    number_precision: Option<u8>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+enum WireTextMode {
+    ShowValue { parameter: u64 },
+    OptionMap { parameter: u64, texts: Vec<WireOptionText> },
+    Formatted { tokens: Vec<WireTextToken> },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WireOptionText {
+    option: u64,
+    text: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+enum WireTextToken {
+    Literal { text: String },
+    Parameter { id: u64 },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WireReflection {
+    id: u64,
+    name: Option<String>,
+    members: Vec<u64>,
+    axis_a: [f64; 2],
+    axis_b: [f64; 2],
+    condition: WireConditionInner,
+    #[serde(default)]
+    text_policy: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WireRotation {
+    id: u64,
+    name: Option<String>,
+    members: Vec<u64>,
+    pivot: [f64; 2],
+    source: WireRotationSource,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+enum WireRotationSource {
+    Angle { parameter: u64 },
+    OptionMap { parameter: u64, angles: Vec<WireOptionAngle> },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WireOptionAngle {
+    option: u64,
+    radians: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WirePlacement {
+    id: u64,
+    name: Option<String>,
+    members: Vec<u64>,
+    attachment: [f64; 2],
+    attachment_angle: f64,
+    parameter: u64,
+    destinations: Vec<WireOptionAnchor>,
+    #[serde(default)]
+    boolean_destinations: Option<[u64; 2]>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WireOptionAnchor {
+    option: u64,
+    anchor: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WireNestedInput {
+    id: u64,
+    source: u64,
+    occurrence: Vec<u64>,
+    target_parameter: u64,
+    mapping: WireNestedMapping,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+enum WireNestedMapping {
+    Direct,
+    NumericScale { factor: f64 },
+    OptionMap { values: Vec<WireOptionValue> },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WireOptionValue {
+    option: u64,
+    value: WireValue,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+enum WireCompatRule {
+    ChoiceAllowsChoice {
+        id: u64,
+        when: u64,
+        when_option: u64,
+        target: u64,
+        allowed: Vec<u64>,
+    },
+    ChoiceRestrictsNumeric {
+        id: u64,
+        when: u64,
+        when_option: u64,
+        target: u64,
+        min: Option<f64>,
+        max: Option<f64>,
+        allowed: Option<Vec<f64>>,
+    },
+    BooleanPermits {
+        id: u64,
+        when: u64,
+        when_state: bool,
+        target: u64,
+        allowed_options: Option<Vec<u64>>,
+        required_boolean: Option<bool>,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WirePreset {
+    id: u64,
+    name: String,
+    values: Vec<WireInstanceValue>,
 }
 
 pub fn write_mycad(document: &Document, path: &Path) -> Result<SaveReport, ExportError> {
@@ -495,32 +719,43 @@ pub fn import_block_asset(
         }
         let vertex_map = document.remap_entity_vertex_ids(&mut block.entities);
         if let Some(dynamic) = block.dynamic.as_mut() {
-            for parameter in &mut dynamic.parameters {
-                let old = parameter.id;
-                parameter.id = document.allocate_parameter_id();
-                parameter_map.insert(old, parameter.id);
-                if let ParameterKind::Choice(choice) = &mut parameter.kind {
-                    for option in &mut choice.options {
-                        let old_opt = option.id;
-                        option.id = document.allocate_option_id();
-                        option_map.insert(old_opt, option.id);
+            let mut anchors = BTreeMap::new();
+            let mut presets = BTreeMap::new();
+            for parameter in &dynamic.parameters {
+                parameter_map.insert(parameter.id, document.allocate_parameter_id());
+                if let ParameterKind::Choice(choice) = &parameter.kind {
+                    for option in &choice.options {
+                        option_map.insert(option.id, document.allocate_option_id());
                     }
                 }
             }
-            for behavior in &mut dynamic.behaviors {
-                let old = behavior.id;
-                behavior.id = document.allocate_action_id();
-                action_map.insert(old, behavior.id);
+            for id in dynamic.collect_action_ids() {
+                action_map.insert(id, document.allocate_action_id());
+            }
+            for anchor in &dynamic.anchors {
+                anchors.insert(anchor.id, document.allocate_anchor_id());
+            }
+            for preset in &dynamic.presets {
+                presets.insert(preset.id, document.allocate_preset_id());
             }
             dynamic
-                .remap_ids(
+                .remap_ids_with(
                     &parameter_map,
                     &option_map,
                     &action_map,
+                    &anchors,
+                    &presets,
                     &entity_map,
                     &vertex_map,
                 )
                 .map_err(|err| ExportError::Validation(err.to_string()))?;
+            for entity in &mut block.entities {
+                if let Some(config) = entity.geometry.insert_configuration_mut() {
+                    if let Some(values) = config.as_mut() {
+                        values.remap_identities(&parameter_map, &option_map);
+                    }
+                }
+            }
         }
         if document.block_key(&block.name).is_some() {
             block.name = unique_imported_name(document, &block.name);
@@ -602,6 +837,8 @@ fn to_wire_document(document: &Document) -> WireDocument {
         next_option_id,
         next_action_id,
         next_vertex_id: document.next_vertex_id(),
+        next_anchor_id: document.next_anchor_id(),
+        next_preset_id: document.next_preset_id(),
         content_generation,
         saved_revision,
         layers: document
@@ -695,6 +932,8 @@ fn from_wire_document(wire: WireDocument) -> Result<Document, ExportError> {
         wire.saved_revision,
     );
     document.set_next_vertex_id(wire.next_vertex_id);
+    document.set_next_anchor_id(wire.next_anchor_id);
+    document.set_next_preset_id(wire.next_preset_id);
     document.assign_missing_ids();
     for block in document.blocks.values() {
         if let Some(dynamic) = &block.dynamic {
@@ -1050,6 +1289,25 @@ fn to_wire_dynamic(dynamic: &DynamicDefinition) -> WireDynamic {
     WireDynamic {
         parameters: dynamic.parameters.iter().map(to_parameter).collect(),
         behaviors: dynamic.behaviors.iter().map(to_behavior).collect(),
+        groups: dynamic
+            .groups
+            .iter()
+            .map(|group| WireGroup {
+                id: group.id.raw(),
+                name: group.name.clone(),
+                members: group.members.iter().map(|id| id.raw()).collect(),
+            })
+            .collect(),
+        anchors: dynamic.anchors.iter().map(to_anchor).collect(),
+        visibility: dynamic.visibility.iter().map(to_visibility).collect(),
+        text_bindings: dynamic.text_bindings.iter().map(to_text_binding).collect(),
+        reflections: dynamic.reflections.iter().map(to_reflection).collect(),
+        rotations: dynamic.rotations.iter().map(to_rotation).collect(),
+        placements: dynamic.placements.iter().map(to_placement).collect(),
+        nested_inputs: dynamic.nested_inputs.iter().map(to_nested_input).collect(),
+        compatibility: dynamic.compatibility.iter().map(to_compat).collect(),
+        presets: dynamic.presets.iter().map(to_preset).collect(),
+        transform_order: dynamic.transform_order.iter().map(|id| id.raw()).collect(),
     }
 }
 
@@ -1065,6 +1323,53 @@ fn from_wire_dynamic(dynamic: WireDynamic) -> Result<DynamicDefinition, ExportEr
             .into_iter()
             .map(from_behavior)
             .collect::<Result<_, _>>()?,
+        groups: dynamic
+            .groups
+            .into_iter()
+            .map(|group| GeometryGroup {
+                id: ActionId(group.id),
+                name: group.name,
+                members: group.members.into_iter().map(EntityId).collect(),
+            })
+            .collect(),
+        anchors: dynamic
+            .anchors
+            .into_iter()
+            .map(from_anchor)
+            .collect::<Result<_, _>>()?,
+        visibility: dynamic
+            .visibility
+            .into_iter()
+            .map(from_visibility)
+            .collect::<Result<_, _>>()?,
+        text_bindings: dynamic
+            .text_bindings
+            .into_iter()
+            .map(from_text_binding)
+            .collect::<Result<_, _>>()?,
+        reflections: dynamic
+            .reflections
+            .into_iter()
+            .map(from_reflection)
+            .collect::<Result<_, _>>()?,
+        rotations: dynamic
+            .rotations
+            .into_iter()
+            .map(from_rotation)
+            .collect::<Result<_, _>>()?,
+        placements: dynamic
+            .placements
+            .into_iter()
+            .map(from_placement)
+            .collect::<Result<_, _>>()?,
+        nested_inputs: dynamic
+            .nested_inputs
+            .into_iter()
+            .map(from_nested_input)
+            .collect::<Result<_, _>>()?,
+        compatibility: dynamic.compatibility.into_iter().map(from_compat).collect(),
+        presets: dynamic.presets.into_iter().map(from_preset).collect(),
+        transform_order: dynamic.transform_order.into_iter().map(ActionId).collect(),
     })
 }
 
@@ -1073,6 +1378,7 @@ fn to_parameter(parameter: &ParameterDef) -> WireParameter {
         id: parameter.id.raw(),
         name: parameter.name.clone(),
         description: parameter.description.clone(),
+        display_order: parameter.display_order,
         kind: match &parameter.kind {
             ParameterKind::Number(numeric) => WireParameterKind::Number {
                 quantity: quantity_name(numeric.quantity).into(),
@@ -1108,67 +1414,577 @@ fn to_parameter(parameter: &ParameterDef) -> WireParameter {
             },
             ParameterKind::Boolean(flag) => WireParameterKind::Boolean {
                 default: flag.default,
+                true_label: Some(flag.true_label.clone()),
+                false_label: Some(flag.false_label.clone()),
             },
             ParameterKind::Text(text) => WireParameterKind::Text {
                 default: text.default.clone(),
+                multiline: text.multiline,
+                max_length: text.max_length,
             },
         },
     }
 }
 
 fn from_parameter(parameter: WireParameter) -> Result<ParameterDef, ExportError> {
+    let display_order = parameter.display_order;
+    let kind = match parameter.kind {
+        WireParameterKind::Number {
+            quantity,
+            unit,
+            default,
+            reference,
+            min,
+            max,
+            step,
+            step_policy,
+            step_origin,
+            display_precision,
+            display_order: numeric_order,
+            domain,
+            size,
+        } => ParameterKind::Number(NumericParameter {
+            quantity: parse_quantity(&quantity)?,
+            unit: from_unit(unit),
+            default,
+            reference,
+            min,
+            max,
+            step,
+            step_policy: parse_step_policy(&step_policy)?,
+            step_origin: parse_step_origin(&step_origin)?,
+            display_precision,
+            display_order: numeric_order,
+            domain: from_domain(domain),
+            size: size.map(from_size).transpose()?,
+        }),
+        WireParameterKind::Choice { options, default } => ParameterKind::Choice(ChoiceParameter {
+            options: options
+                .into_iter()
+                .map(|option| ChoiceOption {
+                    id: OptionId(option.id),
+                    label: option.label,
+                })
+                .collect(),
+            default: OptionId(default),
+        }),
+        WireParameterKind::Boolean {
+            default,
+            true_label,
+            false_label,
+        } => ParameterKind::Boolean(BooleanParameter {
+            default,
+            true_label: true_label.unwrap_or_else(|| "On".into()),
+            false_label: false_label.unwrap_or_else(|| "Off".into()),
+        }),
+        WireParameterKind::Text {
+            default,
+            multiline,
+            max_length,
+        } => ParameterKind::Text(TextParameter {
+            default,
+            multiline,
+            max_length,
+        }),
+    };
+    let display_order = if display_order != 0 {
+        display_order
+    } else if let ParameterKind::Number(numeric) = &kind {
+        numeric.display_order
+    } else {
+        0
+    };
     Ok(ParameterDef {
         id: ParameterId(parameter.id),
         name: parameter.name,
         description: parameter.description,
-        kind: match parameter.kind {
-            WireParameterKind::Number {
-                quantity,
-                unit,
-                default,
-                reference,
-                min,
-                max,
-                step,
-                step_policy,
-                step_origin,
-                display_precision,
-                display_order,
-                domain,
-                size,
-            } => ParameterKind::Number(NumericParameter {
-                quantity: parse_quantity(&quantity)?,
-                unit: from_unit(unit),
-                default,
-                reference,
-                min,
-                max,
-                step,
-                step_policy: parse_step_policy(&step_policy)?,
-                step_origin: parse_step_origin(&step_origin)?,
-                display_precision,
-                display_order,
-                domain: from_domain(domain),
-                size: size.map(from_size).transpose()?,
+        display_order,
+        kind,
+    })
+}
+
+fn to_anchor(anchor: &AnchorDef) -> WireAnchor {
+    WireAnchor {
+        id: anchor.id.raw(),
+        name: anchor.name.clone(),
+        position: [anchor.position.x, anchor.position.y],
+        orientation: anchor.orientation,
+        follow: anchor.follow.as_ref().map(|follow| match follow {
+            AnchorFollow::Size { parameter, role } => WireAnchorFollow::Size {
+                parameter: parameter.raw(),
+                role: follow_name(*role).into(),
+            },
+            AnchorFollow::Geometry(target) => WireAnchorFollow::Geometry {
+                target: to_target(target),
+            },
+        }),
+    }
+}
+
+fn from_anchor(anchor: WireAnchor) -> Result<AnchorDef, ExportError> {
+    Ok(AnchorDef {
+        id: AnchorId(anchor.id),
+        name: anchor.name,
+        position: Point2::new(anchor.position[0], anchor.position[1]),
+        orientation: anchor.orientation,
+        follow: match anchor.follow {
+            Some(WireAnchorFollow::Size { parameter, role }) => Some(AnchorFollow::Size {
+                parameter: ParameterId(parameter),
+                role: parse_follow(&role)?,
             }),
-            WireParameterKind::Choice { options, default } => {
-                ParameterKind::Choice(ChoiceParameter {
-                    options: options
-                        .into_iter()
-                        .map(|option| ChoiceOption {
-                            id: OptionId(option.id),
-                            label: option.label,
-                        })
-                        .collect(),
-                    default: OptionId(default),
-                })
+            Some(WireAnchorFollow::Geometry { target }) => {
+                Some(AnchorFollow::Geometry(from_target(target)))
             }
-            WireParameterKind::Boolean { default } => {
-                ParameterKind::Boolean(BooleanParameter { default })
-            }
-            WireParameterKind::Text { default } => ParameterKind::Text(TextParameter { default }),
+            None => None,
         },
     })
+}
+
+fn to_condition(condition: &ParameterCondition) -> WireConditionInner {
+    match condition {
+        ParameterCondition::Choice { parameter, options } => WireConditionInner::Choice {
+            parameter: parameter.raw(),
+            options: options.iter().map(|id| id.raw()).collect(),
+        },
+        ParameterCondition::Boolean { parameter, state } => WireConditionInner::Boolean {
+            parameter: parameter.raw(),
+            state: *state,
+        },
+    }
+}
+
+fn from_condition(condition: WireConditionInner) -> ParameterCondition {
+    match condition {
+        WireConditionInner::Choice { parameter, options } => ParameterCondition::Choice {
+            parameter: ParameterId(parameter),
+            options: options.into_iter().map(OptionId).collect(),
+        },
+        WireConditionInner::Boolean { parameter, state } => ParameterCondition::Boolean {
+            parameter: ParameterId(parameter),
+            state,
+        },
+    }
+}
+
+fn to_visibility(group: &VisibilityGroup) -> WireVisibility {
+    WireVisibility {
+        id: group.id.raw(),
+        name: group.name.clone(),
+        members: group.members.iter().map(|id| id.raw()).collect(),
+        conditions: group.conditions.iter().map(to_condition).collect(),
+    }
+}
+
+fn from_visibility(group: WireVisibility) -> Result<VisibilityGroup, ExportError> {
+    Ok(VisibilityGroup {
+        id: ActionId(group.id),
+        name: group.name,
+        members: group.members.into_iter().map(EntityId).collect(),
+        conditions: group.conditions.into_iter().map(from_condition).collect(),
+    })
+}
+
+fn to_text_binding(binding: &TextBinding) -> WireTextBinding {
+    WireTextBinding {
+        id: binding.id.raw(),
+        target: binding.target.raw(),
+        mode: match &binding.mode {
+            TextBindingMode::ShowValue { parameter } => WireTextMode::ShowValue {
+                parameter: parameter.raw(),
+            },
+            TextBindingMode::OptionMap { parameter, texts } => WireTextMode::OptionMap {
+                parameter: parameter.raw(),
+                texts: texts
+                    .iter()
+                    .map(|(option, text)| WireOptionText {
+                        option: option.raw(),
+                        text: text.clone(),
+                    })
+                    .collect(),
+            },
+            TextBindingMode::Formatted { tokens } => WireTextMode::Formatted {
+                tokens: tokens
+                    .iter()
+                    .map(|token| match token {
+                        TextToken::Literal(text) => WireTextToken::Literal { text: text.clone() },
+                        TextToken::Parameter(id) => WireTextToken::Parameter { id: id.raw() },
+                    })
+                    .collect(),
+            },
+        },
+        boolean_true: Some(binding.boolean_true.clone()),
+        boolean_false: Some(binding.boolean_false.clone()),
+        number_precision: binding.number_precision,
+    }
+}
+
+fn from_text_binding(binding: WireTextBinding) -> Result<TextBinding, ExportError> {
+    Ok(TextBinding {
+        id: ActionId(binding.id),
+        target: EntityId(binding.target),
+        mode: match binding.mode {
+            WireTextMode::ShowValue { parameter } => TextBindingMode::ShowValue {
+                parameter: ParameterId(parameter),
+            },
+            WireTextMode::OptionMap { parameter, texts } => TextBindingMode::OptionMap {
+                parameter: ParameterId(parameter),
+                texts: texts
+                    .into_iter()
+                    .map(|item| (OptionId(item.option), item.text))
+                    .collect(),
+            },
+            WireTextMode::Formatted { tokens } => TextBindingMode::Formatted {
+                tokens: tokens
+                    .into_iter()
+                    .map(|token| match token {
+                        WireTextToken::Literal { text } => TextToken::Literal(text),
+                        WireTextToken::Parameter { id } => TextToken::Parameter(ParameterId(id)),
+                    })
+                    .collect(),
+            },
+        },
+        boolean_true: binding.boolean_true.unwrap_or_else(|| "On".into()),
+        boolean_false: binding.boolean_false.unwrap_or_else(|| "Off".into()),
+        number_precision: binding.number_precision,
+    })
+}
+
+fn to_reflection(behavior: &ReflectionBehavior) -> WireReflection {
+    WireReflection {
+        id: behavior.id.raw(),
+        name: behavior.name.clone(),
+        members: behavior.members.iter().map(|id| id.raw()).collect(),
+        axis_a: [behavior.axis_a.x, behavior.axis_a.y],
+        axis_b: [behavior.axis_b.x, behavior.axis_b.y],
+        condition: to_condition(&behavior.condition),
+        text_policy: Some(match behavior.text_policy {
+            TextReflectPolicy::KeepReadable => "keep_readable".into(),
+            TextReflectPolicy::KeepUpright => "keep_upright".into(),
+            TextReflectPolicy::Mirror => "mirror".into(),
+        }),
+    }
+}
+
+fn from_reflection(behavior: WireReflection) -> Result<ReflectionBehavior, ExportError> {
+    Ok(ReflectionBehavior {
+        id: ActionId(behavior.id),
+        name: behavior.name,
+        members: behavior.members.into_iter().map(EntityId).collect(),
+        axis_a: Point2::new(behavior.axis_a[0], behavior.axis_a[1]),
+        axis_b: Point2::new(behavior.axis_b[0], behavior.axis_b[1]),
+        condition: from_condition(behavior.condition),
+        text_policy: match behavior.text_policy.as_deref() {
+            Some("keep_upright") => TextReflectPolicy::KeepUpright,
+            Some("mirror") => TextReflectPolicy::Mirror,
+            _ => TextReflectPolicy::KeepReadable,
+        },
+    })
+}
+
+fn to_rotation(behavior: &RotationBehavior) -> WireRotation {
+    WireRotation {
+        id: behavior.id.raw(),
+        name: behavior.name.clone(),
+        members: behavior.members.iter().map(|id| id.raw()).collect(),
+        pivot: [behavior.pivot.x, behavior.pivot.y],
+        source: match &behavior.source {
+            RotationSource::AngleParameter(parameter) => WireRotationSource::Angle {
+                parameter: parameter.raw(),
+            },
+            RotationSource::OptionMap { parameter, angles } => WireRotationSource::OptionMap {
+                parameter: parameter.raw(),
+                angles: angles
+                    .iter()
+                    .map(|(option, radians)| WireOptionAngle {
+                        option: option.raw(),
+                        radians: *radians,
+                    })
+                    .collect(),
+            },
+        },
+    }
+}
+
+fn from_rotation(behavior: WireRotation) -> Result<RotationBehavior, ExportError> {
+    Ok(RotationBehavior {
+        id: ActionId(behavior.id),
+        name: behavior.name,
+        members: behavior.members.into_iter().map(EntityId).collect(),
+        pivot: Point2::new(behavior.pivot[0], behavior.pivot[1]),
+        source: match behavior.source {
+            WireRotationSource::Angle { parameter } => {
+                RotationSource::AngleParameter(ParameterId(parameter))
+            }
+            WireRotationSource::OptionMap { parameter, angles } => RotationSource::OptionMap {
+                parameter: ParameterId(parameter),
+                angles: angles
+                    .into_iter()
+                    .map(|item| (OptionId(item.option), item.radians))
+                    .collect(),
+            },
+        },
+    })
+}
+
+fn to_placement(behavior: &PlacementBehavior) -> WirePlacement {
+    WirePlacement {
+        id: behavior.id.raw(),
+        name: behavior.name.clone(),
+        members: behavior.members.iter().map(|id| id.raw()).collect(),
+        attachment: [behavior.attachment.x, behavior.attachment.y],
+        attachment_angle: behavior.attachment_angle,
+        parameter: behavior.parameter.raw(),
+        destinations: behavior
+            .destinations
+            .iter()
+            .map(|(option, anchor)| WireOptionAnchor {
+                option: option.raw(),
+                anchor: anchor.raw(),
+            })
+            .collect(),
+        boolean_destinations: behavior
+            .boolean_destinations
+            .map(|(off, on)| [off.raw(), on.raw()]),
+    }
+}
+
+fn from_placement(behavior: WirePlacement) -> Result<PlacementBehavior, ExportError> {
+    Ok(PlacementBehavior {
+        id: ActionId(behavior.id),
+        name: behavior.name,
+        members: behavior.members.into_iter().map(EntityId).collect(),
+        attachment: Point2::new(behavior.attachment[0], behavior.attachment[1]),
+        attachment_angle: behavior.attachment_angle,
+        parameter: ParameterId(behavior.parameter),
+        destinations: behavior
+            .destinations
+            .into_iter()
+            .map(|item| (OptionId(item.option), AnchorId(item.anchor)))
+            .collect(),
+        boolean_destinations: behavior
+            .boolean_destinations
+            .map(|ids| (AnchorId(ids[0]), AnchorId(ids[1]))),
+    })
+}
+
+fn to_nested_input(input: &NestedInput) -> WireNestedInput {
+    WireNestedInput {
+        id: input.id.raw(),
+        source: input.source.raw(),
+        occurrence: input
+            .target_occurrence
+            .inserts
+            .iter()
+            .map(|id| id.raw())
+            .collect(),
+        target_parameter: input.target_parameter.raw(),
+        mapping: match &input.mapping {
+            NestedMapping::Direct => WireNestedMapping::Direct,
+            NestedMapping::NumericScale { factor } => WireNestedMapping::NumericScale {
+                factor: *factor,
+            },
+            NestedMapping::OptionMap(map) => WireNestedMapping::OptionMap {
+                values: map
+                    .iter()
+                    .map(|(option, value)| WireOptionValue {
+                        option: option.raw(),
+                        value: to_wire_value(value),
+                    })
+                    .collect(),
+            },
+        },
+    }
+}
+
+fn from_nested_input(input: WireNestedInput) -> Result<NestedInput, ExportError> {
+    Ok(NestedInput {
+        id: ActionId(input.id),
+        source: ParameterId(input.source),
+        target_occurrence: OccurrencePath {
+            inserts: input.occurrence.into_iter().map(EntityId).collect(),
+        },
+        target_parameter: ParameterId(input.target_parameter),
+        mapping: match input.mapping {
+            WireNestedMapping::Direct => NestedMapping::Direct,
+            WireNestedMapping::NumericScale { factor } => NestedMapping::NumericScale { factor },
+            WireNestedMapping::OptionMap { values } => NestedMapping::OptionMap(
+                values
+                    .into_iter()
+                    .map(|item| (OptionId(item.option), from_wire_value(item.value)))
+                    .collect(),
+            ),
+        },
+    })
+}
+
+fn to_compat(rule: &CompatibilityRule) -> WireCompatRule {
+    match rule {
+        CompatibilityRule::ChoiceAllowsChoice {
+            id,
+            when,
+            when_option,
+            target,
+            allowed,
+        } => WireCompatRule::ChoiceAllowsChoice {
+            id: id.raw(),
+            when: when.raw(),
+            when_option: when_option.raw(),
+            target: target.raw(),
+            allowed: allowed.iter().map(|id| id.raw()).collect(),
+        },
+        CompatibilityRule::ChoiceRestrictsNumeric {
+            id,
+            when,
+            when_option,
+            target,
+            min,
+            max,
+            allowed,
+        } => WireCompatRule::ChoiceRestrictsNumeric {
+            id: id.raw(),
+            when: when.raw(),
+            when_option: when_option.raw(),
+            target: target.raw(),
+            min: *min,
+            max: *max,
+            allowed: allowed.clone(),
+        },
+        CompatibilityRule::BooleanPermits {
+            id,
+            when,
+            when_state,
+            target,
+            allowed_options,
+            required_boolean,
+        } => WireCompatRule::BooleanPermits {
+            id: id.raw(),
+            when: when.raw(),
+            when_state: *when_state,
+            target: target.raw(),
+            allowed_options: allowed_options
+                .as_ref()
+                .map(|items| items.iter().map(|id| id.raw()).collect()),
+            required_boolean: *required_boolean,
+        },
+    }
+}
+
+fn from_compat(rule: WireCompatRule) -> CompatibilityRule {
+    match rule {
+        WireCompatRule::ChoiceAllowsChoice {
+            id,
+            when,
+            when_option,
+            target,
+            allowed,
+        } => CompatibilityRule::ChoiceAllowsChoice {
+            id: ActionId(id),
+            when: ParameterId(when),
+            when_option: OptionId(when_option),
+            target: ParameterId(target),
+            allowed: allowed.into_iter().map(OptionId).collect(),
+        },
+        WireCompatRule::ChoiceRestrictsNumeric {
+            id,
+            when,
+            when_option,
+            target,
+            min,
+            max,
+            allowed,
+        } => CompatibilityRule::ChoiceRestrictsNumeric {
+            id: ActionId(id),
+            when: ParameterId(when),
+            when_option: OptionId(when_option),
+            target: ParameterId(target),
+            min,
+            max,
+            allowed,
+        },
+        WireCompatRule::BooleanPermits {
+            id,
+            when,
+            when_state,
+            target,
+            allowed_options,
+            required_boolean,
+        } => CompatibilityRule::BooleanPermits {
+            id: ActionId(id),
+            when: ParameterId(when),
+            when_state,
+            target: ParameterId(target),
+            allowed_options: allowed_options.map(|items| items.into_iter().map(OptionId).collect()),
+            required_boolean,
+        },
+    }
+}
+
+fn to_preset(preset: &Preset) -> WirePreset {
+    WirePreset {
+        id: preset.id.raw(),
+        name: preset.name.clone(),
+        values: preset
+            .values
+            .iter()
+            .map(|(id, value)| WireInstanceValue {
+                parameter: id.raw(),
+                value: to_wire_value(value),
+            })
+            .collect(),
+    }
+}
+
+fn from_preset(preset: WirePreset) -> Preset {
+    Preset {
+        id: PresetId(preset.id),
+        name: preset.name,
+        values: preset
+            .values
+            .into_iter()
+            .map(|item| (ParameterId(item.parameter), from_wire_value(item.value)))
+            .collect(),
+    }
+}
+
+fn to_wire_value(value: &ParameterValue) -> WireValue {
+    match value {
+        ParameterValue::Number(v) => WireValue::Number { value: *v },
+        ParameterValue::Choice(option) => WireValue::Choice {
+            option: option.raw(),
+        },
+        ParameterValue::Boolean(v) => WireValue::Boolean { value: *v },
+        ParameterValue::Text(v) => WireValue::Text { value: v.clone() },
+    }
+}
+
+fn from_wire_value(value: WireValue) -> ParameterValue {
+    match value {
+        WireValue::Number { value } => ParameterValue::Number(value),
+        WireValue::Choice { option } => ParameterValue::Choice(OptionId(option)),
+        WireValue::Boolean { value } => ParameterValue::Boolean(value),
+        WireValue::Text { value } => ParameterValue::Text(value),
+    }
+}
+
+fn follow_name(role: FollowRole) -> &'static str {
+    match role {
+        FollowRole::First => "first",
+        FollowRole::Second => "second",
+        FollowRole::Center => "center",
+        FollowRole::Custom => "custom",
+    }
+}
+
+fn parse_follow(role: &str) -> Result<FollowRole, ExportError> {
+    match role {
+        "first" => Ok(FollowRole::First),
+        "second" => Ok(FollowRole::Second),
+        "center" => Ok(FollowRole::Center),
+        "custom" | "" => Ok(FollowRole::Custom),
+        other => Err(ExportError::Validation(format!(
+            "unknown follow role '{other}'"
+        ))),
+    }
 }
 
 fn to_behavior(behavior: &DynamicBehavior) -> WireBehavior {
@@ -1675,6 +2491,7 @@ mod tests {
                 follow: FollowRole::Second,
                 name: None,
             }],
+            ..Default::default()
         });
         document.replace_block_definition(definition);
         let mut insert = Entity::new(identity_insert(
@@ -1701,6 +2518,115 @@ mod tests {
             .as_number()
             .unwrap();
         assert!((value - 1200.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn phase3_choice_visibility_text_and_preset_roundtrip() {
+        let mut document = Document::default();
+        let style = document.allocate_parameter_id();
+        let first = document.allocate_option_id();
+        let second = document.allocate_option_id();
+        let mut alt_a = Entity::new(Geometry::Line {
+            start: Point3::from_xy(0.0, 0.0),
+            end: Point3::from_xy(10.0, 0.0),
+        });
+        let mut alt_b = Entity::new(Geometry::Line {
+            start: Point3::from_xy(0.0, 20.0),
+            end: Point3::from_xy(10.0, 20.0),
+        });
+        let mut label = Entity::new(Geometry::Text(TextData {
+            insertion: Point3::from_xy(0.0, 5.0),
+            height: 2.5,
+            rotation: 0.0,
+            value: "source".into(),
+            extrusion: cad_core::default_extrusion(),
+            is_attrib_def: false,
+        }));
+        alt_a.id = document.allocate_id();
+        alt_b.id = document.allocate_id();
+        label.id = document.allocate_id();
+        let vis = document.allocate_action_id();
+        let bind = document.allocate_action_id();
+        let preset = document.allocate_preset_id();
+        let mut definition = BlockDefinition::plain(
+            "Assembly",
+            Point3::from_xy(0.0, 0.0),
+            vec![alt_a.clone(), alt_b.clone(), label.clone()],
+        );
+        definition.dynamic = Some(DynamicDefinition {
+            parameters: vec![ParameterDef::choice(
+                style,
+                "Style",
+                ChoiceParameter {
+                    options: vec![
+                        ChoiceOption {
+                            id: first,
+                            label: "Standard".into(),
+                        },
+                        ChoiceOption {
+                            id: second,
+                            label: "Reinforced".into(),
+                        },
+                    ],
+                    default: first,
+                },
+            )],
+            visibility: vec![VisibilityGroup {
+                id: vis,
+                name: "Alt B".into(),
+                members: vec![alt_b.id],
+                conditions: vec![ParameterCondition::Choice {
+                    parameter: style,
+                    options: vec![second],
+                }],
+            }],
+            text_bindings: vec![TextBinding {
+                id: bind,
+                target: label.id,
+                mode: TextBindingMode::ShowValue { parameter: style },
+                boolean_true: "On".into(),
+                boolean_false: "Off".into(),
+                number_precision: None,
+            }],
+            presets: vec![Preset {
+                id: preset,
+                name: "Reinforced".into(),
+                values: [(style, ParameterValue::Choice(second))]
+                    .into_iter()
+                    .collect(),
+            }],
+            ..Default::default()
+        });
+        document.replace_block_definition(definition);
+        let mut insert = Entity::new(identity_insert("Assembly".into(), Point3::from_xy(0.0, 0.0)));
+        let mut config = InstanceConfiguration::default();
+        config.set(style, ParameterValue::Choice(second));
+        insert.geometry.set_insert_configuration(Some(config));
+        document.add_entity(insert);
+        let path = temp("phase3.mycad");
+        write_mycad(&document, &path).expect("write");
+        let loaded = read_mycad(&path).expect("read");
+        let _ = std::fs::remove_file(&path);
+        let def = loaded.block_by_name("Assembly").unwrap().dynamic.as_ref().unwrap();
+        assert_eq!(def.parameters[0].id, style);
+        match &def.parameters[0].kind {
+            ParameterKind::Choice(choice) => {
+                assert_eq!(choice.options[0].id, first);
+                assert_eq!(choice.options[1].label, "Reinforced");
+            }
+            _ => panic!("choice"),
+        }
+        assert_eq!(def.visibility[0].members[0], alt_b.id);
+        assert_eq!(def.text_bindings[0].target, label.id);
+        assert_eq!(def.presets[0].id, preset);
+        assert_eq!(
+            loaded.model_space[0]
+                .geometry
+                .insert_configuration()
+                .unwrap()
+                .get(style),
+            Some(&ParameterValue::Choice(second))
+        );
     }
 
     #[test]
@@ -1761,6 +2687,7 @@ mod tests {
                 follow: FollowRole::Second,
                 name: Some("right rail".into()),
             }],
+            ..Default::default()
         });
         document.replace_block_definition(definition);
         let path = temp("size-meta.mycad");
@@ -1821,6 +2748,7 @@ mod tests {
                 follow: FollowRole::Second,
                 name: None,
             }],
+            ..Default::default()
         });
         document.replace_block_definition(definition);
         let original_id = document.block_by_name("OffsetSymbol").unwrap().id;

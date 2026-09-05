@@ -6,6 +6,7 @@ mod block_edit;
 mod blocks;
 mod commands;
 mod context_menu;
+mod config_form;
 mod diagnostics;
 mod drafting;
 mod dynamic_block;

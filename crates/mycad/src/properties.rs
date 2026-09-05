@@ -64,6 +64,8 @@ pub fn show(ui: &mut Ui, app: &mut MyCadApp) {
         {
             crate::dynamic_block::show_instance_parameters(ui, app, &entity);
         }
+    } else {
+        crate::dynamic_block::show_selected_instance_parameters(ui, app);
     }
 }
 

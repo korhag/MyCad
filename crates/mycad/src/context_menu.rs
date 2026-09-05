@@ -48,6 +48,14 @@ pub enum ContextAction {
     AttachMoveTo(cad_core::ParameterId),
     AttachStretchTo(cad_core::ParameterId),
     NewSize,
+    LinkText,
+    ShowWhen,
+    AlwaysVisible,
+    MirrorForOption,
+    PositionByOption,
+    RotateByParameter,
+    SavePreset,
+    ConfigureBlock,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,6 +129,11 @@ pub struct BlockMenuState {
     pub can_edit_dynamic: bool,
     pub can_attach: bool,
     pub size_parameters: Vec<(cad_core::ParameterId, String)>,
+    pub can_bind_text: bool,
+    pub can_visibility: bool,
+    pub can_transform: bool,
+    pub     can_preset: bool,
+    pub can_configure: bool,
 }
 
 pub enum MenuResult {
@@ -460,6 +473,15 @@ fn idle_menu(
             action,
             ContextAction::EditDynamicBlock,
         );
+        row(
+            ui,
+            None,
+            "Configure Block…",
+            None,
+            block_menu.can_configure,
+            action,
+            ContextAction::ConfigureBlock,
+        );
     }
     if block_menu.can_attach {
         for (id, name) in &block_menu.size_parameters {
@@ -490,6 +512,77 @@ fn idle_menu(
             true,
             action,
             ContextAction::NewSize,
+        );
+    }
+    if block_menu.can_bind_text {
+        row(
+            ui,
+            None,
+            "Link Text to Parameter…",
+            None,
+            true,
+            action,
+            ContextAction::LinkText,
+        );
+    }
+    if block_menu.can_visibility {
+        row(
+            ui,
+            None,
+            "Show When…",
+            None,
+            true,
+            action,
+            ContextAction::ShowWhen,
+        );
+        row(
+            ui,
+            None,
+            "Always visible",
+            None,
+            true,
+            action,
+            ContextAction::AlwaysVisible,
+        );
+    }
+    if block_menu.can_transform {
+        row(
+            ui,
+            None,
+            "Mirror for Option…",
+            None,
+            true,
+            action,
+            ContextAction::MirrorForOption,
+        );
+        row(
+            ui,
+            None,
+            "Position by Option…",
+            None,
+            true,
+            action,
+            ContextAction::PositionByOption,
+        );
+        row(
+            ui,
+            None,
+            "Rotate by Parameter…",
+            None,
+            true,
+            action,
+            ContextAction::RotateByParameter,
+        );
+    }
+    if block_menu.can_preset {
+        row(
+            ui,
+            None,
+            "Save current configuration as preset…",
+            None,
+            true,
+            action,
+            ContextAction::SavePreset,
         );
     }
     if block_menu.can_make_unique {

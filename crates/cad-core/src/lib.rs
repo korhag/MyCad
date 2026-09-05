@@ -10,6 +10,7 @@ pub mod curves;
 pub mod dash;
 pub mod document;
 pub mod dynamic;
+pub mod dynamic_model;
 pub mod entity;
 pub mod entity_transform;
 pub mod evaluate;
@@ -48,14 +49,24 @@ pub use document::{
 };
 pub use dynamic::{
     apply_anchor_policy, apply_size_axis, capability_for, collect_broken_bindings, dedupe_targets,
-    follow_multiplier, format_display_number, increment_numeric, measure_size, nearest_allowed_values,
-    nearest_step_values, normalize_direction, numbers_equal, parse_allowed_value_list,
-    resolve_values, snap_numeric, validate_behavior_conflicts, validate_definition,
-    validate_numeric_value, validate_parameter_def, validate_parameter_value, AnchorPolicy,
-    BehaviorKind, BooleanParameter, ChoiceOption, ChoiceParameter, CompositionRule, DynamicBehavior,
-    DynamicDefinition, DynamicError, FollowRole, GeometryTarget, InstanceConfiguration, MeasureMode,
-    NumericDomain, NumericParameter, NumericQuantity, ParameterDef, ParameterKind, ParameterUnit,
-    ParameterValue, SizeAuthoring, StepOrigin, StepPolicy, TextParameter, EVALUATOR_VERSION,
+    follow_multiplier, format_display_number, increment_numeric, measure_size, migrate_choice_option,
+    nearest_allowed_values, nearest_step_values, normalize_direction, numbers_equal, parse_allowed_value_list,
+    proposed_configuration, resolve_values, snap_numeric, validate_behavior_conflicts,
+    validate_configuration, validate_definition, validate_numeric_value, validate_parameter_def,
+    validate_parameter_value, AnchorPolicy, BehaviorKind, BooleanParameter, ChoiceOption,
+    ChoiceParameter, CompositionRule, DynamicBehavior, DynamicDefinition, DynamicError, FollowRole,
+    GeometryTarget, InstanceConfiguration, MeasureMode, NumericDomain, NumericParameter,
+    NumericQuantity, ParameterDef, ParameterKind, ParameterUnit, ParameterValue, ProposedConfiguration,
+    SizeAuthoring, StepOrigin, StepPolicy, TextParameter, EVALUATOR_VERSION,
+};
+pub use dynamic_model::{
+    active_compatibility_rules, conditions_match, configurations_equal, effective_visibility,
+    escape_mtext_literal, evaluate_text_binding, format_parameter_display, matching_preset,
+    option_usages, parameter_values_equal, remap_choice_value, rule_reason, value_allowed_by_rules,
+    visibility_conditions_for, AnchorDef, AnchorFollow, CompatibilityRule, GeometryGroup,
+    NestedInput, NestedMapping, OccurrencePath, ParameterCondition, PlacementBehavior, Preset,
+    ReflectionBehavior, RotationBehavior, RotationSource, TextBinding, TextBindingMode,
+    TextReflectPolicy, TextToken, TransformKind, VisibilityGroup,
 };
 pub use entity::{
     default_extrusion, Entity, EntityId, Geometry, HatchData, HatchEdge, HatchPath,
@@ -78,7 +89,7 @@ pub use geom::{
     GEOM_TOLERANCE,
 };
 pub use hatch::hatch_path_points;
-pub use ids::{ActionId, BlockDefinitionId, OptionId, ParameterId, VertexId};
+pub use ids::{ActionId, AnchorId, BlockDefinitionId, OptionId, ParameterId, PresetId, VertexId};
 pub use linetype::{
     is_byblock_name, is_bylayer_name, is_continuous_name, normalize_linetype_name, LineType,
 };

@@ -9,7 +9,7 @@ use crate::dynamic::DynamicDefinition;
 use crate::entity::{Entity, EntityId, Geometry};
 use crate::extents::Extents2;
 use crate::geom::{Point2, Point3};
-use crate::ids::{ActionId, BlockDefinitionId, OptionId, ParameterId, VertexId};
+use crate::ids::{ActionId, AnchorId, BlockDefinitionId, OptionId, ParameterId, PresetId, VertexId};
 use crate::linetype::{is_byblock_name, is_bylayer_name, normalize_linetype_name, LineType};
 use crate::transform::Transform2;
 
@@ -313,6 +313,8 @@ pub struct Document {
     next_option_id: u64,
     next_action_id: u64,
     next_vertex_id: u64,
+    next_anchor_id: u64,
+    next_preset_id: u64,
     content_generation: u64,
     saved_revision: u64,
     entity_locations: HashMap<EntityId, EntityLocation>,
@@ -337,6 +339,8 @@ impl Default for Document {
             next_option_id: 1,
             next_action_id: 1,
             next_vertex_id: 1,
+            next_anchor_id: 1,
+            next_preset_id: 1,
             content_generation: 1,
             saved_revision: 0,
             entity_locations: HashMap::new(),
@@ -396,6 +400,18 @@ impl Document {
         id
     }
 
+    pub fn allocate_anchor_id(&mut self) -> AnchorId {
+        let id = AnchorId(self.next_anchor_id);
+        self.next_anchor_id = self.next_anchor_id.saturating_add(1).max(1);
+        id
+    }
+
+    pub fn allocate_preset_id(&mut self) -> PresetId {
+        let id = PresetId(self.next_preset_id);
+        self.next_preset_id = self.next_preset_id.saturating_add(1).max(1);
+        id
+    }
+
     pub fn allocate_vertex_id(&mut self) -> VertexId {
         let id = VertexId(self.next_vertex_id);
         self.next_vertex_id = self.next_vertex_id.saturating_add(1).max(1);
@@ -408,6 +424,22 @@ impl Document {
 
     pub fn set_next_vertex_id(&mut self, next: u64) {
         self.next_vertex_id = next.max(1);
+    }
+
+    pub fn next_anchor_id(&self) -> u64 {
+        self.next_anchor_id
+    }
+
+    pub fn set_next_anchor_id(&mut self, next: u64) {
+        self.next_anchor_id = next.max(1);
+    }
+
+    pub fn next_preset_id(&self) -> u64 {
+        self.next_preset_id
+    }
+
+    pub fn set_next_preset_id(&mut self, next: u64) {
+        self.next_preset_id = next.max(1);
     }
 
     pub fn content_generation(&self) -> u64 {
@@ -482,6 +514,8 @@ impl Document {
         let mut next_param = self.next_parameter_id.max(1);
         let mut next_option = self.next_option_id.max(1);
         let mut next_action = self.next_action_id.max(1);
+        let mut next_anchor = self.next_anchor_id.max(1);
+        let mut next_preset = self.next_preset_id.max(1);
         for block in self.blocks.values() {
             if block.id.is_assigned() {
                 next_def = next_def.max(block.id.raw() + 1);
@@ -504,6 +538,21 @@ impl Document {
                         next_action = next_action.max(behavior.id.raw() + 1);
                     }
                 }
+                for id in dynamic.collect_action_ids() {
+                    if id.is_assigned() {
+                        next_action = next_action.max(id.raw() + 1);
+                    }
+                }
+                for anchor in &dynamic.anchors {
+                    if anchor.id.is_assigned() {
+                        next_anchor = next_anchor.max(anchor.id.raw() + 1);
+                    }
+                }
+                for preset in &dynamic.presets {
+                    if preset.id.is_assigned() {
+                        next_preset = next_preset.max(preset.id.raw() + 1);
+                    }
+                }
             }
         }
         for block in self.blocks.values_mut() {
@@ -516,6 +565,8 @@ impl Document {
         self.next_parameter_id = next_param;
         self.next_option_id = next_option;
         self.next_action_id = next_action;
+        self.next_anchor_id = next_anchor;
+        self.next_preset_id = next_preset;
     }
 
     pub fn assign_missing_vertex_ids(&mut self) {

@@ -5,9 +5,25 @@ All notable changes to MyCad are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project versions with [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Workspace version is `0.23.0` (`Cargo.toml`).
+Workspace version is `0.24.0` (`Cargo.toml`).
 
 ## [Unreleased]
+
+## [0.24.0] - 2026-09-05
+
+### Added
+
+- Author Choice, On/Off, and Text parameters from the Dynamic Block panel, with dropdown, checkbox, and text controls that keep independent values on each INSERT.
+- Link TEXT/MTEXT to parameters, Show When visibility groups, Mirror/Position/Rotate behaviors, named presets, and compatibility rules, all created from selection and remaining editable.
+- Shared configuration form in Properties, Test mode, and Configure Block, including mixed multi-selection of the same definition and one undo transaction per accepted change.
+
+### Changed
+
+- Parameter presentation order is shared by every parameter type, and instance commits validate a complete typed configuration before mutating the document.
+
+### Fixed
+
+- Inactive alternate geometry is omitted from display, picking, snaps, measurements, extents, and interchange export while remaining in the source definition.
 
 ## [0.23.0] - 2026-09-05
 

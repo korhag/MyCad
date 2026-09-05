@@ -248,6 +248,10 @@ pub struct MyCadApp {
     pub(crate) dynamic_convert: Option<ConvertDialog>,
     pub(crate) parameter_drafts: BTreeMap<(EntityId, ParameterId), String>,
     pub(crate) parameter_previews: BTreeMap<EntityId, InstanceConfiguration>,
+    pub(crate) config_form_drafts: BTreeMap<cad_core::ParameterId, String>,
+    pub(crate) config_form_errors: BTreeMap<cad_core::ParameterId, String>,
+    pub(crate) config_pending: Option<crate::config_form::PendingRelated>,
+    pub(crate) configure_dialog: Option<crate::dynamic_block::ConfigureDialog>,
     preview_pending: bool,
     preview_rx: Option<Receiver<PreviewMsg>>,
     last_eval_ok: bool,
@@ -325,6 +329,10 @@ impl MyCadApp {
             dynamic_convert: None,
             parameter_drafts: BTreeMap::new(),
             parameter_previews: BTreeMap::new(),
+            config_form_drafts: BTreeMap::new(),
+            config_form_errors: BTreeMap::new(),
+            config_pending: None,
+            configure_dialog: None,
             preview_pending: false,
             preview_rx: None,
             last_eval_ok: true,
@@ -358,6 +366,10 @@ impl MyCadApp {
         self.dynamic_convert = None;
         self.parameter_drafts.clear();
         self.parameter_previews.clear();
+        self.config_form_drafts.clear();
+        self.config_form_errors.clear();
+        self.config_pending = None;
+        self.configure_dialog = None;
         self.eval_cache.clear();
         self.history.commit_open();
         self.loading_path = Some(path.clone());
@@ -3145,6 +3157,7 @@ impl MyCadApp {
             },
         }
         self.show_dynamic_convert_dialog(ctx);
+        crate::dynamic_block::show_configure_dialog(ctx, self);
     }
 
     fn show_dynamic_convert_dialog(&mut self, ctx: &egui::Context) {
@@ -3454,6 +3467,18 @@ impl MyCadApp {
                     && self.block_edit.is_active()
                     && !self.selection.is_empty(),
                 size_parameters: crate::dynamic_block::authoring_size_parameters(self),
+                can_bind_text: self.dynamic_authoring.is_some()
+                    && self.block_edit.is_active()
+                    && !self.selection.is_empty(),
+                can_visibility: self.dynamic_authoring.is_some()
+                    && self.block_edit.is_active()
+                    && !self.selection.is_empty(),
+                can_transform: self.dynamic_authoring.is_some()
+                    && self.block_edit.is_active()
+                    && !self.selection.is_empty(),
+                can_preset: self.dynamic_authoring.is_some(),
+                can_configure: self.can_edit_selected_block()
+                    && self.selected_insert_is_dynamic(),
             },
         );
         match result {
@@ -3511,6 +3536,14 @@ impl MyCadApp {
                 crate::dynamic_block::attach_stretch_from_click(self, None);
             }
             ContextAction::NewSize => crate::dynamic_block::begin_new_size_from_menu(self),
+            ContextAction::LinkText => crate::dynamic_block::link_text_from_selection(self),
+            ContextAction::ShowWhen => crate::dynamic_block::show_when_from_selection(self),
+            ContextAction::AlwaysVisible => crate::dynamic_block::always_visible_from_selection(self),
+            ContextAction::MirrorForOption => crate::dynamic_block::mirror_from_selection(self),
+            ContextAction::PositionByOption => crate::dynamic_block::position_from_selection(self),
+            ContextAction::RotateByParameter => crate::dynamic_block::rotate_from_selection(self),
+            ContextAction::SavePreset => crate::dynamic_block::save_preset_from_test(self),
+            ContextAction::ConfigureBlock => crate::dynamic_block::begin_configure_block(self),
         }
     }
 
