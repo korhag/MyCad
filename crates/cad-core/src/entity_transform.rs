@@ -408,11 +408,16 @@ fn transform_text(data: &TextData, matrix: Transform2) -> TextData {
     let new_axis = matrix.apply_vector(axis);
     TextData {
         insertion: matrix.apply3(data.insertion),
+        alignment: matrix.apply3(data.alignment),
         height: data.height.abs() * matrix.scale_x(),
         rotation: new_axis.y.atan2(new_axis.x),
         value: data.value.clone(),
         extrusion: data.extrusion,
         is_attrib_def: data.is_attrib_def,
+        halign: data.halign,
+        valign: data.valign,
+        width_factor: data.width_factor,
+        oblique: data.oblique,
     }
 }
 
@@ -426,6 +431,8 @@ fn transform_mtext(data: &MTextData, matrix: Transform2) -> MTextData {
         width: data.width.abs() * matrix.scale_x(),
         value: data.value.clone(),
         extrusion: data.extrusion,
+        attachment: data.attachment,
+        line_spacing: data.line_spacing,
     }
 }
 
@@ -949,6 +956,7 @@ mod tests {
             value: "ROOM".into(),
             extrusion: default_extrusion(),
             is_attrib_def: false,
+            ..Default::default()
         }));
         let mirrored = transform_entity(
             &entity,

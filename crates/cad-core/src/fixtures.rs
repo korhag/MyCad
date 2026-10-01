@@ -191,6 +191,7 @@ pub fn primitives_document() -> Document {
         value: "Round-trip".into(),
         extrusion: default_extrusion(),
         is_attrib_def: false,
+        ..Default::default()
     }));
     text.layer = "ANNOTATION".into();
     document.add_entity(text);
@@ -202,6 +203,7 @@ pub fn primitives_document() -> Document {
         width: 40.0,
         value: "MTEXT sample".into(),
         extrusion: default_extrusion(),
+        ..Default::default()
     }));
     mtext.layer = "ANNOTATION".into();
     document.add_entity(mtext);

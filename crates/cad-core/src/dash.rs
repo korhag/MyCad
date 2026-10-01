@@ -3,7 +3,7 @@
 //! Dash placement is computed on mathematical path distance. Tessellation
 //! chords are a display approximation and never restart the pattern.
 
-use crate::curves::CIRCLE_SEGMENTS;
+use crate::curves::{segments_for_arc, CIRCLE_SEGMENTS};
 use crate::geom::Point2;
 use crate::measure::bulge_circle;
 
@@ -383,18 +383,28 @@ fn point_at_path(segs: &[PathSeg], mut s: f64) -> Option<Point2> {
     segs.last().map(|seg| seg.point_at(seg.length()))
 }
 
-fn sample_span(seg: PathSeg, s0: f64, s1: f64, chord_segments: usize) -> Vec<Point2> {
+fn sample_span(
+    seg: PathSeg,
+    s0: f64,
+    s1: f64,
+    chord_segments: usize,
+    chord_tolerance: Option<f64>,
+) -> Vec<Point2> {
     match seg {
         PathSeg::Line { .. } => vec![seg.point_at(s0), seg.point_at(s1)],
-        PathSeg::Arc { sweep, .. } => {
+        PathSeg::Arc { radius, sweep, .. } => {
             let len = seg.length();
             if len < PATH_EPS {
                 return vec![seg.point_at(s0)];
             }
             let frac = ((s1 - s0) / len).abs();
-            let n = ((chord_segments as f64) * (sweep.abs() / std::f64::consts::TAU) * frac)
-                .ceil()
-                .max(1.0) as usize;
+            let n = if let Some(tol) = chord_tolerance {
+                segments_for_arc(radius, sweep.abs() * frac, tol).max(1)
+            } else {
+                ((chord_segments as f64) * (sweep.abs() / std::f64::consts::TAU) * frac)
+                    .ceil()
+                    .max(1.0) as usize
+            };
             let mut pts = Vec::with_capacity(n + 1);
             for i in 0..=n {
                 let t = i as f64 / n as f64;
@@ -433,13 +443,31 @@ pub fn generate_path_dashes(
     plinegen: bool,
     chord_segments: usize,
 ) -> Vec<(Point2, Point2)> {
+    generate_path_dashes_with_tolerance(segs, pattern, plinegen, chord_segments, None)
+}
+
+/// Same as [`generate_path_dashes`], but arc chords follow `chord_tolerance`
+/// when it is set. Dash boundaries still use path length.
+pub fn generate_path_dashes_with_tolerance(
+    segs: &[PathSeg],
+    pattern: &[f64],
+    plinegen: bool,
+    chord_segments: usize,
+    chord_tolerance: Option<f64>,
+) -> Vec<(Point2, Point2)> {
     let mut out = Vec::new();
     if segs.is_empty() {
         return out;
     }
     if pattern.is_empty() || pattern.iter().all(|d| *d >= 0.0 && d.abs() < 1e-15) {
         for seg in segs {
-            let pts = sample_span(*seg, 0.0, seg.length(), chord_segments.max(CIRCLE_SEGMENTS));
+            let pts = sample_span(
+                *seg,
+                0.0,
+                seg.length(),
+                chord_segments.max(CIRCLE_SEGMENTS),
+                chord_tolerance,
+            );
             for w in pts.windows(2) {
                 out.push((w[0], w[1]));
             }
@@ -460,7 +488,7 @@ pub fn generate_path_dashes(
                 |s| dots.push(s),
             );
             for (s0, s1) in dashes {
-                let pts = sample_span(*seg, s0, s1, chord_segments);
+                let pts = sample_span(*seg, s0, s1, chord_segments, chord_tolerance);
                 for w in pts.windows(2) {
                     out.push((w[0], w[1]));
                 }
@@ -470,7 +498,7 @@ pub fn generate_path_dashes(
             }
         } else {
             for span in a_aligned_dashes(len, pattern) {
-                let pts = sample_span(*seg, span.s0, span.s1, chord_segments);
+                let pts = sample_span(*seg, span.s0, span.s1, chord_segments, chord_tolerance);
                 for w in pts.windows(2) {
                     out.push((w[0], w[1]));
                 }

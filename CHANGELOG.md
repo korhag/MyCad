@@ -5,9 +5,24 @@ All notable changes to MyCad are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project versions with [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Workspace version is `0.25.0` (`Cargo.toml`).
+Workspace version is `0.26.0` (`Cargo.toml`).
 
 ## [Unreleased]
+
+## [0.26.0] - 2026-10-01
+
+### Added
+
+- Viewport lines are anti-aliased, so slanted edges no longer look like staircases.
+- TEXT and MTEXT use an AutoCAD-style Simplex stroke font, including `%%c`, `%%d`, and `%%p`.
+- TEXT honors horizontal and vertical alignment, width factor, and oblique angle. MTEXT honors attachment and wraps to its width.
+
+### Fixed
+
+- Circles, arcs, polyline bulges, and splines stay smooth instead of looking faceted when the drawing is large.
+- LINE endpoints stay in world coordinates, so a flipped extrusion no longer mirrors the line.
+- SOLID and TRACE rectangles draw as rectangles instead of bow-ties. 3DFACE is drawn as edges only.
+- Solid HATCH fills follow concave outlines and leave holes open.
 
 ## [0.25.0] - 2026-09-05
 

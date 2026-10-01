@@ -13,8 +13,8 @@ use cad_core::{
     OptionId, ParameterCondition, ParameterDef, ParameterId, ParameterKind, ParameterUnit,
     ParameterValue, PlacementBehavior, Point2, Point3, PolyVertex, Preset, PresetId,
     ReflectionBehavior, RotationBehavior, RotationSource, SizeAuthoring, StepOrigin, StepPolicy,
-    TextBinding, TextBindingMode, TextData, TextParameter, TextReflectPolicy, TextToken, VertexId,
-    VisibilityGroup,
+    TextBinding, TextBindingMode, TextData, TextHAlign, TextParameter, TextReflectPolicy,
+    TextToken, TextVAlign, VertexId, VisibilityGroup,
 };
 use serde::{Deserialize, Serialize};
 
@@ -181,6 +181,10 @@ enum WireGeometry {
         width: f64,
         value: String,
         extrusion: [f64; 3],
+        #[serde(default = "default_mtext_attachment")]
+        attachment: i16,
+        #[serde(default = "default_line_spacing")]
+        line_spacing: f64,
     },
     Hatch {
         extrusion: [f64; 3],
@@ -221,6 +225,28 @@ struct WireText {
     value: String,
     extrusion: [f64; 3],
     is_attrib_def: bool,
+    #[serde(default)]
+    halign: u8,
+    #[serde(default)]
+    valign: u8,
+    #[serde(default)]
+    alignment: [f64; 3],
+    #[serde(default = "default_width_factor")]
+    width_factor: f64,
+    #[serde(default)]
+    oblique: f64,
+}
+
+fn default_width_factor() -> f64 {
+    1.0
+}
+
+fn default_line_spacing() -> f64 {
+    1.0
+}
+
+fn default_mtext_attachment() -> i16 {
+    1
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1123,6 +1149,8 @@ fn to_wire_geometry(geometry: &Geometry) -> WireGeometry {
             width: data.width,
             value: data.value.clone(),
             extrusion: pt(data.extrusion),
+            attachment: data.attachment,
+            line_spacing: data.line_spacing,
         },
         Geometry::Hatch(hatch) => WireGeometry::Hatch {
             extrusion: pt(hatch.extrusion),
@@ -1262,6 +1290,8 @@ fn from_wire_geometry(geometry: WireGeometry) -> Result<Geometry, ExportError> {
             width,
             value,
             extrusion,
+            attachment,
+            line_spacing,
         } => Geometry::MText(MTextData {
             insertion: from_pt(insertion),
             height,
@@ -1269,6 +1299,8 @@ fn from_wire_geometry(geometry: WireGeometry) -> Result<Geometry, ExportError> {
             width,
             value,
             extrusion: from_pt(extrusion),
+            attachment,
+            line_spacing,
         }),
         WireGeometry::Hatch {
             extrusion,
@@ -2214,6 +2246,11 @@ fn to_text(data: &TextData) -> WireText {
         value: data.value.clone(),
         extrusion: pt(data.extrusion),
         is_attrib_def: data.is_attrib_def,
+        halign: data.halign.to_dxf() as u8,
+        valign: data.valign.to_dxf() as u8,
+        alignment: pt(data.alignment),
+        width_factor: data.width_factor,
+        oblique: data.oblique,
     }
 }
 
@@ -2225,6 +2262,15 @@ fn from_text(data: WireText) -> TextData {
         value: data.value,
         extrusion: from_pt(data.extrusion),
         is_attrib_def: data.is_attrib_def,
+        halign: TextHAlign::from_dxf(i16::from(data.halign)),
+        valign: TextVAlign::from_dxf(i16::from(data.valign)),
+        alignment: from_pt(data.alignment),
+        width_factor: if data.width_factor.is_finite() && data.width_factor > 1e-9 {
+            data.width_factor
+        } else {
+            1.0
+        },
+        oblique: data.oblique,
     }
 }
 
@@ -2458,6 +2504,49 @@ mod tests {
     }
 
     #[test]
+    fn text_style_roundtrip_keeps_new_fields_and_loads_old_json() {
+        let wire = WireText {
+            insertion: [1.0, 2.0, 0.0],
+            height: 2.5,
+            rotation: 0.3,
+            value: "TAG".into(),
+            extrusion: [0.0, 0.0, 1.0],
+            is_attrib_def: false,
+            halign: 1,
+            valign: 2,
+            alignment: [9.0, 4.0, 0.0],
+            width_factor: 0.8,
+            oblique: 0.1,
+        };
+        let json = serde_json::to_string(&wire).unwrap();
+        let back: WireText = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.halign, 1);
+        assert_eq!(back.valign, 2);
+        assert!((back.width_factor - 0.8).abs() < 1e-9);
+        assert!((back.alignment[0] - 9.0).abs() < 1e-9);
+        let old = r#"{"insertion":[1.0,2.0,0.0],"height":2.5,"rotation":0.0,"value":"A","extrusion":[0.0,0.0,1.0],"is_attrib_def":false}"#;
+        let loaded: WireText = serde_json::from_str(old).unwrap();
+        assert_eq!(loaded.halign, 0);
+        assert!((loaded.width_factor - 1.0).abs() < 1e-9);
+        let text = from_text(loaded);
+        assert_eq!(text.halign, TextHAlign::Left);
+        assert!((text.width_factor - 1.0).abs() < 1e-9);
+        let old_mtext = r#"{"type":"MText","insertion":[0.0,0.0,0.0],"height":1.0,"rotation":0.0,"width":12.0,"value":"Note","extrusion":[0.0,0.0,1.0]}"#;
+        let mtext: WireGeometry = serde_json::from_str(old_mtext).unwrap();
+        match mtext {
+            WireGeometry::MText {
+                attachment,
+                line_spacing,
+                ..
+            } => {
+                assert_eq!(attachment, 1);
+                assert!((line_spacing - 1.0).abs() < 1e-9);
+            }
+            _ => panic!("expected mtext"),
+        }
+    }
+
+    #[test]
     fn primitives_roundtrip_preserves_identities() {
         let mut document = primitives_document();
         document.assign_missing_ids();
@@ -2550,6 +2639,7 @@ mod tests {
             value: "source".into(),
             extrusion: cad_core::default_extrusion(),
             is_attrib_def: false,
+            ..Default::default()
         }));
         alt_a.id = document.allocate_id();
         alt_b.id = document.allocate_id();

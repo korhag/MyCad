@@ -589,6 +589,39 @@ fn compare_text(path: &str, a: &TextData, b: &TextData, tol: CompareTol, out: &m
             message: format!("expected {:?} got {:?}", a.value, b.value),
         });
     }
+    if a.halign != b.halign {
+        out.push(Mismatch {
+            path: format!("{path}.halign"),
+            message: format!("expected {:?} got {:?}", a.halign, b.halign),
+        });
+    }
+    if a.valign != b.valign {
+        out.push(Mismatch {
+            path: format!("{path}.valign"),
+            message: format!("expected {:?} got {:?}", a.valign, b.valign),
+        });
+    }
+    point3_field(
+        &format!("{path}.alignment"),
+        a.alignment,
+        b.alignment,
+        tol,
+        out,
+    );
+    scalar_field(
+        &format!("{path}.width_factor"),
+        a.width_factor,
+        b.width_factor,
+        tol.coord,
+        out,
+    );
+    angle_field(
+        &format!("{path}.oblique"),
+        a.oblique,
+        b.oblique,
+        tol.angle,
+        out,
+    );
 }
 
 fn compare_mtext(
@@ -626,6 +659,19 @@ fn compare_mtext(
             message: format!("expected {:?} got {:?}", a.value, b.value),
         });
     }
+    if a.attachment != b.attachment {
+        out.push(Mismatch {
+            path: format!("{path}.attachment"),
+            message: format!("expected {} got {}", a.attachment, b.attachment),
+        });
+    }
+    scalar_field(
+        &format!("{path}.line_spacing"),
+        a.line_spacing,
+        b.line_spacing,
+        tol.coord,
+        out,
+    );
 }
 
 fn compare_hatch(

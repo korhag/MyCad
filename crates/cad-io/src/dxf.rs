@@ -596,10 +596,11 @@ impl<'a> DxfWriter<'a> {
             }
             Geometry::Solid { corners, extrusion } => {
                 self.begin_entity("SOLID", entity);
+                // Model order is the polygon 1-2-4-3; DXF group 12/13 are 3 then 4.
                 self.point(10, corners[0]);
                 self.point(11, corners[1]);
-                self.point(12, corners[2]);
-                self.point(13, corners[3]);
+                self.point(12, corners[3]);
+                self.point(13, corners[2]);
                 self.extrusion(*extrusion);
                 self.report.entities_written += 1;
             }
@@ -871,6 +872,13 @@ impl<'a> DxfWriter<'a> {
         self.pair_f(40, data.height.abs().max(1e-9));
         self.pair(1, sanitize_text(&data.value));
         self.pair_f(50, data.rotation.to_degrees());
+        self.pair_f(41, data.width_factor);
+        self.pair_f(51, data.oblique.to_degrees());
+        if data.halign.uses_alignment_point() || data.valign.uses_alignment_point() {
+            self.point(11, data.alignment);
+        }
+        self.pair_i(72, i32::from(data.halign.to_dxf()));
+        self.pair_i(73, i32::from(data.valign.to_dxf()));
         self.pair(7, "STANDARD");
         self.extrusion(data.extrusion);
     }
@@ -880,7 +888,8 @@ impl<'a> DxfWriter<'a> {
         self.point(10, data.insertion);
         self.pair_f(40, data.height.abs().max(1e-9));
         self.pair_f(41, data.width.abs());
-        self.pair_i(71, 1);
+        self.pair_i(71, i32::from(data.attachment.clamp(1, 9)));
+        self.pair_f(44, data.line_spacing);
         write_mtext_chunks(&data.value, |code, chunk| {
             self.pair(code, chunk);
         });
@@ -1255,6 +1264,7 @@ mod tests {
                 value: "TAG".into(),
                 extrusion: Point3::new(0.0, 0.0, 1.0),
                 is_attrib_def: false,
+                ..Default::default()
             }],
             column_count: 1,
             row_count: 1,
@@ -1304,6 +1314,7 @@ mod tests {
             width: 40.0,
             value: "Hello".into(),
             extrusion: Point3::new(0.0, 0.0, 1.0),
+            ..Default::default()
         })));
         let (report, text) = write_to_string(&document);
         let entities = entities_section(&text);
@@ -1337,6 +1348,7 @@ mod tests {
             value: "Ölçü Çıkış İstanbul ğşıİ".into(),
             extrusion: Point3::new(0.0, 0.0, 1.0),
             is_attrib_def: false,
+            ..Default::default()
         }));
         text.layer = "Şase".into();
         document.add_entity(text);
@@ -1359,6 +1371,7 @@ mod tests {
             width: 80.0,
             value,
             extrusion: Point3::new(0.0, 0.0, 1.0),
+            ..Default::default()
         })));
         let (_, dxf) = write_to_string(&document);
         let entities = entities_section(&dxf);

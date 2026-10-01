@@ -1105,6 +1105,25 @@ impl Document {
             || bounds.max.y >= world.max.y - EPS
     }
 
+    // --------------------------------------------------------
+    // Method: display_chord_tolerance
+    // Purpose: World-space sagitta budget for viewport curves.
+    //          About two millionths of the drawing diagonal, so a
+    //          full-view circle stays smooth without a huge mesh.
+    // --------------------------------------------------------
+    pub fn display_chord_tolerance(&self) -> f64 {
+        let extents = if self.extents_stale || self.diagnostics.extents.is_none() {
+            self.compute_extents()
+        } else {
+            self.diagnostics.extents
+        };
+        let diagonal = extents
+            .map(|e| e.width().hypot(e.height()))
+            .filter(|d| d.is_finite() && *d > 1e-9)
+            .unwrap_or(1.0);
+        (diagonal * 2.0e-6).max(1e-9)
+    }
+
     pub fn compute_extents(&self) -> Option<Extents2> {
         let _span = crate::perf::span("compute_extents");
         let mut extents = Extents2::empty();
@@ -1497,6 +1516,7 @@ mod tests {
                 value: "stray".into(),
                 extrusion: Point3::new(0.0, 0.0, 1.0),
                 is_attrib_def: false,
+                ..Default::default()
             })));
         let e = document.compute_extents().unwrap();
         assert!((e.min.x - 0.0).abs() < 1e-9);

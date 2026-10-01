@@ -1714,6 +1714,7 @@ mod tests {
             value: "source".into(),
             extrusion: default_extrusion(),
             is_attrib_def: false,
+            ..Default::default()
         }));
         let mut flip_line = Entity::new(Geometry::Line {
             start: Point3::from_xy(10.0, 50.0),
@@ -1755,6 +1756,7 @@ mod tests {
             value: "N".into(),
             extrusion: default_extrusion(),
             is_attrib_def: false,
+            ..Default::default()
         }));
         child_text.id = document.allocate_id();
         let mut child_numeric = NumericParameter::length(5.0);

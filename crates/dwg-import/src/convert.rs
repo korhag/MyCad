@@ -6,9 +6,10 @@ use std::ffi::c_void;
 use std::path::Path;
 
 use cad_core::{
-    default_extrusion, normalize_linetype_name, ocs_to_wcs, BlockDefinition, CadColor, Document,
-    DrawingUnits, Entity, EntityId, Geometry, HatchData, HatchEdge, HatchPath, HatchPatternLine,
-    ImportDiagnostics, Layer, LineType, MTextData, Point3, PolyVertex, TextData,
+    default_extrusion, normalize_linetype_name, BlockDefinition, CadColor, Document, DrawingUnits,
+    Entity, EntityId, Geometry, HatchData, HatchEdge, HatchPath, HatchPatternLine,
+    ImportDiagnostics, Layer, LineType, MTextData, Point3, PolyVertex, TextData, TextHAlign,
+    TextVAlign,
 };
 
 use crate::dynapi::{
@@ -424,10 +425,10 @@ unsafe fn convert_geometry(
 ) -> Option<Geometry> {
     Some(match fixedtype {
         libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_LINE => {
-            let extrusion = extrusion_of(entity_ptr, "LINE");
+            // LINE endpoints are already WCS. Extrusion only affects thickness.
             Geometry::Line {
-                start: ocs_to_wcs(pt_field(entity_ptr, "LINE", "start")?, extrusion),
-                end: ocs_to_wcs(pt_field(entity_ptr, "LINE", "end")?, extrusion),
+                start: pt_field(entity_ptr, "LINE", "start")?,
+                end: pt_field(entity_ptr, "LINE", "end")?,
             }
         }
         libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_POINT => Geometry::Point {
@@ -595,23 +596,41 @@ unsafe fn convert_geometry(
                 configuration: None,
             }
         }
-        libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_TEXT => Geometry::Text(TextData {
-            insertion: pt_field(entity_ptr, "TEXT", "ins_pt")?,
-            height: get_field::<f64>(entity_ptr, "TEXT", "height").unwrap_or(1.0),
-            rotation: get_field::<f64>(entity_ptr, "TEXT", "rotation").unwrap_or(0.0),
-            value: get_utf8_field(entity_ptr, "TEXT", "text_value").unwrap_or_default(),
-            extrusion: extrusion_of(entity_ptr, "TEXT"),
-            is_attrib_def: false,
-        }),
+        libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_TEXT => {
+            let (halign, valign, alignment, width_factor, oblique) =
+                text_layout(entity_ptr, "TEXT");
+            Geometry::Text(TextData {
+                insertion: pt_field(entity_ptr, "TEXT", "ins_pt")?,
+                height: get_field::<f64>(entity_ptr, "TEXT", "height").unwrap_or(1.0),
+                rotation: get_field::<f64>(entity_ptr, "TEXT", "rotation").unwrap_or(0.0),
+                value: get_utf8_field(entity_ptr, "TEXT", "text_value").unwrap_or_default(),
+                extrusion: extrusion_of(entity_ptr, "TEXT"),
+                is_attrib_def: false,
+                halign,
+                valign,
+                alignment,
+                width_factor,
+                oblique,
+            })
+        }
         libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_ATTRIB => Geometry::Text(attrib_text(entity_ptr)?),
-        libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_ATTDEF => Geometry::Text(TextData {
-            insertion: pt_field(entity_ptr, "ATTDEF", "ins_pt")?,
-            height: get_field::<f64>(entity_ptr, "ATTDEF", "height").unwrap_or(1.0),
-            rotation: get_field::<f64>(entity_ptr, "ATTDEF", "rotation").unwrap_or(0.0),
-            value: get_utf8_field(entity_ptr, "ATTDEF", "default_value").unwrap_or_default(),
-            extrusion: extrusion_of(entity_ptr, "ATTDEF"),
-            is_attrib_def: true,
-        }),
+        libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_ATTDEF => {
+            let (halign, valign, alignment, width_factor, oblique) =
+                text_layout(entity_ptr, "ATTDEF");
+            Geometry::Text(TextData {
+                insertion: pt_field(entity_ptr, "ATTDEF", "ins_pt")?,
+                height: get_field::<f64>(entity_ptr, "ATTDEF", "height").unwrap_or(1.0),
+                rotation: get_field::<f64>(entity_ptr, "ATTDEF", "rotation").unwrap_or(0.0),
+                value: get_utf8_field(entity_ptr, "ATTDEF", "default_value").unwrap_or_default(),
+                extrusion: extrusion_of(entity_ptr, "ATTDEF"),
+                is_attrib_def: true,
+                halign,
+                valign,
+                alignment,
+                width_factor,
+                oblique,
+            })
+        }
         libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_MTEXT => {
             let x_axis =
                 get_field::<Point3D>(entity_ptr, "MTEXT", "x_axis_dir").unwrap_or(Point3D {
@@ -626,6 +645,13 @@ unsafe fn convert_geometry(
                 width: get_field::<f64>(entity_ptr, "MTEXT", "rect_width").unwrap_or(0.0),
                 value: get_utf8_field(entity_ptr, "MTEXT", "text").unwrap_or_default(),
                 extrusion: extrusion_of(entity_ptr, "MTEXT"),
+                attachment: get_field::<u16>(entity_ptr, "MTEXT", "attachment")
+                    .map(|v| v as i16)
+                    .filter(|v| (1..=9).contains(v))
+                    .unwrap_or(1),
+                line_spacing: get_field::<f64>(entity_ptr, "MTEXT", "linespace_factor")
+                    .filter(|v| v.is_finite() && *v > 1e-9)
+                    .unwrap_or(1.0),
             })
         }
         libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_HATCH => convert_hatch(entity_ptr)?,
@@ -637,12 +663,14 @@ unsafe fn convert_geometry(
                 "SOLID"
             };
             Geometry::Solid {
-                corners: [
+                // DWG stores SOLID/TRACE as 1-2-4-3. Keep polygon order 1-2-4-3
+                // so the viewport does not draw a bow-tie.
+                corners: solid_polygon_corners(
                     pt_field(entity_ptr, dxf, "corner1")?,
                     pt_field(entity_ptr, dxf, "corner2")?,
                     pt_field(entity_ptr, dxf, "corner3")?,
                     pt_field(entity_ptr, dxf, "corner4")?,
-                ],
+                ),
                 extrusion: extrusion_of(entity_ptr, dxf),
             }
         }
@@ -699,20 +727,32 @@ unsafe fn convert_geometry(
                 end: p + v * 1_000_000.0,
             }
         }
-        libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE__3DFACE => Geometry::Solid {
-            corners: [
+        libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE__3DFACE => {
+            let corners = [
                 pt3(get_field::<Point3D>(entity_ptr, "3DFACE", "corner1")?),
                 pt3(get_field::<Point3D>(entity_ptr, "3DFACE", "corner2")?),
                 pt3(get_field::<Point3D>(entity_ptr, "3DFACE", "corner3")?),
                 pt3(get_field::<Point3D>(entity_ptr, "3DFACE", "corner4")?),
-            ],
-            extrusion: default_extrusion(),
-        },
+            ];
+            Geometry::Polyline {
+                vertices: corners
+                    .into_iter()
+                    .map(|point| PolyVertex {
+                        point,
+                        bulge: 0.0,
+                        vertex_id: Default::default(),
+                    })
+                    .collect(),
+                closed: true,
+                linetype_generation_continuous: false,
+            }
+        }
         _ => return None,
     })
 }
 
 fn attrib_text(entity_ptr: *mut c_void) -> Option<TextData> {
+    let (halign, valign, alignment, width_factor, oblique) = text_layout(entity_ptr, "ATTRIB");
     Some(TextData {
         insertion: pt_field(entity_ptr, "ATTRIB", "ins_pt")?,
         height: get_field::<f64>(entity_ptr, "ATTRIB", "height").unwrap_or(1.0),
@@ -720,7 +760,29 @@ fn attrib_text(entity_ptr: *mut c_void) -> Option<TextData> {
         value: get_utf8_field(entity_ptr, "ATTRIB", "text_value").unwrap_or_default(),
         extrusion: extrusion_of(entity_ptr, "ATTRIB"),
         is_attrib_def: false,
+        halign,
+        valign,
+        alignment,
+        width_factor,
+        oblique,
     })
+}
+
+fn text_layout(entity_ptr: *mut c_void, dxf: &str) -> (TextHAlign, TextVAlign, Point3, f64, f64) {
+    let horiz = get_field::<u16>(entity_ptr, dxf, "horiz_alignment").unwrap_or(0) as i16;
+    let vert = get_field::<u16>(entity_ptr, dxf, "vert_alignment").unwrap_or(0) as i16;
+    let alignment = pt_field(entity_ptr, dxf, "alignment_pt").unwrap_or_default();
+    let width_factor = get_field::<f64>(entity_ptr, dxf, "width_factor")
+        .filter(|v| v.is_finite() && *v > 1e-9)
+        .unwrap_or(1.0);
+    let oblique = get_field::<f64>(entity_ptr, dxf, "oblique_angle").unwrap_or(0.0);
+    (
+        TextHAlign::from_dxf(horiz),
+        TextVAlign::from_dxf(vert),
+        alignment,
+        width_factor,
+        oblique,
+    )
 }
 
 fn convert_hatch(entity_ptr: *mut c_void) -> Option<Geometry> {
@@ -819,6 +881,15 @@ fn dimension_dxfname(fixedtype: libredwg_sys::DWG_OBJECT_TYPE) -> &'static str {
 
 fn insert_array_count(value: Option<u32>) -> u32 {
     value.filter(|count| *count > 0).unwrap_or(1)
+}
+
+// ------------------------------------------------------------
+// Function: solid_polygon_corners
+// Purpose: DWG SOLID/TRACE corner order is 1-2-4-3. Return the
+//          boundary order 1-2-4-3 so a rectangle is not a bow-tie.
+// ------------------------------------------------------------
+pub(crate) fn solid_polygon_corners(c1: Point3, c2: Point3, c3: Point3, c4: Point3) -> [Point3; 4] {
+    [c1, c2, c4, c3]
 }
 
 fn extrusion_of(entity_ptr: *mut c_void, dxfname: &str) -> Point3 {
@@ -933,5 +1004,19 @@ mod tests {
         assert_eq!(document.current_layer, "0");
         document.apply_current_layer(None);
         assert_eq!(document.current_layer, "0");
+    }
+
+    #[test]
+    fn solid_corners_are_reordered_to_polygon_order() {
+        let corners = solid_polygon_corners(
+            Point3::from_xy(0.0, 0.0),
+            Point3::from_xy(10.0, 0.0),
+            Point3::from_xy(0.0, 4.0),
+            Point3::from_xy(10.0, 4.0),
+        );
+        assert_eq!(corners[0], Point3::from_xy(0.0, 0.0));
+        assert_eq!(corners[1], Point3::from_xy(10.0, 0.0));
+        assert_eq!(corners[2], Point3::from_xy(10.0, 4.0));
+        assert_eq!(corners[3], Point3::from_xy(0.0, 4.0));
     }
 }

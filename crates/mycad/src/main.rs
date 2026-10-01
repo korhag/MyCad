@@ -52,6 +52,7 @@ fn main() -> ExitCode {
             .with_inner_size([1440.0, 900.0])
             .with_min_inner_size([800.0, 560.0])
             .with_title("MyCad"),
+        multisampling: cad_render::VIEWPORT_MSAA_SAMPLES as u16,
         ..Default::default()
     };
 

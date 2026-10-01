@@ -232,6 +232,71 @@ impl PolyVertex {
     }
 }
 
+// ------------------------------------------------------------
+// Enum: TextHAlign / TextVAlign
+// Purpose: DXF group 72 / 73. Left+Baseline uses the insertion
+//          point; any other combination uses the alignment point.
+// ------------------------------------------------------------
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TextHAlign {
+    #[default]
+    Left = 0,
+    Center = 1,
+    Right = 2,
+    Aligned = 3,
+    Middle = 4,
+    Fit = 5,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TextVAlign {
+    #[default]
+    Baseline = 0,
+    Bottom = 1,
+    Middle = 2,
+    Top = 3,
+}
+
+impl TextHAlign {
+    pub fn from_dxf(code: i16) -> Self {
+        match code {
+            1 => Self::Center,
+            2 => Self::Right,
+            3 => Self::Aligned,
+            4 => Self::Middle,
+            5 => Self::Fit,
+            _ => Self::Left,
+        }
+    }
+
+    pub fn to_dxf(self) -> i16 {
+        self as i16
+    }
+
+    pub fn uses_alignment_point(self) -> bool {
+        !matches!(self, Self::Left)
+    }
+}
+
+impl TextVAlign {
+    pub fn from_dxf(code: i16) -> Self {
+        match code {
+            1 => Self::Bottom,
+            2 => Self::Middle,
+            3 => Self::Top,
+            _ => Self::Baseline,
+        }
+    }
+
+    pub fn to_dxf(self) -> i16 {
+        self as i16
+    }
+
+    pub fn uses_alignment_point(self) -> bool {
+        !matches!(self, Self::Baseline)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TextData {
     pub insertion: Point3,
@@ -240,6 +305,29 @@ pub struct TextData {
     pub value: String,
     pub extrusion: Point3,
     pub is_attrib_def: bool,
+    pub halign: TextHAlign,
+    pub valign: TextVAlign,
+    pub alignment: Point3,
+    pub width_factor: f64,
+    pub oblique: f64,
+}
+
+impl Default for TextData {
+    fn default() -> Self {
+        Self {
+            insertion: Point3::default(),
+            height: 1.0,
+            rotation: 0.0,
+            value: String::new(),
+            extrusion: default_extrusion(),
+            is_attrib_def: false,
+            halign: TextHAlign::Left,
+            valign: TextVAlign::Baseline,
+            alignment: Point3::default(),
+            width_factor: 1.0,
+            oblique: 0.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -250,6 +338,24 @@ pub struct MTextData {
     pub width: f64,
     pub value: String,
     pub extrusion: Point3,
+    /// AutoCAD group 71. 1 is top-left, 9 is bottom-right.
+    pub attachment: i16,
+    pub line_spacing: f64,
+}
+
+impl Default for MTextData {
+    fn default() -> Self {
+        Self {
+            insertion: Point3::default(),
+            height: 1.0,
+            rotation: 0.0,
+            width: 0.0,
+            value: String::new(),
+            extrusion: default_extrusion(),
+            attachment: 1,
+            line_spacing: 1.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -6,19 +6,20 @@
 
 use crate::color::{CadColor, Rgb};
 use crate::curves::{
-    arc_points, bspline_points, circle_points, ellipse_points, polyline_points, CIRCLE_SEGMENTS,
+    arc_points, bspline_points, catmull_rom_fit_points, circle_points, ellipse_points,
+    polyline_points_with_tolerance, segments_per_turn, spline_sample_count,
 };
 use crate::dash::{
-    arc_path_segs, circle_path_segs, generate_path_dashes, line_chain, polyline_path_segs,
-    scaled_pattern, PathSeg,
+    arc_path_segs, circle_path_segs, generate_path_dashes_with_tolerance, line_chain,
+    polyline_path_segs, scaled_pattern, PathSeg,
 };
 use crate::document::Document;
-use crate::entity::{Entity, Geometry, TextData};
+use crate::entity::{Entity, Geometry, TextData, TextHAlign, TextVAlign};
 use crate::extents::Extents2;
-use crate::geom::{Point2, Point3};
-use crate::hatch::hatch_path_points;
+use crate::geom::{ocs_to_wcs, Point2, Point3};
+use crate::hatch::hatch_path_points_with_tolerance;
 use crate::linetype::LineType;
-use crate::stroke_font::{strip_mtext, stroke_text};
+use crate::stroke_font::{measure_styled_width, strip_mtext, stroke_text_styled};
 use crate::transform::Transform2;
 
 // ------------------------------------------------------------
@@ -70,19 +71,125 @@ fn continuous() -> LineType {
     LineType::continuous("CONTINUOUS")
 }
 
-fn emit_text(
-    sink: &mut impl VectorSink,
-    transform: Transform2,
-    rgb: Rgb,
-    insertion: Point3,
+fn local_chord_tolerance(document: &Document, transform: Transform2) -> f64 {
+    let scale = transform
+        .scale_x()
+        .abs()
+        .max(transform.scale_y().abs())
+        .max(1e-12);
+    document.display_chord_tolerance() / scale
+}
+
+fn emit_text_data(sink: &mut impl VectorSink, transform: Transform2, rgb: Rgb, text: &TextData) {
+    let placed = place_text(text, transform);
+    emit_styled_line(
+        sink,
+        rgb,
+        placed.origin,
+        placed.height,
+        placed.rotation,
+        placed.width_factor,
+        placed.oblique,
+        &placed.value,
+    );
+}
+
+struct PlacedText {
+    origin: Point2,
     height: f64,
     rotation: f64,
+    width_factor: f64,
+    oblique: f64,
+    value: String,
+}
+
+fn place_text(text: &TextData, transform: Transform2) -> PlacedText {
+    let scale = transform
+        .scale_x()
+        .abs()
+        .max(transform.scale_y().abs())
+        .max(1e-12);
+    let height = (text.height * scale).max(1e-6);
+    let insertion = transform.apply(text.insertion.xy());
+    let alignment = transform.apply(text.alignment.xy());
+    let (rotation, width_factor, origin_anchor) =
+        if matches!(text.halign, TextHAlign::Aligned | TextHAlign::Fit) {
+            let delta = Point2::new(alignment.x - insertion.x, alignment.y - insertion.y);
+            let distance = delta.distance(Point2::new(0.0, 0.0)).max(1e-9);
+            let rotation = delta.y.atan2(delta.x);
+            let natural = measure_styled_width(&text.value, height, 1.0).max(1e-9);
+            if matches!(text.halign, TextHAlign::Aligned) {
+                let fitted_height = height * (distance / natural);
+                return PlacedText {
+                    origin: insertion,
+                    height: fitted_height.max(1e-6),
+                    rotation,
+                    width_factor: 1.0,
+                    oblique: text.oblique,
+                    value: text.value.clone(),
+                };
+            }
+            (rotation, distance / natural, insertion)
+        } else {
+            (
+                text.rotation + transform.rotation_component(),
+                text.width_factor.max(1e-6),
+                if text.halign.uses_alignment_point() || text.valign.uses_alignment_point() {
+                    alignment
+                } else {
+                    insertion
+                },
+            )
+        };
+    let width = measure_styled_width(&text.value, height, width_factor);
+    let (dx, dy) = text_anchor_offset(text.halign, text.valign, width, height);
+    let (sin, cos) = rotation.sin_cos();
+    PlacedText {
+        origin: Point2::new(
+            origin_anchor.x + dx * cos - dy * sin,
+            origin_anchor.y + dx * sin + dy * cos,
+        ),
+        height,
+        rotation,
+        width_factor,
+        oblique: text.oblique,
+        value: text.value.clone(),
+    }
+}
+
+fn text_anchor_offset(
+    halign: TextHAlign,
+    valign: TextVAlign,
+    width: f64,
+    height: f64,
+) -> (f64, f64) {
+    if matches!(halign, TextHAlign::Middle) {
+        return (-width * 0.5, -height * 0.5);
+    }
+    let dx = match halign {
+        TextHAlign::Center => -width * 0.5,
+        TextHAlign::Right => -width,
+        _ => 0.0,
+    };
+    let dy = match valign {
+        TextVAlign::Middle => -height * 0.5,
+        TextVAlign::Top => -height,
+        TextVAlign::Baseline | TextVAlign::Bottom => 0.0,
+    };
+    (dx, dy)
+}
+
+fn emit_styled_line(
+    sink: &mut impl VectorSink,
+    rgb: Rgb,
+    origin: Point2,
+    height: f64,
+    rotation: f64,
+    width_factor: f64,
+    oblique: f64,
     value: &str,
 ) {
-    let origin = transform.apply(insertion.xy());
-    let h = height * transform.scale_y().abs().max(transform.scale_x().abs());
-    let rot = rotation + transform.rotation_component();
-    for [a, b] in stroke_text(origin, h.max(1e-6), rot, value) {
+    for [a, b] in stroke_text_styled(origin, height, rotation, width_factor, oblique, value) {
         sink.path(
             &[a, b],
             false,
@@ -102,32 +209,80 @@ fn emit_mtext(
     text: &crate::entity::MTextData,
 ) {
     let cleaned = strip_mtext(&text.value);
-    let mut y_off = 0.0;
-    for line in cleaned.lines() {
-        let insertion = Point3::new(text.insertion.x, text.insertion.y - y_off, text.insertion.z);
-        emit_text(
-            sink,
-            transform,
-            rgb,
-            insertion,
-            text.height,
-            text.rotation,
-            line,
+    let scale = transform
+        .scale_x()
+        .abs()
+        .max(transform.scale_y().abs())
+        .max(1e-12);
+    let height = (text.height * scale).max(1e-6);
+    let rotation = text.rotation + transform.rotation_component();
+    let width_limit = text.width.abs() * scale;
+    let lines = wrap_mtext(&cleaned, height, width_limit);
+    let step = height * text.line_spacing.max(0.25) * (5.0 / 3.0);
+    let anchor = transform.apply(text.insertion.xy());
+    let (sin, cos) = rotation.sin_cos();
+    let baseline = mtext_first_baseline(text.attachment, lines.len(), height, step);
+    for (index, line) in lines.iter().enumerate() {
+        let line_width = measure_styled_width(line, height, 1.0);
+        let dx = mtext_line_dx(text.attachment, line_width);
+        let dy = baseline - index as f64 * step;
+        let origin = Point2::new(
+            anchor.x + dx * cos - dy * sin,
+            anchor.y + dx * sin + dy * cos,
         );
-        y_off += text.height * 1.6;
+        emit_styled_line(sink, rgb, origin, height, rotation, 1.0, 0.0, line);
+    }
+}
+
+fn wrap_mtext(text: &str, height: f64, width_limit: f64) -> Vec<String> {
+    let mut lines = Vec::new();
+    for paragraph in text.split('\n') {
+        if width_limit <= 1e-9 {
+            lines.push(paragraph.to_string());
+            continue;
+        }
+        let mut current = String::new();
+        for word in paragraph.split_whitespace() {
+            let trial = if current.is_empty() {
+                word.to_string()
+            } else {
+                format!("{current} {word}")
+            };
+            if current.is_empty() || measure_styled_width(&trial, height, 1.0) <= width_limit {
+                current = trial;
+            } else {
+                lines.push(std::mem::take(&mut current));
+                current = word.to_string();
+            }
+        }
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+fn mtext_line_dx(attachment: i16, line_width: f64) -> f64 {
+    match (attachment.clamp(1, 9) - 1) % 3 {
+        1 => -line_width * 0.5,
+        2 => -line_width,
+        _ => 0.0,
+    }
+}
+
+fn mtext_first_baseline(attachment: i16, line_count: usize, cap: f64, step: f64) -> f64 {
+    let lines = line_count.max(1) as f64;
+    let block = cap + (lines - 1.0) * step;
+    match (attachment.clamp(1, 9) - 1) / 3 {
+        0 => -cap,
+        1 => -cap + block * 0.5,
+        _ => (lines - 1.0) * step,
     }
 }
 
 fn emit_attrib(sink: &mut impl VectorSink, transform: Transform2, rgb: Rgb, attrib: &TextData) {
-    emit_text(
-        sink,
-        transform,
-        rgb,
-        attrib.insertion,
-        attrib.height,
-        attrib.rotation,
-        &attrib.value,
-    );
+    emit_text_data(sink, transform, rgb, attrib);
 }
 
 // ------------------------------------------------------------
@@ -159,6 +314,7 @@ pub fn vectorize_entity(
         .cloned()
         .unwrap_or_else(|| LineType::continuous(&linetype_name));
     let scale = document.effective_linetype_scale(entity);
+    let chord_tol = local_chord_tolerance(document, transform);
 
     match &entity.geometry {
         Geometry::Insert {
@@ -290,10 +446,15 @@ pub fn vectorize_entity(
             radius,
             extrusion,
         } => {
-            let pts: Vec<Point2> = circle_points(*center, *radius, *extrusion, CIRCLE_SEGMENTS)
-                .into_iter()
-                .map(|p| transform.apply(p))
-                .collect();
+            let pts: Vec<Point2> = circle_points(
+                *center,
+                *radius,
+                *extrusion,
+                segments_per_turn(*radius, chord_tol),
+            )
+            .into_iter()
+            .map(|p| transform.apply(p))
+            .collect();
             sink.path(
                 &pts,
                 true,
@@ -318,7 +479,7 @@ pub fn vectorize_entity(
                 *end_angle,
                 true,
                 *extrusion,
-                CIRCLE_SEGMENTS,
+                segments_per_turn(*radius, chord_tol),
             )
             .into_iter()
             .map(|p| transform.apply(p))
@@ -348,7 +509,7 @@ pub fn vectorize_entity(
                 *start_param,
                 *end_param,
                 *extrusion,
-                CIRCLE_SEGMENTS,
+                segments_per_turn(major_axis.length(), chord_tol),
             )
             .into_iter()
             .map(|p| transform.apply(p))
@@ -369,10 +530,11 @@ pub fn vectorize_entity(
             extrusion,
             linetype_generation_continuous,
         } => {
-            let pts: Vec<Point2> = polyline_points(vertices, *closed, *extrusion)
-                .into_iter()
-                .map(|p| transform.apply(p))
-                .collect();
+            let pts: Vec<Point2> =
+                polyline_points_with_tolerance(vertices, *closed, *extrusion, Some(chord_tol))
+                    .into_iter()
+                    .map(|p| transform.apply(p))
+                    .collect();
             let segs = polyline_path_segs(vertices, *closed, *extrusion, transform);
             sink.path(
                 &pts,
@@ -390,10 +552,11 @@ pub fn vectorize_entity(
             linetype_generation_continuous,
         } => {
             let extrusion = Point3::new(0.0, 0.0, 1.0);
-            let pts: Vec<Point2> = polyline_points(vertices, *closed, extrusion)
-                .into_iter()
-                .map(|p| transform.apply(p))
-                .collect();
+            let pts: Vec<Point2> =
+                polyline_points_with_tolerance(vertices, *closed, extrusion, Some(chord_tol))
+                    .into_iter()
+                    .map(|p| transform.apply(p))
+                    .collect();
             let segs = polyline_path_segs(vertices, *closed, extrusion, transform);
             sink.path(
                 &pts,
@@ -414,9 +577,15 @@ pub fn vectorize_entity(
             closed,
         } => {
             let sampled = if control_points.len() >= 2 {
-                bspline_points(*degree, control_points, knots, weights, 24)
+                bspline_points(
+                    *degree,
+                    control_points,
+                    knots,
+                    weights,
+                    spline_sample_count(control_points.len(), *degree),
+                )
             } else {
-                fit_points.iter().map(|p| p.xy()).collect()
+                catmull_rom_fit_points(fit_points, *closed)
             };
             let pts: Vec<Point2> = sampled.into_iter().map(|p| transform.apply(p)).collect();
             sink.path(
@@ -433,15 +602,7 @@ pub fn vectorize_entity(
             if text.is_attrib_def && !stack.is_empty() {
                 return;
             }
-            emit_text(
-                sink,
-                transform,
-                rgb,
-                text.insertion,
-                text.height,
-                text.rotation,
-                &text.value,
-            );
+            emit_text_data(sink, transform, rgb, text);
         }
         Geometry::MText(text) => {
             emit_mtext(sink, transform, rgb, text);
@@ -449,10 +610,15 @@ pub fn vectorize_entity(
         Geometry::Hatch(hatch) => {
             let mut contours = Vec::new();
             for path in &hatch.paths {
-                let world: Vec<Point2> = hatch_path_points(path, hatch.extrusion, hatch.elevation)
-                    .into_iter()
-                    .map(|p| transform.apply(p))
-                    .collect();
+                let world: Vec<Point2> = hatch_path_points_with_tolerance(
+                    path,
+                    hatch.extrusion,
+                    hatch.elevation,
+                    Some(chord_tol),
+                )
+                .into_iter()
+                .map(|p| transform.apply(p))
+                .collect();
                 sink.path(
                     &world,
                     true,
@@ -468,8 +634,11 @@ pub fn vectorize_entity(
                 sink.fill_even_odd(&contours, rgb);
             }
         }
-        Geometry::Solid { corners, .. } => {
-            let pts: Vec<Point2> = corners.iter().map(|c| transform.apply(c.xy())).collect();
+        Geometry::Solid { corners, extrusion } => {
+            let pts: Vec<Point2> = corners
+                .iter()
+                .map(|c| transform.apply(ocs_to_wcs(*c, *extrusion).xy()))
+                .collect();
             sink.path(
                 &pts,
                 true,
@@ -551,6 +720,7 @@ impl PlotGeometry {
 
 struct CollectingSink {
     geometry: PlotGeometry,
+    chord_tolerance: f64,
 }
 
 fn points_usable(pts: &[Point2]) -> bool {
@@ -585,7 +755,13 @@ impl VectorSink for CollectingSink {
             return;
         }
         let pattern = scaled_pattern(&linetype.dashes, scale);
-        for (a, b) in generate_path_dashes(segs, &pattern, plinegen, CIRCLE_SEGMENTS) {
+        for (a, b) in generate_path_dashes_with_tolerance(
+            segs,
+            &pattern,
+            plinegen,
+            0,
+            Some(self.chord_tolerance),
+        ) {
             if !a.is_finite() || !b.is_finite() {
                 self.geometry
                     .warnings
@@ -647,6 +823,7 @@ impl VectorSink for CollectingSink {
 pub fn plot_geometry(document: &Document) -> PlotGeometry {
     let mut sink = CollectingSink {
         geometry: PlotGeometry::default(),
+        chord_tolerance: document.display_chord_tolerance(),
     };
     let mut stack = Vec::new();
     for entity in &document.model_space {
@@ -674,6 +851,7 @@ mod tests {
     use super::*;
     use crate::document::{BlockDefinition, Layer};
     use crate::entity::{default_extrusion, HatchData, HatchPath, MTextData, PolyVertex, TextData};
+    use crate::stroke_font::stroke_text;
 
     fn layer0(document: &mut Document) {
         document.layers.insert(
@@ -704,6 +882,7 @@ mod tests {
             value: "TAG".into(),
             extrusion: default_extrusion(),
             is_attrib_def: false,
+            ..Default::default()
         })));
         assert!(document.compute_extents().is_none());
         let plot = plot_geometry(&document);
@@ -734,6 +913,7 @@ mod tests {
                         value: "PLACEHOLDER".into(),
                         extrusion: default_extrusion(),
                         is_attrib_def: true,
+                        ..Default::default()
                     })),
                 ],
                 ..Default::default()
@@ -752,6 +932,7 @@ mod tests {
                 value: "P-101".into(),
                 extrusion: default_extrusion(),
                 is_attrib_def: false,
+                ..Default::default()
             }],
             column_count: 1,
             row_count: 1,
@@ -790,10 +971,12 @@ mod tests {
             width: 40.0,
             value: "ONE\\PTWO".into(),
             extrusion: default_extrusion(),
+            ..Default::default()
         })));
         let plot = plot_geometry(&document);
-        let one = stroke_text(Point2::new(0.0, 0.0), 2.0, 0.0, "ONE");
-        let two = stroke_text(Point2::new(0.0, -3.2), 2.0, 0.0, "TWO");
+        let step = 2.0 * (5.0 / 3.0);
+        let one = stroke_text(Point2::new(0.0, -2.0), 2.0, 0.0, "ONE");
+        let two = stroke_text(Point2::new(0.0, -2.0 - step), 2.0, 0.0, "TWO");
         assert!(plot
             .strokes
             .iter()
@@ -891,5 +1074,68 @@ mod tests {
         assert_eq!(plot.fills.len(), 1);
         assert!(plot.fills[0].even_odd);
         assert_eq!(plot.fills[0].contours.len(), 2);
+    }
+
+    #[test]
+    fn center_right_and_middle_text_use_the_alignment_point() {
+        let mut document = Document::default();
+        layer0(&mut document);
+        let width = measure_styled_width("M", 10.0, 1.0);
+        document.add_entity(Entity::new(Geometry::Text(TextData {
+            insertion: Point3::from_xy(0.0, 0.0),
+            alignment: Point3::from_xy(100.0, 20.0),
+            height: 10.0,
+            value: "M".into(),
+            halign: TextHAlign::Center,
+            ..TextData::default()
+        })));
+        document.add_entity(Entity::new(Geometry::Text(TextData {
+            alignment: Point3::from_xy(40.0, 5.0),
+            height: 10.0,
+            value: "M".into(),
+            halign: TextHAlign::Right,
+            valign: TextVAlign::Top,
+            ..TextData::default()
+        })));
+        document.add_entity(Entity::new(Geometry::Text(TextData {
+            alignment: Point3::from_xy(0.0, 0.0),
+            height: 10.0,
+            value: "M".into(),
+            halign: TextHAlign::Middle,
+            ..TextData::default()
+        })));
+        let plot = plot_geometry(&document);
+        let center = stroke_text(Point2::new(100.0 - width * 0.5, 20.0), 10.0, 0.0, "M");
+        let right = stroke_text(Point2::new(40.0 - width, 5.0 - 10.0), 10.0, 0.0, "M");
+        let middle = stroke_text(Point2::new(-width * 0.5, -5.0), 10.0, 0.0, "M");
+        assert!(plot_has_stroke(&plot, center[0][0]));
+        assert!(plot_has_stroke(&plot, right[0][0]));
+        assert!(plot_has_stroke(&plot, middle[0][0]));
+    }
+
+    #[test]
+    fn mtext_top_right_attachment_shifts_the_block() {
+        let mut document = Document::default();
+        layer0(&mut document);
+        document.add_entity(Entity::new(Geometry::MText(MTextData {
+            insertion: Point3::from_xy(50.0, 80.0),
+            height: 4.0,
+            value: "HI".into(),
+            attachment: 3,
+            ..MTextData::default()
+        })));
+        let width = measure_styled_width("HI", 4.0, 1.0);
+        let expected = stroke_text(Point2::new(50.0 - width, 80.0 - 4.0), 4.0, 0.0, "HI");
+        let plot = plot_geometry(&document);
+        assert!(plot_has_stroke(&plot, expected[0][0]));
+    }
+
+    fn plot_has_stroke(plot: &PlotGeometry, point: Point2) -> bool {
+        plot.strokes.iter().any(|stroke| {
+            stroke
+                .points
+                .first()
+                .is_some_and(|start| start.distance(point) < 1e-6)
+        })
     }
 }

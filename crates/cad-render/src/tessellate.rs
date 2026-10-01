@@ -3,13 +3,14 @@
 
 use std::collections::HashMap;
 
-use cad_core::dash::{generate_path_dashes, scaled_pattern, PathSeg};
+use cad_core::dash::{generate_path_dashes_with_tolerance, scaled_pattern, PathSeg};
 use cad_core::{
     hatch_path_points, vectorize_entity, CadColor, Document, Entity, EntityId, Extents2, HatchPath,
-    LineType, Point2, Rgb, Transform2, VectorSink, VectorVisibility, CIRCLE_SEGMENTS,
+    LineType, Point2, Rgb, Transform2, VectorSink, VectorVisibility,
 };
 
 use crate::pick::{box_select_into, EntityPick, SelectBoxMode, SpatialIndex};
+use crate::triangulate::{triangulate_even_odd, triangulate_polygon};
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -272,6 +273,7 @@ struct TessSink<'a> {
     list: &'a mut DisplayList,
     pick: Option<&'a mut EntityPick>,
     dim: bool,
+    chord_tolerance: f64,
 }
 
 impl VectorSink for TessSink<'_> {
@@ -298,7 +300,13 @@ impl VectorSink for TessSink<'_> {
             return;
         }
         let pattern = scaled_pattern(&linetype.dashes, scale);
-        for (a, b) in generate_path_dashes(segs, &pattern, plinegen, CIRCLE_SEGMENTS) {
+        for (a, b) in generate_path_dashes_with_tolerance(
+            segs,
+            &pattern,
+            plinegen,
+            0,
+            Some(self.chord_tolerance),
+        ) {
             push_line(self.list, a, b, rgb);
         }
     }
@@ -312,7 +320,21 @@ impl VectorSink for TessSink<'_> {
         } else {
             rgb
         };
-        emit_fan(self.list, pts, rgb);
+        emit_triangles(self.list, &triangulate_polygon(pts), rgb);
+    }
+
+    fn fill_even_odd(&mut self, contours: &[Vec<Point2>], rgb: Rgb) {
+        let rgb = if self.dim {
+            rgb.dim_for_block_context()
+        } else {
+            rgb
+        };
+        for contour in contours {
+            if let Some(pick) = self.pick.as_mut() {
+                pick.add_fill(contour);
+            }
+        }
+        emit_triangles(self.list, &triangulate_even_odd(contours), rgb);
     }
 }
 
@@ -499,6 +521,7 @@ fn emit_pickable_entity(
             list,
             pick: Some(&mut pick),
             dim,
+            chord_tolerance: document.display_chord_tolerance(),
         };
         vectorize_entity(
             document,
@@ -545,6 +568,7 @@ fn emit_top_level_entity(
             list,
             pick: Some(&mut pick),
             dim: false,
+            chord_tolerance: document.display_chord_tolerance(),
         };
         vectorize_entity(
             document,
@@ -625,9 +649,13 @@ fn emit_hatch_pattern(
                 emit_solid_polyline(list, &[a, b], false, rgb);
             } else {
                 let pattern = scaled_pattern(&hatch_lt.dashes, 1.0);
-                for (p0, p1) in
-                    generate_path_dashes(&[PathSeg::Line { a, b }], &pattern, true, CIRCLE_SEGMENTS)
-                {
+                for (p0, p1) in generate_path_dashes_with_tolerance(
+                    &[PathSeg::Line { a, b }],
+                    &pattern,
+                    true,
+                    0,
+                    None,
+                ) {
                     push_line(list, p0, p1, rgb);
                 }
             }
@@ -671,18 +699,13 @@ fn emit_solid_polyline(list: &mut DisplayList, pts: &[Point2], closed: bool, rgb
     }
 }
 
-fn emit_fan(list: &mut DisplayList, pts: &[Point2], rgb: Rgb) {
-    if pts.len() < 3 {
-        return;
-    }
+fn emit_triangles(list: &mut DisplayList, tris: &[[Point2; 3]], rgb: Rgb) {
     let color = rgb.to_array();
     let origin = list.origin;
-    let p0 = to_gpu(pts[0], origin, color);
-    for i in 1..pts.len() - 1 {
-        list.triangle_vertices.push(p0);
-        list.triangle_vertices.push(to_gpu(pts[i], origin, color));
-        list.triangle_vertices
-            .push(to_gpu(pts[i + 1], origin, color));
+    for tri in tris {
+        for point in tri {
+            list.triangle_vertices.push(to_gpu(*point, origin, color));
+        }
     }
 }
 

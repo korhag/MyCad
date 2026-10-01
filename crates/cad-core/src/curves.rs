@@ -5,6 +5,47 @@ use crate::geom::{ocs_to_wcs, Point2, Point3};
 use crate::measure::bulge_circle;
 
 pub const CIRCLE_SEGMENTS: usize = 32;
+const MAX_SEGMENTS_PER_TURN: usize = 512;
+
+// ------------------------------------------------------------
+// Function: segments_per_turn
+// Purpose: How many chords a full circle needs so the sagitta
+//          stays within `chord_tolerance`. Clamped to the old
+//          32-segment floor and a 512-segment cap.
+// ------------------------------------------------------------
+pub fn segments_per_turn(radius: f64, chord_tolerance: f64) -> usize {
+    let radius = radius.abs();
+    if radius < 1e-15 {
+        return CIRCLE_SEGMENTS;
+    }
+    let tol = chord_tolerance.max(1e-12);
+    if tol >= radius {
+        return CIRCLE_SEGMENTS;
+    }
+    let step = 2.0 * (1.0 - (tol / radius).min(1.0)).acos();
+    if !step.is_finite() || step < 1e-9 {
+        return MAX_SEGMENTS_PER_TURN;
+    }
+    let n = (std::f64::consts::TAU / step).ceil() as usize;
+    n.clamp(CIRCLE_SEGMENTS, MAX_SEGMENTS_PER_TURN)
+}
+
+// ------------------------------------------------------------
+// Function: segments_for_arc
+// Purpose: Chord count for one arc of `sweep` radians, using the
+//          same per-turn density as `segments_per_turn`.
+// ------------------------------------------------------------
+pub fn segments_for_arc(radius: f64, sweep: f64, chord_tolerance: f64) -> usize {
+    let per_turn = segments_per_turn(radius, chord_tolerance);
+    ((per_turn as f64) * (sweep.abs() / std::f64::consts::TAU))
+        .ceil()
+        .max(2.0) as usize
+}
+
+pub fn spline_sample_count(control_len: usize, degree: u32) -> usize {
+    let spans = control_len.saturating_sub(degree.max(1) as usize).max(1);
+    (spans * 16).clamp(24, 512)
+}
 
 pub fn circle_points(
     center: Point3,
@@ -175,6 +216,16 @@ pub fn bulge_arc(p1: Point2, p2: Point2, bulge: f64, segments: usize) -> Vec<Poi
     pts
 }
 
+fn bulge_segments(p1: Point2, p2: Point2, bulge: f64, chord_tolerance: Option<f64>) -> usize {
+    let Some(tol) = chord_tolerance else {
+        return POLYLINE_BULGE_SEGMENTS;
+    };
+    let Some(arc) = bulge_circle(p1, p2, bulge) else {
+        return 2;
+    };
+    segments_for_arc(arc.radius, arc.sweep, tol)
+}
+
 fn ocs_xy(point: Point3) -> Point2 {
     Point2::new(point.x, point.y)
 }
@@ -190,6 +241,21 @@ fn bulge_sample_to_wcs(sample: Point2, elevation: f64, extrusion: Point3) -> Poi
 //          reverse handedness, then each sample is mapped to WCS.
 // ------------------------------------------------------------
 pub fn polyline_points(vertices: &[PolyVertex], closed: bool, extrusion: Point3) -> Vec<Point2> {
+    polyline_points_with_tolerance(vertices, closed, extrusion, None)
+}
+
+// ------------------------------------------------------------
+// Function: polyline_points_with_tolerance
+// Purpose: Same as `polyline_points`, but each bulge arc uses
+//          `chord_tolerance` instead of a fixed segment count.
+//          `None` keeps the historical 16-segment bulges.
+// ------------------------------------------------------------
+pub fn polyline_points_with_tolerance(
+    vertices: &[PolyVertex],
+    closed: bool,
+    extrusion: Point3,
+    chord_tolerance: Option<f64>,
+) -> Vec<Point2> {
     if vertices.is_empty() {
         return Vec::new();
     }
@@ -199,12 +265,8 @@ pub fn polyline_points(vertices: &[PolyVertex], closed: bool, extrusion: Point3)
     for i in 0..count {
         let a = vertices[i];
         let b = vertices[(i + 1) % n];
-        let mut seg = bulge_arc(
-            ocs_xy(a.point),
-            ocs_xy(b.point),
-            a.bulge,
-            POLYLINE_BULGE_SEGMENTS,
-        );
+        let segments = bulge_segments(ocs_xy(a.point), ocs_xy(b.point), a.bulge, chord_tolerance);
+        let mut seg = bulge_arc(ocs_xy(a.point), ocs_xy(b.point), a.bulge, segments);
         for sample in &mut seg {
             *sample = bulge_sample_to_wcs(*sample, a.point.z, extrusion);
         }
@@ -350,6 +412,82 @@ fn de_boor(degree: usize, control: &[Point3], knots: &[f64], weights: &[f64], u:
     } else {
         control[span.min(n)]
     }
+}
+
+// ------------------------------------------------------------
+// Function: catmull_rom_fit_points
+// Purpose: Draw a fit-point spline as a centripetal Catmull-Rom
+//          curve through every fit point, instead of straight chords.
+// ------------------------------------------------------------
+pub fn catmull_rom_fit_points(points: &[Point3], closed: bool) -> Vec<Point2> {
+    if points.len() < 3 {
+        return points.iter().map(|p| p.xy()).collect();
+    }
+    let samples_per_span = 16usize;
+    let n = points.len();
+    let spans = if closed { n } else { n - 1 };
+    let mut out = Vec::with_capacity(spans * samples_per_span + 1);
+    for i in 0..spans {
+        let p1 = points[i % n].xy();
+        let p2 = points[(i + 1) % n].xy();
+        let p0 = if !closed && i == 0 {
+            p1
+        } else {
+            points[(i + n - 1) % n].xy()
+        };
+        let p3 = if !closed && i + 1 == spans {
+            p2
+        } else {
+            points[(i + 2) % n].xy()
+        };
+        let steps = if i + 1 == spans {
+            samples_per_span
+        } else {
+            samples_per_span - 1
+        };
+        for step in 0..=steps {
+            let t = step as f64 / samples_per_span as f64;
+            out.push(catmull_rom_centripetal(p0, p1, p2, p3, t));
+        }
+    }
+    if let Some(first) = out.first_mut() {
+        *first = points[0].xy();
+    }
+    if let Some(last) = out.last_mut() {
+        let end = if closed {
+            points[0].xy()
+        } else {
+            points[n - 1].xy()
+        };
+        *last = end;
+    }
+    out
+}
+
+fn catmull_rom_centripetal(p0: Point2, p1: Point2, p2: Point2, p3: Point2, t: f64) -> Point2 {
+    let alpha = 0.5;
+    let knot = |a: Point2, b: Point2, ti: f64| ti + a.distance(b).powf(alpha).max(1e-9);
+    let t0 = 0.0;
+    let t1 = knot(p0, p1, t0);
+    let t2 = knot(p1, p2, t1);
+    let t3 = knot(p2, p3, t2);
+    if (t2 - t1).abs() < 1e-12 {
+        return p1.lerp(p2, t.clamp(0.0, 1.0));
+    }
+    let u = t1 + (t2 - t1) * t.clamp(0.0, 1.0);
+    let lerp_at = |a: Point2, b: Point2, ta: f64, tb: f64| {
+        if (tb - ta).abs() < 1e-12 {
+            b
+        } else {
+            a * ((tb - u) / (tb - ta)) + b * ((u - ta) / (tb - ta))
+        }
+    };
+    let a1 = lerp_at(p0, p1, t0, t1);
+    let a2 = lerp_at(p1, p2, t1, t2);
+    let a3 = lerp_at(p2, p3, t2, t3);
+    let b1 = lerp_at(a1, a2, t0, t2);
+    let b2 = lerp_at(a2, a3, t1, t3);
+    lerp_at(b1, b2, t1, t2)
 }
 
 #[cfg(test)]
@@ -645,5 +783,48 @@ mod tests {
         assert!(ccw_mid.x > 0.0 && ccw_mid.y > 0.0);
         assert!(cw_mid.x < 0.0 && cw_mid.y < 0.0);
         assert_ne!(ccw_mid.y.signum(), cw_mid.y.signum());
+    }
+
+    #[test]
+    fn arc_chords_stay_inside_the_tolerance() {
+        let radius = 250.0;
+        let tol = 0.05;
+        let n = segments_for_arc(radius, std::f64::consts::TAU, tol);
+        let pts = circle_points(
+            Point3::from_xy(0.0, 0.0),
+            radius,
+            Point3::new(0.0, 0.0, 1.0),
+            n,
+        );
+        let mut worst = 0.0_f64;
+        for pair in pts.windows(2) {
+            let mid = pair[0].lerp(pair[1], 0.5);
+            let sagitta = radius - mid.distance(p(0.0, 0.0));
+            worst = worst.max(sagitta);
+        }
+        assert!(
+            worst <= tol + 1e-6,
+            "sagitta {worst} exceeds tolerance {tol}"
+        );
+        assert!(n >= CIRCLE_SEGMENTS);
+        assert!(n <= 512);
+    }
+
+    #[test]
+    fn fit_point_spline_passes_through_the_points() {
+        let fit = [
+            Point3::from_xy(0.0, 0.0),
+            Point3::from_xy(1.0, 2.0),
+            Point3::from_xy(3.0, 2.0),
+            Point3::from_xy(4.0, 0.0),
+        ];
+        let pts = catmull_rom_fit_points(&fit, false);
+        assert!(pts.len() > fit.len());
+        for target in &fit {
+            let hit = pts.iter().any(|p| p.distance(target.xy()) < 1e-6);
+            assert!(hit, "missing fit point ({}, {})", target.x, target.y);
+        }
+        let mid = pts[pts.len() / 2];
+        assert!(mid.y > 0.5, "curve should bow upward, mid y={}", mid.y);
     }
 }

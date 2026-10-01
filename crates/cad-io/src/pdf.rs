@@ -503,6 +503,7 @@ mod tests {
             value: "TITLE".into(),
             extrusion: default_extrusion(),
             is_attrib_def: false,
+            ..Default::default()
         })));
         let options = PdfExportOptions::default();
         let (report, text) = write_pdf(&document, &options);
@@ -528,6 +529,7 @@ mod tests {
             width: 40.0,
             value: "ONE\\PTWO".into(),
             extrusion: default_extrusion(),
+            ..Default::default()
         })));
         let plot = plot_geometry(&document);
         let (_, text) = write_pdf(&document, &PdfExportOptions::default());
@@ -556,6 +558,7 @@ mod tests {
                         value: "PLACEHOLDER".into(),
                         extrusion: default_extrusion(),
                         is_attrib_def: true,
+                        ..Default::default()
                     })),
                 ],
                 ..Default::default()
@@ -573,6 +576,7 @@ mod tests {
                 value: "P-101".into(),
                 extrusion: default_extrusion(),
                 is_attrib_def: false,
+                ..Default::default()
             }],
         ));
         let with_attrib = plot_geometry(&document);

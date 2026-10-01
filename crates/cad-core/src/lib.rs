@@ -18,6 +18,7 @@ pub mod extents;
 pub mod fixtures;
 pub mod geom;
 pub mod hatch;
+mod hershey_simplex;
 pub mod ids;
 pub mod linetype;
 pub mod measure;
@@ -42,8 +43,10 @@ pub use block::{
 pub use color::{aci_rgb, CadColor, Rgb};
 pub use compare::{compare_documents, CompareTol, Mismatch};
 pub use curves::{
-    arc_points, bspline_points, bulge_arc, circle_points, ellipse_arc_points, ellipse_points,
-    polyline_points, CIRCLE_SEGMENTS, POLYLINE_BULGE_SEGMENTS,
+    arc_points, bspline_points, bulge_arc, catmull_rom_fit_points, circle_points,
+    ellipse_arc_points, ellipse_points, polyline_points, polyline_points_with_tolerance,
+    segments_for_arc, segments_per_turn, spline_sample_count, CIRCLE_SEGMENTS,
+    POLYLINE_BULGE_SEGMENTS,
 };
 pub use document::{
     BlockDefinition, Document, DrawingUnits, EntityLocation, EntitySpace, ImportDiagnostics, Layer,
@@ -72,7 +75,7 @@ pub use dynamic_model::{
 };
 pub use entity::{
     default_extrusion, Entity, EntityId, Geometry, HatchData, HatchEdge, HatchPath,
-    HatchPatternLine, MTextData, PolyVertex, TextData,
+    HatchPatternLine, MTextData, PolyVertex, TextData, TextHAlign, TextVAlign,
 };
 pub use entity_transform::{
     reference_radius, transform_entity, transform_entity_matrix, transform_geometry,
@@ -90,7 +93,7 @@ pub use geom::{
     arc_from_three_points, ocs_to_wcs, ArcFromPointsError, Point2, Point3, ThreePointArc,
     GEOM_TOLERANCE,
 };
-pub use hatch::hatch_path_points;
+pub use hatch::{hatch_path_points, hatch_path_points_with_tolerance};
 pub use ids::{ActionId, AnchorId, BlockDefinitionId, OptionId, ParameterId, PresetId, VertexId};
 pub use linetype::{
     is_byblock_name, is_bylayer_name, is_continuous_name, normalize_linetype_name, LineType,
@@ -106,7 +109,10 @@ pub use measure_index::{
     MeasurePrimitive, MeasureRole, MEASURE_APERTURE_PX,
 };
 pub use snap::{SnapFeature, SnapIndex, SnapKind};
-pub use stroke_font::{measure_width, strip_mtext, stroke_text};
+pub use stroke_font::{
+    expand_cad_codes, measure_styled_width, measure_width, strip_mtext, stroke_text,
+    stroke_text_styled,
+};
 pub use thumbnail::{
     path_is_thumbnail_folder, should_scan_asset, ContentFingerprint, SourceIdentity,
     SourceMetadata, ThumbnailRecord, ThumbnailRefreshPolicy, ThumbnailSettings, ThumbnailStatus,

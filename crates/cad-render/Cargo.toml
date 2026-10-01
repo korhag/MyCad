@@ -11,3 +11,4 @@ cad-viewport.workspace = true
 bytemuck.workspace = true
 egui.workspace = true
 egui-wgpu.workspace = true
+earcutr.workspace = true

@@ -447,7 +447,10 @@ fn make_pipeline(
             ..Default::default()
         },
         depth_stencil: None,
-        multisample: wgpu::MultisampleState::default(),
+        multisample: wgpu::MultisampleState {
+            count: crate::VIEWPORT_MSAA_SAMPLES,
+            ..Default::default()
+        },
         multiview: None,
         cache: None,
     })

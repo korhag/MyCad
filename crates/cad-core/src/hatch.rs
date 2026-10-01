@@ -5,7 +5,8 @@
 //! then mapped to WCS so viewport and PDF cannot disagree.
 
 use crate::curves::{
-    arc_points, bspline_points, ellipse_arc_points, polyline_points, CIRCLE_SEGMENTS,
+    arc_points, bspline_points, ellipse_arc_points, polyline_points_with_tolerance,
+    segments_per_turn, spline_sample_count, CIRCLE_SEGMENTS,
 };
 use crate::entity::{default_extrusion, HatchEdge, HatchPath, PolyVertex};
 use crate::geom::{ocs_to_wcs, Point2, Point3};
@@ -32,6 +33,21 @@ fn append_edge(pts: &mut Vec<Point2>, mut samples: Vec<Point2>) {
 //          the major-axis vector relative to the center (DXF).
 // ------------------------------------------------------------
 pub fn hatch_path_points(path: &HatchPath, extrusion: Point3, elevation: f64) -> Vec<Point2> {
+    hatch_path_points_with_tolerance(path, extrusion, elevation, None)
+}
+
+// ------------------------------------------------------------
+// Function: hatch_path_points_with_tolerance
+// Purpose: Sample one hatch boundary. `Some(tol)` picks arc and
+//          bulge density from chord error; `None` keeps the
+//          fixed segment counts used by tests and thumbnails.
+// ------------------------------------------------------------
+pub fn hatch_path_points_with_tolerance(
+    path: &HatchPath,
+    extrusion: Point3,
+    elevation: f64,
+    chord_tolerance: Option<f64>,
+) -> Vec<Point2> {
     match path {
         HatchPath::Polyline { vertices, closed } => {
             let verts: Vec<PolyVertex> = vertices
@@ -42,7 +58,7 @@ pub fn hatch_path_points(path: &HatchPath, extrusion: Point3, elevation: f64) ->
                     vertex_id: Default::default(),
                 })
                 .collect();
-            polyline_points(&verts, *closed, extrusion)
+            polyline_points_with_tolerance(&verts, *closed, extrusion, chord_tolerance)
         }
         HatchPath::Edges(edges) => {
             let mut pts = Vec::new();
@@ -74,7 +90,9 @@ pub fn hatch_path_points(path: &HatchPath, extrusion: Point3, elevation: f64) ->
                             *end_angle,
                             *is_ccw,
                             extrusion,
-                            CIRCLE_SEGMENTS,
+                            chord_tolerance
+                                .map(|tol| segments_per_turn(*radius, tol))
+                                .unwrap_or(CIRCLE_SEGMENTS),
                         );
                         append_edge(&mut pts, samples);
                     }
@@ -87,15 +105,18 @@ pub fn hatch_path_points(path: &HatchPath, extrusion: Point3, elevation: f64) ->
                         is_ccw,
                     } => {
                         // Group 11 is the major-axis vector in OCS, not a WCS point.
+                        let major = Point3::from_xy(major_endpoint.x, major_endpoint.y);
                         let ocs = ellipse_arc_points(
                             Point3::from_xy(center.x, center.y),
-                            Point3::from_xy(major_endpoint.x, major_endpoint.y),
+                            major,
                             *axis_ratio,
                             *start_angle,
                             *end_angle,
                             *is_ccw,
                             default_extrusion(),
-                            CIRCLE_SEGMENTS,
+                            chord_tolerance
+                                .map(|tol| segments_per_turn(major.length(), tol))
+                                .unwrap_or(CIRCLE_SEGMENTS),
                         );
                         let samples: Vec<Point2> = ocs
                             .into_iter()
@@ -108,10 +129,11 @@ pub fn hatch_path_points(path: &HatchPath, extrusion: Point3, elevation: f64) ->
                             .iter()
                             .map(|p| Point3::from_xy(p.x, p.y))
                             .collect();
-                        let samples: Vec<Point2> = bspline_points(3, &ocs, &[], &[], 24)
-                            .into_iter()
-                            .map(|p| map_ocs(p, elevation, extrusion))
-                            .collect();
+                        let samples: Vec<Point2> =
+                            bspline_points(3, &ocs, &[], &[], spline_sample_count(ocs.len(), 3))
+                                .into_iter()
+                                .map(|p| map_ocs(p, elevation, extrusion))
+                                .collect();
                         append_edge(&mut pts, samples);
                     }
                 }
