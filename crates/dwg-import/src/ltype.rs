@@ -4,7 +4,7 @@
 use std::ffi::c_void;
 use std::os::raw::c_char;
 
-use cad_core::normalize_linetype_name;
+use cad_core::{normalize_linetype_name, LineTypeShape};
 
 /// Mirrors `Dwg_LTYPE_dash` / subclass `"LTYPE_dash"` in LibreDWG `dwg.h`.
 #[repr(C)]
@@ -27,10 +27,102 @@ const _: () = {
     assert!(std::mem::align_of::<LtypeDash>() >= 8);
 };
 
+/// LibreDWG replaces a pre-2007 linetype string area with a blank buffer
+/// after it has copied dash text into that area, and it does not turn DXF
+/// style flag bit 1 into `is_shape`. Repair both before `dwg_write_file`.
+pub(crate) fn restore_linetype_strings_area(dwg: *mut libredwg_sys::Dwg_Data) {
+    let count = unsafe { libredwg_sys::dwg_get_num_objects(dwg) };
+    for index in 0..count {
+        let obj = unsafe { libredwg_sys::dwg_get_object(dwg, index) };
+        if obj.is_null() {
+            continue;
+        }
+        let dxfname = crate::dynapi::object_dxfname(obj);
+        let ptr = unsafe { libredwg_sys::uncad_object_object_ptr(obj) };
+        if ptr.is_null() {
+            continue;
+        }
+        if dxfname == "LTYPE" {
+            copy_dash_text(ptr);
+        } else if dxfname == "STYLE" {
+            mark_shape_style(ptr);
+        }
+    }
+}
+
+unsafe extern "C" {
+    fn dwg_dynapi_entity_set_value(
+        entity: *mut c_void,
+        dxfname: *const c_char,
+        fieldname: *const c_char,
+        value: *const c_void,
+        is_utf8: bool,
+    ) -> bool;
+}
+
+fn mark_shape_style(style: *mut c_void) {
+    use crate::dynapi::get_field;
+    let flag = get_field::<u8>(style, "STYLE", "flag").unwrap_or(0);
+    if flag & 1 == 0 {
+        return;
+    }
+    let Ok(c_dxf) = std::ffi::CString::new("STYLE") else {
+        return;
+    };
+    let Ok(c_field) = std::ffi::CString::new("is_shape") else {
+        return;
+    };
+    let value: u8 = 1;
+    unsafe {
+        dwg_dynapi_entity_set_value(
+            style,
+            c_dxf.as_ptr(),
+            c_field.as_ptr(),
+            &value as *const u8 as *const c_void,
+            false,
+        );
+    }
+}
+
+fn copy_dash_text(ltype: *mut c_void) {
+    use crate::dynapi::get_field;
+    let num = get_field::<u8>(ltype, "LTYPE", "numdashes").unwrap_or(0);
+    let dashes =
+        get_field::<*mut LtypeDash>(ltype, "LTYPE", "dashes").unwrap_or(std::ptr::null_mut());
+    let area = get_field::<*mut u8>(ltype, "LTYPE", "strings_area").unwrap_or(std::ptr::null_mut());
+    if num == 0 || dashes.is_null() || area.is_null() {
+        return;
+    }
+    const AREA_BYTES: usize = 256;
+    let mut cursor = 0usize;
+    for index in 0..num {
+        let dash = unsafe { &*dashes.add(usize::from(index)) };
+        if dash.shape_flag & 2 == 0 || dash.text.is_null() {
+            continue;
+        }
+        let bytes = unsafe { std::ffi::CStr::from_ptr(dash.text) }.to_bytes();
+        if cursor + bytes.len() + 1 > AREA_BYTES {
+            break;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), area.add(cursor), bytes.len());
+            *area.add(cursor + bytes.len()) = 0;
+        }
+        cursor += bytes.len() + 1;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DashRecord {
+    pub length: f64,
+    pub shape: Option<LineTypeShape>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct LtypeParseResult {
     pub name: String,
     pub dashes: Vec<f64>,
+    pub shapes: Vec<Option<LineTypeShape>>,
     pub warnings: Vec<String>,
 }
 
@@ -54,7 +146,27 @@ pub(crate) fn parse_ltype_dashes(name: &str, elements: &[(f64, u16)]) -> LtypePa
     LtypeParseResult {
         name,
         dashes,
+        shapes: Vec::new(),
         warnings,
+    }
+}
+
+pub(crate) fn parse_ltype_records(name: &str, records: &[DashRecord]) -> LtypeParseResult {
+    let name = normalize_linetype_name(name);
+    let mut dashes = Vec::with_capacity(records.len());
+    let mut shapes = Vec::with_capacity(records.len());
+    for record in records {
+        dashes.push(record.length);
+        match &record.shape {
+            Some(shape) if shape.flag != 0 => shapes.push(Some(shape.clone())),
+            _ => shapes.push(None),
+        }
+    }
+    LtypeParseResult {
+        name,
+        dashes,
+        shapes,
+        warnings: Vec::new(),
     }
 }
 
@@ -158,6 +270,39 @@ mod tests {
         assert_eq!(parsed.warnings.len(), 1);
         assert!(parsed.warnings[0].contains("shape_flag"));
         assert!(parsed.warnings[0].contains("GASLINE"));
+    }
+
+    #[test]
+    fn complex_record_keeps_shape_fields() {
+        let parsed = parse_ltype_records(
+            "FENCELINE1",
+            &[
+                DashRecord {
+                    length: 0.25,
+                    shape: None,
+                },
+                DashRecord {
+                    length: -0.1,
+                    shape: Some(LineTypeShape {
+                        flag: 4,
+                        shapecode: 130,
+                        text: String::new(),
+                        scale: 0.1,
+                        rotation: 0.4,
+                        x_offset: -0.05,
+                        y_offset: 0.02,
+                        style: "STANDARD".into(),
+                        shape_file: String::new(),
+                    }),
+                },
+            ],
+        );
+        assert!(parsed.warnings.is_empty());
+        assert_eq!(parsed.dashes, vec![0.25, -0.1]);
+        let shape = parsed.shapes[1].as_ref().expect("shape");
+        assert_eq!(shape.flag, 4);
+        assert_eq!(shape.shapecode, 130);
+        assert_eq!(shape.style, "STANDARD");
     }
 
     #[test]

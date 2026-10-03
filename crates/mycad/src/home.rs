@@ -5,9 +5,10 @@
 use cad_core::CadColor;
 use eframe::egui::{Color32, Ui};
 use egui_phosphor::regular::{
-    ANGLE, ARROWS_CLOCKWISE, ARROWS_OUT, ARROWS_OUT_CARDINAL, ARROW_CLOCKWISE,
-    ARROW_COUNTER_CLOCKWISE, CIRCLE, COPY, ERASER, FLIP_HORIZONTAL, LINE_SEGMENT, LINE_SEGMENTS,
-    PATH, POLYGON, RECTANGLE, RULER,
+    ANGLE, ARROWS_CLOCKWISE, ARROWS_HORIZONTAL, ARROWS_OUT, ARROWS_OUT_CARDINAL, ARROW_CLOCKWISE,
+    ARROW_COUNTER_CLOCKWISE, ARROW_LINE_RIGHT, CIRCLE, CIRCLE_HALF_TILT, COPY, DOT_OUTLINE, ERASER,
+    FLIP_HORIZONTAL, HEXAGON, LINE_SEGMENT, LINE_SEGMENTS, PATH, POLYGON, RECTANGLE, RULER,
+    SCISSORS,
 };
 
 use crate::app::MyCadApp;
@@ -31,6 +32,13 @@ const CMD_ROTATE: &str = "rotate";
 const CMD_MIRROR: &str = "mirror";
 const CMD_SCALE: &str = "scale";
 const CMD_ERASE: &str = "erase";
+const CMD_ELLIPSE: &str = "ellipse";
+const CMD_POLYGON: &str = "polygon";
+const CMD_POINT: &str = "point";
+const CMD_STRETCH: &str = "stretch";
+const CMD_TRIM: &str = "trim";
+const CMD_EXTEND: &str = "extend";
+const CMD_OFFSET: &str = "offset";
 
 pub fn show(ui: &mut Ui, app: &mut MyCadApp) {
     let available = ui.available_size();
@@ -60,6 +68,13 @@ fn home_groups(app: &MyCadApp) -> Vec<RibbonGroup> {
     let mirror_active = kind == CommandKind::Mirror;
     let scale_active = kind == CommandKind::Scale;
     let erase_active = kind == CommandKind::Erase;
+    let ellipse_active = kind == CommandKind::Ellipse;
+    let polygon_active = kind == CommandKind::Polygon;
+    let point_active = kind == CommandKind::Point;
+    let stretch_active = kind == CommandKind::Stretch;
+    let trim_active = kind == CommandKind::Trim;
+    let extend_active = kind == CommandKind::Extend;
+    let offset_active = kind == CommandKind::Offset;
     vec![
         RibbonGroup {
             id: "history",
@@ -132,6 +147,36 @@ fn home_groups(app: &MyCadApp) -> Vec<RibbonGroup> {
                     true,
                     rectangle_active,
                 ),
+                command(
+                    CMD_ELLIPSE,
+                    "Ellipse",
+                    "Ellipse",
+                    CIRCLE_HALF_TILT,
+                    "EL",
+                    5,
+                    true,
+                    ellipse_active,
+                ),
+                command(
+                    CMD_POLYGON,
+                    "Polygon",
+                    "Polygon",
+                    HEXAGON,
+                    "POL",
+                    6,
+                    true,
+                    polygon_active,
+                ),
+                command(
+                    CMD_POINT,
+                    "Point",
+                    "Point",
+                    DOT_OUTLINE,
+                    "PO",
+                    7,
+                    true,
+                    point_active,
+                ),
             ],
         },
         RibbonGroup {
@@ -188,6 +233,46 @@ fn home_groups(app: &MyCadApp) -> Vec<RibbonGroup> {
                     5,
                     true,
                     erase_active,
+                ),
+                command(
+                    CMD_STRETCH,
+                    "Stretch",
+                    "Stretch",
+                    ARROWS_HORIZONTAL,
+                    "S",
+                    6,
+                    true,
+                    stretch_active,
+                ),
+                command(
+                    CMD_TRIM,
+                    "Trim",
+                    "Trim",
+                    SCISSORS,
+                    "TR",
+                    7,
+                    true,
+                    trim_active,
+                ),
+                command(
+                    CMD_EXTEND,
+                    "Extend",
+                    "Extend",
+                    ARROW_LINE_RIGHT,
+                    "EX",
+                    8,
+                    true,
+                    extend_active,
+                ),
+                command(
+                    CMD_OFFSET,
+                    "Offset",
+                    "Offset",
+                    ARROWS_OUT,
+                    "O",
+                    9,
+                    true,
+                    offset_active,
                 ),
             ],
         },
@@ -355,6 +440,13 @@ fn dispatch(app: &mut MyCadApp, action: RibbonAction) {
         RibbonAction::Command(CMD_MIRROR) => app.start_mirror_command(),
         RibbonAction::Command(CMD_SCALE) => app.start_scale_command(),
         RibbonAction::Command(CMD_ERASE) => app.start_erase_command(),
+        RibbonAction::Command(CMD_ELLIPSE) => app.start_ellipse_command(),
+        RibbonAction::Command(CMD_POLYGON) => app.start_polygon_command(),
+        RibbonAction::Command(CMD_POINT) => app.start_point_command(),
+        RibbonAction::Command(CMD_STRETCH) => app.start_stretch_command(),
+        RibbonAction::Command(CMD_TRIM) => app.start_trim_command(),
+        RibbonAction::Command(CMD_EXTEND) => app.start_extend_command(),
+        RibbonAction::Command(CMD_OFFSET) => app.start_offset_command(),
         RibbonAction::Command(_) => {}
         RibbonAction::SetLayer(name) => app.set_current_layer(&name),
         RibbonAction::SetSelectedLayerCurrent => app.set_selected_layer_current(),

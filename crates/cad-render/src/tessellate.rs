@@ -5,8 +5,8 @@ use std::collections::HashMap;
 
 use cad_core::dash::{generate_path_dashes_with_tolerance, scaled_pattern, PathSeg};
 use cad_core::{
-    hatch_path_points, vectorize_entity, CadColor, Document, Entity, EntityId, Extents2, HatchPath,
-    LineType, Point2, Rgb, Transform2, VectorSink, VectorVisibility,
+    vectorize_entity, CadColor, Document, Entity, EntityId, Extents2, LineType, Point2, Rgb,
+    Transform2, VectorSink, VectorVisibility,
 };
 
 use crate::pick::{box_select_into, EntityPick, SelectBoxMode, SpatialIndex};
@@ -114,13 +114,31 @@ impl DisplayList {
         document: &Document,
         entity: &Entity,
     ) -> Option<AppendedGeometry> {
-        let entity_index = document
-            .model_space
-            .iter()
-            .position(|existing| existing.id == entity.id)
-            .unwrap_or(document.model_space.len().saturating_sub(1));
+        self.append_entity_with(document, entity, Transform2::identity(), false)
+    }
+
+    // --------------------------------------------------------
+    // Method: append_entity_with
+    // Purpose: Draw one entity under a world transform. Block-edit
+    //          members pass the open instance transform and stay bright.
+    // --------------------------------------------------------
+    pub fn append_entity_with(
+        &mut self,
+        document: &Document,
+        entity: &Entity,
+        transform: Transform2,
+        dim: bool,
+    ) -> Option<AppendedGeometry> {
+        let line_start = self.line_vertices.len() as u32;
+        let fill_start = self.triangle_vertices.len() as u32;
+        let before = self.picks.len();
         let mut stack = Vec::new();
-        let appended = emit_top_level_entity(document, entity, entity_index, self, &mut stack)?;
+        emit_pickable_entity(
+            document, entity, transform, entity.id, dim, self, &mut stack,
+        );
+        if self.picks.len() == before {
+            return None;
+        }
         let slot = (self.picks.len() - 1) as u32;
         let bounds = self.picks[slot as usize].bounds;
         if self.spatial.is_empty() {
@@ -133,19 +151,43 @@ impl DisplayList {
         } else {
             self.spatial.insert(slot, bounds);
         }
-        Some(appended)
+        Some(AppendedGeometry {
+            line_start,
+            fill_start,
+        })
     }
 
     pub fn replace_entity(&mut self, document: &Document, entity: &Entity) -> bool {
+        self.replace_entity_with(document, entity, Transform2::identity())
+    }
+
+    pub fn replace_entity_with(
+        &mut self,
+        document: &Document,
+        entity: &Entity,
+        transform: Transform2,
+    ) -> bool {
         if !self.pick_of.contains_key(&entity.id) {
-            return self.append_entity(document, entity).is_some();
+            return self
+                .append_entity_with(document, entity, transform, false)
+                .is_some();
         }
         let mut scratch = DisplayList {
             origin: self.origin,
             ..DisplayList::default()
         };
+        let before = scratch.picks.len();
         let mut stack = Vec::new();
-        if emit_top_level_entity(document, entity, 0, &mut scratch, &mut stack).is_none() {
+        emit_pickable_entity(
+            document,
+            entity,
+            transform,
+            entity.id,
+            false,
+            &mut scratch,
+            &mut stack,
+        );
+        if scratch.picks.len() == before {
             return self.remove_entity(entity.id);
         }
         let Some(&slot) = self.pick_of.get(&entity.id) else {
@@ -153,8 +195,12 @@ impl DisplayList {
         };
         let old_range = self.draw_ranges[slot as usize];
         let old_bounds = self.picks[slot as usize].bounds;
-        let new_pick = scratch.picks.pop().expect("tessellated pick");
-        let new_range = scratch.draw_ranges.pop().expect("tessellated range");
+        let Some(new_pick) = scratch.picks.pop() else {
+            return false;
+        };
+        let Some(new_range) = scratch.draw_ranges.pop() else {
+            return false;
+        };
         let new_line_count = new_range.line_end - new_range.line_start;
         let new_fill_count = new_range.fill_end - new_range.fill_start;
         let old_line_count = old_range.line_end - old_range.line_start;
@@ -214,6 +260,68 @@ impl DisplayList {
         self.draw_ranges[slot as usize] = EntityDrawRange::default();
         self.pick_of.remove(&entity_id);
         true
+    }
+
+    // --------------------------------------------------------
+    // Method: derive_block_edit
+    // Purpose: Build a one-level in-place edit from the model-space
+    //          picture. Context vertices are dimmed in place and only
+    //          the open block is redrawn, so the first open does not
+    //          walk the whole drawing again.
+    //          Returns None for nested edits and for an INSERT that is
+    //          not a direct model-space entity.
+    // --------------------------------------------------------
+    pub fn derive_block_edit(
+        &self,
+        document: &Document,
+        view: &BlockEditView,
+    ) -> Option<DisplayList> {
+        if view.frames.len() != 1 {
+            return None;
+        }
+        let frame = &view.frames[0];
+        let entity = document
+            .model_space
+            .iter()
+            .find(|candidate| candidate.id == frame.instance_id)?;
+        if !matches!(entity.geometry, cad_core::Geometry::Insert { .. }) {
+            return None;
+        }
+        let mut list = self.clone();
+        dim_vertex_colors(&mut list.line_vertices);
+        dim_vertex_colors(&mut list.triangle_vertices);
+        list.remove_entity(entity.id);
+        let appended_at = list.picks.len();
+        let mut stack = Vec::new();
+        emit_edited_insert(
+            document,
+            entity,
+            Transform2::identity(),
+            0,
+            view,
+            &mut list,
+            &mut stack,
+        );
+        list.index_appended_picks(appended_at);
+        Some(list)
+    }
+
+    fn index_appended_picks(&mut self, start: usize) {
+        if start >= self.picks.len() {
+            return;
+        }
+        if self.spatial.is_empty() {
+            self.spatial = SpatialIndex::build(
+                self.picks
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, pick)| (slot as u32, pick.bounds)),
+            );
+            return;
+        }
+        for slot in start..self.picks.len() {
+            self.spatial.insert(slot as u32, self.picks[slot].bounds);
+        }
     }
 }
 
@@ -433,70 +541,106 @@ fn emit_block_edit_space(
 ) {
     let next = view.frames.get(depth);
     for entity in entities {
-        if next.is_some_and(|frame| entity.id == frame.instance_id) {
-            if let cad_core::Geometry::Insert {
-                block_name,
-                insertion,
-                scale,
-                rotation,
-                extrusion,
-                column_count,
-                row_count,
-                column_spacing,
-                row_spacing,
-                ..
-            } = &entity.geometry
-            {
-                if stack.iter().any(|n| n.eq_ignore_ascii_case(block_name)) {
-                    continue;
-                }
-                let Some(block) = document.block_by_name(block_name) else {
-                    continue;
-                };
-                stack.push(block_name.clone());
-                let local = Transform2::block_insert(
-                    *insertion,
-                    *scale,
-                    *rotation,
-                    *extrusion,
-                    block.base_pt,
-                );
-                let nested = transform.then(local);
-                let cols = (*column_count).max(1);
-                let rows = (*row_count).max(1);
-                for col in 0..cols {
-                    for row in 0..rows {
-                        let extra = Transform2::translate(
-                            col as f64 * *column_spacing,
-                            row as f64 * *row_spacing,
-                        );
-                        let instance = nested.then(extra);
-                        if depth + 1 == view.frames.len() {
-                            for child in &block.entities {
-                                emit_pickable_entity(
-                                    document, child, instance, child.id, false, list, stack,
-                                );
-                            }
-                        } else {
-                            emit_block_edit_space(
-                                document,
-                                &block.entities,
-                                instance,
-                                depth + 1,
-                                view,
-                                list,
-                                stack,
-                            );
-                        }
-                    }
-                }
-                stack.pop();
-                continue;
-            }
+        if next.is_some_and(|frame| entity.id == frame.instance_id)
+            && emit_edited_insert(document, entity, transform, depth, view, list, stack)
+        {
+            continue;
         }
         let dim = true;
         emit_pickable_entity(document, entity, transform, entity.id, dim, list, stack);
     }
+}
+
+// --------------------------------------------------------
+// Function: emit_edited_insert
+// Purpose: Draw one INSERT that is open for edit. Array cells share
+//          this path with the full rebuild and with derive_block_edit.
+//          Returns false when the entity is not an INSERT so the caller
+//          can draw it as ordinary dimmed context.
+// --------------------------------------------------------
+fn emit_edited_insert(
+    document: &Document,
+    entity: &cad_core::Entity,
+    transform: Transform2,
+    depth: usize,
+    view: &BlockEditView,
+    list: &mut DisplayList,
+    stack: &mut Vec<String>,
+) -> bool {
+    let cad_core::Geometry::Insert {
+        block_name,
+        insertion,
+        scale,
+        rotation,
+        extrusion,
+        column_count,
+        row_count,
+        column_spacing,
+        row_spacing,
+        ..
+    } = &entity.geometry
+    else {
+        return false;
+    };
+    if cad_core::nesting_too_deep(stack)
+        || stack
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(block_name))
+    {
+        return true;
+    }
+    let Some(block) = document.block_by_name(block_name) else {
+        return true;
+    };
+    stack.push(block_name.clone());
+    let local = Transform2::block_insert(*insertion, *scale, *rotation, *extrusion, block.base_pt);
+    let nested = transform.then(local);
+    let (cols, rows) = cad_core::clamped_array_counts(*column_count, *row_count);
+    let at_leaf = depth + 1 == view.frames.len();
+    for col in 0..cols {
+        for row in 0..rows {
+            let extra =
+                Transform2::translate(col as f64 * *column_spacing, row as f64 * *row_spacing);
+            let instance = nested.then(extra);
+            if at_leaf {
+                for child in &block.entities {
+                    emit_pickable_entity(document, child, instance, child.id, false, list, stack);
+                }
+            } else {
+                emit_block_edit_space(
+                    document,
+                    &block.entities,
+                    instance,
+                    depth + 1,
+                    view,
+                    list,
+                    stack,
+                );
+            }
+        }
+    }
+    stack.pop();
+    true
+}
+
+fn dim_vertex_colors(vertices: &mut [GpuVertex]) {
+    for vertex in vertices {
+        let alpha = vertex.color[3];
+        if alpha <= 0.0 {
+            continue;
+        }
+        let rgb = Rgb {
+            r: unorm8(vertex.color[0]),
+            g: unorm8(vertex.color[1]),
+            b: unorm8(vertex.color[2]),
+        };
+        let dimmed = rgb.dim_for_block_context().to_array();
+        vertex.color = [dimmed[0], dimmed[1], dimmed[2], alpha];
+    }
+}
+
+fn unorm8(channel: f32) -> u8 {
+    (channel * 255.0).round().clamp(0.0, 255.0) as u8
 }
 
 fn emit_pickable_entity(
@@ -597,94 +741,6 @@ fn emit_top_level_entity(
         line_start,
         fill_start,
     })
-}
-
-#[allow(dead_code)]
-fn emit_hatch_pattern(
-    list: &mut DisplayList,
-    transform: Transform2,
-    rgb: Rgb,
-    def: &cad_core::HatchPatternLine,
-    paths: &[HatchPath],
-) {
-    let mut hull = Vec::new();
-    for path in paths {
-        hull.extend(
-            hatch_path_points(path, cad_core::default_extrusion(), 0.0)
-                .into_iter()
-                .map(|p| transform.apply(p)),
-        );
-    }
-    if hull.len() < 2 {
-        return;
-    }
-    let mut min = hull[0];
-    let mut max = hull[0];
-    for p in &hull {
-        min.x = min.x.min(p.x);
-        min.y = min.y.min(p.y);
-        max.x = max.x.max(p.x);
-        max.y = max.y.max(p.y);
-    }
-    let dir = Point2::new(def.angle.cos(), def.angle.sin());
-    let offset = transform.apply(def.offset.xy()) - transform.apply(Point2::new(0.0, 0.0));
-    let step = offset.distance(Point2::new(0.0, 0.0)).max(1e-3);
-    let span = (max.x - min.x).max(max.y - min.y) * 2.0;
-    let n = ((span / step).ceil() as i32).clamp(1, 256);
-    let base = transform.apply(def.base.xy());
-    let perp = Point2::new(-dir.y, dir.x);
-    for i in -n..=n {
-        let origin = Point2::new(
-            base.x + perp.x * step * i as f64,
-            base.y + perp.y * step * i as f64,
-        );
-        let a = Point2::new(origin.x - dir.x * span, origin.y - dir.y * span);
-        let b = Point2::new(origin.x + dir.x * span, origin.y + dir.y * span);
-        if segment_hits_hull(a, b, &hull) {
-            let hatch_lt = LineType {
-                name: "HATCH".into(),
-                dashes: def.dashes.clone(),
-            };
-            if hatch_lt.is_continuous() {
-                emit_solid_polyline(list, &[a, b], false, rgb);
-            } else {
-                let pattern = scaled_pattern(&hatch_lt.dashes, 1.0);
-                for (p0, p1) in generate_path_dashes_with_tolerance(
-                    &[PathSeg::Line { a, b }],
-                    &pattern,
-                    true,
-                    0,
-                    None,
-                ) {
-                    push_line(list, p0, p1, rgb);
-                }
-            }
-        }
-    }
-}
-
-fn segment_hits_hull(a: Point2, b: Point2, hull: &[Point2]) -> bool {
-    let mid = a.lerp(b, 0.5);
-    point_in_polygon(mid, hull)
-}
-
-fn point_in_polygon(p: Point2, poly: &[Point2]) -> bool {
-    if poly.len() < 3 {
-        return false;
-    }
-    let mut inside = false;
-    let mut j = poly.len() - 1;
-    for i in 0..poly.len() {
-        let pi = poly[i];
-        let pj = poly[j];
-        if ((pi.y > p.y) != (pj.y > p.y))
-            && (p.x < (pj.x - pi.x) * (p.y - pi.y) / (pj.y - pi.y + 1e-30) + pi.x)
-        {
-            inside = !inside;
-        }
-        j = i;
-    }
-    inside
 }
 
 fn emit_solid_polyline(list: &mut DisplayList, pts: &[Point2], closed: bool, rgb: Rgb) {

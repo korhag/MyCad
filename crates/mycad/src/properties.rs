@@ -43,7 +43,15 @@ pub fn show(ui: &mut Ui, app: &mut MyCadApp) {
         };
         if selection.len() == 1 {
             if let Some(entity) = document.entity_by_id(selection[0]) {
-                show_single(ui, document, entity);
+                let references = match &entity.geometry {
+                    Geometry::Insert { block_name, .. } => Some(if app.tree_generation.is_some() {
+                        app.block_tree.reference_count(block_name)
+                    } else {
+                        cad_core::count_block_references(document, block_name)
+                    }),
+                    _ => None,
+                };
+                show_single(ui, document, entity, references);
             }
         } else {
             show_multiple(ui, document, selection);
@@ -69,7 +77,7 @@ pub fn show(ui: &mut Ui, app: &mut MyCadApp) {
     }
 }
 
-fn show_single(ui: &mut Ui, document: &Document, entity: &Entity) {
+fn show_single(ui: &mut Ui, document: &Document, entity: &Entity, references: Option<usize>) {
     ui.label(RichText::new(entity.geometry.type_name()).strong());
     ui.add_space(4.0);
     ui.label(RichText::new("Common").small().weak());
@@ -97,7 +105,7 @@ fn show_single(ui: &mut Ui, document: &Document, entity: &Entity) {
         .num_columns(2)
         .spacing([12.0, 4.0])
         .show(ui, |ui| {
-            geometry_rows(ui, document, &entity.geometry);
+            geometry_rows(ui, document, &entity.geometry, references);
         });
 }
 
@@ -148,7 +156,7 @@ fn show_multiple(ui: &mut Ui, document: &Document, ids: &[cad_core::EntityId]) {
         });
 }
 
-fn geometry_rows(ui: &mut Ui, document: &Document, geometry: &Geometry) {
+fn geometry_rows(ui: &mut Ui, document: &Document, geometry: &Geometry, references: Option<usize>) {
     let units = document.units;
     match geometry {
         Geometry::Line { start, end } => {
@@ -236,9 +244,8 @@ fn geometry_rows(ui: &mut Ui, document: &Document, geometry: &Geometry) {
             kv(
                 ui,
                 "References",
-                document
-                    .block_by_name(block_name)
-                    .map(|_| cad_core::count_block_references(document, block_name).to_string())
+                references
+                    .map(|count| count.to_string())
                     .unwrap_or_else(|| "missing".into()),
             );
             kv(ui, "Insertion", point_label(*insertion));
@@ -276,6 +283,9 @@ fn geometry_rows(ui: &mut Ui, document: &Document, geometry: &Geometry) {
             kv(ui, "Insertion", point_label(text.insertion));
             kv(ui, "Height", format_num(text.height));
             kv(ui, "Rotation", format_angle_deg(text.rotation));
+            if let Some(attribute) = &text.attribute {
+                kv(ui, "Tag", attribute.tag.clone());
+            }
             kv(ui, "Value", truncate(&text.value, 48));
         }
         Geometry::MText(text) => {
@@ -297,11 +307,30 @@ fn geometry_rows(ui: &mut Ui, document: &Document, geometry: &Geometry) {
             kv(ui, "Corner 2", point_label(corners[1]));
         }
         Geometry::Leader { vertices } => kv(ui, "Vertices", vertices.len().to_string()),
+        Geometry::Image(frame) | Geometry::Wipeout(frame) => {
+            kv(ui, "Corner", point_label(frame.corner));
+            if !frame.path.is_empty() {
+                kv(ui, "Path", frame.path.clone());
+            }
+        }
+        Geometry::Viewport(viewport) => {
+            kv(ui, "Center", point_label(viewport.center));
+            kv(ui, "Width", format_length(viewport.width, units));
+            kv(ui, "Height", format_length(viewport.height, units));
+            kv(
+                ui,
+                "View height",
+                format_length(viewport.view_height, units),
+            );
+        }
         Geometry::MLine { vertices, closed } => {
             kv(ui, "Vertices", vertices.len().to_string());
             kv(ui, "Closed", yes_no(*closed));
         }
-        Geometry::Dimension { block_name } => kv(ui, "Block", block_name.clone()),
+        Geometry::Dimension(data) => {
+            kv(ui, "Block", data.block_name.clone());
+            kv(ui, "Style", data.dimstyle.clone());
+        }
     }
 }
 

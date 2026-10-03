@@ -21,14 +21,51 @@ pub fn is_continuous_name(name: &str) -> bool {
 }
 
 // ------------------------------------------------------------
+// Type: LineTypeShape
+// Purpose: One complex dash (shape or text) stored with the pattern.
+//          The viewport draws dash lengths only.
+// ------------------------------------------------------------
+#[derive(Debug, Clone, PartialEq)]
+pub struct LineTypeShape {
+    pub flag: u16,
+    pub shapecode: u16,
+    pub text: String,
+    pub scale: f64,
+    pub rotation: f64,
+    pub x_offset: f64,
+    pub y_offset: f64,
+    pub style: String,
+    /// Shape-file font, such as `ltypeshp.shx`, when the dash is not a text style.
+    pub shape_file: String,
+}
+
+impl Default for LineTypeShape {
+    fn default() -> Self {
+        Self {
+            flag: 0,
+            shapecode: 0,
+            text: String::new(),
+            scale: 1.0,
+            rotation: 0.0,
+            x_offset: 0.0,
+            y_offset: 0.0,
+            style: String::new(),
+            shape_file: String::new(),
+        }
+    }
+}
+
+// ------------------------------------------------------------
 // Type: LineType
 // Purpose: Named dash pattern in world units (positive = dash,
 //          negative = gap, zero = dot). Empty pattern is continuous.
+//          `shapes` is parallel to `dashes`; None is a plain dash.
 // ------------------------------------------------------------
 #[derive(Debug, Clone, PartialEq)]
 pub struct LineType {
     pub name: String,
     pub dashes: Vec<f64>,
+    pub shapes: Vec<Option<LineTypeShape>>,
 }
 
 impl LineType {
@@ -36,6 +73,7 @@ impl LineType {
         Self {
             name: name.into(),
             dashes: Vec::new(),
+            shapes: Vec::new(),
         }
     }
 
@@ -60,6 +98,11 @@ impl LineType {
         Self {
             name: name.to_string(),
             dashes,
+            shapes: Vec::new(),
         }
+    }
+
+    pub fn shape_at(&self, index: usize) -> Option<&LineTypeShape> {
+        self.shapes.get(index).and_then(|shape| shape.as_ref())
     }
 }

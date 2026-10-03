@@ -22,6 +22,9 @@ pub struct BlockEditFrame {
     pub baseline: BlockDefinition,
     pub dirty: bool,
     pub undo_mark: usize,
+    /// References of this block, counted once on enter. A block cannot
+    /// reference itself, so the count cannot change while it is open.
+    pub reference_count: usize,
 }
 
 // ------------------------------------------------------------
@@ -217,6 +220,7 @@ impl BlockEditSession {
         let local = insert_transform(document, entity)
             .ok_or_else(|| "Block transform is not available".to_string())?;
         let world_from_local = parent_world.then(local);
+        let reference_count = count_block_references(document, &definition.name);
         self.stack.push(BlockEditFrame {
             block_name: definition.name.clone(),
             instance_id,
@@ -225,6 +229,7 @@ impl BlockEditSession {
             baseline: definition,
             dirty: false,
             undo_mark: history.undo_len(),
+            reference_count,
         });
         self.ui = BlockUi::None;
         Ok(())
@@ -325,7 +330,7 @@ pub fn insert_is_editable(entity: &Entity) -> bool {
 fn rewrite_baseline_block_names(entities: &mut [Entity], from: &str, to: &str) {
     for entity in entities {
         match &mut entity.geometry {
-            Geometry::Insert { block_name, .. } | Geometry::Dimension { block_name } => {
+            Geometry::Insert { block_name, .. } => {
                 if block_name.eq_ignore_ascii_case(from) {
                     *block_name = to.to_string();
                 }
@@ -338,7 +343,6 @@ fn rewrite_baseline_block_names(entities: &mut [Entity], from: &str, to: &str) {
 pub fn show_toolbar(
     ui: &mut Ui,
     session: &BlockEditSession,
-    document: &Document,
     can_add: bool,
     can_remove: bool,
 ) -> ToolbarAction {
@@ -346,7 +350,7 @@ pub fn show_toolbar(
         return ToolbarAction::None;
     };
     let mut action = ToolbarAction::None;
-    let references = count_block_references(document, &frame.block_name);
+    let references = frame.reference_count;
     egui::Frame::new()
         .fill(Color32::from_rgb(28, 38, 36))
         .inner_margin(egui::Margin::symmetric(8, 6))

@@ -214,9 +214,10 @@ fn nested_dependency_revisions(
     stack: &mut Vec<String>,
 ) -> Vec<(u64, u64)> {
     let mut revisions = Vec::new();
-    if stack
-        .iter()
-        .any(|name| name.eq_ignore_ascii_case(&definition.name))
+    if crate::nesting_too_deep(stack)
+        || stack
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(&definition.name))
     {
         return revisions;
     }
@@ -871,7 +872,7 @@ pub fn materialize_evaluated_with(
         }
     }
     let mut model = std::mem::take(&mut evaluated.model_space);
-    rewrite_entities(source, &mut evaluated, cache, request, &mut model)?;
+    rewrite_entities(source, &mut evaluated, cache, request, &mut model, 0)?;
     evaluated.model_space = model;
     let source_names: Vec<String> = source.blocks.keys().cloned().collect();
     for name in source_names {
@@ -884,7 +885,7 @@ pub fn materialize_evaluated_with(
         else {
             continue;
         };
-        rewrite_entities(source, &mut evaluated, cache, request, &mut entities)?;
+        rewrite_entities(source, &mut evaluated, cache, request, &mut entities, 0)?;
         if let Some(block) = evaluated.block_by_name_mut(&name) {
             block.entities = entities;
         }
@@ -920,7 +921,7 @@ pub fn apply_definition_preview(
     };
     let preview = evaluate_definition(source, &definition, Some(config), cache, request)?;
     let mut entities = preview.entities.clone();
-    rewrite_entities(source, evaluated, cache, request, &mut entities)?;
+    rewrite_entities(source, evaluated, cache, request, &mut entities, 0)?;
     if let Some(block) = evaluated.block_by_name_mut(block_name) {
         block.entities = entities;
     }
@@ -933,7 +934,11 @@ fn rewrite_entities(
     cache: &mut EvaluationCache,
     request: EvaluationRequest,
     entities: &mut [Entity],
+    depth: usize,
 ) -> Result<(), DynamicError> {
+    if depth >= crate::MAX_BLOCK_DEPTH {
+        return Ok(());
+    }
     for entity in entities.iter_mut() {
         let Some(block_name) = entity.geometry.insert_block_name().map(str::to_string) else {
             continue;
@@ -951,7 +956,14 @@ fn rewrite_entities(
         let evaluated_block =
             evaluate_definition(source, definition, config.as_ref(), cache, request)?;
         let mut generated = evaluated_definition(definition, evaluated_block.as_ref());
-        rewrite_entities(source, evaluated, cache, request, &mut generated.entities)?;
+        rewrite_entities(
+            source,
+            evaluated,
+            cache,
+            request,
+            &mut generated.entities,
+            depth + 1,
+        )?;
         let generated_name = generated.name.clone();
         evaluated.blocks.insert(generated_name.clone(), generated);
         if let Some(name) = entity.geometry.insert_block_name_mut() {
@@ -972,18 +984,45 @@ fn evaluated_definition(source: &BlockDefinition, evaluated: &EvaluatedBlock) ->
     definition
 }
 
+// ------------------------------------------------------------
+// Type: DynamicExportLink
+// Purpose: One flattened block written to DWG/DXF, and the dynamic
+//          definition plus instance values it stands for.
+// ------------------------------------------------------------
+#[derive(Debug, Clone, PartialEq)]
+pub struct DynamicExportLink {
+    pub export_block: String,
+    pub source_block: String,
+    pub configuration: InstanceConfiguration,
+}
+
+// ------------------------------------------------------------
+// Type: MaterializedExport
+// Purpose: Static document safe to write as DWG/DXF, plus the
+//          names a companion file needs to restore dynamic blocks.
+// ------------------------------------------------------------
+#[derive(Debug, Clone)]
+pub struct MaterializedExport {
+    pub document: Document,
+    pub links: Vec<DynamicExportLink>,
+    pub generated_blocks: Vec<String>,
+}
+
 pub fn export_materialized(
     source: &Document,
     cache: &mut EvaluationCache,
     request: EvaluationRequest,
-) -> Result<Document, DynamicError> {
+) -> Result<MaterializedExport, DynamicError> {
     let mut evaluated = materialize_evaluated(source, cache, request)?;
+    let pending = pending_export_links(source, &evaluated);
     let generated: Vec<String> = evaluated
         .blocks
         .keys()
         .filter(|name| is_generated_block_name(name))
         .cloned()
         .collect();
+    let mut links = Vec::new();
+    let mut generated_blocks = Vec::new();
     for name in generated {
         let Some(mut definition) = evaluated.remove_block_definition(&name) else {
             continue;
@@ -994,11 +1033,73 @@ pub fn export_materialized(
         for block in evaluated.blocks.values_mut() {
             rewrite_insert_block_name(&mut block.entities, &name, &export_name);
         }
-        definition.name = export_name.clone();
+        if let Some((source_block, configuration)) = pending.get(&name) {
+            links.push(DynamicExportLink {
+                export_block: export_name.clone(),
+                source_block: source_block.clone(),
+                configuration: configuration.clone(),
+            });
+        }
+        generated_blocks.push(export_name.clone());
+        definition.name = export_name;
         definition.dynamic = None;
         evaluated.replace_block_definition(definition);
     }
-    Ok(evaluated)
+    Ok(MaterializedExport {
+        document: evaluated,
+        links,
+        generated_blocks,
+    })
+}
+
+/// Top-level inserts only. Nested dynamic blocks are rebuilt from the parent
+/// configuration, so they do not need their own link.
+fn pending_export_links(
+    source: &Document,
+    evaluated: &Document,
+) -> BTreeMap<String, (String, InstanceConfiguration)> {
+    let mut links = BTreeMap::new();
+    note_export_inserts(source, evaluated, &evaluated.model_space, &mut links);
+    for block in evaluated.blocks.values() {
+        if is_generated_block_name(&block.name) || block.is_dynamic() {
+            continue;
+        }
+        note_export_inserts(source, evaluated, &block.entities, &mut links);
+    }
+    links
+}
+
+fn note_export_inserts(
+    source: &Document,
+    evaluated: &Document,
+    entities: &[Entity],
+    links: &mut BTreeMap<String, (String, InstanceConfiguration)>,
+) {
+    for entity in entities {
+        let Some(name) = entity.geometry.insert_block_name() else {
+            continue;
+        };
+        if !is_generated_block_name(name) {
+            continue;
+        }
+        let Some(generated) = evaluated.block_by_name(name) else {
+            continue;
+        };
+        let configuration = entity
+            .geometry
+            .insert_configuration()
+            .cloned()
+            .unwrap_or_default();
+        match links.get(name) {
+            Some((_, existing)) if !existing.values.is_empty() => {}
+            _ => {
+                links.insert(
+                    name.to_string(),
+                    (definition_source_name(generated, source), configuration),
+                );
+            }
+        }
+    }
 }
 
 fn definition_source_name(generated: &BlockDefinition, source: &Document) -> String {
@@ -1432,13 +1533,40 @@ mod tests {
         let exported =
             export_materialized(&document, &mut EvaluationCache::default(), request).unwrap();
         let names: Vec<_> = exported
+            .document
             .model_space
             .iter()
             .map(|entity| entity.geometry.insert_block_name().unwrap().to_string())
             .collect();
         assert_ne!(names[0], names[1]);
-        let a = exported.block_by_name(&names[0]).unwrap();
-        let b = exported.block_by_name(&names[1]).unwrap();
+        assert_eq!(exported.links.len(), 2);
+        let mut spans = Vec::new();
+        for link in &exported.links {
+            assert_eq!(link.source_block, "AdjustableFrame");
+            assert!(exported.generated_blocks.contains(&link.export_block));
+            assert_eq!(
+                exported
+                    .document
+                    .block_by_name(&link.export_block)
+                    .and_then(|block| block.entities.get(1))
+                    .and_then(|entity| match &entity.geometry {
+                        Geometry::Line { start, .. } => Some(start.x),
+                        _ => None,
+                    }),
+                link.configuration
+                    .get(param)
+                    .and_then(|value| value.as_number())
+            );
+            spans.push(
+                link.configuration
+                    .get(param)
+                    .and_then(|value| value.as_number()),
+            );
+        }
+        spans.sort_by(|left, right| left.partial_cmp(right).unwrap());
+        assert_eq!(spans, vec![Some(800.0), Some(1600.0)]);
+        let a = exported.document.block_by_name(&names[0]).unwrap();
+        let b = exported.document.block_by_name(&names[1]).unwrap();
         assert!(a.dynamic.is_none());
         assert!(b.dynamic.is_none());
         let Geometry::Line { start: a_start, .. } = &a.entities[1].geometry else {

@@ -151,28 +151,6 @@ pub fn pick_entity(
     )
 }
 
-#[allow(dead_code)]
-pub fn box_pick_entities(
-    display: &DisplayList,
-    camera: &Camera2,
-    start: Point2,
-    current: Point2,
-    viewport_origin: Point2,
-    viewport_size: Point2,
-) -> (SelectBoxMode, Vec<EntityId>) {
-    let mut out = Vec::new();
-    let mode = box_pick_entities_into(
-        display,
-        camera,
-        start,
-        current,
-        viewport_origin,
-        viewport_size,
-        &mut out,
-    );
-    (mode, out)
-}
-
 pub fn box_pick_entities_into(
     display: &DisplayList,
     camera: &Camera2,

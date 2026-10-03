@@ -163,7 +163,8 @@ pub fn show(ui: &mut Ui, app: &mut MyCadApp) {
         }
     }
 
-    let index = app.block_tree.clone();
+    // Move the tree out for the frame so drawing it does not clone every name.
+    let index = std::mem::take(&mut app.block_tree);
     let query = app.blocks_panel.search.trim().to_ascii_lowercase();
     let active = app
         .block_edit
@@ -193,6 +194,7 @@ pub fn show(ui: &mut Ui, app: &mut MyCadApp) {
     if index.model_children().is_empty() && query.is_empty() {
         ui.weak("No blocks in model space.");
     }
+    app.block_tree = index;
 
     ui.add_space(8.0);
     ui.horizontal(|ui| {

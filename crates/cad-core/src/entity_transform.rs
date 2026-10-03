@@ -297,11 +297,31 @@ pub fn transform_geometry(
             vertices: vertices.iter().map(|p| matrix.apply3(*p)).collect(),
             closed: *closed,
         },
+        Geometry::Viewport(data) => {
+            let mut next = data.clone();
+            next.center = matrix.apply3(data.center);
+            next.width *= matrix.scale_x().abs();
+            next.height *= matrix.scale_y().abs();
+            Geometry::Viewport(next)
+        }
         Geometry::Hatch(hatch) => Geometry::Hatch(transform_hatch(hatch, matrix)?),
-        Geometry::Dimension { .. } => {
+        Geometry::Dimension(_) => {
             return Err(TransformError::Unsupported(vec![geometry.type_name()]));
         }
+        Geometry::Image(frame) => Geometry::Image(transform_frame(frame, matrix)),
+        Geometry::Wipeout(frame) => Geometry::Wipeout(transform_frame(frame, matrix)),
     })
+}
+
+fn transform_frame(
+    frame: &crate::entity::RasterFrame,
+    matrix: Transform2,
+) -> crate::entity::RasterFrame {
+    let mut next = frame.clone();
+    next.corner = matrix.apply3(frame.corner);
+    next.u_vector = apply_vector3(matrix, frame.u_vector);
+    next.v_vector = apply_vector3(matrix, frame.v_vector);
+    next
 }
 
 pub fn reference_radius<'a>(entities: impl IntoIterator<Item = &'a Entity>, base: Point2) -> f64 {
@@ -316,7 +336,7 @@ pub fn reference_radius<'a>(entities: impl IntoIterator<Item = &'a Entity>, base
 
 fn geometry_supported(geometry: &Geometry) -> Result<(), TransformError> {
     match geometry {
-        Geometry::Dimension { .. } => Err(TransformError::Unsupported(vec![geometry.type_name()])),
+        Geometry::Dimension(_) => Err(TransformError::Unsupported(vec![geometry.type_name()])),
         Geometry::Circle { extrusion, .. }
         | Geometry::Arc { extrusion, .. }
         | Geometry::Ellipse { extrusion, .. }
@@ -333,7 +353,10 @@ fn geometry_supported(geometry: &Geometry) -> Result<(), TransformError> {
         | Geometry::Polyline { .. }
         | Geometry::Spline { .. }
         | Geometry::Leader { .. }
-        | Geometry::MLine { .. } => Ok(()),
+        | Geometry::MLine { .. }
+        | Geometry::Viewport(_)
+        | Geometry::Image(_)
+        | Geometry::Wipeout(_) => Ok(()),
     }
 }
 
@@ -418,6 +441,8 @@ fn transform_text(data: &TextData, matrix: Transform2) -> TextData {
         valign: data.valign,
         width_factor: data.width_factor,
         oblique: data.oblique,
+        style: data.style.clone(),
+        attribute: data.attribute.clone(),
     }
 }
 
@@ -433,6 +458,7 @@ fn transform_mtext(data: &MTextData, matrix: Transform2) -> MTextData {
         extrusion: data.extrusion,
         attachment: data.attachment,
         line_spacing: data.line_spacing,
+        style: data.style.clone(),
     }
 }
 
@@ -462,6 +488,11 @@ fn transform_hatch(hatch: &HatchData, matrix: Transform2) -> Result<HatchData, T
         extrusion: hatch.extrusion,
         elevation: hatch.elevation,
         solid_fill: hatch.solid_fill,
+        pattern_name: hatch.pattern_name.clone(),
+        pattern_scale: hatch.pattern_scale,
+        pattern_angle: hatch.pattern_angle,
+        pattern_type: hatch.pattern_type,
+        double: hatch.double,
         paths,
         pattern_lines,
     })
@@ -600,7 +631,11 @@ fn representative_points(geometry: &Geometry) -> Vec<Point2> {
         Geometry::Leader { vertices } | Geometry::MLine { vertices, .. } => {
             vertices.iter().map(|p| p.xy()).collect()
         }
-        Geometry::Hatch(_) | Geometry::Dimension { .. } => Vec::new(),
+        Geometry::Viewport(viewport) => viewport.corners().iter().map(|p| p.xy()).collect(),
+        Geometry::Image(frame) | Geometry::Wipeout(frame) => {
+            frame.corners().iter().map(|point| point.xy()).collect()
+        }
+        Geometry::Hatch(_) | Geometry::Dimension(_) => Vec::new(),
     }
 }
 
@@ -860,10 +895,12 @@ mod tests {
             solid_fill: true,
             paths: Vec::new(),
             pattern_lines: Vec::new(),
+            ..HatchData::default()
         }));
-        let dimension = Entity::new(Geometry::Dimension {
+        let dimension = Entity::new(Geometry::Dimension(crate::entity::DimensionData {
             block_name: "*D1".into(),
-        });
+            ..crate::entity::DimensionData::default()
+        }));
         let err = validate_entities([&ok, &hatch, &dimension]).unwrap_err();
         assert_eq!(err, TransformError::Unsupported(vec!["Dimension"]));
         assert_eq!(err.to_string(), "Cannot transform Dimension");

@@ -5,9 +5,159 @@ All notable changes to MyCad are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project versions with [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Workspace version is `0.26.0` (`Cargo.toml`).
+Workspace version is `0.40.0` (`Cargo.toml`).
 
 ## [Unreleased]
+
+## [0.40.0] - 2026-10-03
+
+### Changed
+
+- Save continues without a prompt when every entity is kept. Classes LibreDWG could not read are listed in Diagnostics with a count, and the status bar names how many were not carried over.
+
+### Fixed
+
+- The class list counts only objects LibreDWG left unread. A class it decoded, such as SUN, is no longer treated as missing content.
+- A shape linetype keeps its shape font, such as `ltypeshp.shx`. The saved drawing writes a shape style for that font and the dash still points at it. Text in a complex dash, such as a zigzag letter, is kept in the AutoCAD 2000 file as well.
+
+## [0.39.0] - 2026-10-03
+
+### Added
+
+- Complex linetypes keep their shape and text dashes: flag, shapecode, text, scale, rotation, offsets, and style. They are written on the LTYPE record so AutoCAD can draw patterns such as FENCELINE1 and AMZIGZAG. The viewport and PDF still draw the dash lengths only.
+
+## [0.38.0] - 2026-10-03
+
+### Changed
+
+- A non-zero LibreDWG read status is named in the import warning. Status 68 is "unhandled class" and "value out of bounds", and the DXF names of classes that were not turned into entities are recorded when LibreDWG still has them.
+- Save lists those read losses, unhandled class names, and complex linetypes that could not be stored, next to unsupported entity counts. A drawing with none of those losses still saves without the prompt.
+
+## [0.37.0] - 2026-10-03
+
+### Added
+
+- Block attributes keep their tag, prompt, and flags. An INSERT is saved with ATTRIB entities and a SEQEND, and an ATTDEF stays an attribute definition.
+- Text styles are saved and restored on TEXT, MTEXT, and attributes. TrueType font names are kept in the file; the viewport still draws the stroke font.
+- Layers keep lock, plot, and lineweight, and entities keep a lineweight that is not ByLayer. PDF skips a layer that does not plot and strokes at the resolved lineweight. Move, copy, and the other edit commands leave objects on a locked layer unchanged; they can still be selected.
+- Hatch patterns keep their name, scale, angle, and definition lines. The viewport and PDF draw those lines.
+- Dimensions are saved as DIMENSION entities with their `*D` block and dimension style, so a reopened drawing still has a dimension rather than exploded lines.
+- External references keep their path. MyCad does not load the external drawing. An image or wipeout opened from a DWG is kept in the model and drawn as its frame. Saving writes that frame as a closed polyline: ODA File Converter rejects the raster object LibreDWG produces (`AcDbRasterImage` improperly read).
+
+### Fixed
+
+- A layer true color is saved and opened as that color, not as the blue byte of the color.
+- A sheet listed in the drawing is still written when its block is missing.
+- Saving and reopening no longer drops attribute values or hatch pattern lines from the comparison used by the round-trip tests.
+
+## [0.31.0] - 2026-10-02
+
+### Added
+
+- Paper space and extra sheets are saved as LAYOUT objects with their blocks (`*PAPER_SPACE`, `*PAPER_SPACE0`, and further sheets), VIEWPORT entities, and basic plot size and margins. A colleague opening the `-MyCad` copy keeps those sheets.
+
+### Changed
+
+- The unsupported-content prompt no longer lists paper space. Layouts are written with the drawing.
+
+## [0.30.0] - 2026-10-02
+
+### Added
+
+- **File → New** (`Ctrl+N`) starts an empty millimetre drawing on layer 0. Unsaved edits are kept until you confirm.
+
+### Changed
+
+- Saving a DWG or DXF writes an AutoCAD 2000 file with the tables, handles, and layout objects AutoCAD expects, so a colleague can open the `-MyCad` copy.
+- The unsupported-content prompt names each entity type and any paper-space layouts that will not be saved, and it says the original file is not overwritten.
+
+### Fixed
+
+- A varying-Z polyline is saved as a 3D POLYLINE and keeps every vertex when the file is opened again. TEXT, POLYLINE, and LEADER include the groups AutoCAD requires.
+- A linetype or layer used by an entity is added to the tables when the opened drawing did not include it. Characters AutoCAD rejects in names are replaced.
+
+## [0.29.0] - 2026-10-02
+
+### Added
+
+- Draw ELLIPSE, POLYGON, and POINT from the Home ribbon, the Draw menu, or the command line.
+- Modify with STRETCH, TRIM, EXTEND, and OFFSET. Each trim, extend, or offset click is its own undo step.
+- A Command dock below the viewport. Type an alias such as `L`, `TR`, or `EL`, then Enter or Space. An empty Enter repeats the last command. Restore it from **View → Show Command Line**.
+
+## [0.28.0] - 2026-10-02
+
+### Added
+
+- Saving a DWG or DXF also writes a companion file beside it (`Plant.dwg.mycad`). The drawing stays a normal AutoCAD file: dynamic blocks are ordinary static blocks there. Opening it in MyCad again restores those dynamic blocks when the companion is present. If the companion is missing, or a block was edited outside MyCad, that block stays static and the drawing still opens.
+
+### Changed
+
+- Drawings are no longer saved as a separate `.mycad` file. Older `.mycad` drawings still open.
+
+## [0.27.5] - 2026-10-02
+
+### Fixed
+
+- Drawing, moving, erasing, and undoing inside a block no longer freeze the window. Only the changed members update, and the other copies refresh in the background when you close the block.
+- A very deep block chain or a huge INSERT array can no longer hang or crash the app. Background work that fails is reported on the status line, and an unexpected stop writes `crash.log` with a message pointing to it.
+- Block fingerprint point collection builds again. Two helpers no longer borrow the same point list at once.
+
+### Changed
+
+- Full drawing rebuilds run in the background, so the picture you already see stays on screen while the new one is prepared.
+- Object snap looks at the nearest candidates in the aperture instead of every nearby object, so a dense drawing stays responsive while you draw.
+
+## [0.27.4] - 2026-10-02
+
+### Changed
+
+- Blocks open quickly the first time. The faded drawing is reused instead of redrawn, and a hovered or selected block is prepared in the background before you double-click.
+
+## [0.27.3] - 2026-10-02
+
+### Changed
+
+- Open starts on Drawing files, so `.mycad` and `.dwg` are both listed without changing the filter.
+
+## [0.27.2] - 2026-10-02
+
+### Changed
+
+- Show a spinning busy cursor and status text while a drawing opens, saves, previews, or prepares a block view, so waits are visible.
+
+## [0.27.1] - 2026-10-02
+
+### Fixed
+
+- Opening a block and pressing Escape no longer rebuild the whole drawing on the UI thread. The previous picture is restored immediately, and a first visit tessellates in the background so the window stays responsive.
+
+## [0.27.0] - 2026-10-02
+
+### Added
+
+- Object snap now includes quadrant, intersection, tangent, perpendicular, nearest, node, and insertion. POLAR (F10) and object snap tracking (F11) lock the cursor to a straight or angled path.
+- Shift+right-click, or Snap Overrides on the command menu, sets a one-shot snap. Right-click OSNAP or POLAR on the status bar to change running snaps and the angle increment.
+- Pausing on a snap tracks from that point. A typed length is measured along the tracking path from the tracked point.
+
+### Fixed
+
+- Center snap is offered when the cursor is on a CIRCLE or ARC rim, so concentric circles share a center without hovering the center itself.
+
+## [0.26.2] - 2026-10-02
+
+### Added
+
+- Troubleshooting now says to run `cargo clean --release` when the linker reports `LNK1207` or another corrupt build file left by a crashed compile.
+
+## [0.26.1] - 2026-10-02
+
+### Added
+
+- A pinned Rust toolchain and Windows, Fedora, and Arch build steps, plus troubleshooting for compiler crashes and a window that does not open.
+
+### Changed
+
+- When the window fails to open, MyCad prints how to pick a graphics backend (`WGPU_BACKEND`) and points at the GPU driver.
 
 ## [0.26.0] - 2026-10-01
 

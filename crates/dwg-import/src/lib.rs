@@ -12,6 +12,7 @@ use std::time::Instant;
 use cad_core::{Document, ImportDiagnostics};
 use thiserror::Error;
 
+mod classes;
 mod convert;
 mod dynapi;
 mod export;
@@ -90,9 +91,7 @@ fn import_cad_file(path: &Path, kind: CadReadKind) -> Result<Document, ImportErr
         ..Default::default()
     };
     if error != 0 {
-        diagnostics.warnings.push(format!(
-            "LibreDWG returned non-zero status {error} (non-critical)"
-        ));
+        diagnostics.warnings.push(format_libredwg_status(error));
     }
 
     let mut document = unsafe { convert::convert_document(dwg.as_mut(), path, diagnostics) };
@@ -126,6 +125,40 @@ pub(crate) fn version_label(version: i32) -> String {
     format!("LibreDWG version enum {version}")
 }
 
+/// Named LibreDWG error bits below `DWG_ERR_CLASSESNOTFOUND`.
+/// Status 68 is unhandled class (4) plus value out of bounds (64).
+pub(crate) fn libredwg_status_names(error: i32) -> Vec<&'static str> {
+    const BITS: &[(i32, &str)] = &[
+        (1, "wrong CRC"),
+        (2, "not yet supported"),
+        (4, "unhandled class"),
+        (8, "invalid type"),
+        (16, "invalid handle"),
+        (32, "invalid extended data"),
+        (64, "value out of bounds"),
+    ];
+    BITS.iter()
+        .filter(|(bit, _)| error & bit != 0)
+        .map(|(_, name)| *name)
+        .collect()
+}
+
+pub(crate) fn format_libredwg_status(error: i32) -> String {
+    let names = libredwg_status_names(error);
+    if names.is_empty() {
+        return format!("LibreDWG read reported status {error}");
+    }
+    let listed = match names.as_slice() {
+        [one] => (*one).to_string(),
+        [first, second] => format!("{first} and {second}"),
+        _ => {
+            let last = names[names.len() - 1];
+            format!("{} and {last}", names[..names.len() - 1].join(", "))
+        }
+    };
+    format!("LibreDWG read reported {listed} (status {error})")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,5 +166,17 @@ mod tests {
     #[test]
     fn ac1032_is_r2018() {
         assert_eq!(ac_magic_label("AC1032"), "R2018");
+    }
+
+    #[test]
+    fn status_68_names_unhandled_class_and_bounds() {
+        let names = libredwg_status_names(68);
+        assert!(names.contains(&"unhandled class"));
+        assert!(names.contains(&"value out of bounds"));
+        let warning = format_libredwg_status(68);
+        assert!(warning.contains("unhandled class"));
+        assert!(warning.contains("value out of bounds"));
+        assert!(warning.contains("68"));
+        assert!(!warning.contains("non-critical"));
     }
 }

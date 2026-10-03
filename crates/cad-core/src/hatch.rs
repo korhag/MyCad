@@ -334,6 +334,7 @@ mod tests {
                 is_ccw: true,
             }])],
             pattern_lines: Vec::new(),
+            ..HatchData::default()
         };
         let pts = hatch_path_points(&hatch.paths[0], hatch.extrusion, hatch.elevation);
         assert_point(pts[0], Point2::new(-1.0, 0.0), "start mirrored");

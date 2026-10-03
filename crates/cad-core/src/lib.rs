@@ -6,6 +6,7 @@
 pub mod block;
 pub mod color;
 pub mod compare;
+pub mod curve_edit;
 pub mod curves;
 pub mod dash;
 pub mod document;
@@ -20,28 +21,35 @@ pub mod geom;
 pub mod hatch;
 mod hershey_simplex;
 pub mod ids;
+mod intersect;
 pub mod linetype;
 pub mod measure;
 pub mod measure_index;
 pub mod perf;
 pub mod snap;
+pub mod snap_edges;
 pub mod stroke_font;
 pub mod thumbnail;
 pub mod transform;
 pub mod vectorize;
 
 pub use block::{
-    block_depends_on, count_block_references, create_block_from_entities,
+    block_depends_on, clamped_array_counts, count_block_references, create_block_from_entities,
     duplicate_block_definition, identity_insert, insert_instance_ids, insert_instance_ids_in_space,
-    insert_transform, is_system_block_name, is_user_editable_block_name, make_unique_block,
-    membership_matrix, next_user_block_name, purge_unused_user_blocks, rename_block,
-    resolve_block_name, transfer_entity, user_block_list, validate_block_rename,
+    insert_transform, is_paper_layout_block, is_system_block_name, is_user_editable_block_name,
+    make_unique_block, membership_matrix, nesting_too_deep, next_user_block_name,
+    paper_layout_block_order, purge_unused_user_blocks, rename_block, resolve_block_name,
+    sorted_paper_layout_blocks, transfer_entity, user_block_list, validate_block_rename,
     validate_user_block_name, would_create_block_cycle, BlockError, BlockListEntry, BlockTreeChild,
-    BlockTreeIndex, CreateBlockResult, MakeUniqueResult, TransferResult,
-    NON_UNIFORM_MEMBERSHIP_MESSAGE,
+    BlockTreeIndex, CreateBlockResult, MakeUniqueResult, TransferResult, MAX_BLOCK_DEPTH,
+    MAX_INSERT_ARRAY_CELLS, NON_UNIFORM_MEMBERSHIP_MESSAGE,
 };
-pub use color::{aci_rgb, CadColor, Rgb};
+pub use color::{aci_rgb, nearest_aci, CadColor, Rgb};
 pub use compare::{compare_documents, CompareTol, Mismatch};
+pub use curve_edit::{
+    extend_geometry, offset_geometry, stretch_geometry, trim_geometry, EditError, StretchOutcome,
+    TrimResult, MAX_EXTEND_EDGES, MAX_STRETCH_PREVIEW, MAX_TRIM_EDGES,
+};
 pub use curves::{
     arc_points, bspline_points, bulge_arc, catmull_rom_fit_points, circle_points,
     ellipse_arc_points, ellipse_points, polyline_points, polyline_points_with_tolerance,
@@ -50,6 +58,7 @@ pub use curves::{
 };
 pub use document::{
     BlockDefinition, Document, DrawingUnits, EntityLocation, EntitySpace, ImportDiagnostics, Layer,
+    PaperLayout, TextStyle,
 };
 pub use dynamic::{
     apply_anchor_policy, apply_size_axis, capability_for, collect_broken_bindings, dedupe_targets,
@@ -74,8 +83,11 @@ pub use dynamic_model::{
     TextReflectPolicy, TextToken, TransformKind, VisibilityGroup,
 };
 pub use entity::{
-    default_extrusion, Entity, EntityId, Geometry, HatchData, HatchEdge, HatchPath,
-    HatchPatternLine, MTextData, PolyVertex, TextData, TextHAlign, TextVAlign,
+    default_extrusion, AttributeInfo, DimensionData, DimensionKind, Entity, EntityId, Geometry,
+    HatchData, HatchEdge, HatchPath, HatchPatternLine, MTextData, PolyVertex, RasterFrame,
+    TextData, TextHAlign, TextVAlign, ViewportData, ATTRIB_CONSTANT, ATTRIB_INVISIBLE,
+    ATTRIB_PRESET, ATTRIB_VERIFY, LINEWEIGHT_BYBLOCK, LINEWEIGHT_BYLAYER, LINEWEIGHT_DEFAULT,
+    MAX_HATCH_PATTERN_SEGMENTS,
 };
 pub use entity_transform::{
     reference_radius, transform_entity, transform_entity_matrix, transform_geometry,
@@ -84,11 +96,11 @@ pub use entity_transform::{
 pub use evaluate::{
     apply_definition_preview, check_generation, document_has_dynamic_content, evaluate_definition,
     export_materialized, generated_block_name, is_generated_block_name, materialize_evaluated,
-    materialize_evaluated_with, EvalKey, EvaluatedBlock, EvaluationCache, EvaluationRequest,
-    GENERATED_BLOCK_PREFIX,
+    materialize_evaluated_with, DynamicExportLink, EvalKey, EvaluatedBlock, EvaluationCache,
+    EvaluationRequest, MaterializedExport, GENERATED_BLOCK_PREFIX,
 };
 pub use extents::Extents2;
-pub use fixtures::primitives_document;
+pub use fixtures::{autocad_features_document, primitives_document};
 pub use geom::{
     arc_from_three_points, ocs_to_wcs, ArcFromPointsError, Point2, Point3, ThreePointArc,
     GEOM_TOLERANCE,
@@ -97,6 +109,7 @@ pub use hatch::{hatch_path_points, hatch_path_points_with_tolerance};
 pub use ids::{ActionId, AnchorId, BlockDefinitionId, OptionId, ParameterId, PresetId, VertexId};
 pub use linetype::{
     is_byblock_name, is_bylayer_name, is_continuous_name, normalize_linetype_name, LineType,
+    LineTypeShape,
 };
 pub use measure::{
     arc_length, arc_sweep, bulge_circle, circle_area, format_angle_deg, format_area, format_length,
@@ -108,7 +121,8 @@ pub use measure_index::{
     area_from_primitive, radius_from_primitive, straight_of, MeasureGeom, MeasureIndex,
     MeasurePrimitive, MeasureRole, MEASURE_APERTURE_PX,
 };
-pub use snap::{SnapFeature, SnapIndex, SnapKind};
+pub use snap::{SnapFeature, SnapIndex, SnapKind, MAX_SNAP_CANDIDATES};
+pub use snap_edges::edge_snaps;
 pub use stroke_font::{
     expand_cad_codes, measure_styled_width, measure_width, strip_mtext, stroke_text,
     stroke_text_styled,

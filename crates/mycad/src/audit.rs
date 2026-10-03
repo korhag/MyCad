@@ -257,10 +257,11 @@ impl<'a> AuditCtx<'a> {
                 row_spacing,
                 ..
             } => {
-                if self
-                    .stack
-                    .iter()
-                    .any(|n| n.eq_ignore_ascii_case(block_name))
+                if cad_core::nesting_too_deep(&self.stack)
+                    || self
+                        .stack
+                        .iter()
+                        .any(|n| n.eq_ignore_ascii_case(block_name))
                 {
                     return;
                 }
@@ -284,8 +285,7 @@ impl<'a> AuditCtx<'a> {
                     extrusion: *extrusion,
                     base: block.base_pt,
                 });
-                let cols = (*column_count).max(1);
-                let rows = (*row_count).max(1);
+                let (cols, rows) = cad_core::clamped_array_counts(*column_count, *row_count);
                 let children = block.entities.clone();
                 let base = block.base_pt;
                 for col in 0..cols {
@@ -308,11 +308,13 @@ impl<'a> AuditCtx<'a> {
                 self.insert_stack.pop();
                 self.stack.pop();
             }
-            Geometry::Dimension { block_name } => {
-                if self
-                    .stack
-                    .iter()
-                    .any(|n| n.eq_ignore_ascii_case(block_name))
+            Geometry::Dimension(data) => {
+                let block_name = &data.block_name;
+                if cad_core::nesting_too_deep(&self.stack)
+                    || self
+                        .stack
+                        .iter()
+                        .any(|n| n.eq_ignore_ascii_case(block_name))
                 {
                     return;
                 }
@@ -487,6 +489,16 @@ impl<'a> AuditCtx<'a> {
                     &vertices.iter().map(|p| p.xy()).collect::<Vec<_>>(),
                     transform,
                 ),
+            Geometry::Image(frame) | Geometry::Wipeout(frame) => {
+                for corner in frame.corners() {
+                    self.consider_point("RASTER", corner.xy(), transform);
+                }
+            }
+            Geometry::Viewport(viewport) => {
+                for corner in viewport.corners() {
+                    self.consider_point("VIEWPORT", corner.xy(), transform);
+                }
+            }
         }
     }
 }
@@ -951,7 +963,9 @@ fn collect_linetype_usage(
         }
     }
     if let Geometry::Insert { block_name, .. } = &entity.geometry {
-        if stack.iter().any(|n| n.eq_ignore_ascii_case(block_name)) {
+        if cad_core::nesting_too_deep(stack)
+            || stack.iter().any(|n| n.eq_ignore_ascii_case(block_name))
+        {
             return;
         }
         let Some(block) = document.blocks.get(block_name) else {

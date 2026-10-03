@@ -28,6 +28,10 @@ pub fn show(ui: &mut Ui, app: &MyCadApp) {
     ui.monospace(format!("Objects: {}", d.object_count));
     ui.monospace(format!("Imported entities: {}", d.entity_total()));
     ui.monospace(format!("Unsupported entities: {}", d.unsupported_total()));
+    let paper_entities = doc.paper_space_entity_count();
+    if paper_entities > 0 {
+        ui.monospace(format!("Paper-space entities: {paper_entities}"));
+    }
     ui.monospace(format!("Import: {:.3}s", d.import_time.as_secs_f64()));
     ui.monospace(format!(
         "Render prepare: {:.3}s",
@@ -56,6 +60,13 @@ pub fn show(ui: &mut Ui, app: &MyCadApp) {
         ui.weak("None");
     } else {
         for (name, count) in &d.unsupported_counts {
+            ui.monospace(format!("{name:>24}  {count}"));
+        }
+    }
+    if !d.unhandled_classes.is_empty() {
+        ui.add_space(8.0);
+        ui.label("Not carried over on save");
+        for (name, count) in &d.unhandled_classes {
             ui.monospace(format!("{name:>24}  {count}"));
         }
     }

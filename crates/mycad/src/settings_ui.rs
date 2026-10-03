@@ -174,29 +174,69 @@ fn viewport_tab(ui: &mut egui::Ui, app: &mut MyCadApp) {
     ui.add_space(16.0);
     ui.separator();
     ui.heading("Drafting");
-    ui.checkbox(
-        &mut app.settings_draft.drafting.ortho_enabled,
-        "ORTHO enabled (F8)",
-    );
+    if ui
+        .checkbox(
+            &mut app.settings_draft.drafting.ortho_enabled,
+            "ORTHO enabled (F8)",
+        )
+        .changed()
+        && app.settings_draft.drafting.ortho_enabled
+    {
+        app.settings_draft.drafting.polar_enabled = false;
+    }
+    if ui
+        .checkbox(
+            &mut app.settings_draft.drafting.polar_enabled,
+            "POLAR tracking (F10)",
+        )
+        .changed()
+        && app.settings_draft.drafting.polar_enabled
+    {
+        app.settings_draft.drafting.ortho_enabled = false;
+    }
+    ui.horizontal(|ui| {
+        ui.label("Polar increment");
+        let current = crate::drafting::sanitize_polar_increment(
+            app.settings_draft.drafting.polar_increment_deg,
+        );
+        egui::ComboBox::from_id_salt("polar-increment")
+            .selected_text(format!("{current}°"))
+            .show_ui(ui, |ui| {
+                for increment in crate::drafting::POLAR_INCREMENTS_DEG {
+                    ui.selectable_value(
+                        &mut app.settings_draft.drafting.polar_increment_deg,
+                        increment,
+                        format!("{increment}°"),
+                    );
+                }
+            });
+    });
     ui.checkbox(
         &mut app.settings_draft.drafting.osnap_enabled,
         "Object snap enabled (F3)",
     );
+    ui.checkbox(
+        &mut app.settings_draft.drafting.otrack_enabled,
+        "Object snap tracking (F11)",
+    );
     ui.add_space(6.0);
     ui.label("Running object snaps");
+    let snaps = &mut app.settings_draft.drafting.running_snaps;
     ui.horizontal(|ui| {
-        ui.checkbox(
-            &mut app.settings_draft.drafting.running_snaps.endpoint,
-            "Endpoint",
-        );
-        ui.checkbox(
-            &mut app.settings_draft.drafting.running_snaps.midpoint,
-            "Midpoint",
-        );
-        ui.checkbox(
-            &mut app.settings_draft.drafting.running_snaps.center,
-            "Center",
-        );
+        ui.checkbox(&mut snaps.endpoint, "Endpoint");
+        ui.checkbox(&mut snaps.midpoint, "Midpoint");
+        ui.checkbox(&mut snaps.center, "Center");
+        ui.checkbox(&mut snaps.intersection, "Intersection");
+    });
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut snaps.quadrant, "Quadrant");
+        ui.checkbox(&mut snaps.node, "Node");
+        ui.checkbox(&mut snaps.insertion, "Insertion");
+    });
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut snaps.tangent, "Tangent");
+        ui.checkbox(&mut snaps.perpendicular, "Perpendicular");
+        ui.checkbox(&mut snaps.nearest, "Nearest");
     });
 }
 

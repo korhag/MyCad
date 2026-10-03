@@ -3,7 +3,9 @@
 mod app;
 mod audit;
 mod block_edit;
+mod block_prefetch;
 mod blocks;
+mod command_line;
 mod commands;
 mod config_form;
 mod context_menu;
@@ -11,6 +13,7 @@ mod diagnostics;
 mod drafting;
 mod dynamic_block;
 mod dynamic_input;
+mod edit_tools;
 mod history;
 mod home;
 mod input;
@@ -29,6 +32,11 @@ use std::env;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+// Printed when the window fails to open so a graphics problem is actionable
+// on any machine, including a VM or a Remote Desktop session.
+const GRAPHICS_STARTUP_HINT: &str = "\
+If the window did not open, update the GPU driver or set WGPU_BACKEND to dx12, vulkan, or gl.";
+
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     let import_only = args.iter().any(|a| a == "--import-only");
@@ -46,6 +54,8 @@ fn main() -> ExitCode {
             path.unwrap_or_else(perf_baseline::default_sample_path),
         );
     }
+
+    install_panic_hook();
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -66,9 +76,54 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("MyCad failed to start: {err}");
+            eprintln!("{GRAPHICS_STARTUP_HINT}");
             ExitCode::FAILURE
         }
     }
+}
+
+fn install_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let message = panic_message(info);
+        let location = info
+            .location()
+            .map(|place| format!("{}:{}:{}", place.file(), place.line(), place.column()))
+            .unwrap_or_else(|| "unknown location".into());
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        let body = format!(
+            "MyCad {}\n{message}\n{location}\n\n{backtrace}\n",
+            env!("CARGO_PKG_VERSION")
+        );
+        let path = crash_log_path();
+        let _ = std::fs::create_dir_all(path.parent().unwrap_or(std::path::Path::new(".")));
+        let _ = std::fs::write(&path, body);
+        let _ = rfd::MessageDialog::new()
+            .set_title("MyCad stopped unexpectedly")
+            .set_level(rfd::MessageLevel::Error)
+            .set_description(format!(
+                "MyCad hit an unexpected error.\n\nA report was saved to:\n{}",
+                path.display()
+            ))
+            .show();
+        previous(info);
+    }));
+}
+
+fn panic_message(info: &std::panic::PanicHookInfo<'_>) -> String {
+    if let Some(message) = info.payload().downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = info.payload().downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unexpected error".into()
+    }
+}
+
+fn crash_log_path() -> PathBuf {
+    eframe::storage_dir("MyCad")
+        .unwrap_or_else(std::env::temp_dir)
+        .join("crash.log")
 }
 
 fn run_import_only(path: Option<PathBuf>) -> ExitCode {

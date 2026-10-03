@@ -1,0 +1,21 @@
+---
+description: Keep the UI thread responsive and the app crash-safe
+alwaysApply: true
+---
+
+# Responsive UI
+
+The window must stay responsive. A large drawing must not freeze the UI thread, and bad file data must not crash or hang the app.
+
+- No O(drawing) work on the UI thread. That includes tessellation, snap and measure index builds, `Document` clones, file I/O, and block evaluation. Run it on a worker with a job id and a generation token. Keep the picture that is already on screen until the new one is ready, and discard a result whose job or generation is stale.
+- An edit updates only what changed, in model space and inside a block edit. A full rebuild is a background job, never a synchronous call on the UI thread.
+- Per-frame work is bounded by the snap aperture or the visible area. Every query has a named cap.
+- Do not call `Arc::make_mut` on the document while a worker may still hold it.
+- Do not use `unwrap`, `expect`, or unchecked indexing on user input or file data. Every INSERT walk respects `MAX_BLOCK_DEPTH` and the INSERT array cap.
+- Workers use `catch_unwind` and report the failure. A thread that fails to start is handled, not ignored.
+- Before finishing, `--perf-baseline` interaction and edit samples stay under 16 ms preferred and 33 ms maximum.
+
+```text
+BAD — refresh_derived() on the UI thread after a line inside a block
+GOOD — patch the changed member; rebuild the rest on the preview worker
+```

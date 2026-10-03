@@ -139,6 +139,8 @@ pub fn run_cpu_baseline(document: &Document, io: bool) -> BaselineReport {
     time_interaction(&display, extents, document, &mut samples);
     time_refresh_derived_proxy(document, &mut samples);
     time_block_edit(document, &mut samples);
+    time_block_member_patch(document, &mut samples);
+    time_dense_osnap(document, &mut samples);
 
     if io {
         time_save_export(document, &mut samples);
@@ -286,6 +288,88 @@ fn time_block_edit(document: &Document, samples: &mut Vec<Sample>) {
     });
 }
 
+fn time_block_member_patch(document: &Document, samples: &mut Vec<Sample>) {
+    let Some(entity) = document
+        .model_space
+        .iter()
+        .find(|entity| matches!(entity.geometry, Geometry::Insert { .. }))
+    else {
+        samples.push(Sample::with_detail(
+            "block_edit member patch",
+            Duration::ZERO,
+            "no INSERT in model space".into(),
+        ));
+        return;
+    };
+    let Geometry::Insert { block_name, .. } = &entity.geometry else {
+        return;
+    };
+    let Some(block) = document.block_by_name(block_name) else {
+        samples.push(Sample::with_detail(
+            "block_edit member patch",
+            Duration::ZERO,
+            "block definition missing".into(),
+        ));
+        return;
+    };
+    let Some(member) = block.entities.first().cloned() else {
+        samples.push(Sample::with_detail(
+            "block_edit member patch",
+            Duration::ZERO,
+            "block has no members".into(),
+        ));
+        return;
+    };
+    let view = BlockEditView {
+        frames: vec![BlockEditViewFrame {
+            instance_id: entity.id,
+            block_name: block_name.clone(),
+        }],
+    };
+    let mut display = tessellate_document_for_block_edit(document, &view);
+    let mut snaps = SnapIndex::build(document).into_block_edit(
+        document,
+        entity.id,
+        cad_core::Transform2::identity(),
+    );
+    timed("block_edit member patch", samples, || {
+        let _ =
+            display.append_entity_with(document, &member, cad_core::Transform2::identity(), false);
+        snaps.append_entity_with(
+            document,
+            &member,
+            cad_core::Transform2::identity(),
+            member.id,
+        );
+    });
+}
+
+fn time_dense_osnap(document: &Document, samples: &mut Vec<Sample>) {
+    let snaps = SnapIndex::build(document);
+    let measures = MeasureIndex::build(document);
+    let extents = document
+        .diagnostics
+        .extents
+        .or_else(|| document.compute_extents())
+        .unwrap_or_else(|| {
+            cad_core::Extents2::from_corners(Point2::new(-1.0, -1.0), Point2::new(1.0, 1.0))
+        });
+    let span = (extents.max.x - extents.min.x).max(extents.max.y - extents.min.y);
+    let half = (span / VIEW_HEIGHT * 12.0).max(1e-6);
+    let center = extents.center();
+    let region = cad_core::Extents2::from_corners(
+        Point2::new(center.x - half, center.y - half),
+        Point2::new(center.x + half, center.y + half),
+    );
+    timed("dense aperture osnap query", samples, || {
+        let mut points = Vec::new();
+        let mut edges = Vec::new();
+        snaps.query(region, &mut points);
+        measures.query(region, &mut edges);
+        (points.len(), edges.len())
+    });
+}
+
 fn time_save_export(document: &Document, samples: &mut Vec<Sample>) {
     let dir = std::env::temp_dir();
     let stem = format!("mycad-perf-{}", std::process::id());
@@ -395,6 +479,8 @@ mod tests {
             "entity_by_id (1)",
             "refresh_derived (Move/Undo/Erase proxy)",
             "tessellate_document_for_block_edit",
+            "block_edit member patch",
+            "dense aperture osnap query",
         ] {
             assert!(names.contains(&required), "missing {required} in {names:?}");
         }

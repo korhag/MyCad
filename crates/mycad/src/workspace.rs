@@ -21,6 +21,7 @@ pub enum WorkspaceTab {
     Diagnostics,
     Blocks,
     DynamicBlock,
+    CommandLine,
 }
 
 impl WorkspaceTab {
@@ -32,6 +33,7 @@ impl WorkspaceTab {
             Self::Diagnostics => "Diagnostics",
             Self::Blocks => "Blocks",
             Self::DynamicBlock => "Dynamic Block",
+            Self::CommandLine => "Command",
         }
     }
 }
@@ -65,9 +67,13 @@ pub fn default_dock_state() -> DockState<WorkspaceTab> {
         0.24,
         vec![WorkspaceTab::Properties, WorkspaceTab::Blocks],
     );
+    let [viewport, _diag] =
+        state
+            .main_surface_mut()
+            .split_right(viewport, 0.76, vec![WorkspaceTab::Diagnostics]);
     let _ = state
         .main_surface_mut()
-        .split_right(viewport, 0.76, vec![WorkspaceTab::Diagnostics]);
+        .split_below(viewport, 0.88, vec![WorkspaceTab::CommandLine]);
     state
 }
 
@@ -122,6 +128,26 @@ pub fn migrate_home_tab(state: &mut DockState<WorkspaceTab>, already_migrated: b
         );
     } else {
         state.push_to_focused_leaf(WorkspaceTab::Home);
+    }
+    true
+}
+
+pub fn migrate_command_line_tab(
+    state: &mut DockState<WorkspaceTab>,
+    already_migrated: bool,
+) -> bool {
+    if already_migrated || state.find_tab(&WorkspaceTab::CommandLine).is_some() {
+        return true;
+    }
+    if let Some((surface, node, _)) = state.find_tab(&WorkspaceTab::Viewport) {
+        let _ = state.split(
+            (surface, node),
+            Split::Below,
+            0.88,
+            Node::leaf(WorkspaceTab::CommandLine),
+        );
+    } else {
+        state.push_to_focused_leaf(WorkspaceTab::CommandLine);
     }
     true
 }
@@ -232,6 +258,17 @@ pub fn ensure_tab(state: &mut DockState<WorkspaceTab>, tab: WorkspaceTab) {
             return;
         }
     }
+    if tab == WorkspaceTab::CommandLine {
+        if let Some((surface, node, _)) = state.find_tab(&WorkspaceTab::Viewport) {
+            let _ = state.split(
+                (surface, node),
+                Split::Below,
+                0.88,
+                Node::leaf(WorkspaceTab::CommandLine),
+            );
+            return;
+        }
+    }
     state.push_to_focused_leaf(tab);
 }
 
@@ -324,6 +361,7 @@ impl TabViewer for WorkspaceViewer<'_> {
             WorkspaceTab::Diagnostics => crate::diagnostics::show(ui, self.app),
             WorkspaceTab::Blocks => crate::blocks::show(ui, self.app),
             WorkspaceTab::DynamicBlock => crate::dynamic_block::show_authoring(ui, self.app),
+            WorkspaceTab::CommandLine => crate::command_line::show(ui, self.app),
         }
     }
 
@@ -386,6 +424,7 @@ mod layout_tests {
         assert!(tabs.contains(&WorkspaceTab::Properties));
         assert!(tabs.contains(&WorkspaceTab::Blocks));
         assert!(tabs.contains(&WorkspaceTab::Diagnostics));
+        assert!(tabs.contains(&WorkspaceTab::CommandLine));
     }
 
     #[test]

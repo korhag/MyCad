@@ -65,10 +65,28 @@ pub trait VectorSink {
             self.fill(contour, rgb);
         }
     }
+
+    fn stroke_mm(&mut self, _mm: f64) {}
 }
 
 fn continuous() -> LineType {
     LineType::continuous("CONTINUOUS")
+}
+
+fn resolved_stroke_mm(document: &Document, entity: &Entity) -> f64 {
+    let raw = match entity.lineweight {
+        crate::LINEWEIGHT_BYLAYER => document
+            .layer(&entity.layer)
+            .map(|layer| layer.lineweight)
+            .unwrap_or(crate::LINEWEIGHT_DEFAULT),
+        crate::LINEWEIGHT_BYBLOCK | crate::LINEWEIGHT_DEFAULT => crate::LINEWEIGHT_DEFAULT,
+        other => other,
+    };
+    if raw < 0 {
+        0.0
+    } else {
+        f64::from(raw) / 100.0
+    }
 }
 
 fn local_chord_tolerance(document: &Document, transform: Transform2) -> f64 {
@@ -281,7 +299,113 @@ fn mtext_first_baseline(attachment: i16, line_count: usize, cap: f64, step: f64)
     }
 }
 
+fn emit_hatch_pattern_lines(
+    sink: &mut impl VectorSink,
+    hatch: &crate::entity::HatchData,
+    contours: &[Vec<Point2>],
+    rgb: Rgb,
+) {
+    let mut lines = hatch.pattern_lines.clone();
+    if lines.is_empty() {
+        let angle = hatch.pattern_angle;
+        let scale = if hatch.pattern_scale.is_finite() && hatch.pattern_scale > 1e-6 {
+            hatch.pattern_scale
+        } else {
+            1.0
+        };
+        lines.push(crate::entity::HatchPatternLine {
+            angle,
+            base: Point3::default(),
+            offset: Point3::from_xy(-angle.sin() * scale, angle.cos() * scale),
+            dashes: Vec::new(),
+        });
+    }
+    let mut emitted = 0_usize;
+    for line in &lines {
+        if emitted >= crate::MAX_HATCH_PATTERN_SEGMENTS {
+            break;
+        }
+        let mut hull = Vec::new();
+        for contour in contours {
+            hull.extend(contour.iter().copied());
+        }
+        if hull.len() < 2 {
+            continue;
+        }
+        let mut min = hull[0];
+        let mut max = hull[0];
+        for point in &hull {
+            min.x = min.x.min(point.x);
+            min.y = min.y.min(point.y);
+            max.x = max.x.max(point.x);
+            max.y = max.y.max(point.y);
+        }
+        let dir = Point2::new(line.angle.cos(), line.angle.sin());
+        let offset = line.offset.xy();
+        let step = offset.x.hypot(offset.y).max(1e-3);
+        let span = (max.x - min.x).hypot(max.y - min.y).max(step) * 2.0;
+        let count = ((span / step).ceil() as i32).clamp(1, 64);
+        let base = line.base.xy();
+        let perp = Point2::new(-dir.y, dir.x);
+        for index in -count..=count {
+            if emitted >= crate::MAX_HATCH_PATTERN_SEGMENTS {
+                break;
+            }
+            let origin = Point2::new(
+                base.x + perp.x * step * f64::from(index),
+                base.y + perp.y * step * f64::from(index),
+            );
+            let a = Point2::new(origin.x - dir.x * span, origin.y - dir.y * span);
+            let b = Point2::new(origin.x + dir.x * span, origin.y + dir.y * span);
+            let mid = Point2::new((a.x + b.x) * 0.5, (a.y + b.y) * 0.5);
+            if contours
+                .iter()
+                .any(|contour| point_in_polygon(mid, contour))
+            {
+                sink.path(
+                    &[a, b],
+                    false,
+                    &line_chain(&[a, b], false),
+                    true,
+                    rgb,
+                    &continuous(),
+                    1.0,
+                );
+                emitted += 1;
+            }
+        }
+    }
+}
+
+fn point_in_polygon(point: Point2, poly: &[Point2]) -> bool {
+    if poly.len() < 3 {
+        return false;
+    }
+    let mut inside = false;
+    let mut previous = poly.len() - 1;
+    for index in 0..poly.len() {
+        let current = poly[index];
+        let prior = poly[previous];
+        if ((current.y > point.y) != (prior.y > point.y))
+            && (point.x
+                < (prior.x - current.x) * (point.y - current.y) / (prior.y - current.y + 1e-30)
+                    + current.x)
+        {
+            inside = !inside;
+        }
+        previous = index;
+    }
+    inside
+}
+
 fn emit_attrib(sink: &mut impl VectorSink, transform: Transform2, rgb: Rgb, attrib: &TextData) {
+    if attrib
+        .attribute
+        .as_ref()
+        .is_some_and(|info| info.invisible())
+    {
+        return;
+    }
     emit_text_data(sink, transform, rgb, attrib);
 }
 
@@ -308,6 +432,7 @@ pub fn vectorize_entity(
         .map(|l| l.color)
         .unwrap_or(CadColor::Aci(7));
     let rgb = entity.color.resolve(layer_color, block_color);
+    sink.stroke_mm(resolved_stroke_mm(document, entity));
     let linetype_name = document.resolved_linetype_name(entity, block_linetype);
     let linetype = document
         .linetype(&linetype_name)
@@ -330,7 +455,9 @@ pub fn vectorize_entity(
             row_spacing,
             configuration: _,
         } => {
-            if stack.iter().any(|n| n.eq_ignore_ascii_case(block_name)) {
+            if crate::nesting_too_deep(stack)
+                || stack.iter().any(|n| n.eq_ignore_ascii_case(block_name))
+            {
                 return;
             }
             let Some(block) = document.blocks.get(block_name) else {
@@ -342,8 +469,7 @@ pub fn vectorize_entity(
                 other => other,
             };
             let inherit_lt = document.resolved_linetype_name(entity, block_linetype);
-            let cols = (*column_count).max(1);
-            let rows = (*row_count).max(1);
+            let (cols, rows) = crate::clamped_array_counts(*column_count, *row_count);
             for col in 0..cols {
                 for row in 0..rows {
                     let extra = Transform2::translate(
@@ -379,8 +505,11 @@ pub fn vectorize_entity(
             }
             stack.pop();
         }
-        Geometry::Dimension { block_name } => {
-            if stack.iter().any(|n| n.eq_ignore_ascii_case(block_name)) {
+        Geometry::Dimension(data) => {
+            let block_name = &data.block_name;
+            if crate::nesting_too_deep(stack)
+                || stack.iter().any(|n| n.eq_ignore_ascii_case(block_name))
+            {
                 return;
             }
             if let Some(block) = document.blocks.get(block_name) {
@@ -602,6 +731,9 @@ pub fn vectorize_entity(
             if text.is_attrib_def && !stack.is_empty() {
                 return;
             }
+            if text.attribute.as_ref().is_some_and(|info| info.invisible()) {
+                return;
+            }
             emit_text_data(sink, transform, rgb, text);
         }
         Geometry::MText(text) => {
@@ -632,6 +764,8 @@ pub fn vectorize_entity(
             }
             if hatch.solid_fill {
                 sink.fill_even_odd(&contours, rgb);
+            } else {
+                emit_hatch_pattern_lines(sink, hatch, &contours, rgb);
             }
         }
         Geometry::Solid { corners, extrusion } => {
@@ -662,6 +796,38 @@ pub fn vectorize_entity(
                 scale,
             );
         }
+        Geometry::Image(frame) | Geometry::Wipeout(frame) => {
+            let pts: Vec<Point2> = frame
+                .corners()
+                .iter()
+                .map(|corner| transform.apply(corner.xy()))
+                .collect();
+            sink.path(
+                &pts,
+                true,
+                &line_chain(&pts, true),
+                true,
+                rgb,
+                &linetype,
+                scale,
+            );
+        }
+        Geometry::Viewport(viewport) => {
+            let pts: Vec<Point2> = viewport
+                .corners()
+                .iter()
+                .map(|corner| transform.apply(corner.xy()))
+                .collect();
+            sink.path(
+                &pts,
+                true,
+                &line_chain(&pts, true),
+                true,
+                rgb,
+                &linetype,
+                scale,
+            );
+        }
     }
 }
 
@@ -675,6 +841,8 @@ pub struct PlotStroke {
     pub points: Vec<Point2>,
     pub closed: bool,
     pub rgb: Rgb,
+    /// Millimetres. Zero keeps the PDF page default.
+    pub width_mm: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -721,6 +889,7 @@ impl PlotGeometry {
 struct CollectingSink {
     geometry: PlotGeometry,
     chord_tolerance: f64,
+    stroke_mm: f64,
 }
 
 fn points_usable(pts: &[Point2]) -> bool {
@@ -728,6 +897,10 @@ fn points_usable(pts: &[Point2]) -> bool {
 }
 
 impl VectorSink for CollectingSink {
+    fn stroke_mm(&mut self, mm: f64) {
+        self.stroke_mm = if mm.is_finite() && mm > 0.0 { mm } else { 0.0 };
+    }
+
     fn path(
         &mut self,
         pts: &[Point2],
@@ -751,6 +924,7 @@ impl VectorSink for CollectingSink {
                 points: pts.to_vec(),
                 closed,
                 rgb,
+                width_mm: self.stroke_mm,
             });
             return;
         }
@@ -772,6 +946,7 @@ impl VectorSink for CollectingSink {
                 points: vec![a, b],
                 closed: false,
                 rgb,
+                width_mm: self.stroke_mm,
             });
         }
     }
@@ -824,6 +999,7 @@ pub fn plot_geometry(document: &Document) -> PlotGeometry {
     let mut sink = CollectingSink {
         geometry: PlotGeometry::default(),
         chord_tolerance: document.display_chord_tolerance(),
+        stroke_mm: 0.0,
     };
     let mut stack = Vec::new();
     for entity in &document.model_space {
@@ -862,6 +1038,7 @@ mod tests {
                 frozen: false,
                 color: CadColor::Aci(7),
                 linetype: "CONTINUOUS".into(),
+                ..Layer::default()
             },
         );
     }
@@ -1069,6 +1246,7 @@ mod tests {
                 },
             ],
             pattern_lines: Vec::new(),
+            ..HatchData::default()
         })));
         let plot = plot_geometry(&document);
         assert_eq!(plot.fills.len(), 1);

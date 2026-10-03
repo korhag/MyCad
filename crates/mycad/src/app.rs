@@ -13,19 +13,21 @@ use cad_core::{
     insert_instance_ids_in_space, make_unique_block, materialize_evaluated,
     materialize_evaluated_with, membership_matrix, purge_unused_user_blocks, reference_radius,
     transfer_entity, transform_entity_matrix, transform_geometry, validate_block_rename,
-    validate_entities, would_create_block_cycle, BlockTreeIndex, Document, Entity, EntityId,
-    EntitySpace, EntityTransform, EvaluationCache, EvaluationRequest, Extents2, Geometry,
-    InstanceConfiguration, MeasureIndex, MeasureRole, MeasurementResult, ParameterId, Point2,
-    Point3, SnapFeature, SnapIndex, Transform2, TransformError, GEOM_TOLERANCE,
+    validate_entities, would_create_block_cycle, BlockTreeIndex, Document, DrawingUnits, Entity,
+    EntityId, EntitySpace, EntityTransform, EvaluationCache, EvaluationRequest, Extents2, Geometry,
+    InstanceConfiguration, MaterializedExport, MeasureIndex, MeasureRole, MeasurementResult,
+    ParameterId, Point2, Point3, SnapFeature, SnapIndex, Transform2, TransformError,
+    GEOM_TOLERANCE,
 };
 use cad_io::{
-    export_pdf, read_mycad, write_dxf, write_mycad, CadFileFormat, DxfExportOptions,
-    PdfExportOptions, PdfOrientation, PdfPaperSize, PdfPlotArea, PdfPlotStyle, SaveReport,
-    PDF_MARGIN_MM, PDF_STROKE_WEIGHTS,
+    apply_companion, companion_path, drawing_for_companion, export_pdf, read_companion_optional,
+    read_mycad, write_companion, write_dxf, CadFileFormat, DxfExportOptions, PdfExportOptions,
+    PdfOrientation, PdfPaperSize, PdfPlotArea, PdfPlotStyle, SaveReport, PDF_MARGIN_MM,
+    PDF_STROKE_WEIGHTS,
 };
 use cad_render::{
-    tessellate_document, tessellate_document_for_block_edit, CadFrame, CadGpu, DisplayList,
-    GpuUpload, OverlayBatches, SelectBoxMode,
+    tessellate_document, tessellate_document_for_block_edit, BlockEditView, BlockEditViewFrame,
+    CadFrame, CadGpu, DisplayList, GpuUpload, OverlayBatches, SelectBoxMode,
 };
 use cad_viewport::Camera2;
 use dwg_import::{write_dwg, DwgWriteError, ExportError as DwgExportError, ImportError};
@@ -36,6 +38,7 @@ use crate::block_edit::{
     self, insert_is_editable, BlockEditSession, BlockUi, CreateBlockDialog, CreateDialogResult,
     LeaveChoice, LeaveIntent, ToolbarAction,
 };
+use crate::block_prefetch::{BlockPrefetch, HoverQuery, PrefetchJob, PrefetchReadiness};
 use crate::blocks::BlocksPanel;
 use crate::commands::{
     AngleState, AreaState, CommandKind, CommandOutput, CommandState, ModifyKind,
@@ -44,7 +47,7 @@ use crate::context_menu::{self, ContextAction, ContextKind, MenuResult, Viewport
 use crate::drafting::DraftingState;
 use crate::dynamic_block::{AuthoringPick, AuthoringState, ConvertDialog, ConvertDialogResult};
 use crate::dynamic_input::{DynamicInput, DynamicKeyResult, DynamicLayout, LiveValues};
-use crate::history::{Edit, History, ModelSpaceChange, Transaction};
+use crate::history::{Edit, History, SpaceChange, Transaction};
 use crate::input::{InputAction, InputMap};
 use crate::measurement::{self, CardAction, MeasurementOverlay};
 use crate::selection::{box_pick_entities_into, pick_entity, Selection, SelectionOp};
@@ -54,7 +57,60 @@ use crate::theme;
 use crate::workspace::{self, WorkspaceTab};
 
 const SELECTION_OVERLAY_COLOR: [f32; 4] = [255.0 / 255.0, 196.0 / 255.0, 72.0 / 255.0, 1.0];
+
+fn catch_worker<T>(work: impl FnOnce() -> T) -> Result<T, String> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)) {
+        Ok(value) => Ok(value),
+        Err(payload) => Err(panic_payload(payload.as_ref())),
+    }
+}
+
+fn panic_payload(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "Background work failed".into()
+    }
+}
+
+fn rekey_index(
+    snaps: Arc<SnapIndex>,
+    document: &Document,
+    rekey: bool,
+    instance_id: Option<EntityId>,
+    world_from_local: Transform2,
+) -> SnapIndex {
+    if rekey {
+        if let Some(id) = instance_id {
+            return (*snaps)
+                .clone()
+                .into_block_edit(document, id, world_from_local);
+        }
+    }
+    (*snaps).clone()
+}
+
+fn rekey_measures(
+    measures: Arc<MeasureIndex>,
+    document: &Document,
+    rekey: bool,
+    instance_id: Option<EntityId>,
+    world_from_local: Transform2,
+) -> MeasureIndex {
+    if rekey {
+        if let Some(id) = instance_id {
+            return (*measures)
+                .clone()
+                .into_block_edit(document, id, world_from_local);
+        }
+    }
+    (*measures).clone()
+}
 const SAVE_TOOLTIP: &str = "Save\nCtrl+S";
+/// How long a background job must run before the busy cursor appears.
+const BUSY_CUE_DELAY_SECS: f64 = 0.15;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PdfPlotAreaKind {
@@ -105,6 +161,7 @@ enum LoadMsg {
         display: Box<DisplayList>,
         snaps: Box<SnapIndex>,
         measures: Box<MeasureIndex>,
+        companion_note: Option<String>,
     },
     Failure {
         path: PathBuf,
@@ -117,6 +174,7 @@ enum PreviewMsg {
         document_generation: u64,
         session_generation: u64,
         preview_generation: u64,
+        view_frames: Vec<EntityId>,
         display: Box<DisplayList>,
         snaps: Box<SnapIndex>,
         measures: Box<MeasureIndex>,
@@ -126,28 +184,140 @@ enum PreviewMsg {
         document_generation: u64,
         session_generation: u64,
         preview_generation: u64,
+        view_frames: Vec<EntityId>,
         message: String,
     },
+}
+
+/// Model space or a nested in-place edit, for one document generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ViewKey {
+    pub(crate) generation: u64,
+    pub(crate) frames: Vec<EntityId>,
+}
+
+struct CachedView {
+    key: ViewKey,
+    display: Arc<DisplayList>,
+    snaps: Arc<SnapIndex>,
+    measures: Arc<MeasureIndex>,
+}
+
+#[derive(Default)]
+struct ViewCache {
+    entries: Vec<CachedView>,
+}
+
+impl ViewCache {
+    fn get(&self, key: &ViewKey) -> Option<CachedView> {
+        self.entries
+            .iter()
+            .rev()
+            .find(|entry| entry.key == *key)
+            .map(|entry| CachedView {
+                key: entry.key.clone(),
+                display: Arc::clone(&entry.display),
+                snaps: Arc::clone(&entry.snaps),
+                measures: Arc::clone(&entry.measures),
+            })
+    }
+
+    fn insert(
+        &mut self,
+        key: ViewKey,
+        display: Arc<DisplayList>,
+        snaps: Arc<SnapIndex>,
+        measures: Arc<MeasureIndex>,
+    ) {
+        if let Some(existing) = self.entries.iter_mut().find(|entry| entry.key == key) {
+            existing.display = display;
+            existing.snaps = snaps;
+            existing.measures = measures;
+            return;
+        }
+        // The model picture is the source for a fast block open and for
+        // leaving an edit. Other views share the remaining slots.
+        if self.entries.len() >= 4 {
+            if let Some(index) = self
+                .entries
+                .iter()
+                .position(|entry| !entry.key.frames.is_empty())
+            {
+                self.entries.remove(index);
+            }
+        }
+        self.entries.push(CachedView {
+            key,
+            display,
+            snaps,
+            measures,
+        });
+    }
+
+    fn model_picture(&self, generation: u64) -> Option<Arc<DisplayList>> {
+        self.model_entry(generation)
+            .map(|entry| Arc::clone(&entry.display))
+    }
+
+    fn model_entry(&self, generation: u64) -> Option<&CachedView> {
+        self.entries
+            .iter()
+            .rev()
+            .find(|entry| entry.key.generation == generation && entry.key.frames.is_empty())
+    }
+
+    fn retain_generation(&mut self, generation: u64) {
+        self.entries
+            .retain(|entry| entry.key.generation == generation);
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
+fn tessellate_block_view(
+    document: &Document,
+    model: Option<&DisplayList>,
+    view: Option<&BlockEditView>,
+) -> DisplayList {
+    if let (Some(model), Some(view)) = (model, view) {
+        if let Some(derived) = model.derive_block_edit(document, view) {
+            return derived;
+        }
+    }
+    if let Some(view) = view {
+        tessellate_document_for_block_edit(document, view)
+    } else {
+        tessellate_document(document)
+    }
+}
+
+pub(crate) struct ViewTessMsg {
+    pub(crate) job: u64,
+    pub(crate) key: ViewKey,
+    pub(crate) display: Box<DisplayList>,
+    pub(crate) snaps: Box<SnapIndex>,
+    pub(crate) measures: Box<MeasureIndex>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IoKind {
     SavingDxf,
     SavingDwg,
-    SavingMycad,
     ExportingPdf,
 }
 
 impl IoKind {
     fn status(self) -> &'static str {
         match self {
-            Self::SavingDxf | Self::SavingDwg | Self::SavingMycad => "Saving drawing…",
+            Self::SavingDxf | Self::SavingDwg => "Saving drawing…",
             Self::ExportingPdf => "Exporting PDF…",
         }
     }
 
     fn is_save(self) -> bool {
-        matches!(self, Self::SavingDxf | Self::SavingDwg | Self::SavingMycad)
+        matches!(self, Self::SavingDxf | Self::SavingDwg)
     }
 }
 
@@ -173,12 +343,15 @@ struct BoxSelectDrag {
 enum PendingDiscard {
     OpenDialog,
     Open(PathBuf),
+    NewDrawing,
     Quit,
 }
 
 struct KeyChord {
     f3: bool,
     f8: bool,
+    f10: bool,
+    f11: bool,
     line: bool,
     polyline: bool,
     circle: bool,
@@ -190,6 +363,7 @@ struct KeyChord {
     undo: bool,
     redo: bool,
     open: bool,
+    new_drawing: bool,
     save: bool,
     save_as: bool,
 }
@@ -221,6 +395,8 @@ pub struct MyCadApp {
     pub(crate) drafting: DraftingState,
     command: CommandState,
     last_command: Option<CommandKind>,
+    last_polygon_sides: u32,
+    pub(crate) command_line: crate::command_line::CommandLine,
     dynamic_input: DynamicInput,
     context_menu: Option<ViewportMenu>,
     pub(crate) history: History,
@@ -254,6 +430,28 @@ pub struct MyCadApp {
     pub(crate) configure_dialog: Option<crate::dynamic_block::ConfigureDialog>,
     preview_pending: bool,
     preview_rx: Option<Receiver<PreviewMsg>>,
+    /// Display lists for the current generation. Entering or leaving a block
+    /// swaps one of these instead of tessellating again.
+    view_cache: ViewCache,
+    displayed_key: Option<ViewKey>,
+    view_rx: Option<Receiver<Result<ViewTessMsg, String>>>,
+    view_job: u64,
+    /// True while a block-edit picture is still being built off the UI thread.
+    view_pending: bool,
+    block_prefetch: BlockPrefetch,
+    /// `ctx` time when the current background wait started.
+    busy_since: Option<f64>,
+    /// `content_generation` the snap and measure indexes were built for.
+    geometry_generation: Option<u64>,
+    /// True after the open block's snaps were re-keyed per member, so an
+    /// edit can patch those members instead of rebuilding the drawing.
+    block_indexes_ready: bool,
+    /// The open block changed. Other copies update when the edit closes.
+    block_reconcile_pending: bool,
+    #[cfg(test)]
+    pub(crate) full_refresh_count: u32,
+    /// `content_generation` the block tree was built or patched for.
+    pub(crate) tree_generation: Option<u64>,
     last_eval_ok: bool,
     last_context_world: Option<Point2>,
     pub(crate) status: String,
@@ -303,6 +501,8 @@ impl MyCadApp {
             drafting: DraftingState::new(drafting_preferences),
             command: CommandState::Idle,
             last_command: None,
+            last_polygon_sides: crate::commands::DEFAULT_POLYGON_SIDES,
+            command_line: crate::command_line::CommandLine::default(),
             dynamic_input: DynamicInput::default(),
             context_menu: None,
             history: History::default(),
@@ -335,6 +535,19 @@ impl MyCadApp {
             configure_dialog: None,
             preview_pending: false,
             preview_rx: None,
+            view_cache: ViewCache::default(),
+            displayed_key: None,
+            view_rx: None,
+            view_job: 0,
+            view_pending: false,
+            block_prefetch: BlockPrefetch::default(),
+            busy_since: None,
+            geometry_generation: None,
+            block_indexes_ready: false,
+            block_reconcile_pending: false,
+            #[cfg(test)]
+            full_refresh_count: 0,
+            tree_generation: None,
             last_eval_ok: true,
             last_context_world: None,
             status: "Ready".to_string(),
@@ -372,46 +585,62 @@ impl MyCadApp {
         self.configure_dialog = None;
         self.eval_cache.clear();
         self.history.commit_open();
+        let path = resolve_open_path(path);
         self.loading_path = Some(path.clone());
         self.status = format!("Loading {}…", file_name(&path));
         let (tx, rx) = mpsc::channel();
         self.load_rx = Some(rx);
-        thread::Builder::new()
+        let report_path = path.clone();
+        let spawned = thread::Builder::new()
             .name("mycad-open".into())
             .spawn(move || {
-                let loaded = if CadFileFormat::from_path(&path) == Some(CadFileFormat::Mycad) {
-                    read_mycad(&path).map_err(|err| err.to_string())
-                } else {
-                    dwg_import::import_dwg(&path).map_err(|err| format_import_error(&err))
-                };
-                match loaded {
-                    Ok(mut document) => {
-                        let prepare = Instant::now();
-                        let _prepare_span = cad_core::perf::span("import_prepare");
-                        let request = EvaluationRequest {
-                            generation: document.content_generation(),
-                        };
-                        let mut cache = EvaluationCache::default();
-                        let view = materialize_evaluated(&document, &mut cache, request)
-                            .unwrap_or_else(|_| document.clone());
-                        let display = tessellate_document(&view);
-                        let snaps = SnapIndex::build(&view);
-                        let measures = MeasureIndex::build(&view);
-                        drop(_prepare_span);
-                        document.diagnostics.render_prepare_time = prepare.elapsed();
-                        let _ = tx.send(LoadMsg::Success {
-                            document: Box::new(document),
-                            display: Box::new(display),
-                            snaps: Box::new(snaps),
-                            measures: Box::new(measures),
-                        });
+                let finished = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let loaded = if CadFileFormat::from_path(&path) == Some(CadFileFormat::Mycad) {
+                        read_mycad(&path).map_err(|err| err.to_string())
+                    } else {
+                        dwg_import::import_dwg(&path).map_err(|err| format_import_error(&err))
+                    };
+                    match loaded {
+                        Ok(mut document) => {
+                            let companion_note = apply_open_companion(&path, &mut document);
+                            let prepare = Instant::now();
+                            let _prepare_span = cad_core::perf::span("import_prepare");
+                            let request = EvaluationRequest {
+                                generation: document.content_generation(),
+                            };
+                            let mut cache = EvaluationCache::default();
+                            let view = materialize_evaluated(&document, &mut cache, request)
+                                .unwrap_or_else(|_| document.clone());
+                            let display = tessellate_document(&view);
+                            let snaps = SnapIndex::build(&view);
+                            let measures = MeasureIndex::build(&view);
+                            drop(_prepare_span);
+                            document.diagnostics.render_prepare_time = prepare.elapsed();
+                            let _ = tx.send(LoadMsg::Success {
+                                document: Box::new(document),
+                                display: Box::new(display),
+                                snaps: Box::new(snaps),
+                                measures: Box::new(measures),
+                                companion_note,
+                            });
+                        }
+                        Err(message) => {
+                            let _ = tx.send(LoadMsg::Failure { path, message });
+                        }
                     }
-                    Err(message) => {
-                        let _ = tx.send(LoadMsg::Failure { path, message });
-                    }
+                }));
+                if finished.is_err() {
+                    let _ = tx.send(LoadMsg::Failure {
+                        path: report_path,
+                        message: "Opening the drawing failed unexpectedly".into(),
+                    });
                 }
-            })
-            .expect("import thread");
+            });
+        if spawned.is_err() {
+            self.load_rx = None;
+            self.loading_path = None;
+            self.status = "Could not start background work".into();
+        }
     }
 
     fn poll_load(&mut self, viewport: Rect) {
@@ -424,6 +653,7 @@ impl MyCadApp {
                 display,
                 snaps,
                 measures,
+                companion_note,
             }) => {
                 let document = *document;
                 let display = *display;
@@ -444,6 +674,9 @@ impl MyCadApp {
                     document.diagnostics.entity_total(),
                     document.diagnostics.unsupported_total()
                 );
+                if let Some(note) = companion_note {
+                    self.status = format!("{}  •  {note}", self.status);
+                }
                 self.selection.clear();
                 self.box_select = None;
                 self.command.cancel();
@@ -451,6 +684,10 @@ impl MyCadApp {
                 self.drafting.clear_acquisition();
                 self.history.clear();
                 self.source_written_by_mycad = false;
+                self.view_cache.clear();
+                self.displayed_key = None;
+                self.geometry_generation = None;
+                self.tree_generation = None;
                 self.document = Some(Arc::new(document));
                 self.rebuild_block_tree();
                 self.display = Arc::new(display);
@@ -458,6 +695,7 @@ impl MyCadApp {
                 self.measures = Arc::new(*measures);
                 self.gpu_upload = GpuUpload::Full;
                 self.display_generation = self.display_generation.wrapping_add(1);
+                self.publish_live_view();
                 self.loading_path = None;
                 self.load_rx = None;
                 self.error = None;
@@ -497,6 +735,49 @@ impl MyCadApp {
         self.open_dialog_now();
     }
 
+    fn new_drawing(&mut self) {
+        if !self.close_block_edit_for_document_action(LeaveIntent::OpenDrawing) {
+            return;
+        }
+        if self.is_dirty() {
+            self.pending_discard = Some(PendingDiscard::NewDrawing);
+            return;
+        }
+        self.install_blank_document();
+    }
+
+    fn install_blank_document(&mut self) {
+        self.error = None;
+        self.selection.clear();
+        self.box_select = None;
+        self.command.cancel();
+        self.measurement = None;
+        self.dynamic_input.set_layout(DynamicLayout::Hidden);
+        self.context_menu = None;
+        self.drafting.clear_acquisition();
+        self.block_edit.clear();
+        self.dynamic_authoring = None;
+        self.dynamic_convert = None;
+        self.parameter_drafts.clear();
+        self.parameter_previews.clear();
+        self.config_form_drafts.clear();
+        self.config_form_errors.clear();
+        self.config_pending = None;
+        self.configure_dialog = None;
+        self.eval_cache.clear();
+        self.history.clear();
+        self.source_written_by_mycad = false;
+        self.view_cache.clear();
+        self.displayed_key = None;
+        self.geometry_generation = None;
+        self.tree_generation = None;
+        self.loading_path = None;
+        self.document = Some(Arc::new(blank_drawing()));
+        self.rebuild_block_tree();
+        self.refresh_derived();
+        self.status = "New drawing".into();
+    }
+
     fn start_load(&mut self, path: PathBuf) {
         if !self.close_block_edit_for_document_action(LeaveIntent::OpenDrawing) {
             self.pending_open = Some(path);
@@ -510,6 +791,11 @@ impl MyCadApp {
     }
 
     fn close_block_edit_for_document_action(&mut self, intent: LeaveIntent) -> bool {
+        if !self.block_edit.is_active() {
+            self.dynamic_authoring = None;
+            return true;
+        }
+        self.remember_current_display();
         while self.block_edit.is_active() {
             if self.block_edit.current_is_dirty() {
                 self.block_edit.ui = BlockUi::LeaveDirty {
@@ -520,13 +806,15 @@ impl MyCadApp {
                         .unwrap_or_default(),
                     intent,
                 };
+                self.selection.clear();
+                self.refresh_block_view();
                 return false;
             }
             self.block_edit.pop();
-            self.selection.clear();
-            self.refresh_derived();
         }
         self.dynamic_authoring = None;
+        self.selection.clear();
+        self.refresh_block_view();
         true
     }
 
@@ -591,47 +879,14 @@ impl MyCadApp {
             self.status = "No drawing is open".into();
             return false;
         };
-        let prefer_native = document_has_dynamic_content(document)
-            || document
-                .source_path
-                .as_deref()
-                .is_some_and(|path| CadFileFormat::from_path(path) == Some(CadFileFormat::Mycad));
-        let prefer_dwg = document
-            .source_path
-            .as_deref()
-            .is_some_and(|path| CadFileFormat::from_path(path) == Some(CadFileFormat::Dwg));
+        let prefer_dwg = save_prefers_dwg(document);
         let mut dialog = rfd::FileDialog::new();
-        if prefer_native {
-            dialog = dialog
-                .add_filter("MyCAD Drawing", &["mycad", "MYCAD"])
-                .add_filter("DXF Drawing", &["dxf", "DXF"])
-                .add_filter("DWG Drawing - AutoCAD 2000", &["dwg", "DWG"]);
-        } else if prefer_dwg {
-            dialog = dialog
-                .add_filter("DWG Drawing - AutoCAD 2000", &["dwg", "DWG"])
-                .add_filter("DXF Drawing", &["dxf", "DXF"])
-                .add_filter("MyCAD Drawing", &["mycad", "MYCAD"]);
-        } else {
-            dialog = dialog
-                .add_filter("DXF Drawing", &["dxf", "DXF"])
-                .add_filter("DWG Drawing - AutoCAD 2000", &["dwg", "DWG"])
-                .add_filter("MyCAD Drawing", &["mycad", "MYCAD"]);
-        }
-        dialog = dialog.add_filter("All files", &["*"]);
-        let name = if prefer_native {
-            suggested_native_name(document)
-        } else {
-            suggested_save_name(document, prefer_dwg)
-        };
-        dialog = dialog.set_file_name(name);
+        dialog = add_save_filters(dialog, prefer_dwg).add_filter("All files", &["*"]);
+        dialog = dialog.set_file_name(suggested_save_name(document, prefer_dwg));
         let Some(path) = dialog.save_file() else {
             return false;
         };
-        let path = if prefer_native && CadFileFormat::from_path(&path).is_none() {
-            with_extension(path, "mycad")
-        } else {
-            with_save_extension(path, prefer_dwg)
-        };
+        let path = with_save_extension(path, prefer_dwg);
         self.write_cad_to(&path)
     }
 
@@ -639,7 +894,8 @@ impl MyCadApp {
         match CadFileFormat::from_path(path) {
             Some(CadFileFormat::Dwg) => self.write_dwg_to(path),
             Some(CadFileFormat::Mycad) | Some(CadFileFormat::MycadBlock) => {
-                self.start_io_job(IoKind::SavingMycad, path.to_path_buf(), None)
+                self.status = "Drawings save as DWG or DXF".into();
+                false
             }
             _ => self.write_dxf_to(path),
         }
@@ -654,32 +910,28 @@ impl MyCadApp {
     }
 
     fn finish_cad_save(&mut self, path: &Path, report: SaveReport) -> bool {
-        let native = CadFileFormat::from_path(path) == Some(CadFileFormat::Mycad);
         let dynamic = self
             .document
             .as_deref()
             .is_some_and(document_has_dynamic_content);
+        let companion_failed = companion_update_failed(&report);
         if let Some(document) = self.document.as_mut().map(Arc::make_mut) {
             document.source_path = Some(path.to_path_buf());
-            if native {
+            if !dynamic || !companion_failed {
                 document.mark_saved_revision();
             }
         }
         self.source_written_by_mycad = true;
-        if native || !dynamic {
+        if !dynamic || !companion_failed {
             self.history.mark_clean();
         }
         self.error = None;
-        self.status = if native {
-            format_save_status(path, &report)
-        } else if dynamic {
-            format!(
-                "{} — interchange file stores configured geometry; keep a .mycad file for editable parameters",
-                format_save_status(path, &report)
-            )
-        } else {
-            format_save_status(path, &report)
-        };
+        let omitted_classes = self
+            .document
+            .as_ref()
+            .map(|document| document.diagnostics.unhandled_classes.len())
+            .unwrap_or(0);
+        self.status = format_save_status(path, &report, omitted_classes);
         true
     }
 
@@ -712,12 +964,7 @@ impl MyCadApp {
     }
 
     fn open_dialog_now(&mut self) {
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("MyCAD drawings", &["mycad", "MYCAD"])
-            .add_filter("DWG drawings", &["dwg", "DWG"])
-            .add_filter("All files", &["*"])
-            .pick_file()
-        {
+        if let Some(path) = open_file_dialog().pick_file() {
             self.start_load_now(path);
         }
     }
@@ -830,8 +1077,64 @@ impl MyCadApp {
         self.start_kind(CommandKind::Scale);
     }
 
+    pub(crate) fn status_line(&self) -> &str {
+        &self.status
+    }
+
+    pub(crate) fn command_prompt(&self) -> &'static str {
+        self.command.prompt()
+    }
+
+    pub(crate) fn run_typed_command(&mut self, text: &str) {
+        let text = text.trim();
+        if text.is_empty() {
+            if let Some(kind) = self.last_command {
+                self.start_kind(kind);
+            }
+            return;
+        }
+        match crate::commands::command_for_name(text) {
+            Some(kind) => self.start_kind(kind),
+            None => self.status = format!("Unknown command: {text}"),
+        }
+    }
+
+    pub(crate) fn cancel_active_command(&mut self) {
+        if self.command.is_active() {
+            self.cancel_command();
+        }
+    }
+
     pub(crate) fn start_erase_command(&mut self) {
         self.start_kind(CommandKind::Erase);
+    }
+
+    pub(crate) fn start_ellipse_command(&mut self) {
+        self.start_kind(CommandKind::Ellipse);
+    }
+
+    pub(crate) fn start_polygon_command(&mut self) {
+        self.start_kind(CommandKind::Polygon);
+    }
+
+    pub(crate) fn start_point_command(&mut self) {
+        self.start_kind(CommandKind::Point);
+    }
+
+    pub(crate) fn start_stretch_command(&mut self) {
+        self.start_kind(CommandKind::Stretch);
+    }
+
+    pub(crate) fn start_trim_command(&mut self) {
+        self.start_kind(CommandKind::Trim);
+    }
+
+    pub(crate) fn start_extend_command(&mut self) {
+        self.start_kind(CommandKind::Extend);
+    }
+
+    pub(crate) fn start_offset_command(&mut self) {
+        self.start_kind(CommandKind::Offset);
     }
 
     // Clicking a different CAD tool cancels the current interaction with
@@ -888,6 +1191,13 @@ impl MyCadApp {
                 }
                 self.command.start_modify(ModifyKind::Erase, Vec::new());
             }
+            CommandKind::Ellipse => self.command.start_ellipse(),
+            CommandKind::Polygon => self.command.start_polygon(self.last_polygon_sides),
+            CommandKind::Point => self.command.start_point(),
+            CommandKind::Stretch => self.command.start_stretch(),
+            CommandKind::Trim => self.command.start_trim(),
+            CommandKind::Extend => self.command.start_extend(),
+            CommandKind::Offset => self.command.start_offset(),
             CommandKind::Idle => {}
         }
         self.sync_dynamic_layout();
@@ -938,6 +1248,8 @@ impl MyCadApp {
         if self.command.kind().is_modify() {
             return;
         }
+        let kind = self.command.kind();
+        self.remember_completed(kind);
         self.idle_after_command("Ready");
     }
 
@@ -1003,11 +1315,27 @@ impl MyCadApp {
                 self.dynamic_input.typed_angle_deg(),
                 self.dynamic_input.typed_factor(),
             )
+        } else if self.command.is_offset_select() {
+            self.pick_offset_target(point);
+            return;
         } else {
-            self.command.accept_point(point)
+            self.command.accept_draft_point(
+                point,
+                self.dynamic_input.typed_distance(),
+                self.dynamic_input.typed_count(),
+            )
         };
+        let accepted = !matches!(output, CommandOutput::Rejected(_));
         match output {
             CommandOutput::Geometry(geometry) => {
+                if kind == CommandKind::Polygon {
+                    if let Geometry::LwPolyline { vertices, .. } = &geometry {
+                        let sides = vertices.len() as u32;
+                        if sides >= 3 {
+                            self.last_polygon_sides = sides;
+                        }
+                    }
+                }
                 let stays_active = self.command.is_active();
                 self.commit_geometry(geometry);
                 self.remember_completed(kind);
@@ -1034,6 +1362,19 @@ impl MyCadApp {
             CommandOutput::Modify { transform, copies } => {
                 self.commit_modify(transform, copies);
             }
+            CommandOutput::Trim { pick } => self.commit_trim(pick),
+            CommandOutput::Extend { pick } => self.commit_extend(pick),
+            CommandOutput::Offset {
+                entity,
+                side,
+                distance,
+            } => self.commit_offset(entity, side, distance),
+            CommandOutput::Stretch {
+                corner_a,
+                corner_b,
+                dx,
+                dy,
+            } => self.commit_stretch(corner_a, corner_b, dx, dy),
             CommandOutput::Rejected(message) => {
                 self.status = message.into();
             }
@@ -1045,6 +1386,9 @@ impl MyCadApp {
                     self.set_modify_reference_radius();
                 }
             }
+        }
+        if accepted {
+            self.drafting.consume_pick();
         }
         self.drafting.command_base_point = self.command.base_point();
     }
@@ -1089,7 +1433,7 @@ impl MyCadApp {
         } else if let Some(transaction) = transaction {
             self.apply_derived_from_transaction(&transaction.invert());
         } else {
-            self.refresh_derived();
+            self.schedule_full_refresh();
         }
         self.status = "Undo".into();
     }
@@ -1125,7 +1469,7 @@ impl MyCadApp {
         } else if let Some(transaction) = transaction {
             self.apply_derived_from_transaction(&transaction);
         } else {
-            self.refresh_derived();
+            self.schedule_full_refresh();
         }
         self.status = "Redo".into();
     }
@@ -1160,6 +1504,43 @@ impl MyCadApp {
 
     pub(crate) fn io_busy(&self) -> bool {
         self.io_rx.is_some()
+    }
+
+    fn is_busy(&self) -> bool {
+        self.load_rx.is_some()
+            || self.io_rx.is_some()
+            || self.preview_rx.is_some()
+            || self.view_rx.is_some()
+            || self.view_pending
+    }
+
+    fn show_busy_cue(&mut self, ctx: &egui::Context) {
+        let now = ctx.input(|input| input.time);
+        if self.is_busy() {
+            if self.busy_since.is_none() {
+                self.busy_since = Some(now);
+            }
+            ctx.request_repaint();
+        } else {
+            self.busy_since = None;
+        }
+        if !busy_cue_visible(self.busy_since, now) {
+            if self.is_busy() {
+                ctx.request_repaint_after(std::time::Duration::from_secs_f64(BUSY_CUE_DELAY_SECS));
+            }
+            return;
+        }
+        ctx.set_cursor_icon(egui::CursorIcon::Progress);
+        let Some(pos) = self.last_pointer else {
+            return;
+        };
+        egui::Area::new(egui::Id::new("mycad-busy-spinner"))
+            .order(egui::Order::Tooltip)
+            .fixed_pos(pos + egui::vec2(14.0, 14.0))
+            .interactable(false)
+            .show(ctx, |ui| {
+                ui.add(egui::Spinner::new().size(14.0));
+            });
     }
 
     #[cfg(test)]
@@ -1219,47 +1600,56 @@ impl MyCadApp {
         let thread_name = match kind {
             IoKind::SavingDxf => "mycad-dxf-save",
             IoKind::SavingDwg => "mycad-dwg-save",
-            IoKind::SavingMycad => "mycad-native-save",
             IoKind::ExportingPdf => "mycad-pdf-export",
         };
-        thread::Builder::new()
+        let spawned = thread::Builder::new()
             .name(thread_name.into())
             .spawn(move || {
-                let dest = path;
-                let result = match kind {
-                    IoKind::SavingDxf => {
-                        let _span = cad_core::perf::span("write_dxf");
-                        let prepared = export_snapshot(&snapshot);
-                        write_dxf(&prepared, &dest, &DxfExportOptions::default())
-                            .map_err(|err| format_save_failed(&err))
-                    }
-                    IoKind::SavingDwg => {
-                        let _span = cad_core::perf::span("write_dwg");
-                        let prepared = export_snapshot(&snapshot);
-                        write_dwg(&prepared, &dest)
-                            .map_err(|err| format_save_failed(format_dwg_write_error(&err)))
-                    }
-                    IoKind::SavingMycad => {
-                        let _span = cad_core::perf::span("write_mycad");
-                        write_mycad(&snapshot, &dest).map_err(|err| format_save_failed(&err))
-                    }
-                    IoKind::ExportingPdf => {
-                        let _span = cad_core::perf::span("export_pdf");
-                        let prepared = export_snapshot(&snapshot);
-                        export_pdf(&prepared, &dest, &pdf_options.unwrap_or_default())
-                            .map_err(|err| format_save_failed(&err))
-                    }
-                };
-                let _ = tx.send(match result {
-                    Ok(report) => IoMsg::Success {
-                        kind,
-                        path: dest,
-                        report,
-                    },
-                    Err(message) => IoMsg::Failure { message },
-                });
-            })
-            .expect("io thread");
+                let finished = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let dest = path;
+                    let result = match kind {
+                        IoKind::SavingDxf => {
+                            let _span = cad_core::perf::span("write_dxf");
+                            let prepared = export_snapshot(&snapshot);
+                            write_dxf(&prepared.document, &dest, &DxfExportOptions::default())
+                                .map(|report| sync_companion(&snapshot, &prepared, &dest, report))
+                                .map_err(|err| format_save_failed(&err))
+                        }
+                        IoKind::SavingDwg => {
+                            let _span = cad_core::perf::span("write_dwg");
+                            let prepared = export_snapshot(&snapshot);
+                            write_dwg(&prepared.document, &dest)
+                                .map(|report| sync_companion(&snapshot, &prepared, &dest, report))
+                                .map_err(|err| format_save_failed(format_dwg_write_error(&err)))
+                        }
+                        IoKind::ExportingPdf => {
+                            let _span = cad_core::perf::span("export_pdf");
+                            let prepared = export_snapshot(&snapshot);
+                            export_pdf(&prepared.document, &dest, &pdf_options.unwrap_or_default())
+                                .map_err(|err| format_save_failed(&err))
+                        }
+                    };
+                    let _ = tx.send(match result {
+                        Ok(report) => IoMsg::Success {
+                            kind,
+                            path: dest,
+                            report,
+                        },
+                        Err(message) => IoMsg::Failure { message },
+                    });
+                }));
+                if finished.is_err() {
+                    let _ = tx.send(IoMsg::Failure {
+                        message: "Saving the drawing failed unexpectedly".into(),
+                    });
+                }
+            });
+        if spawned.is_err() {
+            self.io_rx = None;
+            self.io_kind = None;
+            self.status = "Could not start background work".into();
+            return false;
+        }
         true
     }
 
@@ -1300,9 +1690,10 @@ impl MyCadApp {
 
     pub(crate) fn refresh_derived(&mut self) {
         let _span = cad_core::perf::span("refresh_derived");
-        self.rebuild_block_tree();
+        self.rebuild_block_tree_if_stale();
         let mut cache = std::mem::take(&mut self.eval_cache);
         let tess_view = self.block_edit.tess_view();
+        let reuse_geometry = self.can_reuse_static_geometry();
         if self.document.is_none() {
             self.eval_cache = cache;
             self.display = Arc::new(DisplayList::default());
@@ -1312,14 +1703,22 @@ impl MyCadApp {
             self.gpu_upload = GpuUpload::Full;
             self.display_generation = self.display_generation.wrapping_add(1);
             self.selection.clear();
+            self.geometry_generation = None;
+            self.publish_live_view();
             return;
         }
         let mut status = None;
         let overrides = self.parameter_previews.clone();
         let authoring = self.dynamic_authoring.clone();
+        let rekey = self.single_cell_block_edit();
+        let rekey_id = self.block_edit.current().map(|frame| frame.instance_id);
+        let world_from_local = self.block_edit.world_from_local();
         {
-            let document = self.document.as_mut().map(Arc::make_mut).unwrap();
-            document.recompute_cached_extents();
+            let Some(document) = self.document.as_mut().map(Arc::make_mut) else {
+                self.eval_cache = cache;
+                return;
+            };
+            document.ensure_cached_extents();
             if document_has_dynamic_content(document) {
                 let request = EvaluationRequest {
                     generation: document.content_generation(),
@@ -1358,8 +1757,18 @@ impl MyCadApp {
                             } else {
                                 tessellate_document(&evaluated)
                             });
-                            self.snaps = Arc::new(SnapIndex::build(&evaluated));
-                            self.measures = Arc::new(MeasureIndex::build(&evaluated));
+                            let mut snaps = SnapIndex::build(&evaluated);
+                            let mut measures = MeasureIndex::build(&evaluated);
+                            if rekey {
+                                if let Some(id) = rekey_id {
+                                    snaps = snaps.into_block_edit(&evaluated, id, world_from_local);
+                                    measures =
+                                        measures.into_block_edit(&evaluated, id, world_from_local);
+                                }
+                            }
+                            self.snaps = Arc::new(snaps);
+                            self.measures = Arc::new(measures);
+                            self.block_indexes_ready = rekey;
                             self.last_eval_ok = true;
                         }
                     }
@@ -1367,10 +1776,41 @@ impl MyCadApp {
                         status = Some(err.to_string());
                         if self.last_eval_ok {
                             self.display = Arc::new(tessellate_document(document));
-                            self.snaps = Arc::new(SnapIndex::build(document));
-                            self.measures = Arc::new(MeasureIndex::build(document));
+                            let mut snaps = SnapIndex::build(document);
+                            let mut measures = MeasureIndex::build(document);
+                            if rekey {
+                                if let Some(id) = rekey_id {
+                                    snaps = snaps.into_block_edit(document, id, world_from_local);
+                                    measures =
+                                        measures.into_block_edit(document, id, world_from_local);
+                                }
+                            }
+                            self.snaps = Arc::new(snaps);
+                            self.measures = Arc::new(measures);
+                            self.block_indexes_ready = rekey;
                         }
                         self.last_eval_ok = false;
+                    }
+                }
+            } else if reuse_geometry {
+                self.display = Arc::new(if let Some(view) = tess_view {
+                    tessellate_document_for_block_edit(document, &view)
+                } else {
+                    tessellate_document(document)
+                });
+                if rekey && !self.block_indexes_ready {
+                    if let Some(id) = rekey_id {
+                        let snaps =
+                            SnapIndex::for_block_edit(&self.snaps, document, id, world_from_local);
+                        let measures = MeasureIndex::for_block_edit(
+                            &self.measures,
+                            document,
+                            id,
+                            world_from_local,
+                        );
+                        self.snaps = Arc::new(snaps);
+                        self.measures = Arc::new(measures);
+                        self.block_indexes_ready = true;
                     }
                 }
             } else {
@@ -1379,8 +1819,17 @@ impl MyCadApp {
                 } else {
                     tessellate_document(document)
                 });
-                self.snaps = Arc::new(SnapIndex::build(document));
-                self.measures = Arc::new(MeasureIndex::build(document));
+                let mut snaps = SnapIndex::build(document);
+                let mut measures = MeasureIndex::build(document);
+                if rekey {
+                    if let Some(id) = rekey_id {
+                        snaps = snaps.into_block_edit(document, id, world_from_local);
+                        measures = measures.into_block_edit(document, id, world_from_local);
+                    }
+                }
+                self.snaps = Arc::new(snaps);
+                self.measures = Arc::new(measures);
+                self.block_indexes_ready = rekey;
             }
             self.selection.retain_valid(document);
         }
@@ -1391,6 +1840,487 @@ impl MyCadApp {
         self.gpu_upload = GpuUpload::Full;
         self.display_generation = self.display_generation.wrapping_add(1);
         self.eval_cache = cache;
+        self.publish_live_view();
+    }
+
+    /// Switch the block-edit picture without rebuilding snaps, measures, or the block tree.
+    fn refresh_block_view(&mut self) {
+        if self.block_reconcile_pending {
+            self.block_reconcile_pending = false;
+            self.block_indexes_ready = false;
+            self.schedule_full_refresh();
+            return;
+        }
+        if self.try_restore_cached_view() {
+            return;
+        }
+        if self.take_running_prefetch() {
+            return;
+        }
+        // Tests apply the picture immediately so assertions can read it.
+        if cfg!(test) || !self.can_reuse_static_geometry() {
+            if !cfg!(test) && self.document.is_some() {
+                self.view_pending = true;
+                self.request_preview();
+                self.flush_preview();
+                return;
+            }
+            self.schedule_full_refresh();
+            return;
+        }
+        self.spawn_view_tessellation();
+    }
+
+    fn can_reuse_static_geometry(&self) -> bool {
+        let Some(document) = self.document.as_ref() else {
+            return false;
+        };
+        self.geometry_generation == Some(document.content_generation())
+            && !document_has_dynamic_content(document)
+            && self.dynamic_authoring.is_none()
+            && self.parameter_previews.is_empty()
+    }
+
+    fn current_view_key(&self) -> Option<ViewKey> {
+        let document = self.document.as_ref()?;
+        Some(ViewKey {
+            generation: document.content_generation(),
+            frames: self
+                .block_edit
+                .stack
+                .iter()
+                .map(|frame| frame.instance_id)
+                .collect(),
+        })
+    }
+
+    fn remember_current_display(&mut self) {
+        let Some(key) = self.current_view_key() else {
+            return;
+        };
+        if self.displayed_key.as_ref() == Some(&key) {
+            self.view_cache.insert(
+                key,
+                Arc::clone(&self.display),
+                Arc::clone(&self.snaps),
+                Arc::clone(&self.measures),
+            );
+        }
+    }
+
+    fn try_restore_cached_view(&mut self) -> bool {
+        let Some(key) = self.current_view_key() else {
+            return false;
+        };
+        let Some(cached) = self.view_cache.get(&key) else {
+            return false;
+        };
+        self.display = cached.display;
+        self.snaps = cached.snaps;
+        self.measures = cached.measures;
+        self.block_indexes_ready = self.single_cell_block_edit();
+        self.displayed_key = Some(key);
+        self.view_pending = false;
+        self.view_job = self.view_job.wrapping_add(1);
+        self.view_rx = None;
+        self.measurement = None;
+        self.gpu_upload = GpuUpload::Full;
+        self.display_generation = self.display_generation.wrapping_add(1);
+        if let Some(document) = self.document.as_ref() {
+            self.selection.retain_valid(document);
+        }
+        true
+    }
+
+    fn publish_live_view(&mut self) {
+        self.view_pending = false;
+        self.view_job = self.view_job.wrapping_add(1);
+        self.view_rx = None;
+        let Some(key) = self.current_view_key() else {
+            self.displayed_key = None;
+            self.view_cache.clear();
+            self.geometry_generation = None;
+            return;
+        };
+        self.view_cache.retain_generation(key.generation);
+        self.displayed_key = Some(key.clone());
+        self.view_cache.insert(
+            key,
+            Arc::clone(&self.display),
+            Arc::clone(&self.snaps),
+            Arc::clone(&self.measures),
+        );
+        if let Some(document) = self.document.as_ref() {
+            self.geometry_generation = Some(document.content_generation());
+        }
+    }
+
+    fn spawn_view_tessellation(&mut self) {
+        if self
+            .document
+            .as_ref()
+            .is_some_and(|document| Arc::strong_count(document) == 1)
+        {
+            if let Some(document) = self.document.as_mut().map(Arc::make_mut) {
+                document.ensure_cached_extents();
+            }
+        }
+        let Some(document) = self.document.clone() else {
+            self.refresh_derived();
+            return;
+        };
+        let Some(key) = self.current_view_key() else {
+            return;
+        };
+        let view = self.block_edit.tess_view();
+        let generation = document.content_generation();
+        let model = self.view_cache.model_picture(generation);
+        let model_snaps = self
+            .view_cache
+            .model_entry(generation)
+            .map(|entry| Arc::clone(&entry.snaps))
+            .unwrap_or_else(|| Arc::clone(&self.snaps));
+        let model_measures = self
+            .view_cache
+            .model_entry(generation)
+            .map(|entry| Arc::clone(&entry.measures))
+            .unwrap_or_else(|| Arc::clone(&self.measures));
+        let world_from_local = self.block_edit.world_from_local();
+        let rekey = self.single_cell_block_edit();
+        let instance_id = self.block_edit.current().map(|frame| frame.instance_id);
+        self.view_job = self.view_job.wrapping_add(1);
+        let job = self.view_job;
+        let (tx, rx) = mpsc::channel();
+        self.view_rx = Some(rx);
+        self.view_pending = true;
+        let spawned = thread::Builder::new()
+            .name("mycad-view".into())
+            .spawn(move || {
+                let result = catch_worker(|| {
+                    let _span = cad_core::perf::span("view_tessellation");
+                    let display =
+                        tessellate_block_view(document.as_ref(), model.as_deref(), view.as_ref());
+                    let snaps = rekey_index(
+                        model_snaps,
+                        document.as_ref(),
+                        rekey,
+                        instance_id,
+                        world_from_local,
+                    );
+                    let measures = rekey_measures(
+                        model_measures,
+                        document.as_ref(),
+                        rekey,
+                        instance_id,
+                        world_from_local,
+                    );
+                    drop(document);
+                    ViewTessMsg {
+                        job,
+                        key,
+                        display: Box::new(display),
+                        snaps: Box::new(snaps),
+                        measures: Box::new(measures),
+                    }
+                });
+                let _ = tx.send(result);
+            });
+        if spawned.is_err() {
+            self.view_rx = None;
+            self.view_pending = false;
+            self.status = "Could not start background work".into();
+        }
+    }
+
+    fn poll_view_refresh(&mut self, ctx: &egui::Context) {
+        let Some(rx) = self.view_rx.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(message)) => {
+                self.view_rx = None;
+                if message.job != self.view_job
+                    || self.current_view_key().as_ref() != Some(&message.key)
+                {
+                    self.view_pending = false;
+                    return;
+                }
+                self.apply_ready_view(message);
+                ctx.request_repaint();
+            }
+            Ok(Err(message)) => {
+                self.view_rx = None;
+                self.view_pending = false;
+                self.status = message;
+            }
+            Err(TryRecvError::Empty) => ctx.request_repaint(),
+            Err(TryRecvError::Disconnected) => {
+                self.view_rx = None;
+                self.view_pending = false;
+                self.status = "Block view failed".into();
+            }
+        }
+    }
+
+    fn apply_ready_view(&mut self, message: ViewTessMsg) {
+        self.display = Arc::new(*message.display);
+        self.snaps = Arc::new(*message.snaps);
+        self.measures = Arc::new(*message.measures);
+        self.block_indexes_ready = self.single_cell_block_edit();
+        self.displayed_key = Some(message.key.clone());
+        self.view_cache.insert(
+            message.key,
+            Arc::clone(&self.display),
+            Arc::clone(&self.snaps),
+            Arc::clone(&self.measures),
+        );
+        self.view_pending = false;
+        self.measurement = None;
+        self.gpu_upload = GpuUpload::Full;
+        self.display_generation = self.display_generation.wrapping_add(1);
+        self.drafting.invalidate_snap_cache();
+        if let Some(document) = self.document.as_ref() {
+            self.selection.retain_valid(document);
+        }
+    }
+
+    /// The prefetch for this block is already running. Show that result
+    /// instead of tessellating the same picture a second time.
+    fn take_running_prefetch(&mut self) -> bool {
+        let Some(key) = self.current_view_key() else {
+            return false;
+        };
+        let matches = self
+            .block_prefetch
+            .running
+            .as_ref()
+            .is_some_and(|job| job.key == key);
+        if !matches {
+            return false;
+        }
+        let Some(job) = self.block_prefetch.running.take() else {
+            return false;
+        };
+        self.view_job = job.job;
+        match job.rx.try_recv() {
+            Ok(Ok(message)) => {
+                if message.job == self.view_job
+                    && self.current_view_key().as_ref() == Some(&message.key)
+                {
+                    self.apply_ready_view(message);
+                } else {
+                    self.view_pending = false;
+                }
+                true
+            }
+            Ok(Err(message)) => {
+                self.view_pending = false;
+                self.status = message;
+                true
+            }
+            Err(TryRecvError::Empty) => {
+                self.view_rx = Some(job.rx);
+                self.view_pending = true;
+                true
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.status = "Block view failed".into();
+                false
+            }
+        }
+    }
+
+    fn poll_block_prefetch(&mut self) {
+        let finished = match self.block_prefetch.running.as_ref() {
+            Some(job) => match job.rx.try_recv() {
+                Ok(Ok(message)) => Some(Ok(message)),
+                Ok(Err(_)) => Some(Err(())),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => Some(Err(())),
+            },
+            None => None,
+        };
+        if finished.is_some() {
+            self.block_prefetch.running = None;
+        }
+        if let Some(Ok(message)) = finished {
+            self.store_prefetch(message);
+        }
+        self.start_waiting_prefetch();
+    }
+
+    fn store_prefetch(&mut self, message: ViewTessMsg) {
+        let Some(document) = self.document.as_ref() else {
+            return;
+        };
+        if message.key.generation != document.content_generation() {
+            return;
+        }
+        self.view_cache.insert(
+            message.key,
+            Arc::new(*message.display),
+            Arc::new(*message.snaps),
+            Arc::new(*message.measures),
+        );
+    }
+
+    fn request_block_prefetch(&mut self, instance_id: EntityId) {
+        let Some(generation) = self
+            .document
+            .as_ref()
+            .map(|document| document.content_generation())
+        else {
+            return;
+        };
+        let key = ViewKey {
+            generation,
+            frames: vec![instance_id],
+        };
+        if self.view_cache.get(&key).is_some() {
+            return;
+        }
+        if self.block_prefetch.is_running(instance_id, generation) {
+            return;
+        }
+        match self.prefetch_readiness() {
+            PrefetchReadiness::Never => {}
+            PrefetchReadiness::Later => self.block_prefetch.set_waiting(instance_id),
+            PrefetchReadiness::Ready => self.spawn_block_prefetch(instance_id),
+        }
+    }
+
+    fn start_waiting_prefetch(&mut self) {
+        let Some(instance_id) = self.block_prefetch.waiting() else {
+            return;
+        };
+        if self.prefetch_readiness() != PrefetchReadiness::Ready {
+            return;
+        }
+        self.block_prefetch.clear_waiting();
+        self.spawn_block_prefetch(instance_id);
+    }
+
+    fn prefetch_readiness(&self) -> PrefetchReadiness {
+        let Some(document) = self.document.as_ref() else {
+            return PrefetchReadiness::Never;
+        };
+        if !self.can_reuse_static_geometry()
+            || !self.block_edit.stack.is_empty()
+            || self
+                .view_cache
+                .model_picture(document.content_generation())
+                .is_none()
+        {
+            return PrefetchReadiness::Never;
+        }
+        if self.command.is_active()
+            || self.view_pending
+            || self.view_rx.is_some()
+            || self.preview_rx.is_some()
+            || self.preview_pending
+            || self.load_rx.is_some()
+            || self.io_rx.is_some()
+            || self.block_prefetch.running.is_some()
+        {
+            return PrefetchReadiness::Later;
+        }
+        PrefetchReadiness::Ready
+    }
+
+    fn spawn_block_prefetch(&mut self, instance_id: EntityId) {
+        let Some(document) = self.document.clone() else {
+            return;
+        };
+        let generation = document.content_generation();
+        let key = ViewKey {
+            generation,
+            frames: vec![instance_id],
+        };
+        if self.view_cache.get(&key).is_some() {
+            return;
+        }
+        let Some(model_entry) = self.view_cache.model_entry(generation) else {
+            return;
+        };
+        let model = Arc::clone(&model_entry.display);
+        let model_snaps = Arc::clone(&model_entry.snaps);
+        let model_measures = Arc::clone(&model_entry.measures);
+        let block_name = document
+            .entity_by_id(instance_id)
+            .and_then(|entity| entity.geometry.insert_block_name())
+            .unwrap_or_default()
+            .to_string();
+        let view = BlockEditView {
+            frames: vec![BlockEditViewFrame {
+                instance_id,
+                block_name,
+            }],
+        };
+        self.view_job = self.view_job.wrapping_add(1);
+        let job = self.view_job;
+        let (tx, rx) = mpsc::channel();
+        self.block_prefetch.running = Some(PrefetchJob {
+            key: key.clone(),
+            job,
+            rx,
+        });
+        let spawned = thread::Builder::new()
+            .name("mycad-block-prefetch".into())
+            .spawn(move || {
+                let result = catch_worker(|| {
+                    let _span = cad_core::perf::span("block_prefetch");
+                    let display =
+                        tessellate_block_view(document.as_ref(), Some(model.as_ref()), Some(&view));
+                    let transform = document
+                        .entity_by_id(instance_id)
+                        .and_then(|entity| cad_core::insert_transform(document.as_ref(), entity))
+                        .unwrap_or_else(Transform2::identity);
+                    let snaps = (*model_snaps).clone().into_block_edit(
+                        document.as_ref(),
+                        instance_id,
+                        transform,
+                    );
+                    let measures = (*model_measures).clone().into_block_edit(
+                        document.as_ref(),
+                        instance_id,
+                        transform,
+                    );
+                    drop(document);
+                    ViewTessMsg {
+                        job,
+                        key,
+                        display: Box::new(display),
+                        snaps: Box::new(snaps),
+                        measures: Box::new(measures),
+                    }
+                });
+                let _ = tx.send(result);
+            });
+        if spawned.is_err() {
+            self.block_prefetch.running = None;
+        }
+    }
+
+    fn rebuild_block_tree_if_stale(&mut self) {
+        let generation = self
+            .document
+            .as_ref()
+            .map(|document| document.content_generation());
+        if generation == self.tree_generation {
+            return;
+        }
+        self.rebuild_block_tree();
+    }
+
+    fn block_reference_count(&self, name: &str) -> usize {
+        let Some(document) = self.document.as_ref() else {
+            return 0;
+        };
+        if self.tree_generation == Some(document.content_generation()) {
+            self.block_tree.reference_count(name)
+        } else {
+            cad_core::count_block_references(document, name)
+        }
     }
 
     pub(crate) fn request_preview(&mut self) {
@@ -1416,13 +2346,6 @@ impl MyCadApp {
             self.refresh_derived();
             return;
         };
-        if !document_has_dynamic_content(document.as_ref())
-            && self.dynamic_authoring.is_none()
-            && self.parameter_previews.is_empty()
-        {
-            self.refresh_derived();
-            return;
-        }
         let document_generation = document.content_generation();
         let session_generation = self
             .dynamic_authoring
@@ -1437,82 +2360,118 @@ impl MyCadApp {
         let authoring = self.dynamic_authoring.clone();
         let overrides = self.parameter_previews.clone();
         let tess_view = self.block_edit.tess_view();
+        let view_frames: Vec<EntityId> = self
+            .block_edit
+            .stack
+            .iter()
+            .map(|frame| frame.instance_id)
+            .collect();
+        let rekey = self.single_cell_block_edit();
+        let instance_id = self.block_edit.current().map(|frame| frame.instance_id);
+        let world_from_local = self.block_edit.world_from_local();
         let (tx, rx) = mpsc::channel();
         self.preview_rx = Some(rx);
-        let _ = thread::Builder::new()
+        let spawned = thread::Builder::new()
             .name("mycad-preview".into())
             .spawn(move || {
-                let _span = cad_core::perf::span("preview_worker");
-                let mut cache = EvaluationCache::default();
-                let mut source = (*document).clone();
-                source.recompute_cached_extents();
-                let request = EvaluationRequest {
-                    generation: document_generation,
-                };
-                let evaluated = if document_has_dynamic_content(&source) {
-                    materialize_evaluated_with(
-                        &source,
-                        &mut cache,
-                        request,
-                        if overrides.is_empty() {
-                            None
-                        } else {
-                            Some(&overrides)
-                        },
-                    )
-                } else {
-                    Ok(source.clone())
-                };
-                match evaluated {
-                    Ok(mut evaluated) => {
-                        if let Some(authoring) = authoring.as_ref() {
-                            if let Some(test) = authoring.test_config(&source) {
-                                if let Err(err) = apply_definition_preview(
-                                    &source,
-                                    &mut evaluated,
-                                    &authoring.block_name,
-                                    &test,
-                                    &mut cache,
-                                    request,
-                                ) {
-                                    let _ = tx.send(PreviewMsg::Failed {
-                                        document_generation,
-                                        session_generation,
-                                        preview_generation,
-                                        message: err.to_string(),
-                                    });
-                                    return;
+                let panic_frames = view_frames.clone();
+                let result = catch_worker(|| {
+                    let _span = cad_core::perf::span("preview_worker");
+                    let mut cache = EvaluationCache::default();
+                    let mut source = (*document).clone();
+                    drop(document);
+                    source.recompute_cached_extents();
+                    let request = EvaluationRequest {
+                        generation: document_generation,
+                    };
+                    let evaluated = if document_has_dynamic_content(&source) {
+                        materialize_evaluated_with(
+                            &source,
+                            &mut cache,
+                            request,
+                            if overrides.is_empty() {
+                                None
+                            } else {
+                                Some(&overrides)
+                            },
+                        )
+                    } else {
+                        Ok(source.clone())
+                    };
+                    match evaluated {
+                        Ok(mut evaluated) => {
+                            if let Some(authoring) = authoring.as_ref() {
+                                if let Some(test) = authoring.test_config(&source) {
+                                    if let Err(err) = apply_definition_preview(
+                                        &source,
+                                        &mut evaluated,
+                                        &authoring.block_name,
+                                        &test,
+                                        &mut cache,
+                                        request,
+                                    ) {
+                                        let _ = tx.send(PreviewMsg::Failed {
+                                            document_generation,
+                                            session_generation,
+                                            preview_generation,
+                                            view_frames: view_frames.clone(),
+                                            message: err.to_string(),
+                                        });
+                                        return;
+                                    }
                                 }
                             }
+                            let display = if let Some(view) = tess_view {
+                                tessellate_document_for_block_edit(&evaluated, &view)
+                            } else {
+                                tessellate_document(&evaluated)
+                            };
+                            let mut snaps = SnapIndex::build(&evaluated);
+                            let mut measures = MeasureIndex::build(&evaluated);
+                            if rekey {
+                                if let Some(id) = instance_id {
+                                    snaps = snaps.into_block_edit(&evaluated, id, world_from_local);
+                                    measures =
+                                        measures.into_block_edit(&evaluated, id, world_from_local);
+                                }
+                            }
+                            let extents = evaluated.compute_extents();
+                            let _ = tx.send(PreviewMsg::Ready {
+                                document_generation,
+                                session_generation,
+                                preview_generation,
+                                view_frames: view_frames.clone(),
+                                display: Box::new(display),
+                                snaps: Box::new(snaps),
+                                measures: Box::new(measures),
+                                extents,
+                            });
                         }
-                        let display = if let Some(view) = tess_view {
-                            tessellate_document_for_block_edit(&evaluated, &view)
-                        } else {
-                            tessellate_document(&evaluated)
-                        };
-                        let snaps = SnapIndex::build(&evaluated);
-                        let measures = MeasureIndex::build(&evaluated);
-                        let extents = evaluated.compute_extents();
-                        let _ = tx.send(PreviewMsg::Ready {
-                            document_generation,
-                            session_generation,
-                            preview_generation,
-                            display: Box::new(display),
-                            snaps: Box::new(snaps),
-                            measures: Box::new(measures),
-                            extents,
-                        });
+                        Err(err) => {
+                            let _ = tx.send(PreviewMsg::Failed {
+                                document_generation,
+                                session_generation,
+                                preview_generation,
+                                view_frames,
+                                message: err.to_string(),
+                            });
+                        }
                     }
-                    Err(err) => {
-                        let _ = tx.send(PreviewMsg::Failed {
-                            document_generation,
-                            session_generation,
-                            preview_generation,
-                            message: err.to_string(),
-                        });
-                    }
+                });
+                if let Err(message) = result {
+                    let _ = tx.send(PreviewMsg::Failed {
+                        document_generation,
+                        session_generation,
+                        preview_generation,
+                        view_frames: panic_frames,
+                        message,
+                    });
                 }
             });
+        if spawned.is_err() {
+            self.preview_rx = None;
+            self.status = "Could not start background work".into();
+        }
     }
 
     fn poll_preview(&mut self, ctx: &egui::Context) {
@@ -1558,8 +2517,17 @@ impl MyCadApp {
                         current_preview,
                     ),
                 };
-                if !current {
-                    self.status = "Discarded superseded preview".into();
+                let frames_match = match &message {
+                    PreviewMsg::Ready { view_frames, .. }
+                    | PreviewMsg::Failed { view_frames, .. } => self
+                        .current_view_key()
+                        .is_some_and(|key| key.frames == *view_frames),
+                };
+                if !current || !frames_match {
+                    if !current {
+                        self.status = "Discarded superseded preview".into();
+                    }
+                    self.view_pending = false;
                 } else {
                     match message {
                         PreviewMsg::Ready {
@@ -1569,17 +2537,26 @@ impl MyCadApp {
                             extents,
                             ..
                         } => {
-                            if let Some(document) = self.document.as_mut().map(Arc::make_mut) {
-                                document.diagnostics.extents = extents;
+                            if self
+                                .document
+                                .as_ref()
+                                .is_some_and(|document| Arc::strong_count(document) == 1)
+                            {
+                                if let Some(document) = self.document.as_mut().map(Arc::make_mut) {
+                                    document.diagnostics.extents = extents;
+                                }
                             }
                             self.display = Arc::new(*display);
                             self.snaps = Arc::new(*snaps);
                             self.measures = Arc::new(*measures);
+                            self.block_indexes_ready = self.single_cell_block_edit();
                             self.last_eval_ok = true;
                             self.gpu_upload = GpuUpload::Full;
                             self.display_generation = self.display_generation.wrapping_add(1);
+                            self.publish_live_view();
                         }
                         PreviewMsg::Failed { message, .. } => {
+                            self.view_pending = false;
                             self.status = message;
                         }
                     }
@@ -1593,6 +2570,7 @@ impl MyCadApp {
             Err(TryRecvError::Empty) => ctx.request_repaint(),
             Err(TryRecvError::Disconnected) => {
                 self.preview_rx = None;
+                self.status = "Drawing update failed".into();
                 if self.preview_pending {
                     self.preview_pending = false;
                     self.spawn_preview();
@@ -1607,29 +2585,217 @@ impl MyCadApp {
             .as_deref()
             .map(BlockTreeIndex::build)
             .unwrap_or_default();
+        self.mark_block_tree_current();
+    }
+
+    fn mark_block_tree_current(&mut self) {
+        self.tree_generation = self
+            .document
+            .as_ref()
+            .map(|document| document.content_generation());
+    }
+
+    pub(crate) fn schedule_full_refresh(&mut self) {
+        #[cfg(test)]
+        {
+            self.full_refresh_count = self.full_refresh_count.saturating_add(1);
+            self.refresh_derived();
+        }
+        #[cfg(not(test))]
+        {
+            self.preview_pending = true;
+        }
+    }
+
+    fn single_cell_block_edit(&self) -> bool {
+        if self.block_edit.stack.len() != 1 {
+            return false;
+        }
+        let Some(document) = self.document.as_ref() else {
+            return false;
+        };
+        if document_has_dynamic_content(document)
+            || self.dynamic_authoring.is_some()
+            || !self.parameter_previews.is_empty()
+        {
+            return false;
+        }
+        let Some(frame) = self.block_edit.current() else {
+            return false;
+        };
+        let Some(entity) = document.entity_by_id(frame.instance_id) else {
+            return false;
+        };
+        match &entity.geometry {
+            Geometry::Insert {
+                column_count,
+                row_count,
+                ..
+            } => *column_count <= 1 && *row_count <= 1,
+            _ => false,
+        }
+    }
+
+    fn patch_block_inserted(&mut self, entities: &[Entity]) {
+        if !self.block_indexes_ready {
+            self.schedule_full_refresh();
+            return;
+        }
+        let transform = self.block_edit.world_from_local();
+        let Some(document) = self.document.as_ref() else {
+            return;
+        };
+        let (line_start, fill_start, appended_any) = {
+            let display = Arc::make_mut(&mut self.display);
+            let mut line_start = display.line_vertices.len() as u32;
+            let mut fill_start = display.triangle_vertices.len() as u32;
+            let mut appended_any = false;
+            for entity in entities {
+                if let Some(range) = display.append_entity_with(document, entity, transform, false)
+                {
+                    if !appended_any {
+                        line_start = range.line_start;
+                        fill_start = range.fill_start;
+                        appended_any = true;
+                    }
+                }
+            }
+            (line_start, fill_start, appended_any)
+        };
+        {
+            let snaps = Arc::make_mut(&mut self.snaps);
+            for entity in entities {
+                snaps.append_entity_with(document, entity, transform, entity.id);
+            }
+        }
+        {
+            let measures = Arc::make_mut(&mut self.measures);
+            for entity in entities {
+                measures.append_entity_with(document, entity, transform, entity.id);
+            }
+        }
+        self.block_reconcile_pending = true;
+        self.finish_block_patch(
+            entities.iter().any(entity_affects_block_tree),
+            if appended_any {
+                GpuUpload::Append {
+                    line_start,
+                    fill_start,
+                }
+            } else {
+                GpuUpload::Full
+            },
+        );
+    }
+
+    fn patch_block_removed(&mut self, entities: &[Entity]) {
+        if !self.block_indexes_ready {
+            self.schedule_full_refresh();
+            return;
+        }
+        {
+            let display = Arc::make_mut(&mut self.display);
+            for entity in entities {
+                display.remove_entity(entity.id);
+            }
+        }
+        {
+            let snaps = Arc::make_mut(&mut self.snaps);
+            for entity in entities {
+                snaps.remove_entity(entity.id);
+            }
+        }
+        {
+            let measures = Arc::make_mut(&mut self.measures);
+            for entity in entities {
+                measures.remove_entity(entity.id);
+            }
+        }
+        self.block_reconcile_pending = true;
+        self.finish_block_patch(
+            entities.iter().any(entity_affects_block_tree),
+            GpuUpload::Full,
+        );
+    }
+
+    fn patch_block_replaced(&mut self, pairs: &[(Entity, Entity)]) {
+        if !self.block_indexes_ready {
+            self.schedule_full_refresh();
+            return;
+        }
+        let transform = self.block_edit.world_from_local();
+        let Some(document) = self.document.as_ref() else {
+            return;
+        };
+        {
+            let display = Arc::make_mut(&mut self.display);
+            for (_, after) in pairs {
+                let current = document.entity_by_id(after.id).unwrap_or(after);
+                display.replace_entity_with(document, current, transform);
+            }
+        }
+        {
+            let snaps = Arc::make_mut(&mut self.snaps);
+            for (_, after) in pairs {
+                let current = document.entity_by_id(after.id).unwrap_or(after);
+                snaps.replace_entity_with(document, current, transform, current.id);
+            }
+        }
+        {
+            let measures = Arc::make_mut(&mut self.measures);
+            for (_, after) in pairs {
+                let current = document.entity_by_id(after.id).unwrap_or(after);
+                measures.replace_entity_with(document, current, transform, current.id);
+            }
+        }
+        self.block_reconcile_pending = true;
+        self.finish_block_patch(
+            pairs.iter().any(|(before, after)| {
+                entity_affects_block_tree(before) || entity_affects_block_tree(after)
+            }),
+            GpuUpload::Full,
+        );
+    }
+
+    fn finish_block_patch(&mut self, affects_tree: bool, upload: GpuUpload) {
+        if affects_tree {
+            self.rebuild_block_tree();
+        } else {
+            self.mark_block_tree_current();
+        }
+        self.bump_display(upload);
     }
 
     fn apply_derived_from_transaction(&mut self, applied: &Transaction) {
-        if self.block_edit.is_active()
-            || self
-                .document
-                .as_deref()
-                .is_some_and(document_has_dynamic_content)
+        if self
+            .document
+            .as_deref()
+            .is_some_and(document_has_dynamic_content)
         {
-            self.refresh_derived();
+            self.schedule_full_refresh();
+            return;
+        }
+        if self.block_edit.is_active() {
+            let space = self.block_edit.active_space();
+            match applied.space_change(&space) {
+                Some(SpaceChange::Inserted(entities)) => self.patch_block_inserted(&entities),
+                Some(SpaceChange::Removed(entities)) => self.patch_block_removed(&entities),
+                Some(SpaceChange::Replaced(pairs)) => self.patch_block_replaced(&pairs),
+                None => self.schedule_full_refresh(),
+            }
             return;
         }
         match applied.model_space_change() {
-            Some(ModelSpaceChange::Inserted(entities)) => self.patch_inserted(&entities),
-            Some(ModelSpaceChange::Removed(entities)) => self.patch_removed(&entities),
-            Some(ModelSpaceChange::Replaced(pairs)) => self.patch_replaced(&pairs),
-            None => self.refresh_derived(),
+            Some(SpaceChange::Inserted(entities)) => self.patch_inserted(&entities),
+            Some(SpaceChange::Removed(entities)) => self.patch_removed(&entities),
+            Some(SpaceChange::Replaced(pairs)) => self.patch_replaced(&pairs),
+            None => self.schedule_full_refresh(),
         }
     }
 
     fn patch_inserted(&mut self, entities: &[Entity]) {
         if self.block_edit.is_active() {
-            self.refresh_derived();
+            self.patch_block_inserted(entities);
             return;
         }
         {
@@ -1673,6 +2839,8 @@ impl MyCadApp {
         }
         if entities.iter().any(entity_affects_block_tree) {
             self.rebuild_block_tree();
+        } else {
+            self.mark_block_tree_current();
         }
         self.bump_display(if appended_any {
             GpuUpload::Append {
@@ -1686,7 +2854,7 @@ impl MyCadApp {
 
     fn patch_removed(&mut self, entities: &[Entity]) {
         if self.block_edit.is_active() {
-            self.refresh_derived();
+            self.patch_block_removed(entities);
             return;
         }
         {
@@ -1717,13 +2885,15 @@ impl MyCadApp {
         }
         if entities.iter().any(entity_affects_block_tree) {
             self.rebuild_block_tree();
+        } else {
+            self.mark_block_tree_current();
         }
         self.bump_display(GpuUpload::Full);
     }
 
     fn patch_replaced(&mut self, pairs: &[(Entity, Entity)]) {
         if self.block_edit.is_active() {
-            self.refresh_derived();
+            self.patch_block_replaced(pairs);
             return;
         }
         {
@@ -1762,6 +2932,8 @@ impl MyCadApp {
             entity_affects_block_tree(before) || entity_affects_block_tree(after)
         }) {
             self.rebuild_block_tree();
+        } else {
+            self.mark_block_tree_current();
         }
         self.bump_display(GpuUpload::Full);
     }
@@ -1772,6 +2944,9 @@ impl MyCadApp {
         self.display_generation = self.display_generation.wrapping_add(1);
         if let Some(document) = self.document.as_ref() {
             self.selection.retain_valid(document);
+        }
+        if !self.view_pending {
+            self.publish_live_view();
         }
     }
 
@@ -1788,6 +2963,7 @@ impl MyCadApp {
         }
         self.blocks_panel.retarget_rename(from, to);
         self.blocks_panel.error = None;
+        self.mark_block_tree_current();
     }
 
     fn commit_geometry(&mut self, geometry: Geometry) {
@@ -1829,10 +3005,11 @@ impl MyCadApp {
             )
         };
         self.history.record(edit);
-        self.block_edit
-            .refresh_dirty(self.document.as_ref().unwrap());
+        if let Some(document) = self.document.as_ref() {
+            self.block_edit.refresh_dirty(document);
+        }
         if self.block_edit.is_active() {
-            self.refresh_derived();
+            self.patch_block_inserted(std::slice::from_ref(&entity));
             self.status = format!("{type_name} added");
             return;
         }
@@ -1852,6 +3029,12 @@ impl MyCadApp {
             None => GpuUpload::Full,
         };
         self.display_generation = self.display_generation.wrapping_add(1);
+        if entity_affects_block_tree(&entity) {
+            self.rebuild_block_tree();
+        } else {
+            self.mark_block_tree_current();
+        }
+        self.publish_live_view();
         self.status = format!("{type_name} added");
     }
 
@@ -1935,7 +3118,9 @@ impl MyCadApp {
 
     fn commit_modify(&mut self, transform: EntityTransform, copies: bool) {
         let kind = self.command.kind();
-        let targets = self.editable_ids(self.command.modify_targets());
+        let requested = self.command.modify_targets().to_vec();
+        let targets = self.editable_ids(&requested);
+        let skipped_locked = targets.len() < requested.len();
         let Some(document) = self.document.as_ref() else {
             self.cancel_command();
             self.status = "No drawing is open".into();
@@ -1994,70 +3179,347 @@ impl MyCadApp {
                 }
             }
         }
-        let model_only = originals.iter().all(|(space, _)| space.is_model());
-        let mut created = Vec::new();
-        let mut replaced = Vec::new();
-        {
-            let Some(document) = self.document.as_mut().map(Arc::make_mut) else {
-                return;
-            };
-            if copies {
-                for ((space, _), entity) in originals.iter().zip(transformed) {
+        let (created_in, replaced_in) = if copies {
+            let created = originals
+                .iter()
+                .zip(transformed)
+                .map(|((space, _), entity)| {
                     let mut entity = entity;
                     entity.id = EntityId::UNASSIGNED;
-                    let Some(entity) = document.add_entity_to(space, entity) else {
-                        continue;
-                    };
-                    if space.is_model() {
-                        document
-                            .diagnostics
-                            .bump_entity(entity.geometry.type_name());
-                        document.diagnostics.object_count =
-                            document.diagnostics.object_count.saturating_add(1);
-                    }
-                    let index = document.entity_index_in(space, entity.id).unwrap_or(0);
-                    self.history.record(Edit::InsertEntity {
-                        space: space.clone(),
-                        index,
-                        entity: entity.clone(),
-                    });
-                    created.push(entity);
-                }
-                self.selection
-                    .replace_all(created.iter().map(|entity| entity.id));
-            } else {
-                for ((space, before), after) in originals.iter().zip(transformed) {
-                    let Some(index) = document.entity_index_in(space, before.id) else {
-                        continue;
-                    };
-                    let _ = document.replace_entity_in(space, before.id, after.clone());
-                    self.history.record(Edit::ReplaceEntity {
-                        space: space.clone(),
-                        index,
-                        before: before.clone(),
-                        after: after.clone(),
-                    });
-                    replaced.push((before.clone(), after));
-                }
-                self.selection.replace_all(targets);
-            }
-        }
-        if let Some(document) = self.document.as_ref() {
-            self.block_edit.refresh_dirty(document);
-        }
+                    (space.clone(), entity)
+                })
+                .collect();
+            (created, Vec::new())
+        } else {
+            let replaced = originals
+                .into_iter()
+                .zip(transformed)
+                .map(|((space, before), after)| (space, before, after))
+                .collect();
+            (Vec::new(), replaced)
+        };
+        self.apply_entity_changes(Vec::new(), replaced_in, created_in);
         self.remember_completed(kind);
         self.finish_active_transaction();
         self.command.finish();
         self.dynamic_input.set_layout(DynamicLayout::Hidden);
         self.drafting.clear_acquisition();
-        if !model_only || self.block_edit.is_active() {
-            self.refresh_derived();
-        } else if copies {
-            self.patch_inserted(&created);
+        self.status = if skipped_locked {
+            format!(
+                "{} complete. Objects on a locked layer were left unchanged",
+                kind.label()
+            )
         } else {
-            self.patch_replaced(&replaced);
+            format!("{} complete", kind.label())
+        };
+    }
+
+    fn apply_entity_changes(
+        &mut self,
+        removed: Vec<(EntitySpace, Entity)>,
+        replaced: Vec<(EntitySpace, Entity, Entity)>,
+        created: Vec<(EntitySpace, Entity)>,
+    ) {
+        let model_only = removed.iter().all(|(space, _)| space.is_model())
+            && replaced.iter().all(|(space, _, _)| space.is_model())
+            && created.iter().all(|(space, _)| space.is_model());
+        let mut removed_entities = Vec::new();
+        let mut replaced_pairs = Vec::new();
+        let mut created_entities = Vec::new();
+        {
+            let Some(document) = self.document.as_mut().map(Arc::make_mut) else {
+                return;
+            };
+            let mut removals: Vec<(EntitySpace, usize, Entity)> = removed
+                .iter()
+                .filter_map(|(space, entity)| {
+                    let index = document.entity_index_in(space, entity.id)?;
+                    Some((space.clone(), index, entity.clone()))
+                })
+                .collect();
+            removals.sort_by_key(|(_, index, _)| std::cmp::Reverse(*index));
+            for (space, index, entity) in removals {
+                if space.is_model() {
+                    document.diagnostics.object_count =
+                        document.diagnostics.object_count.saturating_sub(1);
+                }
+                let edit = Edit::RemoveEntity {
+                    space,
+                    index,
+                    entity: entity.clone(),
+                };
+                edit.apply(document);
+                self.history.record(edit);
+                removed_entities.push(entity);
+            }
+            for (space, before, after) in replaced {
+                let Some(index) = document.entity_index_in(&space, before.id) else {
+                    continue;
+                };
+                let _ = document.replace_entity_in(&space, before.id, after.clone());
+                self.history.record(Edit::ReplaceEntity {
+                    space,
+                    index,
+                    before: before.clone(),
+                    after: after.clone(),
+                });
+                replaced_pairs.push((before, after));
+            }
+            for (space, entity) in created {
+                let Some(entity) = document.add_entity_to(&space, entity) else {
+                    continue;
+                };
+                if space.is_model() {
+                    document
+                        .diagnostics
+                        .bump_entity(entity.geometry.type_name());
+                    document.diagnostics.object_count =
+                        document.diagnostics.object_count.saturating_add(1);
+                }
+                let index = document.entity_index_in(&space, entity.id).unwrap_or(0);
+                self.history.record(Edit::InsertEntity {
+                    space,
+                    index,
+                    entity: entity.clone(),
+                });
+                created_entities.push(entity);
+            }
         }
-        self.status = format!("{} complete", kind.label());
+        if let Some(document) = self.document.as_ref() {
+            self.block_edit.refresh_dirty(document);
+        }
+        let touched: Vec<EntityId> = replaced_pairs
+            .iter()
+            .map(|(_, after)| after.id)
+            .chain(created_entities.iter().map(|entity| entity.id))
+            .collect();
+        if !touched.is_empty() {
+            self.selection.replace_all(touched);
+        } else if !removed_entities.is_empty() {
+            self.selection
+                .remove_all(removed_entities.iter().map(|entity| entity.id));
+        }
+        let kinds = [
+            !removed_entities.is_empty(),
+            !replaced_pairs.is_empty(),
+            !created_entities.is_empty(),
+        ]
+        .into_iter()
+        .filter(|present| *present)
+        .count();
+        if kinds > 1 || !model_only {
+            self.schedule_full_refresh();
+            return;
+        }
+        if self.block_edit.is_active() {
+            if !removed_entities.is_empty() {
+                self.patch_block_removed(&removed_entities);
+            } else if !replaced_pairs.is_empty() {
+                self.patch_block_replaced(&replaced_pairs);
+            } else if !created_entities.is_empty() {
+                self.patch_block_inserted(&created_entities);
+            }
+        } else if !removed_entities.is_empty() {
+            self.patch_removed(&removed_entities);
+        } else if !replaced_pairs.is_empty() {
+            self.patch_replaced(&replaced_pairs);
+        } else if !created_entities.is_empty() {
+            self.patch_inserted(&created_entities);
+        }
+    }
+
+    fn commit_trim(&mut self, pick: Point2) {
+        self.commit_curve_edit(pick, true);
+    }
+
+    fn commit_extend(&mut self, pick: Point2) {
+        self.commit_curve_edit(pick, false);
+    }
+
+    fn commit_curve_edit(&mut self, pick: Point2, trim: bool) {
+        let aperture = measurement::world_aperture(&self.camera, self.viewport_size.y);
+        let active = self.block_edit.active_space();
+        let to_world = self.block_edit.world_from_local();
+        let to_local = self.block_edit.local_from_world();
+        let Some(document) = self.document.as_ref() else {
+            self.status = "No drawing is open".into();
+            return;
+        };
+        let planned = if trim {
+            crate::edit_tools::trim_at(document, &self.measures, &active, to_world, pick, aperture)
+                .map(|(entity, result)| (entity, result.pieces))
+        } else {
+            crate::edit_tools::extend_at(
+                document,
+                &self.measures,
+                &active,
+                to_world,
+                pick,
+                aperture,
+            )
+            .map(|(entity, geometry)| (entity, vec![geometry]))
+        };
+        let (entity, pieces) = match planned {
+            Ok(value) => value,
+            Err(err) => {
+                self.status = err.to_string();
+                return;
+            }
+        };
+        let Some((space, _)) = document.find_entity_location(entity.id) else {
+            self.status = cad_core::EditError::Unsupported.to_string();
+            return;
+        };
+        let mut local = Vec::new();
+        for piece in pieces {
+            match transform_geometry(&piece, to_local) {
+                Ok(geometry) => local.push(geometry),
+                Err(_) => {
+                    self.status = cad_core::EditError::Unsupported.to_string();
+                    return;
+                }
+            }
+        }
+        let mut removed = Vec::new();
+        let mut replaced = Vec::new();
+        let mut created = Vec::new();
+        if local.is_empty() {
+            removed.push((space, entity));
+        } else {
+            let mut after = entity.clone();
+            after.geometry = local.remove(0);
+            replaced.push((space.clone(), entity.clone(), after));
+            for geometry in local {
+                let mut copy = entity.clone();
+                copy.id = EntityId::UNASSIGNED;
+                copy.geometry = geometry;
+                created.push((space.clone(), copy));
+            }
+        }
+        self.apply_entity_changes(removed, replaced, created);
+        self.finish_active_transaction();
+        self.history.begin();
+        self.sync_dynamic_layout();
+        self.status = self.command.prompt().into();
+    }
+
+    fn pick_offset_target(&mut self, point: Point2) {
+        let aperture = measurement::world_aperture(&self.camera, self.viewport_size.y);
+        let active = self.block_edit.active_space();
+        let Some(document) = self.document.as_ref() else {
+            self.status = "No drawing is open".into();
+            return;
+        };
+        let Some(hit) = self.measures.pick(point, aperture, None) else {
+            self.status = "Select an object to offset".into();
+            return;
+        };
+        let id = hit.owner;
+        let in_space = document
+            .find_entity_location(id)
+            .is_some_and(|(space, _)| space == active);
+        if !in_space || !self.command.set_offset_target(id) {
+            self.status = "Select an object to offset".into();
+            return;
+        }
+        self.sync_dynamic_layout();
+        self.status = self.command.prompt().into();
+    }
+
+    fn commit_offset(&mut self, id: EntityId, side: Point2, distance: f64) {
+        let active = self.block_edit.active_space();
+        let to_world = self.block_edit.world_from_local();
+        let to_local = self.block_edit.local_from_world();
+        let Some(document) = self.document.as_ref() else {
+            self.status = "No drawing is open".into();
+            return;
+        };
+        let (source, world) =
+            match crate::edit_tools::offset_copy(document, &active, to_world, id, distance, side) {
+                Ok(value) => value,
+                Err(err) => {
+                    self.status = err.to_string();
+                    return;
+                }
+            };
+        let Some((space, _)) = document.find_entity_location(source.id) else {
+            self.status = cad_core::EditError::Unsupported.to_string();
+            return;
+        };
+        let geometry = match transform_geometry(&world, to_local) {
+            Ok(geometry) => geometry,
+            Err(_) => {
+                self.status = cad_core::EditError::Unsupported.to_string();
+                return;
+            }
+        };
+        let mut copy = source;
+        copy.id = EntityId::UNASSIGNED;
+        copy.geometry = geometry;
+        self.apply_entity_changes(Vec::new(), Vec::new(), vec![(space, copy)]);
+        self.command.repeat_offset();
+        self.finish_active_transaction();
+        self.history.begin();
+        self.sync_dynamic_layout();
+        self.dynamic_input.reset_values();
+        self.status = self.command.prompt().into();
+    }
+
+    fn commit_stretch(&mut self, corner_a: Point2, corner_b: Point2, dx: f64, dy: f64) {
+        let active = self.block_edit.active_space();
+        let to_world = self.block_edit.world_from_local();
+        let to_local = self.block_edit.local_from_world();
+        let window = Extents2::from_corners(corner_a, corner_b);
+        let Some(document) = self.document.as_ref() else {
+            self.status = "No drawing is open".into();
+            return;
+        };
+        let hits = match crate::edit_tools::stretch_hits(
+            document,
+            &self.measures,
+            &active,
+            to_world,
+            window,
+            dx,
+            dy,
+        ) {
+            Ok(hits) => hits,
+            Err(err) => {
+                self.cancel_command();
+                self.status = err.to_string();
+                return;
+            }
+        };
+        if hits.is_empty() {
+            self.cancel_command();
+            self.status = "Nothing in the crossing window".into();
+            return;
+        }
+        let mut replaced = Vec::new();
+        for hit in hits {
+            let Some((space, _)) = document.find_entity_location(hit.before.id) else {
+                continue;
+            };
+            let Ok(geometry) = transform_geometry(&hit.after_world, to_local) else {
+                continue;
+            };
+            let mut after = hit.before.clone();
+            after.geometry = geometry;
+            replaced.push((space, hit.before, after));
+        }
+        if replaced.is_empty() {
+            self.cancel_command();
+            self.status = "Nothing in the crossing window".into();
+            return;
+        }
+        let kind = self.command.kind();
+        self.apply_entity_changes(Vec::new(), replaced, Vec::new());
+        self.remember_completed(kind);
+        self.finish_active_transaction();
+        self.command.finish();
+        self.dynamic_input.set_layout(DynamicLayout::Hidden);
+        self.drafting.clear_acquisition();
+        self.status = "STRETCH complete".into();
     }
 
     pub(crate) fn erase_selected(&mut self) {
@@ -2081,8 +3543,16 @@ impl MyCadApp {
         if ids.is_empty() {
             return;
         }
-        let ids = self.editable_ids(ids);
+        let requested = ids.to_vec();
+        let ids = self.editable_ids(&requested);
         if ids.is_empty() {
+            if requested.iter().any(|id| {
+                self.document
+                    .as_ref()
+                    .is_some_and(|document| document.entity_on_locked_layer(*id))
+            }) {
+                self.status = "Objects on a locked layer were left unchanged".into();
+            }
             return;
         }
         let Some(document) = self.document.as_ref() else {
@@ -2127,14 +3597,17 @@ impl MyCadApp {
         self.remember_completed(CommandKind::Erase);
         self.finish_active_transaction();
         self.selection.remove_all(ids.iter().copied());
-        let incremental = model_only && !self.block_edit.is_active();
+        let patch_block = self.block_edit.is_active();
+        let incremental = model_only && !patch_block;
         if stay_in_erase && self.command.is_erase_picking() {
             self.dynamic_input.set_layout(DynamicLayout::Hidden);
             self.drafting.clear_acquisition();
-            if incremental {
+            if patch_block {
+                self.patch_block_removed(&removed_entities);
+            } else if incremental {
                 self.patch_removed(&removed_entities);
             } else {
-                self.refresh_derived();
+                self.schedule_full_refresh();
             }
             self.status = self.command.prompt().into();
             return;
@@ -2143,10 +3616,12 @@ impl MyCadApp {
         self.dynamic_input.set_layout(DynamicLayout::Hidden);
         self.drafting.clear_acquisition();
         self.selection.clear();
-        if incremental {
+        if patch_block {
+            self.patch_block_removed(&removed_entities);
+        } else if incremental {
             self.patch_removed(&removed_entities);
         } else {
-            self.refresh_derived();
+            self.schedule_full_refresh();
         }
         self.status = "Erase complete".into();
     }
@@ -2276,6 +3751,19 @@ impl MyCadApp {
             CommandOutput::Measurement(result) => self.complete_measurement(result),
             CommandOutput::Rejected(message) => self.status = message.into(),
             CommandOutput::Modify { transform, copies } => self.commit_modify(transform, copies),
+            CommandOutput::Trim { pick } => self.commit_trim(pick),
+            CommandOutput::Extend { pick } => self.commit_extend(pick),
+            CommandOutput::Offset {
+                entity,
+                side,
+                distance,
+            } => self.commit_offset(entity, side, distance),
+            CommandOutput::Stretch {
+                corner_a,
+                corner_b,
+                dx,
+                dy,
+            } => self.commit_stretch(corner_a, corner_b, dx, dy),
             CommandOutput::None => {
                 self.sync_dynamic_layout();
                 self.dynamic_input.reset_values();
@@ -2284,23 +3772,39 @@ impl MyCadApp {
         }
     }
 
-    fn toggle_ortho(&mut self) {
-        self.drafting.preferences.ortho_enabled = !self.drafting.preferences.ortho_enabled;
+    fn persist_drafting(&mut self) {
+        self.drafting.preferences.sanitize();
         self.settings.drafting = self.drafting.preferences;
         if self.show_settings {
             self.settings_draft.drafting = self.drafting.preferences;
         }
     }
 
+    fn toggle_ortho(&mut self) {
+        self.drafting.preferences.toggle_ortho();
+        self.persist_drafting();
+    }
+
     fn toggle_osnap(&mut self) {
         self.drafting.preferences.osnap_enabled = !self.drafting.preferences.osnap_enabled;
-        self.settings.drafting = self.drafting.preferences;
-        if self.show_settings {
-            self.settings_draft.drafting = self.drafting.preferences;
-        }
+        self.persist_drafting();
         if !self.drafting.preferences.osnap_enabled {
             self.drafting.acquired_snap = None;
         }
+    }
+
+    fn toggle_polar(&mut self) {
+        self.drafting.preferences.toggle_polar();
+        self.persist_drafting();
+    }
+
+    fn toggle_otrack(&mut self) {
+        self.drafting.preferences.otrack_enabled = !self.drafting.preferences.otrack_enabled;
+        if !self.drafting.preferences.otrack_enabled {
+            self.drafting.tracked_points.clear();
+            self.drafting.tracking_hint = None;
+        }
+        self.persist_drafting();
     }
 
     fn editable_ids(&self, ids: &[EntityId]) -> Vec<EntityId> {
@@ -2308,14 +3812,17 @@ impl MyCadApp {
         let Some(document) = self.document.as_ref() else {
             return Vec::new();
         };
-        ids.iter()
+        let editable: Vec<EntityId> = ids
+            .iter()
             .copied()
             .filter(|id| {
                 document
                     .find_entity_location(*id)
                     .is_some_and(|(space, _)| space == active)
             })
-            .collect()
+            .filter(|id| !document.entity_on_locked_layer(*id))
+            .collect();
+        editable
     }
 
     fn editable_selection_ids(&self) -> Vec<EntityId> {
@@ -2482,7 +3989,7 @@ impl MyCadApp {
                 if let Some(document) = self.document.as_ref() {
                     self.block_edit.refresh_dirty(document);
                 }
-                self.refresh_derived();
+                self.schedule_full_refresh();
                 self.status = format!("Block {name} created");
             }
             Err(err) => {
@@ -2494,6 +4001,7 @@ impl MyCadApp {
     }
 
     pub(crate) fn enter_block_edit(&mut self, instance_id: EntityId) {
+        self.remember_current_display();
         let entered = {
             let Some(document) = self.document.as_ref() else {
                 return;
@@ -2505,7 +4013,7 @@ impl MyCadApp {
                         .current()
                         .map(|frame| frame.block_name.clone())
                         .unwrap_or_default();
-                    let refs = cad_core::count_block_references(document, &name);
+                    let refs = self.block_reference_count(&name);
                     Ok(format!("Editing: {name}    •    {refs} references"))
                 }
                 Err(err) => Err(err),
@@ -2515,7 +4023,7 @@ impl MyCadApp {
             Ok(status) => {
                 self.selection.clear();
                 self.command.cancel();
-                self.refresh_derived();
+                self.refresh_block_view();
                 self.status = status;
             }
             Err(err) => self.status = err,
@@ -2572,6 +4080,7 @@ impl MyCadApp {
     }
 
     fn close_block_level(&mut self, discard: bool) {
+        self.remember_current_display();
         if discard {
             if let Some(document) = self.document.as_mut().map(Arc::make_mut) {
                 self.block_edit.discard_current(document, &mut self.history);
@@ -2587,13 +4096,9 @@ impl MyCadApp {
             self.dynamic_authoring = None;
         }
         self.selection.clear();
-        self.refresh_derived();
+        self.refresh_block_view();
         if let Some(frame) = self.block_edit.current() {
-            let refs = self
-                .document
-                .as_ref()
-                .map(|document| cad_core::count_block_references(document, &frame.block_name))
-                .unwrap_or(0);
+            let refs = self.block_reference_count(&frame.block_name);
             self.status = format!("Editing: {}    •    {refs} references", frame.block_name);
         } else {
             self.status = "Block edit closed".into();
@@ -2601,6 +4106,7 @@ impl MyCadApp {
     }
 
     fn leave_to_breadcrumb(&mut self, index: usize) {
+        self.remember_current_display();
         while self.block_edit.stack.len() > index {
             if self.block_edit.current_is_dirty() {
                 self.block_edit.ui = BlockUi::LeaveDirty {
@@ -2616,7 +4122,7 @@ impl MyCadApp {
             self.block_edit.pop();
         }
         self.selection.clear();
-        self.refresh_derived();
+        self.refresh_block_view();
     }
 
     fn request_leave_block(&mut self, intent: LeaveIntent) {
@@ -2721,13 +4227,13 @@ impl MyCadApp {
         self.history.commit_open();
         if let Some(err) = error {
             self.status = err.to_string();
-            self.refresh_derived();
+            self.schedule_full_refresh();
             return;
         }
         if let Some(document) = self.document.as_ref() {
             self.block_edit.refresh_dirty(document);
         }
-        self.refresh_derived();
+        self.schedule_full_refresh();
         self.status = "Added to block".into();
     }
 
@@ -2785,13 +4291,13 @@ impl MyCadApp {
         self.history.commit_open();
         if let Some(err) = error {
             self.status = err.to_string();
-            self.refresh_derived();
+            self.schedule_full_refresh();
             return;
         }
         if let Some(document) = self.document.as_ref() {
             self.block_edit.refresh_dirty(document);
         }
-        self.refresh_derived();
+        self.schedule_full_refresh();
         self.status = "Removed from block".into();
     }
 
@@ -2823,7 +4329,7 @@ impl MyCadApp {
                     after: result.insert_after,
                 });
                 self.history.commit_open();
-                self.refresh_derived();
+                self.schedule_full_refresh();
                 self.status = format!("Block {name} created");
             }
             Err(err) => {
@@ -2884,7 +4390,7 @@ impl MyCadApp {
         if space.is_model() && !self.block_edit.is_active() {
             self.patch_inserted(&[entity]);
         } else {
-            self.refresh_derived();
+            self.schedule_full_refresh();
         }
         self.blocks_panel.error = None;
         self.status = format!("Inserted {name}");
@@ -3007,7 +4513,7 @@ impl MyCadApp {
                 self.history.commit_open();
                 self.blocks_panel.selected = Some(new_name.clone());
                 self.blocks_panel.error = None;
-                self.refresh_derived();
+                self.schedule_full_refresh();
                 self.status = format!("Duplicated as {new_name}");
             }
             Err(err) => {
@@ -3106,7 +4612,7 @@ impl MyCadApp {
         }
         self.history.commit_open();
         self.blocks_panel.error = None;
-        self.refresh_derived();
+        self.schedule_full_refresh();
         self.status = format!("Purged {count} unused block(s)");
     }
 
@@ -3216,12 +4722,11 @@ impl MyCadApp {
         let toolbar_action = if self.block_edit.is_active() {
             let can_add = self.can_add_to_block();
             let can_remove = self.can_remove_from_block();
-            self.document
-                .as_ref()
-                .map(|document| {
-                    block_edit::show_toolbar(ui, &self.block_edit, document, can_add, can_remove)
-                })
-                .unwrap_or(ToolbarAction::None)
+            if self.document.is_some() {
+                block_edit::show_toolbar(ui, &self.block_edit, can_add, can_remove)
+            } else {
+                ToolbarAction::None
+            }
         } else {
             ToolbarAction::None
         };
@@ -3366,6 +4871,8 @@ impl MyCadApp {
             acquired_snap,
             start_marker,
             close_hint,
+            &self.drafting.tracked_points,
+            self.drafting.tracking_hint.as_ref(),
         );
         crate::dynamic_block::paint_authoring_overlays(&painter, self, rect);
         if let Some([start, end]) = self
@@ -3373,6 +4880,48 @@ impl MyCadApp {
             .preview_mirror_axis(self.drafting.current_point)
         {
             crate::drafting::paint_world_axis(&painter, rect, self.camera, start, end);
+        }
+        if let Some((first, opposite)) = self.command.stretch_window(self.drafting.current_point) {
+            let colors = if self.show_settings {
+                &self.settings_draft.display
+            } else {
+                &self.settings.display
+            };
+            crate::drafting::paint_crossing_window(
+                &painter,
+                rect,
+                self.camera,
+                first,
+                opposite,
+                colors.crossing_selection.to_color32(),
+                colors.crossing_selection.to_fill(),
+            );
+        }
+        if let Some((corner_a, corner_b, dx, dy)) =
+            self.command.stretch_motion(self.drafting.current_point)
+        {
+            if let Some(document) = self.document.as_ref() {
+                let window = Extents2::from_corners(corner_a, corner_b);
+                if let Ok(hits) = crate::edit_tools::stretch_hits(
+                    document,
+                    &self.measures,
+                    &self.block_edit.active_space(),
+                    self.block_edit.world_from_local(),
+                    window,
+                    dx,
+                    dy,
+                ) {
+                    let mut segments = Vec::new();
+                    for hit in hits {
+                        crate::edit_tools::preview_segments(
+                            &hit.after_world,
+                            cad_core::MAX_STRETCH_PREVIEW,
+                            &mut segments,
+                        );
+                    }
+                    crate::drafting::paint_segments(&painter, rect, self.camera, &segments);
+                }
+            }
         }
         let units = self
             .document
@@ -3391,7 +4940,8 @@ impl MyCadApp {
         }
         if let Some(cursor) = self.last_pointer.filter(|pos| rect.contains(*pos)) {
             let mut live =
-                LiveValues::from_points(self.command.base_point(), self.drafting.current_point);
+                LiveValues::from_points(self.command.base_point(), self.drafting.current_point)
+                    .with_count(f64::from(self.command.polygon_sides()));
             if let Some(EntityTransform::UniformScale { factor, .. }) =
                 self.command.preview_transform(
                     self.drafting.current_point,
@@ -3589,6 +5139,18 @@ impl MyCadApp {
             ContextAction::RotateByParameter => crate::dynamic_block::rotate_from_selection(self),
             ContextAction::SavePreset => crate::dynamic_block::save_preset_from_test(self),
             ContextAction::ConfigureBlock => crate::dynamic_block::begin_configure_block(self),
+            ContextAction::SnapOverride(kind) => {
+                self.drafting.snap_override = Some(crate::drafting::OneShotSnap::Kind(kind));
+                self.status = format!("Snap override: {}", kind.label());
+            }
+            ContextAction::SnapNone => {
+                self.drafting.snap_override = Some(crate::drafting::OneShotSnap::None);
+                self.status = "Next point ignores object snap".into();
+            }
+            ContextAction::OsnapSettings => {
+                self.settings_tab = SettingsTab::Viewport;
+                self.open_settings();
+            }
         }
     }
 
@@ -3790,11 +5352,11 @@ impl MyCadApp {
         if !self.pending_lossy_save {
             return;
         }
-        let count = self
+        let message = self
             .document
             .as_ref()
-            .map(|document| document.diagnostics.unsupported_total())
-            .unwrap_or(0);
+            .map(|document| lossy_save_message(&document.diagnostics))
+            .unwrap_or_default();
         let mut save_copy = false;
         let mut cancel = false;
         egui::Window::new("Unsupported content")
@@ -3802,7 +5364,8 @@ impl MyCadApp {
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                ui.label(lossy_save_message(count));
+                ui.set_min_width(420.0);
+                ui.label(message);
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if ui.button("Save a Copy").clicked() {
@@ -3842,7 +5405,9 @@ impl MyCadApp {
         };
         let title = match pending {
             PendingDiscard::Quit => "Quit without saving?",
-            PendingDiscard::OpenDialog | PendingDiscard::Open(_) => "Discard unsaved changes?",
+            PendingDiscard::OpenDialog | PendingDiscard::Open(_) | PendingDiscard::NewDrawing => {
+                "Discard unsaved changes?"
+            }
         };
         let file_label = self
             .document
@@ -3889,6 +5454,7 @@ impl MyCadApp {
         match pending {
             Some(PendingDiscard::OpenDialog) => self.open_dialog_now(),
             Some(PendingDiscard::Open(path)) => self.start_load_now(path),
+            Some(PendingDiscard::NewDrawing) => self.install_blank_document(),
             Some(PendingDiscard::Quit) => {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
@@ -3902,6 +5468,8 @@ impl eframe::App for MyCadApp {
         let _span = cad_core::perf::span("MyCadApp::update");
         self.poll_io(ctx);
         self.poll_preview(ctx);
+        self.poll_view_refresh(ctx);
+        self.poll_block_prefetch();
         self.input_consumed_escape = false;
         if ctx.input(|input| input.viewport().close_requested())
             && (self.is_dirty() || self.block_edit.is_active())
@@ -3950,6 +5518,8 @@ impl eframe::App for MyCadApp {
                 KeyChord {
                     f3: input.key_pressed(egui::Key::F3),
                     f8: input.key_pressed(egui::Key::F8),
+                    f10: input.key_pressed(egui::Key::F10),
+                    f11: input.key_pressed(egui::Key::F11),
                     line: plain && input.key_pressed(egui::Key::L),
                     polyline: plain && input.key_pressed(egui::Key::P),
                     circle: plain && input.key_pressed(egui::Key::C),
@@ -3963,6 +5533,7 @@ impl eframe::App for MyCadApp {
                         && (input.key_pressed(egui::Key::Y)
                             || (input.modifiers.shift && input.key_pressed(egui::Key::Z))),
                     open: ctrl && !input.modifiers.shift && input.key_pressed(egui::Key::O),
+                    new_drawing: ctrl && !input.modifiers.shift && input.key_pressed(egui::Key::N),
                     save: ctrl && !input.modifiers.shift && input.key_pressed(egui::Key::S),
                     save_as: ctrl && input.modifiers.shift && input.key_pressed(egui::Key::S),
                 }
@@ -3973,12 +5544,20 @@ impl eframe::App for MyCadApp {
             if keys.f8 {
                 self.toggle_ortho();
             }
+            if keys.f10 {
+                self.toggle_polar();
+            }
+            if keys.f11 {
+                self.toggle_otrack();
+            }
             if keys.undo {
                 self.undo();
             } else if keys.redo {
                 self.redo();
             } else if keys.open {
                 self.open_dialog();
+            } else if keys.new_drawing {
+                self.new_drawing();
             } else if keys.save {
                 let _ = self.save_drawing();
             } else if keys.save_as {
@@ -4011,10 +5590,16 @@ impl eframe::App for MyCadApp {
                 self.input_consumed_escape = true;
             } else if self.context_menu.is_none() {
                 let live =
-                    LiveValues::from_points(self.command.base_point(), self.drafting.current_point);
+                    LiveValues::from_points(self.command.base_point(), self.drafting.current_point)
+                        .with_count(f64::from(self.command.polygon_sides()));
                 let finish_empty = matches!(
                     self.command.kind(),
-                    CommandKind::Line | CommandKind::Polyline
+                    CommandKind::Line
+                        | CommandKind::Polyline
+                        | CommandKind::Point
+                        | CommandKind::Trim
+                        | CommandKind::Extend
+                        | CommandKind::Offset
                 ) || self.command.is_selecting_objects();
                 let numeric =
                     ctx.input_mut(|input| self.dynamic_input.consume(input, live, finish_empty));
@@ -4067,6 +5652,7 @@ impl eframe::App for MyCadApp {
         if self.load_rx.is_some()
             || self.io_rx.is_some()
             || self.preview_rx.is_some()
+            || self.view_rx.is_some()
             || self.capture.is_some()
         {
             ctx.request_repaint();
@@ -4083,6 +5669,10 @@ impl eframe::App for MyCadApp {
                 }
                 ui.separator();
                 ui.menu_button("File", |ui| {
+                    if ui.button("New    Ctrl+N").clicked() {
+                        ui.close();
+                        self.new_drawing();
+                    }
                     if ui.button("Open…    Ctrl+O").clicked() {
                         ui.close();
                         self.open_dialog();
@@ -4158,6 +5748,18 @@ impl eframe::App for MyCadApp {
                         ui.close();
                         self.start_rectangle_command();
                     }
+                    if ui.button("Ellipse    EL").clicked() {
+                        ui.close();
+                        self.start_ellipse_command();
+                    }
+                    if ui.button("Polygon    POL").clicked() {
+                        ui.close();
+                        self.start_polygon_command();
+                    }
+                    if ui.button("Point    PO").clicked() {
+                        ui.close();
+                        self.start_point_command();
+                    }
                 });
                 ui.menu_button("Modify", |ui| {
                     if ui.button("Move").clicked() {
@@ -4184,6 +5786,23 @@ impl eframe::App for MyCadApp {
                     if ui.button("Erase    Del").clicked() {
                         ui.close();
                         self.start_erase_command();
+                    }
+                    ui.separator();
+                    if ui.button("Stretch    S").clicked() {
+                        ui.close();
+                        self.start_stretch_command();
+                    }
+                    if ui.button("Trim    TR").clicked() {
+                        ui.close();
+                        self.start_trim_command();
+                    }
+                    if ui.button("Extend    EX").clicked() {
+                        ui.close();
+                        self.start_extend_command();
+                    }
+                    if ui.button("Offset    O").clicked() {
+                        ui.close();
+                        self.start_offset_command();
                     }
                 });
                 ui.menu_button("Measure", |ui| {
@@ -4230,6 +5849,10 @@ impl eframe::App for MyCadApp {
                         ui.close();
                         workspace::ensure_tab(&mut self.dock_state, WorkspaceTab::DynamicBlock);
                     }
+                    if ui.button("Show Command Line").clicked() {
+                        ui.close();
+                        workspace::ensure_tab(&mut self.dock_state, WorkspaceTab::CommandLine);
+                    }
                     if ui.button("Reset layout").clicked() {
                         ui.close();
                         self.dock_state = workspace::default_dock_state();
@@ -4253,6 +5876,9 @@ impl eframe::App for MyCadApp {
                     } else if let Some(kind) = self.io_kind {
                         ui.spinner();
                         ui.label(kind.status());
+                    } else if self.view_pending {
+                        ui.spinner();
+                        ui.label("Preparing view…");
                     }
                 });
             });
@@ -4265,11 +5891,100 @@ impl eframe::App for MyCadApp {
                 ui.separator();
                 ui.label(&self.status).on_hover_text(self.command.prompt());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
+                    let otrack = ui
+                        .selectable_label(self.drafting.preferences.otrack_enabled, "OTRACK  F11")
+                        .on_hover_text("Object snap tracking");
+                    if otrack.clicked() {
+                        self.toggle_otrack();
+                    }
+                    let osnap = ui
                         .selectable_label(self.drafting.preferences.osnap_enabled, "OSNAP  F3")
-                        .clicked()
-                    {
+                        .on_hover_text("Right-click to choose running object snaps");
+                    if osnap.clicked() {
                         self.toggle_osnap();
+                    }
+                    let mut snaps_changed = false;
+                    osnap.context_menu(|ui| {
+                        snaps_changed |= snap_checkbox(
+                            ui,
+                            &mut self.drafting.preferences,
+                            "Endpoint",
+                            |snaps| &mut snaps.endpoint,
+                        );
+                        snaps_changed |= snap_checkbox(
+                            ui,
+                            &mut self.drafting.preferences,
+                            "Midpoint",
+                            |snaps| &mut snaps.midpoint,
+                        );
+                        snaps_changed |=
+                            snap_checkbox(ui, &mut self.drafting.preferences, "Center", |snaps| {
+                                &mut snaps.center
+                            });
+                        snaps_changed |= snap_checkbox(
+                            ui,
+                            &mut self.drafting.preferences,
+                            "Intersection",
+                            |snaps| &mut snaps.intersection,
+                        );
+                        snaps_changed |= snap_checkbox(
+                            ui,
+                            &mut self.drafting.preferences,
+                            "Quadrant",
+                            |snaps| &mut snaps.quadrant,
+                        );
+                        snaps_changed |=
+                            snap_checkbox(ui, &mut self.drafting.preferences, "Tangent", |snaps| {
+                                &mut snaps.tangent
+                            });
+                        snaps_changed |= snap_checkbox(
+                            ui,
+                            &mut self.drafting.preferences,
+                            "Perpendicular",
+                            |snaps| &mut snaps.perpendicular,
+                        );
+                        snaps_changed |=
+                            snap_checkbox(ui, &mut self.drafting.preferences, "Nearest", |snaps| {
+                                &mut snaps.nearest
+                            });
+                        snaps_changed |=
+                            snap_checkbox(ui, &mut self.drafting.preferences, "Node", |snaps| {
+                                &mut snaps.node
+                            });
+                        snaps_changed |= snap_checkbox(
+                            ui,
+                            &mut self.drafting.preferences,
+                            "Insertion",
+                            |snaps| &mut snaps.insertion,
+                        );
+                    });
+                    if snaps_changed {
+                        self.persist_drafting();
+                    }
+                    let polar = ui
+                        .selectable_label(self.drafting.preferences.polar_enabled, "POLAR  F10")
+                        .on_hover_text("Right-click to choose the angle increment");
+                    if polar.clicked() {
+                        self.toggle_polar();
+                    }
+                    let mut polar_changed = false;
+                    polar.context_menu(|ui| {
+                        ui.label("Increment");
+                        for increment in crate::drafting::POLAR_INCREMENTS_DEG {
+                            let selected =
+                                (self.drafting.preferences.polar_increment_deg - increment).abs()
+                                    < 1e-6;
+                            if ui
+                                .selectable_label(selected, format!("{increment}°"))
+                                .clicked()
+                            {
+                                self.drafting.preferences.polar_increment_deg = increment;
+                                polar_changed = true;
+                            }
+                        }
+                    });
+                    if polar_changed {
+                        self.persist_drafting();
                     }
                     if ui
                         .selectable_label(self.drafting.preferences.ortho_enabled, "ORTHO  F8")
@@ -4308,12 +6023,17 @@ impl eframe::App for MyCadApp {
             SettingsAction::None => {}
         }
         self.flush_preview();
+        self.show_busy_cue(ctx);
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         self.settings.set_dock_state(&self.dock_state);
         self.settings.save(storage);
     }
+}
+
+fn busy_cue_visible(busy_since: Option<f64>, now: f64) -> bool {
+    busy_since.is_some_and(|started| now - started >= BUSY_CUE_DELAY_SECS)
 }
 
 fn paint_pdf_preview(ui: &mut Ui, state: &PdfPlotDialogState) {
@@ -4397,15 +6117,81 @@ fn handle_plot_window_pick(
     }
 }
 
+fn consider_block_prefetch(
+    app: &mut MyCadApp,
+    ui: &Ui,
+    response: &egui::Response,
+    origin: Point2,
+    size: Point2,
+) {
+    if let Some(id) = selected_editable_insert(app) {
+        app.request_block_prefetch(id);
+    }
+    if !response.hovered() {
+        app.block_prefetch.clear_hover();
+        return;
+    }
+    let pos = ui
+        .input(|input| input.pointer.hover_pos())
+        .filter(|pos| rect_contains_pos(origin, size, *pos));
+    let time = ui.input(|input| input.time);
+    match app.block_prefetch.observe_pointer(pos, time) {
+        HoverQuery::Wait(delay) => {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_secs_f64(delay.max(0.0)));
+        }
+        HoverQuery::Pick => {
+            let Some(screen) = pos else {
+                return;
+            };
+            let hit = pick_entity(
+                &app.display,
+                &app.camera,
+                Point2::new(screen.x as f64, screen.y as f64),
+                origin,
+                size,
+            );
+            if let Some(id) = hit.and_then(|id| editable_insert_id(app, id)) {
+                app.request_block_prefetch(id);
+            }
+        }
+        HoverQuery::Idle => {}
+    }
+}
+
+fn selected_editable_insert(app: &MyCadApp) -> Option<EntityId> {
+    let ids = app.selection.ids();
+    if ids.len() != 1 {
+        return None;
+    }
+    editable_insert_id(app, ids[0])
+}
+
+fn editable_insert_id(app: &MyCadApp, id: EntityId) -> Option<EntityId> {
+    let entity = app.document.as_ref()?.entity_by_id(id)?;
+    insert_is_editable(entity).then_some(id)
+}
+
 fn rect_contains_pos(origin: Point2, size: Point2, pos: egui::Pos2) -> bool {
     let x = pos.x as f64;
     let y = pos.y as f64;
     x >= origin.x && y >= origin.y && x <= origin.x + size.x && y <= origin.y + size.y
 }
 
+fn snap_checkbox(
+    ui: &mut egui::Ui,
+    preferences: &mut crate::drafting::DraftingPreferences,
+    label: &str,
+    field: impl FnOnce(&mut crate::drafting::RunningSnaps) -> &mut bool,
+) -> bool {
+    ui.checkbox(field(&mut preferences.running_snaps), label)
+        .changed()
+}
+
 fn handle_viewport_input(app: &mut MyCadApp, ui: &Ui, response: &egui::Response, rect: Rect) {
     let origin = Point2::new(rect.min.x as f64, rect.min.y as f64);
     let size = Point2::new(rect.width() as f64, rect.height() as f64);
+    consider_block_prefetch(app, ui, response, origin, size);
     let bindings = app.settings.bindings.clone();
     let modifiers = ui.input(|i| i.modifiers);
     let typing = crate::input::text_field_has_focus(ui.ctx());
@@ -4424,16 +6210,28 @@ fn handle_viewport_input(app: &mut MyCadApp, ui: &Ui, response: &egui::Response,
             if app.command.uses_osnap() {
                 let base = app.command.base_point();
                 app.command.write_snap_features(&mut app.command_snaps);
+                let time = ui.input(|input| input.time);
                 let resolved = app.drafting.resolve_point(
                     raw,
                     base,
                     modifiers.shift,
                     &app.camera,
                     size.y,
-                    &app.snaps,
-                    &app.command_snaps,
+                    crate::drafting::SnapSources {
+                        points: &app.snaps,
+                        edges: &app.measures,
+                        extra: &app.command_snaps,
+                        generation: app.geometry_generation.unwrap_or(0),
+                    },
+                    time,
                 );
-                let constrained = app.dynamic_input.constrain(base, resolved);
+                let constrained =
+                    app.dynamic_input
+                        .constrain_along(base, resolved, app.drafting.along_path());
+                if let Some(delay) = app.drafting.dwell_remaining(time) {
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_secs_f64(delay));
+                }
                 if let Some(snap) = app.drafting.acquired_snap {
                     if snap.point.distance(constrained) > GEOM_TOLERANCE {
                         app.drafting.acquired_snap = None;
@@ -4555,7 +6353,23 @@ fn handle_viewport_input(app: &mut MyCadApp, ui: &Ui, response: &egui::Response,
     }
 
     let mut opened_menu = false;
-    if !panning && !box_active {
+    if !panning
+        && !box_active
+        && app.command.requests_point()
+        && modifiers.shift
+        && response.clicked_by(PointerButton::Secondary)
+    {
+        let pos = response
+            .interact_pointer_pos()
+            .or(app.last_pointer)
+            .unwrap_or(rect.center());
+        app.context_menu = Some(crate::context_menu::ViewportMenu::new(
+            pos,
+            crate::context_menu::ContextKind::Snap,
+        ));
+        opened_menu = true;
+    }
+    if !panning && !box_active && !opened_menu {
         for button in [
             PointerButton::Primary,
             PointerButton::Middle,
@@ -4575,7 +6389,9 @@ fn handle_viewport_input(app: &mut MyCadApp, ui: &Ui, response: &egui::Response,
         }
     }
 
-    if !opened_menu && !app.measure_card_hovered && app.command.requests_point() {
+    if app.view_pending {
+        // The picture still belongs to the previous space until tessellation finishes.
+    } else if !opened_menu && !app.measure_card_hovered && app.command.requests_point() {
         if response.clicked_by(PointerButton::Primary) {
             if let Some(point) = app.drafting.current_point {
                 if app.command.kind().is_measure() {
@@ -4851,26 +6667,100 @@ fn with_extension(path: PathBuf, extension: &str) -> PathBuf {
 fn in_place_cad_path(document: &Document, written_by_mycad: bool) -> Option<&Path> {
     let path = document.source_path.as_deref()?;
     match CadFileFormat::from_path(path) {
-        Some(CadFileFormat::Mycad) => Some(path),
         Some(CadFileFormat::Dxf) => Some(path),
         Some(CadFileFormat::Dwg) if written_by_mycad || is_mycad_saved_dwg(path) => Some(path),
         _ => None,
     }
 }
 
-fn suggested_native_name(document: &Document) -> String {
-    drawing_stem_name(document, "mycad")
+fn save_prefers_dwg(document: &Document) -> bool {
+    document_has_dynamic_content(document)
+        || document
+            .source_path
+            .as_deref()
+            .is_some_and(|path| CadFileFormat::from_path(path) == Some(CadFileFormat::Dwg))
 }
 
-fn export_snapshot(document: &Document) -> Document {
+const DWG_SAVE_FILTER: &[&str] = &["dwg", "DWG"];
+const DXF_SAVE_FILTER: &[&str] = &["dxf", "DXF"];
+
+fn add_save_filters(dialog: rfd::FileDialog, prefer_dwg: bool) -> rfd::FileDialog {
+    if prefer_dwg {
+        dialog
+            .add_filter("DWG Drawing - AutoCAD 2000", DWG_SAVE_FILTER)
+            .add_filter("DXF Drawing", DXF_SAVE_FILTER)
+    } else {
+        dialog
+            .add_filter("DXF Drawing", DXF_SAVE_FILTER)
+            .add_filter("DWG Drawing - AutoCAD 2000", DWG_SAVE_FILTER)
+    }
+}
+
+fn export_snapshot(document: &Document) -> MaterializedExport {
+    let empty = || MaterializedExport {
+        document: document.clone(),
+        links: Vec::new(),
+        generated_blocks: Vec::new(),
+    };
     if !document_has_dynamic_content(document) {
-        return document.clone();
+        return empty();
     }
     let request = EvaluationRequest {
         generation: document.content_generation(),
     };
     export_materialized(document, &mut EvaluationCache::default(), request)
-        .unwrap_or_else(|_| document.clone())
+        .unwrap_or_else(|_| empty())
+}
+
+fn sync_companion(
+    source: &Document,
+    prepared: &MaterializedExport,
+    dest: &Path,
+    mut report: SaveReport,
+) -> SaveReport {
+    let path = companion_path(dest);
+    if document_has_dynamic_content(source) {
+        if let Err(err) = write_companion(
+            &path,
+            source,
+            &prepared.document,
+            &prepared.links,
+            &prepared.generated_blocks,
+        ) {
+            report
+                .warnings
+                .push(format!("companion file was not written: {err}"));
+        }
+    } else if let Err(err) = std::fs::remove_file(&path) {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            report
+                .warnings
+                .push(format!("companion file was not removed: {err}"));
+        }
+    }
+    report
+}
+
+fn companion_update_failed(report: &SaveReport) -> bool {
+    report
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("companion file"))
+}
+
+fn resolve_open_path(path: PathBuf) -> PathBuf {
+    drawing_for_companion(&path).unwrap_or(path)
+}
+
+fn apply_open_companion(path: &Path, document: &mut Document) -> Option<String> {
+    if CadFileFormat::from_path(path) == Some(CadFileFormat::Mycad) {
+        return None;
+    }
+    match read_companion_optional(&companion_path(path)) {
+        Ok(Some(companion)) => apply_companion(document, companion).status_line(),
+        Ok(None) => None,
+        Err(err) => Some(format!("Companion file was not applied: {err}")),
+    }
 }
 
 fn is_mycad_saved_dwg(path: &Path) -> bool {
@@ -4880,25 +6770,78 @@ fn is_mycad_saved_dwg(path: &Path) -> bool {
 }
 
 fn needs_lossy_save_warning(document: &Document) -> bool {
-    document.diagnostics.unsupported_total() > 0
+    document.diagnostics.has_save_loss()
 }
 
-fn lossy_save_message(count: u64) -> String {
-    let noun = if count == 1 { "entity" } else { "entities" };
-    format!(
-        "This drawing contains {count} {noun} that MyCad cannot fully preserve. Saving as DWG/DXF may change or remove unsupported content."
-    )
+const NEW_DRAWING_UNITS: DrawingUnits = DrawingUnits::Millimeters;
+
+fn blank_drawing() -> Document {
+    let mut document = Document::default();
+    document.units = NEW_DRAWING_UNITS;
+    document.ensure_layer_zero();
+    document.linetypes.insert(
+        "CONTINUOUS".into(),
+        cad_core::LineType::continuous("CONTINUOUS"),
+    );
+    document
 }
 
-fn format_save_status(path: &Path, report: &SaveReport) -> String {
+fn lossy_save_message(diagnostics: &cad_core::ImportDiagnostics) -> String {
+    let mut lines = Vec::new();
+    let unsupported = diagnostics.unsupported_total();
+    if unsupported > 0 {
+        let noun = if unsupported == 1 {
+            "entity"
+        } else {
+            "entities"
+        };
+        lines.push(format!(
+            "This drawing contains {unsupported} {noun} that MyCad cannot fully preserve."
+        ));
+        let listed = diagnostics
+            .unsupported_counts
+            .iter()
+            .map(|(name, count)| format!("{count} {name}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if !listed.is_empty() {
+            lines.push(listed);
+        }
+    }
+    for note in &diagnostics.lossy_notes {
+        lines.push(note.clone());
+    }
+    lines.push(
+        "The original file is not overwritten. Save a Copy writes a -MyCad drawing that AutoCAD can open without that content.".into(),
+    );
+    lines.join("\n")
+}
+
+fn format_save_status(path: &Path, report: &SaveReport, omitted_classes: usize) -> String {
     let name = file_name(path);
-    if CadFileFormat::from_path(path) == Some(CadFileFormat::Dwg) && !report.warnings.is_empty() {
+    let mut status = if companion_update_failed(report) {
+        format!("Saved {name}, but the MyCad companion file was not updated")
+    } else if CadFileFormat::from_path(path) == Some(CadFileFormat::Dwg)
+        && !report.warnings.is_empty()
+    {
         let count = report.warnings.len();
         let noun = if count == 1 { "warning" } else { "warnings" };
         format!("DWG saved with {count} compatibility {noun}")
     } else {
         format!("Saved {name}")
+    };
+    if omitted_classes > 0 {
+        let noun = if omitted_classes == 1 {
+            "class"
+        } else {
+            "classes"
+        };
+        let verb = if omitted_classes == 1 { "was" } else { "were" };
+        status.push_str(&format!(
+            ". {omitted_classes} drawing {noun} from the original {verb} not carried over (see Diagnostics)"
+        ));
     }
+    status
 }
 
 fn format_pdf_export_status(path: &Path, _report: &SaveReport) -> String {
@@ -4952,7 +6895,7 @@ fn format_dwg_write_error(err: &DwgWriteError) -> String {
 fn entity_affects_block_tree(entity: &Entity) -> bool {
     matches!(
         entity.geometry,
-        Geometry::Insert { .. } | Geometry::Dimension { .. }
+        Geometry::Insert { .. } | Geometry::Dimension(_)
     )
 }
 
@@ -5017,9 +6960,31 @@ fn area_from_entity(
     }
 }
 
+/// Extensions shown by the Open dialog's default filter. The first filter is
+/// the one Windows selects, so both native and DWG drawings are visible.
+const OPEN_DRAWING_EXTENSIONS: &[&str] = &["mycad", "MYCAD", "dwg", "DWG"];
+
+fn open_file_dialog() -> rfd::FileDialog {
+    rfd::FileDialog::new()
+        .add_filter("Drawing files", OPEN_DRAWING_EXTENSIONS)
+        .add_filter("MyCAD drawings", &["mycad", "MYCAD"])
+        .add_filter("DWG drawings", &["dwg", "DWG"])
+        .add_filter("All files", &["*"])
+}
+
 #[cfg(test)]
 mod save_as_tests {
     use super::*;
+
+    #[test]
+    fn open_dialog_default_filter_lists_mycad_and_dwg() {
+        assert!(OPEN_DRAWING_EXTENSIONS
+            .iter()
+            .any(|ext| ext.eq_ignore_ascii_case("mycad")));
+        assert!(OPEN_DRAWING_EXTENSIONS
+            .iter()
+            .any(|ext| ext.eq_ignore_ascii_case("dwg")));
+    }
 
     #[test]
     fn dwg_source_suggests_a_mycad_copy_name() {
@@ -5108,6 +7073,55 @@ mod save_as_tests {
     }
 
     #[test]
+    fn mycad_drawing_cannot_save_in_place() {
+        let mut document = Document::default();
+        document.source_path = Some(PathBuf::from("plant.mycad"));
+        assert!(in_place_cad_path(&document, true).is_none());
+    }
+
+    #[test]
+    fn save_filters_do_not_offer_mycad() {
+        for ext in DWG_SAVE_FILTER.iter().chain(DXF_SAVE_FILTER.iter()) {
+            assert!(!ext.eq_ignore_ascii_case("mycad"));
+        }
+    }
+
+    #[test]
+    fn dynamic_drawing_prefers_dwg() {
+        let mut document = Document::default();
+        let param = document.allocate_parameter_id();
+        let mut definition =
+            cad_core::BlockDefinition::plain("Frame", Point3::from_xy(0.0, 0.0), Vec::new());
+        definition.dynamic = Some(cad_core::DynamicDefinition {
+            parameters: vec![cad_core::ParameterDef::number(
+                param,
+                "Span",
+                cad_core::NumericParameter::length(1.0),
+            )],
+            ..Default::default()
+        });
+        document.replace_block_definition(definition);
+        assert!(save_prefers_dwg(&document));
+        assert_eq!(suggested_save_name(&document, true), "drawing-MyCad.dwg");
+    }
+
+    #[test]
+    fn companion_open_path_uses_the_drawing() {
+        assert_eq!(
+            resolve_open_path(PathBuf::from("Plant.dwg.mycad")),
+            PathBuf::from("Plant.dwg")
+        );
+        assert_eq!(
+            resolve_open_path(PathBuf::from("Plant.dxf.mycad")),
+            PathBuf::from("Plant.dxf")
+        );
+        assert_eq!(
+            resolve_open_path(PathBuf::from("Plant.mycad")),
+            PathBuf::from("Plant.mycad")
+        );
+    }
+
+    #[test]
     fn pdf_name_does_not_reuse_dxf_extension() {
         let mut document = Document::default();
         document.source_path = Some(PathBuf::from("plant.dxf"));
@@ -5133,11 +7147,11 @@ mod save_as_tests {
             entities_written: 4,
         };
         assert_eq!(
-            format_save_status(Path::new("Plant.dxf"), &report),
+            format_save_status(Path::new("Plant.dxf"), &report, 0),
             "Saved Plant.dxf"
         );
         assert_eq!(
-            format_save_status(Path::new("Plant.dwg"), &report),
+            format_save_status(Path::new("Plant.dwg"), &report, 0),
             "Saved Plant.dwg"
         );
     }
@@ -5153,7 +7167,7 @@ mod save_as_tests {
             entities_written: 12,
         };
         assert_eq!(
-            format_save_status(Path::new("Plant.dwg"), &report),
+            format_save_status(Path::new("Plant.dwg"), &report, 0),
             "DWG saved with 3 compatibility warnings"
         );
         let one = SaveReport {
@@ -5161,11 +7175,11 @@ mod save_as_tests {
             entities_written: 2,
         };
         assert_eq!(
-            format_save_status(Path::new("Plant.dwg"), &one),
+            format_save_status(Path::new("Plant.dwg"), &one, 0),
             "DWG saved with 1 compatibility warning"
         );
         assert_eq!(
-            format_save_status(Path::new("Plant.dxf"), &report),
+            format_save_status(Path::new("Plant.dxf"), &report, 0),
             "Saved Plant.dxf"
         );
     }
@@ -5192,14 +7206,108 @@ mod save_as_tests {
     }
 
     #[test]
-    fn lossy_save_message_uses_singular_and_plural() {
-        assert_eq!(
-            lossy_save_message(1),
-            "This drawing contains 1 entity that MyCad cannot fully preserve. Saving as DWG/DXF may change or remove unsupported content."
+    fn lossy_save_message_lists_unsupported_types() {
+        let mut document = Document::default();
+        document.diagnostics.bump_unsupported("VIEWPORT");
+        document.diagnostics.bump_unsupported("VIEWPORT");
+        document.diagnostics.bump_unsupported("MULTILEADER");
+        let message = lossy_save_message(&document.diagnostics);
+        assert!(message.contains("3 entities"));
+        assert!(message.contains("2 VIEWPORT"));
+        assert!(message.contains("1 MULTILEADER"));
+        assert!(message.contains("not overwritten"));
+        assert!(message.contains("-MyCad"));
+        assert!(needs_lossy_save_warning(&document));
+        assert!(!needs_lossy_save_warning(&Document::default()));
+    }
+
+    #[test]
+    fn complex_linetype_loss_opens_the_save_dialog() {
+        let mut document = Document::default();
+        document.diagnostics.note_lossy(
+            "LTYPE 'GASLINE': complex text/shape dashes at indices [1] (shape_flag != 0) are not saved; using length spacing only",
         );
+        assert_eq!(document.diagnostics.unsupported_total(), 0);
+        assert!(needs_lossy_save_warning(&document));
+        let message = lossy_save_message(&document.diagnostics);
+        assert!(message.contains("GASLINE"));
+        assert!(message.contains("not overwritten"));
+    }
+
+    #[test]
+    fn header_extent_warning_does_not_open_the_save_dialog() {
+        let mut document = Document::default();
+        document
+            .diagnostics
+            .warnings
+            .push("HEADER EXTMIN 0.000000,0.000000,0.000000".into());
+        assert!(!needs_lossy_save_warning(&document));
+    }
+
+    #[test]
+    fn unhandled_classes_do_not_open_the_save_dialog() {
+        let mut document = Document::default();
+        document.diagnostics.warnings.push(
+            "LibreDWG read reported unhandled class and value out of bounds (status 68)".into(),
+        );
+        document
+            .diagnostics
+            .record_unhandled_class("ACDB_BLOCKREPRESENTATION");
+        document.diagnostics.finish_unhandled_classes();
+        assert!(!needs_lossy_save_warning(&document));
+        assert!(document
+            .diagnostics
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("ACDB_BLOCKREPRESENTATION")));
+        let report = SaveReport {
+            warnings: Vec::new(),
+            entities_written: 1,
+        };
+        let status = format_save_status(
+            Path::new("Plant.dwg"),
+            &report,
+            document.diagnostics.unhandled_classes.len(),
+        );
+        assert!(status.contains("1 drawing class"));
+        assert!(status.contains("see Diagnostics"));
+        assert!(status.starts_with("Saved Plant.dwg"));
+    }
+
+    #[test]
+    fn new_drawing_uses_millimetres_and_layer_zero() {
+        let mut app = MyCadApp::for_test();
+        app.new_drawing();
+        let document = app.document.as_ref().expect("blank drawing");
+        assert_eq!(document.units, DrawingUnits::Millimeters);
+        assert!(document.layers.contains_key("0"));
+        assert!(document.linetypes.contains_key("CONTINUOUS"));
+        assert!(document.source_path.is_none());
+        assert!(!app.is_dirty());
+        assert_eq!(app.status, "New drawing");
+    }
+
+    #[test]
+    fn new_drawing_asks_before_discarding_edits() {
+        let mut app = MyCadApp::for_test();
+        app.new_drawing();
+        app.history.record(crate::history::Edit::InsertEntity {
+            space: EntitySpace::ModelSpace,
+            index: 0,
+            entity: Entity::new(Geometry::Point {
+                position: Point3::from_xy(1.0, 2.0),
+            }),
+        });
+        assert!(app.is_dirty());
+        app.new_drawing();
+        assert!(matches!(
+            app.pending_discard,
+            Some(PendingDiscard::NewDrawing)
+        ));
+        assert!(app.document.as_ref().expect("kept").source_path.is_none());
         assert_eq!(
-            lossy_save_message(14),
-            "This drawing contains 14 entities that MyCad cannot fully preserve. Saving as DWG/DXF may change or remove unsupported content."
+            app.document.as_ref().expect("kept").units,
+            DrawingUnits::Millimeters
         );
     }
 }
@@ -5555,6 +7663,217 @@ mod interaction_tests {
             selection_op_for_pointer(&map, PointerButton::Primary, ctrl),
             Some(SelectionOp::Remove)
         );
+    }
+
+    #[test]
+    fn leaving_a_block_restores_the_cached_model_picture() {
+        let mut app = MyCadApp::for_test();
+        let insert_id = {
+            let document = app.ensure_document().expect("document");
+            document.replace_block_definition(cad_core::BlockDefinition::plain(
+                "Widget",
+                Point3::from_xy(0.0, 0.0),
+                vec![Entity::new(Geometry::Line {
+                    start: Point3::from_xy(0.0, 0.0),
+                    end: Point3::from_xy(2.0, 0.0),
+                })],
+            ));
+            document
+                .add_entity(Entity::new(cad_core::identity_insert(
+                    "Widget".into(),
+                    Point3::from_xy(0.0, 0.0),
+                )))
+                .id
+        };
+        app.refresh_derived();
+        let model = std::sync::Arc::clone(&app.display);
+        let snaps = std::sync::Arc::clone(&app.snaps);
+        app.enter_block_edit(insert_id);
+        assert!(app.block_edit.is_active());
+        assert!(!std::sync::Arc::ptr_eq(&model, &app.display));
+        assert!(!std::sync::Arc::ptr_eq(&snaps, &app.snaps));
+        let editing = std::sync::Arc::clone(&app.display);
+        let editing_snaps = std::sync::Arc::clone(&app.snaps);
+        app.close_block_level(false);
+        assert!(!app.block_edit.is_active());
+        assert!(std::sync::Arc::ptr_eq(&model, &app.display));
+        assert!(std::sync::Arc::ptr_eq(&snaps, &app.snaps));
+        assert_eq!(app.status, "Block edit closed");
+        app.enter_block_edit(insert_id);
+        assert!(std::sync::Arc::ptr_eq(&editing, &app.display));
+        assert!(std::sync::Arc::ptr_eq(&editing_snaps, &app.snaps));
+    }
+
+    fn widget_insert(app: &mut MyCadApp) -> EntityId {
+        let document = app.ensure_document().expect("document");
+        document.replace_block_definition(cad_core::BlockDefinition::plain(
+            "Widget",
+            Point3::from_xy(0.0, 0.0),
+            vec![Entity::new(Geometry::Line {
+                start: Point3::from_xy(0.0, 0.0),
+                end: Point3::from_xy(2.0, 0.0),
+            })],
+        ));
+        document
+            .add_entity(Entity::new(cad_core::identity_insert(
+                "Widget".into(),
+                Point3::from_xy(0.0, 0.0),
+            )))
+            .id
+    }
+
+    #[test]
+    fn view_cache_keeps_the_model_picture() {
+        let mut cache = ViewCache::default();
+        let model_key = ViewKey {
+            generation: 1,
+            frames: Vec::new(),
+        };
+        let picture = std::sync::Arc::new(cad_render::DisplayList::default());
+        let snaps = std::sync::Arc::new(cad_core::SnapIndex::default());
+        let measures = std::sync::Arc::new(cad_core::MeasureIndex::default());
+        cache.insert(
+            model_key.clone(),
+            std::sync::Arc::clone(&picture),
+            std::sync::Arc::clone(&snaps),
+            std::sync::Arc::clone(&measures),
+        );
+        for index in 0..4 {
+            cache.insert(
+                ViewKey {
+                    generation: 1,
+                    frames: vec![EntityId(index + 1)],
+                },
+                std::sync::Arc::new(cad_render::DisplayList::default()),
+                std::sync::Arc::new(cad_core::SnapIndex::default()),
+                std::sync::Arc::new(cad_core::MeasureIndex::default()),
+            );
+        }
+        let kept = cache.get(&model_key).expect("model picture");
+        assert!(std::sync::Arc::ptr_eq(&picture, &kept.display));
+        assert!(cache.entries.len() <= 4);
+    }
+
+    #[test]
+    fn opening_a_block_takes_over_its_prefetch() {
+        let mut app = MyCadApp::for_test();
+        let insert_id = widget_insert(&mut app);
+        app.refresh_derived();
+        let model = std::sync::Arc::clone(&app.display);
+        let generation = app.document.as_ref().unwrap().content_generation();
+        let key = ViewKey {
+            generation,
+            frames: vec![insert_id],
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let job = 41;
+        app.view_job = job;
+        app.block_prefetch.running = Some(PrefetchJob {
+            key,
+            job,
+            rx: receiver,
+        });
+        app.enter_block_edit(insert_id);
+        assert!(app.block_prefetch.running.is_none());
+        assert_eq!(app.view_job, job, "must not start a second tessellation");
+        assert!(app.view_rx.is_some());
+        assert!(app.view_pending);
+        assert!(std::sync::Arc::ptr_eq(&model, &app.display));
+        drop(sender);
+    }
+
+    #[test]
+    fn a_prefetch_for_an_old_drawing_is_dropped() {
+        let mut app = MyCadApp::for_test();
+        let insert_id = widget_insert(&mut app);
+        app.refresh_derived();
+        let generation = app.document.as_ref().unwrap().content_generation();
+        let key = ViewKey {
+            generation,
+            frames: vec![insert_id],
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        app.block_prefetch.running = Some(PrefetchJob {
+            key: key.clone(),
+            job: 3,
+            rx: receiver,
+        });
+        app.ensure_document().unwrap().bump_generation();
+        sender
+            .send(Ok(ViewTessMsg {
+                job: 3,
+                key: key.clone(),
+                display: Box::new(cad_render::DisplayList::default()),
+                snaps: Box::new(cad_core::SnapIndex::default()),
+                measures: Box::new(cad_core::MeasureIndex::default()),
+            }))
+            .unwrap();
+        app.poll_block_prefetch();
+        assert!(app.block_prefetch.running.is_none());
+        assert!(app.view_cache.get(&key).is_none());
+    }
+
+    #[test]
+    fn editing_inside_a_block_does_not_rebuild_the_drawing() {
+        let mut app = MyCadApp::for_test();
+        let insert_id = widget_insert(&mut app);
+        app.refresh_derived();
+        app.full_refresh_count = 0;
+        app.enter_block_edit(insert_id);
+        let after_enter = app.full_refresh_count;
+        assert!(after_enter >= 1);
+        assert!(app.block_indexes_ready);
+        app.start_line_command();
+        app.accept_command_point(Point2::new(0.0, 1.0));
+        app.accept_command_point(Point2::new(2.0, 1.0));
+        assert_eq!(app.full_refresh_count, after_enter);
+        let member = app
+            .document
+            .as_ref()
+            .and_then(|document| document.block_by_name("Widget"))
+            .and_then(|block| block.entities.last().map(|entity| entity.id))
+            .expect("new member");
+        assert!(app.display.pick_for(member).is_some());
+        let mut hits = Vec::new();
+        app.snaps.query(
+            cad_core::Extents2::from_corners(Point2::new(1.5, 0.5), Point2::new(2.5, 1.5)),
+            &mut hits,
+        );
+        assert!(hits
+            .iter()
+            .any(|feature| feature.point.distance(Point2::new(2.0, 1.0)) < 1e-6));
+        app.cancel_command();
+        app.selection.replace(member);
+        app.erase_selected();
+        assert_eq!(app.full_refresh_count, after_enter);
+        assert!(app.display.pick_for(member).is_none());
+        app.undo();
+        assert_eq!(app.full_refresh_count, after_enter);
+        assert!(app.display.pick_for(member).is_some());
+    }
+
+    #[test]
+    fn a_worker_panic_becomes_a_status_message() {
+        let err = catch_worker(|| -> () { panic!("tessellation boom") }).unwrap_err();
+        assert!(err.contains("tessellation boom"));
+        let mut app = MyCadApp::for_test();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        app.view_rx = Some(receiver);
+        app.view_pending = true;
+        app.view_job = 7;
+        sender.send(Err(err)).unwrap();
+        app.poll_view_refresh(&egui::Context::default());
+        assert!(app.status.contains("tessellation boom"));
+        assert!(app.view_rx.is_none());
+        assert!(!app.view_pending);
+    }
+
+    #[test]
+    fn busy_cue_waits_before_it_appears() {
+        assert!(!busy_cue_visible(None, BUSY_CUE_DELAY_SECS));
+        assert!(!busy_cue_visible(Some(0.0), BUSY_CUE_DELAY_SECS * 0.5));
+        assert!(busy_cue_visible(Some(0.0), BUSY_CUE_DELAY_SECS));
+        assert!(busy_cue_visible(Some(0.0), BUSY_CUE_DELAY_SECS + 1.0));
     }
 }
 

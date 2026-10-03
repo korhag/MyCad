@@ -6,7 +6,8 @@ use crate::drafting::DraftingPreferences;
 use crate::input::InputMap;
 use crate::workspace::{
     decode_dock_layout, default_dock_state, encode_dock_layout, migrate_blocks_tab,
-    migrate_home_tab, recover_home_split_once, sanitize_dock_state, WorkspaceTab,
+    migrate_command_line_tab, migrate_home_tab, recover_home_split_once, sanitize_dock_state,
+    WorkspaceTab,
 };
 
 pub const STORAGE_KEY: &str = "mycad_settings";
@@ -159,6 +160,8 @@ pub struct AppSettings {
     #[serde(default)]
     pub blocks_tab_migrated: bool,
     #[serde(default)]
+    pub command_line_migrated: bool,
+    #[serde(default)]
     pub responsive_ribbon_recovered: bool,
     #[serde(default)]
     pub compact_home_height_applied: bool,
@@ -176,6 +179,7 @@ impl Default for AppSettings {
             drafting: DraftingPreferences::default(),
             home_layout_migrated: false,
             blocks_tab_migrated: false,
+            command_line_migrated: false,
             responsive_ribbon_recovered: false,
             compact_home_height_applied: false,
             library_preview: LibraryPreviewSettings::default(),
@@ -204,9 +208,12 @@ impl AppSettings {
         let mut state = decode_dock_layout(self.dock_layout.as_ref());
         self.home_layout_migrated = migrate_home_tab(&mut state, self.home_layout_migrated);
         self.blocks_tab_migrated = migrate_blocks_tab(&mut state, self.blocks_tab_migrated);
+        self.command_line_migrated =
+            migrate_command_line_tab(&mut state, self.command_line_migrated);
         self.responsive_ribbon_recovered =
             recover_home_split_once(&mut state, self.responsive_ribbon_recovered);
         self.dock_layout = Some(encode_dock_layout(&state));
+        self.drafting.sanitize();
     }
 
     pub fn dock_state(&self) -> egui_dock::DockState<WorkspaceTab> {

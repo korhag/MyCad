@@ -18,6 +18,7 @@ fn layer0(document: &mut Document) {
             frozen: false,
             color: CadColor::Aci(7),
             linetype: "CONTINUOUS".into(),
+            ..Layer::default()
         },
     );
 }
@@ -253,6 +254,7 @@ fn dashed() -> cad_core::LineType {
     cad_core::LineType {
         name: "DASHED".into(),
         dashes: vec![12.0, -6.0],
+        shapes: Vec::new(),
     }
 }
 
@@ -401,6 +403,7 @@ fn explicit_center_uses_imported_definition() {
         cad_core::LineType {
             name: "CENTER".into(),
             dashes: vec![32.0, -6.0, 4.0, -6.0],
+            shapes: Vec::new(),
         },
     );
     let mut entity = Entity::new(Geometry::Line {
@@ -1127,4 +1130,173 @@ fn block_edit_tessellation_picks_definition_members() {
         member_color > context_color + 0.2,
         "active members stay full color, context is dimmed ({member_color} vs {context_color})"
     );
+}
+
+fn block_with_context(columns: u32) -> (Document, EntityId, EntityId) {
+    use cad_core::{create_block_from_entities, EntitySpace};
+    let mut document = Document::default();
+    layer0(&mut document);
+    let line = document.add_entity(Entity::new(Geometry::Line {
+        start: Point3::from_xy(10.0, 0.0),
+        end: Point3::from_xy(20.0, 0.0),
+    }));
+    let member_id = line.id;
+    create_block_from_entities(
+        &mut document,
+        &EntitySpace::ModelSpace,
+        &[member_id],
+        "Leg",
+        Point2::new(15.0, 0.0),
+        true,
+    )
+    .unwrap();
+    let insert_id = document.model_space[0].id;
+    if let Geometry::Insert {
+        column_count,
+        column_spacing,
+        ..
+    } = &mut document.model_space[0].geometry
+    {
+        *column_count = columns;
+        *column_spacing = 30.0;
+    }
+    document.add_entity(Entity::new(Geometry::Line {
+        start: Point3::from_xy(0.0, 10.0),
+        end: Point3::from_xy(5.0, 10.0),
+    }));
+    (document, insert_id, member_id)
+}
+
+fn edit_view(insert_id: EntityId) -> BlockEditView {
+    BlockEditView {
+        frames: vec![BlockEditViewFrame {
+            instance_id: insert_id,
+            block_name: "Leg".into(),
+        }],
+    }
+}
+
+fn visible_vertices(list: &DisplayList) -> Vec<(i32, i32, i32, i32, i32)> {
+    let mut vertices = Vec::new();
+    for vertex in list
+        .line_vertices
+        .iter()
+        .chain(list.triangle_vertices.iter())
+    {
+        if vertex.color[3] <= 0.0 {
+            continue;
+        }
+        vertices.push((
+            (vertex.position[0] * 1000.0).round() as i32,
+            (vertex.position[1] * 1000.0).round() as i32,
+            (vertex.color[0] * 1000.0).round() as i32,
+            (vertex.color[1] * 1000.0).round() as i32,
+            (vertex.color[2] * 1000.0).round() as i32,
+        ));
+    }
+    vertices.sort_unstable();
+    vertices
+}
+
+fn live_bounds(list: &DisplayList) -> Vec<(EntityId, i64, i64, i64, i64)> {
+    let mut ids: Vec<EntityId> = list.picks.iter().map(|pick| pick.entity_id).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let mut bounds = Vec::new();
+    for id in ids {
+        let Some(pick) = list.pick_for(id) else {
+            continue;
+        };
+        if pick.is_empty() {
+            continue;
+        }
+        bounds.push((
+            id,
+            (pick.bounds.min.x * 1000.0).round() as i64,
+            (pick.bounds.min.y * 1000.0).round() as i64,
+            (pick.bounds.max.x * 1000.0).round() as i64,
+            (pick.bounds.max.y * 1000.0).round() as i64,
+        ));
+    }
+    bounds
+}
+
+#[test]
+fn derived_block_edit_matches_a_full_rebuild() {
+    for columns in [1, 2] {
+        let (document, insert_id, member_id) = block_with_context(columns);
+        let model = tessellate_document(&document);
+        let view = edit_view(insert_id);
+        let derived = model
+            .derive_block_edit(&document, &view)
+            .expect("model-space insert");
+        let full = tessellate_document_for_block_edit(&document, &view);
+        assert_eq!(
+            visible_vertices(&derived),
+            visible_vertices(&full),
+            "columns {columns}"
+        );
+        assert_eq!(
+            live_bounds(&derived),
+            live_bounds(&full),
+            "columns {columns}"
+        );
+        assert!(derived.pick_for(member_id).is_some());
+        assert!(derived.pick_for(insert_id).is_none());
+    }
+}
+
+#[test]
+fn derive_block_edit_rejects_nested_and_non_model_inserts() {
+    let (document, insert_id, member_id) = block_with_context(1);
+    let model = tessellate_document(&document);
+    let nested = BlockEditView {
+        frames: vec![
+            BlockEditViewFrame {
+                instance_id: insert_id,
+                block_name: "Leg".into(),
+            },
+            BlockEditViewFrame {
+                instance_id: member_id,
+                block_name: "Inner".into(),
+            },
+        ],
+    };
+    assert!(model.derive_block_edit(&document, &nested).is_none());
+    let missing = edit_view(member_id);
+    assert!(model.derive_block_edit(&document, &missing).is_none());
+}
+
+#[test]
+fn a_two_hundred_deep_block_chain_does_not_overflow() {
+    let mut document = Document::default();
+    layer0(&mut document);
+    document.replace_block_definition(BlockDefinition::plain(
+        "N0",
+        Point3::from_xy(0.0, 0.0),
+        vec![Entity::new(Geometry::Line {
+            start: Point3::from_xy(0.0, 0.0),
+            end: Point3::from_xy(1.0, 0.0),
+        })],
+    ));
+    for level in 1..200 {
+        let name = format!("N{level}");
+        let child = format!("N{}", level - 1);
+        document.replace_block_definition(BlockDefinition::plain(
+            &name,
+            Point3::from_xy(0.0, 0.0),
+            vec![Entity::new(cad_core::identity_insert(
+                child,
+                Point3::from_xy(0.0, 0.0),
+            ))],
+        ));
+    }
+    document.add_entity(Entity::new(cad_core::identity_insert(
+        "N199".into(),
+        Point3::from_xy(0.0, 0.0),
+    )));
+    let _display = tessellate_document(&document);
+    let _snaps = cad_core::SnapIndex::build(&document);
+    let _measures = cad_core::MeasureIndex::build(&document);
+    let _extents = document.compute_extents();
 }

@@ -147,7 +147,17 @@ fn emit_plot(
     report: &mut SaveReport,
 ) {
     let mut last_stroke: Option<Rgb> = None;
+    let mut last_width = options.stroke_pt.max(0.05);
     for stroke in &plot.strokes {
+        let width = if stroke.width_mm > 0.0 {
+            (stroke.width_mm * 72.0 / 25.4).max(0.05)
+        } else {
+            options.stroke_pt.max(0.05)
+        };
+        if (width - last_width).abs() > 1e-4 {
+            out.push_str(&format!("{width:.4} w\n"));
+            last_width = width;
+        }
         if last_stroke != Some(stroke.rgb) {
             set_stroke_color(out, options.style, stroke.rgb);
             last_stroke = Some(stroke.rgb);
@@ -293,6 +303,7 @@ mod tests {
                 frozen: false,
                 color: CadColor::Aci(7),
                 linetype: "CONTINUOUS".into(),
+                ..Layer::default()
             },
         );
     }
@@ -383,6 +394,7 @@ mod tests {
                 frozen: false,
                 color: CadColor::Aci(1),
                 linetype: "CONTINUOUS".into(),
+                ..Layer::default()
             },
         );
         let mut hidden = Entity::new(Geometry::Line {
@@ -478,6 +490,7 @@ mod tests {
                 frozen: true,
                 color: CadColor::Aci(1),
                 linetype: "CONTINUOUS".into(),
+                ..Layer::default()
             },
         );
         let mut frozen = Entity::new(Geometry::Line {
@@ -703,6 +716,7 @@ mod tests {
                 is_ccw: ccw,
             }])],
             pattern_lines: Vec::new(),
+            ..HatchData::default()
         })));
         document
     }
@@ -738,6 +752,7 @@ mod tests {
                 is_ccw: ccw,
             }])],
             pattern_lines: Vec::new(),
+            ..HatchData::default()
         })));
         document
     }
@@ -815,6 +830,7 @@ mod tests {
                 },
             ],
             pattern_lines: Vec::new(),
+            ..HatchData::default()
         })));
         let (_, text) = write_pdf(&document, &PdfExportOptions::default());
         assert!(text.contains(" f*\n") || text.split_whitespace().any(|t| t == "f*"));

@@ -8,8 +8,8 @@ use crate::measure::{
     point_segment_distance, MeasureError,
 };
 use crate::{
-    ocs_to_wcs, Document, Entity, EntityId, Extents2, Geometry, Point2, Point3, Transform2,
-    GEOM_TOLERANCE,
+    clamped_array_counts, nesting_too_deep, ocs_to_wcs, Document, Entity, EntityId, Extents2,
+    Geometry, Point2, Point3, Transform2, GEOM_TOLERANCE, MAX_SNAP_CANDIDATES,
 };
 
 pub const MEASURE_APERTURE_PX: f64 = 6.0;
@@ -158,17 +158,26 @@ impl MeasureIndex {
     }
 
     pub fn append_entity(&mut self, document: &Document, entity: &Entity) {
+        self.append_entity_with(document, entity, Transform2::identity(), entity.id);
+    }
+
+    // --------------------------------------------------------
+    // Method: append_entity_with
+    // Purpose: Add one entity's edges under an explicit owner and
+    //          world transform, matching SnapIndex.
+    // --------------------------------------------------------
+    pub fn append_entity_with(
+        &mut self,
+        document: &Document,
+        entity: &Entity,
+        transform: Transform2,
+        owner: EntityId,
+    ) {
         let mut added = Vec::new();
         let mut stack = Vec::new();
         let mut path = Vec::new();
         collect(
-            document,
-            entity,
-            entity.id,
-            Transform2::identity(),
-            &mut stack,
-            &mut path,
-            &mut added,
+            document, entity, owner, transform, &mut stack, &mut path, &mut added,
         );
         if added.is_empty() {
             return;
@@ -190,6 +199,49 @@ impl MeasureIndex {
         }
     }
 
+    pub fn for_block_edit(
+        model: &Self,
+        document: &Document,
+        instance_id: EntityId,
+        world_from_local: Transform2,
+    ) -> Self {
+        model
+            .clone()
+            .into_block_edit(document, instance_id, world_from_local)
+    }
+
+    pub fn into_block_edit(
+        mut self,
+        document: &Document,
+        instance_id: EntityId,
+        world_from_local: Transform2,
+    ) -> Self {
+        let Some(entity) = document.entity_by_id(instance_id) else {
+            return self;
+        };
+        let Geometry::Insert {
+            block_name,
+            column_count,
+            row_count,
+            ..
+        } = &entity.geometry
+        else {
+            return self;
+        };
+        if *column_count > 1 || *row_count > 1 {
+            return self;
+        }
+        let Some(block) = document.block_by_name(block_name) else {
+            return self;
+        };
+        let members = block.entities.clone();
+        self.remove_entity(instance_id);
+        for child in &members {
+            self.append_entity_with(document, child, world_from_local, child.id);
+        }
+        self
+    }
+
     pub fn remove_entity(&mut self, id: EntityId) {
         let Some(slots) = self.owner_slots.remove(&id) else {
             return;
@@ -205,8 +257,18 @@ impl MeasureIndex {
     }
 
     pub fn replace_entity(&mut self, document: &Document, entity: &Entity) {
-        self.remove_entity(entity.id);
-        self.append_entity(document, entity);
+        self.replace_entity_with(document, entity, Transform2::identity(), entity.id);
+    }
+
+    pub fn replace_entity_with(
+        &mut self,
+        document: &Document,
+        entity: &Entity,
+        transform: Transform2,
+        owner: EntityId,
+    ) {
+        self.remove_entity(owner);
+        self.append_entity_with(document, entity, transform, owner);
     }
 
     pub fn from_primitives(primitives: Vec<MeasurePrimitive>) -> Self {
@@ -283,6 +345,52 @@ impl MeasureIndex {
         best.map(|(_, slot)| &self.primitives[slot])
     }
 
+    pub fn query(&self, region: Extents2, out: &mut Vec<MeasurePrimitive>) {
+        out.clear();
+        let center = region.center();
+        let mut best: Vec<(u64, usize)> = Vec::new();
+        self.for_region(region, |slot| {
+            if !self.alive.get(slot).copied().unwrap_or(false) {
+                return;
+            }
+            let Some(primitive) = self.primitives.get(slot) else {
+                return;
+            };
+            if matches!(primitive.geom, MeasureGeom::ClosedLoop { .. }) {
+                return;
+            }
+            if !primitive.bounds.intersects(region) {
+                return;
+            }
+            let distance = primitive.distance_to(center);
+            let key = if distance.is_finite() {
+                distance.to_bits()
+            } else {
+                u64::MAX
+            };
+            if best.len() < MAX_SNAP_CANDIDATES {
+                best.push((key, slot));
+                return;
+            }
+            if let Some(worst) = best
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, (distance, _))| *distance)
+                .map(|(index, _)| index)
+            {
+                if key < best[worst].0 {
+                    best[worst] = (key, slot);
+                }
+            }
+        });
+        best.sort_by_key(|(distance, _)| *distance);
+        for (_, slot) in best {
+            if let Some(primitive) = self.primitives.get(slot) {
+                out.push(primitive.clone());
+            }
+        }
+    }
+
     pub fn primitives_for_owner(&self, owner: EntityId) -> impl Iterator<Item = &MeasurePrimitive> {
         self.owner_slots
             .get(&owner)
@@ -308,14 +416,17 @@ impl MeasureIndex {
         let mut seen = Vec::new();
         for y in y0..=y1 {
             for x in x0..=x1 {
-                for slot in &self.cells[y * self.cols + x] {
-                    let slot = *slot as usize;
-                    if !seen.contains(&slot) {
-                        seen.push(slot);
-                        visit(slot);
-                    }
-                }
+                seen.extend(
+                    self.cells[y * self.cols + x]
+                        .iter()
+                        .map(|slot| *slot as usize),
+                );
             }
+        }
+        seen.sort_unstable();
+        seen.dedup();
+        for slot in seen {
+            visit(slot);
         }
     }
 
@@ -398,9 +509,10 @@ fn collect(
             row_spacing,
             ..
         } => {
-            if block_stack
-                .iter()
-                .any(|name| name.eq_ignore_ascii_case(block_name))
+            if nesting_too_deep(block_stack)
+                || block_stack
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(block_name))
             {
                 return;
             }
@@ -408,8 +520,9 @@ fn collect(
                 return;
             };
             block_stack.push(block_name.clone());
-            for col in 0..(*column_count).max(1) {
-                for row in 0..(*row_count).max(1) {
+            let (cols, rows) = clamped_array_counts(*column_count, *row_count);
+            for col in 0..cols {
+                for row in 0..rows {
                     let array_offset = Transform2::translate(
                         col as f64 * *column_spacing,
                         row as f64 * *row_spacing,
@@ -746,6 +859,24 @@ mod tests {
     }
 
     #[test]
+    fn query_returns_primitives_that_touch_the_region() {
+        let document = line_doc();
+        let index = MeasureIndex::build(&document);
+        let mut found = Vec::new();
+        index.query(
+            Extents2::from_corners(Point2::new(4.0, -0.2), Point2::new(6.0, 0.2)),
+            &mut found,
+        );
+        assert_eq!(found.len(), 1);
+        found.clear();
+        index.query(
+            Extents2::from_corners(Point2::new(4.0, 2.0), Point2::new(6.0, 3.0)),
+            &mut found,
+        );
+        assert!(found.is_empty());
+    }
+
+    #[test]
     fn picks_a_line_within_aperture_not_the_whole_document() {
         let document = line_doc();
         let index = MeasureIndex::build(&document);
@@ -906,5 +1037,42 @@ mod tests {
             .pick(Point2::new(5.0, 6.02), 0.1, Some(MeasureRole::Straight))
             .is_none());
         assert!(index.primitives_for_owner(line.id).next().is_none());
+    }
+
+    #[test]
+    fn query_keeps_only_the_nearest_primitives() {
+        let mut document = Document::default();
+        for index in 0..200 {
+            let x = index as f64;
+            document.model_space.push(Entity::new(Geometry::Line {
+                start: Point3::from_xy(x, 0.0),
+                end: Point3::from_xy(x, 1.0),
+            }));
+        }
+        document.assign_missing_ids();
+        let index = MeasureIndex::build(&document);
+        let mut found = Vec::new();
+        index.query(
+            Extents2::from_corners(Point2::new(-1.0, -1.0), Point2::new(200.0, 2.0)),
+            &mut found,
+        );
+        assert_eq!(found.len(), crate::MAX_SNAP_CANDIDATES);
+    }
+
+    #[test]
+    fn a_long_line_is_reported_once() {
+        let mut document = Document::default();
+        document.model_space.push(Entity::new(Geometry::Line {
+            start: Point3::from_xy(0.0, 0.0),
+            end: Point3::from_xy(10_000.0, 0.0),
+        }));
+        document.assign_missing_ids();
+        let index = MeasureIndex::build(&document);
+        let mut found = Vec::new();
+        index.query(
+            Extents2::from_corners(Point2::new(-1.0, -1.0), Point2::new(10_001.0, 1.0)),
+            &mut found,
+        );
+        assert_eq!(found.len(), 1);
     }
 }

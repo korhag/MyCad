@@ -2,8 +2,55 @@
 
 use crate::color::CadColor;
 use crate::dynamic::InstanceConfiguration;
-use crate::geom::Point3;
+use crate::geom::{Point2, Point3};
 use crate::ids::VertexId;
+
+pub const MAX_HATCH_PATTERN_SEGMENTS: usize = 4000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DimensionKind {
+    #[default]
+    Linear,
+    Aligned,
+    Radius,
+    Diameter,
+    Angular2Line,
+    Angular3Point,
+    Ordinate,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DimensionData {
+    pub block_name: String,
+    pub kind: DimensionKind,
+    pub definition: Point3,
+    pub text_midpoint: Point3,
+    pub extension1: Point3,
+    pub extension2: Point3,
+    pub rotation: f64,
+    pub text: String,
+    pub dimstyle: String,
+}
+
+impl Default for DimensionData {
+    fn default() -> Self {
+        Self {
+            block_name: String::new(),
+            kind: DimensionKind::Linear,
+            definition: Point3::default(),
+            text_midpoint: Point3::default(),
+            extension1: Point3::default(),
+            extension2: Point3::default(),
+            rotation: 0.0,
+            text: String::new(),
+            dimstyle: "STANDARD".into(),
+        }
+    }
+}
+
+pub const LINEWEIGHT_BYLAYER: i16 = -1;
+pub const LINEWEIGHT_BYBLOCK: i16 = -2;
+pub const LINEWEIGHT_DEFAULT: i16 = -3;
 
 // ------------------------------------------------------------
 // Type: EntityId
@@ -36,6 +83,7 @@ pub struct Entity {
     pub color: CadColor,
     pub linetype: String,
     pub linetype_scale: f64,
+    pub lineweight: i16,
     pub visible: bool,
     pub geometry: Geometry,
 }
@@ -48,6 +96,7 @@ impl Entity {
             color: CadColor::ByLayer,
             linetype: "BYLAYER".to_string(),
             linetype_scale: 1.0,
+            lineweight: LINEWEIGHT_BYLAYER,
             visible: true,
             geometry,
         }
@@ -119,9 +168,7 @@ pub enum Geometry {
     Text(TextData),
     MText(MTextData),
     Hatch(HatchData),
-    Dimension {
-        block_name: String,
-    },
+    Dimension(DimensionData),
     Solid {
         corners: [Point3; 4],
         extrusion: Point3,
@@ -133,6 +180,129 @@ pub enum Geometry {
         vertices: Vec<Point3>,
         closed: bool,
     },
+    /// A paper-space viewport. The rectangle lives on the sheet; the view
+    /// fields describe the model-space window it shows.
+    Viewport(ViewportData),
+    Image(RasterFrame),
+    Wipeout(RasterFrame),
+}
+
+// ------------------------------------------------------------
+// Type: ViewportData
+// Purpose: One VIEWPORT entity. Paper size and sheet name live on
+//          `PaperLayout`, not here.
+// ------------------------------------------------------------
+#[derive(Debug, Clone, PartialEq)]
+pub struct RasterFrame {
+    pub corner: Point3,
+    pub u_vector: Point3,
+    pub v_vector: Point3,
+    pub size: Point2,
+    pub clip: Vec<Point2>,
+    pub path: String,
+}
+
+impl Default for RasterFrame {
+    fn default() -> Self {
+        Self {
+            corner: Point3::default(),
+            u_vector: Point3::from_xy(1.0, 0.0),
+            v_vector: Point3::from_xy(0.0, 1.0),
+            size: Point2::new(1.0, 1.0),
+            clip: Vec::new(),
+            path: String::new(),
+        }
+    }
+}
+
+impl RasterFrame {
+    pub fn corners(&self) -> [Point3; 4] {
+        let u = Point3::new(
+            self.u_vector.x * self.size.x,
+            self.u_vector.y * self.size.x,
+            self.u_vector.z * self.size.x,
+        );
+        let v = Point3::new(
+            self.v_vector.x * self.size.y,
+            self.v_vector.y * self.size.y,
+            self.v_vector.z * self.size.y,
+        );
+        [
+            self.corner,
+            Point3::new(
+                self.corner.x + u.x,
+                self.corner.y + u.y,
+                self.corner.z + u.z,
+            ),
+            Point3::new(
+                self.corner.x + u.x + v.x,
+                self.corner.y + u.y + v.y,
+                self.corner.z + u.z + v.z,
+            ),
+            Point3::new(
+                self.corner.x + v.x,
+                self.corner.y + v.y,
+                self.corner.z + v.z,
+            ),
+        ]
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ViewportData {
+    pub center: Point3,
+    pub width: f64,
+    pub height: f64,
+    pub view_center: Point2,
+    pub view_height: f64,
+    pub view_target: Point3,
+    pub view_direction: Point3,
+    pub twist: f64,
+    pub lens_length: f64,
+    pub front_z: f64,
+    pub back_z: f64,
+    pub snap_angle: f64,
+    pub circle_zoom: i32,
+    pub status: i32,
+    pub id: i32,
+    pub status_flag: i32,
+}
+
+impl Default for ViewportData {
+    fn default() -> Self {
+        Self {
+            center: Point3::default(),
+            width: 100.0,
+            height: 100.0,
+            view_center: Point2::default(),
+            view_height: 100.0,
+            view_target: Point3::default(),
+            view_direction: Point3::new(0.0, 0.0, 1.0),
+            twist: 0.0,
+            lens_length: 50.0,
+            front_z: 0.0,
+            back_z: 0.0,
+            snap_angle: 0.0,
+            circle_zoom: 100,
+            status: 1,
+            id: 1,
+            status_flag: 0,
+        }
+    }
+}
+
+impl ViewportData {
+    pub fn corners(&self) -> [Point3; 4] {
+        let half_width = self.width.abs() * 0.5;
+        let half_height = self.height.abs() * 0.5;
+        let center = self.center;
+        [
+            Point3::new(center.x - half_width, center.y - half_height, center.z),
+            Point3::new(center.x + half_width, center.y - half_height, center.z),
+            Point3::new(center.x + half_width, center.y + half_height, center.z),
+            Point3::new(center.x - half_width, center.y + half_height, center.z),
+        ]
+    }
 }
 
 impl Geometry {
@@ -154,16 +324,20 @@ impl Geometry {
             Self::Text(_) => "Text",
             Self::MText(_) => "MText",
             Self::Hatch(_) => "Hatch",
-            Self::Dimension { .. } => "Dimension",
+            Self::Dimension(_) => "Dimension",
             Self::Solid { .. } => "Solid",
             Self::Leader { .. } => "Leader",
             Self::MLine { .. } => "MLine",
+            Self::Viewport(_) => "Viewport",
+            Self::Image(_) => "Image",
+            Self::Wipeout(_) => "Wipeout",
         }
     }
 
     pub fn insert_block_name(&self) -> Option<&str> {
         match self {
-            Self::Insert { block_name, .. } | Self::Dimension { block_name } => Some(block_name),
+            Self::Insert { block_name, .. } => Some(block_name),
+            Self::Dimension(data) => Some(&data.block_name),
             _ => None,
         }
     }
@@ -297,6 +471,24 @@ impl TextVAlign {
     }
 }
 
+pub const ATTRIB_INVISIBLE: i16 = 1;
+pub const ATTRIB_CONSTANT: i16 = 2;
+pub const ATTRIB_VERIFY: i16 = 4;
+pub const ATTRIB_PRESET: i16 = 8;
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct AttributeInfo {
+    pub tag: String,
+    pub prompt: String,
+    pub flags: i16,
+}
+
+impl AttributeInfo {
+    pub fn invisible(&self) -> bool {
+        self.flags & ATTRIB_INVISIBLE != 0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TextData {
     pub insertion: Point3,
@@ -310,6 +502,9 @@ pub struct TextData {
     pub alignment: Point3,
     pub width_factor: f64,
     pub oblique: f64,
+    /// STYLE table name. Empty means STANDARD.
+    pub style: String,
+    pub attribute: Option<AttributeInfo>,
 }
 
 impl Default for TextData {
@@ -326,6 +521,8 @@ impl Default for TextData {
             alignment: Point3::default(),
             width_factor: 1.0,
             oblique: 0.0,
+            style: "STANDARD".to_string(),
+            attribute: None,
         }
     }
 }
@@ -341,6 +538,7 @@ pub struct MTextData {
     /// AutoCAD group 71. 1 is top-left, 9 is bottom-right.
     pub attachment: i16,
     pub line_spacing: f64,
+    pub style: String,
 }
 
 impl Default for MTextData {
@@ -354,6 +552,7 @@ impl Default for MTextData {
             extrusion: default_extrusion(),
             attachment: 1,
             line_spacing: 1.0,
+            style: "STANDARD".to_string(),
         }
     }
 }
@@ -363,8 +562,30 @@ pub struct HatchData {
     pub extrusion: Point3,
     pub elevation: f64,
     pub solid_fill: bool,
+    pub pattern_name: String,
+    pub pattern_scale: f64,
+    pub pattern_angle: f64,
+    pub pattern_type: i16,
+    pub double: bool,
     pub paths: Vec<HatchPath>,
     pub pattern_lines: Vec<HatchPatternLine>,
+}
+
+impl Default for HatchData {
+    fn default() -> Self {
+        Self {
+            extrusion: default_extrusion(),
+            elevation: 0.0,
+            solid_fill: true,
+            pattern_name: "SOLID".into(),
+            pattern_scale: 1.0,
+            pattern_angle: 0.0,
+            pattern_type: 1,
+            double: false,
+            paths: Vec::new(),
+            pattern_lines: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

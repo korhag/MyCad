@@ -61,6 +61,25 @@ fn field_write_size_matches<T>(
     write_size == std::mem::size_of::<T>()
 }
 
+/// Pointer at an embedded struct field, such as `LAYOUT.plotsettings`.
+pub fn embedded_object(parent: *mut c_void, dxfname: &str, field: &str) -> Option<*mut c_void> {
+    if parent.is_null() {
+        return None;
+    }
+    let c_dxfname = CString::new(dxfname).ok()?;
+    let c_field = CString::new(field).ok()?;
+    let desc =
+        unsafe { libredwg_sys::dwg_dynapi_entity_field(c_dxfname.as_ptr(), c_field.as_ptr()) };
+    if desc.is_null() {
+        return None;
+    }
+    let desc = unsafe { &*desc };
+    if desc.is_indirect() != 0 || desc.is_malloc() != 0 {
+        return None;
+    }
+    Some(unsafe { parent.byte_add(usize::from(desc.offset)) })
+}
+
 pub fn get_field<T: Copy>(entity: *mut c_void, dxfname: &str, field: &str) -> Option<T> {
     if entity.is_null() {
         return None;

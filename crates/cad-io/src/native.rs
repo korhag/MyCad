@@ -14,7 +14,7 @@ use cad_core::{
     ParameterValue, PlacementBehavior, Point2, Point3, PolyVertex, Preset, PresetId,
     ReflectionBehavior, RotationBehavior, RotationSource, SizeAuthoring, StepOrigin, StepPolicy,
     TextBinding, TextBindingMode, TextData, TextHAlign, TextParameter, TextReflectPolicy,
-    TextToken, TextVAlign, VertexId, VisibilityGroup,
+    TextToken, TextVAlign, VertexId, VisibilityGroup, MAX_BLOCK_DEPTH,
 };
 use serde::{Deserialize, Serialize};
 
@@ -25,7 +25,6 @@ pub const MYCAD_FORMAT: &str = "mycad";
 pub const MYCAD_BLOCK_FORMAT: &str = "mycadblock";
 pub const MYCAD_SCHEMA: u32 = 1;
 const MAX_ENTITIES: usize = 2_000_000;
-const MAX_NESTING: usize = 64;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct WireFile {
@@ -62,6 +61,8 @@ struct WireDocument {
     saved_revision: u64,
     layers: Vec<WireLayer>,
     linetypes: Vec<WireLineType>,
+    #[serde(default)]
+    text_styles: Vec<WireTextStyle>,
     blocks: Vec<WireBlock>,
     model_space: Vec<WireEntity>,
 }
@@ -73,12 +74,73 @@ struct WireLayer {
     frozen: bool,
     color: WireColor,
     linetype: String,
+    #[serde(default)]
+    locked: bool,
+    #[serde(default = "default_plot")]
+    plot: bool,
+    #[serde(default = "default_layer_lineweight")]
+    lineweight: i16,
+}
+
+fn default_plot() -> bool {
+    true
+}
+
+fn default_layer_lineweight() -> i16 {
+    -3
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WireLineTypeShape {
+    #[serde(default)]
+    flag: u16,
+    #[serde(default)]
+    shapecode: u16,
+    #[serde(default)]
+    text: String,
+    #[serde(default = "default_shape_scale")]
+    scale: f64,
+    #[serde(default)]
+    rotation: f64,
+    #[serde(default)]
+    x_offset: f64,
+    #[serde(default)]
+    y_offset: f64,
+    #[serde(default)]
+    style: String,
+    #[serde(default)]
+    shape_file: String,
+}
+
+fn default_shape_scale() -> f64 {
+    1.0
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct WireLineType {
     name: String,
     dashes: Vec<f64>,
+    #[serde(default)]
+    shapes: Vec<Option<WireLineTypeShape>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WireTextStyle {
+    name: String,
+    #[serde(default = "default_font_file")]
+    font_file: String,
+    #[serde(default)]
+    bigfont_file: String,
+    #[serde(default)]
+    height: f64,
+    #[serde(default = "default_width_factor")]
+    width_factor: f64,
+    #[serde(default)]
+    oblique: f64,
+}
+
+fn default_font_file() -> String {
+    "txt".to_string()
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -91,13 +153,29 @@ enum WireColor {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct WireBlock {
+pub(crate) struct WireBlock {
     id: u64,
     name: String,
     base_pt: [f64; 3],
     content_revision: u64,
     entities: Vec<WireEntity>,
     dynamic: Option<WireDynamic>,
+    #[serde(default)]
+    xref_path: String,
+    #[serde(default)]
+    xref_overlay: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WireRaster {
+    corner: [f64; 3],
+    u_vector: [f64; 3],
+    v_vector: [f64; 3],
+    size: [f64; 2],
+    #[serde(default)]
+    clip: Vec<[f64; 2]>,
+    #[serde(default)]
+    path: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -107,8 +185,22 @@ struct WireEntity {
     color: WireColor,
     linetype: String,
     linetype_scale: f64,
+    #[serde(default = "default_entity_lineweight")]
+    lineweight: i16,
     visible: bool,
     geometry: WireGeometry,
+}
+
+fn default_entity_lineweight() -> i16 {
+    -1
+}
+
+fn default_hatch_name() -> String {
+    "SOLID".to_string()
+}
+
+fn default_hatch_type() -> i16 {
+    1
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -185,16 +277,44 @@ enum WireGeometry {
         attachment: i16,
         #[serde(default = "default_line_spacing")]
         line_spacing: f64,
+        #[serde(default = "default_style_name")]
+        style: String,
     },
     Hatch {
         extrusion: [f64; 3],
         elevation: f64,
         solid_fill: bool,
+        #[serde(default = "default_hatch_name")]
+        pattern_name: String,
+        #[serde(default = "default_width_factor")]
+        pattern_scale: f64,
+        #[serde(default)]
+        pattern_angle: f64,
+        #[serde(default = "default_hatch_type")]
+        pattern_type: i16,
+        #[serde(default)]
+        double: bool,
         paths: Vec<WireHatchPath>,
         pattern_lines: Vec<WirePatternLine>,
     },
     Dimension {
         block_name: String,
+        #[serde(default)]
+        kind: u8,
+        #[serde(default)]
+        definition: [f64; 3],
+        #[serde(default)]
+        text_midpoint: [f64; 3],
+        #[serde(default)]
+        extension1: [f64; 3],
+        #[serde(default)]
+        extension2: [f64; 3],
+        #[serde(default)]
+        rotation: f64,
+        #[serde(default)]
+        text: String,
+        #[serde(default = "default_style_name")]
+        dimstyle: String,
     },
     Solid {
         corners: [[f64; 3]; 4],
@@ -206,6 +326,26 @@ enum WireGeometry {
     MLine {
         vertices: Vec<[f64; 3]>,
         closed: bool,
+    },
+    Image(WireRaster),
+    Wipeout(WireRaster),
+    Viewport {
+        center: [f64; 3],
+        width: f64,
+        height: f64,
+        view_center: [f64; 2],
+        view_height: f64,
+        view_target: [f64; 3],
+        view_direction: [f64; 3],
+        twist: f64,
+        lens_length: f64,
+        front_z: f64,
+        back_z: f64,
+        snap_angle: f64,
+        circle_zoom: i32,
+        status: i32,
+        id: i32,
+        status_flag: i32,
     },
 }
 
@@ -235,6 +375,14 @@ struct WireText {
     width_factor: f64,
     #[serde(default)]
     oblique: f64,
+    #[serde(default = "default_style_name")]
+    style: String,
+    #[serde(default)]
+    attribute_tag: String,
+    #[serde(default)]
+    attribute_prompt: String,
+    #[serde(default)]
+    attribute_flags: i16,
 }
 
 fn default_width_factor() -> f64 {
@@ -247,6 +395,10 @@ fn default_line_spacing() -> f64 {
 
 fn default_mtext_attachment() -> i16 {
     1
+}
+
+fn default_style_name() -> String {
+    "STANDARD".to_string()
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -297,7 +449,7 @@ struct WirePatternLine {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct WireConfig {
+pub(crate) struct WireConfig {
     values: Vec<WireInstanceValue>,
 }
 
@@ -829,7 +981,7 @@ fn collect_dependencies(
     out: &mut Vec<WireBlock>,
     stack: &mut Vec<String>,
 ) -> Result<(), ExportError> {
-    if stack.len() > MAX_NESTING {
+    if stack.len() >= MAX_BLOCK_DEPTH {
         return Err(ExportError::Validation("block nesting is too deep".into()));
     }
     if stack
@@ -889,6 +1041,9 @@ fn to_wire_document(document: &Document) -> WireDocument {
                 frozen: layer.frozen,
                 color: to_color(layer.color),
                 linetype: layer.linetype.clone(),
+                locked: layer.locked,
+                plot: layer.plot,
+                lineweight: layer.lineweight,
             })
             .collect(),
         linetypes: document
@@ -897,6 +1052,35 @@ fn to_wire_document(document: &Document) -> WireDocument {
             .map(|lt| WireLineType {
                 name: lt.name.clone(),
                 dashes: lt.dashes.clone(),
+                shapes: lt
+                    .shapes
+                    .iter()
+                    .map(|shape| {
+                        shape.as_ref().map(|shape| WireLineTypeShape {
+                            flag: shape.flag,
+                            shapecode: shape.shapecode,
+                            text: shape.text.clone(),
+                            scale: shape.scale,
+                            rotation: shape.rotation,
+                            x_offset: shape.x_offset,
+                            y_offset: shape.y_offset,
+                            style: shape.style.clone(),
+                            shape_file: shape.shape_file.clone(),
+                        })
+                    })
+                    .collect(),
+            })
+            .collect(),
+        text_styles: document
+            .text_styles
+            .values()
+            .map(|style| WireTextStyle {
+                name: style.name.clone(),
+                font_file: style.font_file.clone(),
+                bigfont_file: style.bigfont_file.clone(),
+                height: style.height,
+                width_factor: style.width_factor,
+                oblique: style.oblique,
             })
             .collect(),
         blocks: document.blocks.values().map(to_wire_block).collect(),
@@ -917,18 +1101,73 @@ fn from_wire_document(wire: WireDocument) -> Result<Document, ExportError> {
                 name: layer.name,
                 visible: layer.visible,
                 frozen: layer.frozen,
+                locked: layer.locked,
+                plot: layer.plot,
                 color: from_color(layer.color),
                 linetype: layer.linetype,
+                lineweight: layer.lineweight,
             },
         );
     }
     document.ensure_layer_zero();
+    for style in wire.text_styles {
+        if style.name.trim().is_empty() {
+            continue;
+        }
+        document.text_styles.insert(
+            style.name.clone(),
+            cad_core::TextStyle {
+                name: style.name,
+                font_file: if style.font_file.trim().is_empty() {
+                    "txt".into()
+                } else {
+                    style.font_file
+                },
+                bigfont_file: style.bigfont_file,
+                height: style.height,
+                width_factor: if style.width_factor.is_finite() && style.width_factor > 1e-9 {
+                    style.width_factor
+                } else {
+                    1.0
+                },
+                oblique: style.oblique,
+            },
+        );
+    }
     for lt in wire.linetypes {
+        let mut shapes = lt
+            .shapes
+            .into_iter()
+            .map(|shape| {
+                shape.map(|shape| cad_core::LineTypeShape {
+                    flag: shape.flag,
+                    shapecode: shape.shapecode,
+                    text: shape.text,
+                    scale: if shape.scale.is_finite() {
+                        shape.scale
+                    } else {
+                        1.0
+                    },
+                    rotation: if shape.rotation.is_finite() {
+                        shape.rotation
+                    } else {
+                        0.0
+                    },
+                    x_offset: shape.x_offset,
+                    y_offset: shape.y_offset,
+                    style: shape.style,
+                    shape_file: shape.shape_file,
+                })
+            })
+            .collect::<Vec<_>>();
+        shapes.truncate(lt.dashes.len());
+        shapes.resize(lt.dashes.len(), None);
         document.linetypes.insert(
             lt.name.clone(),
             LineType {
                 name: lt.name,
                 dashes: lt.dashes,
+                shapes,
             },
         );
     }
@@ -983,7 +1222,7 @@ fn from_wire_document(wire: WireDocument) -> Result<Document, ExportError> {
     Ok(document)
 }
 
-fn to_wire_block(block: &BlockDefinition) -> WireBlock {
+pub(crate) fn to_wire_block(block: &BlockDefinition) -> WireBlock {
     WireBlock {
         id: block.id.raw(),
         name: block.name.clone(),
@@ -991,13 +1230,17 @@ fn to_wire_block(block: &BlockDefinition) -> WireBlock {
         content_revision: block.content_revision,
         entities: block.entities.iter().map(to_wire_entity).collect(),
         dynamic: block.dynamic.as_ref().map(to_wire_dynamic),
+        xref_path: block.xref_path.clone(),
+        xref_overlay: block.xref_overlay,
     }
 }
 
-fn from_wire_block(block: WireBlock) -> Result<BlockDefinition, ExportError> {
+pub(crate) fn from_wire_block(block: WireBlock) -> Result<BlockDefinition, ExportError> {
     let mut definition = BlockDefinition::plain(block.name, from_pt(block.base_pt), Vec::new());
     definition.id = BlockDefinitionId(block.id);
     definition.content_revision = block.content_revision;
+    definition.xref_path = block.xref_path;
+    definition.xref_overlay = block.xref_overlay;
     for entity in block.entities {
         definition.entities.push(from_wire_entity(entity)?);
     }
@@ -1018,6 +1261,7 @@ fn to_wire_entity(entity: &Entity) -> WireEntity {
         color: to_color(entity.color),
         linetype: entity.linetype.clone(),
         linetype_scale: entity.linetype_scale,
+        lineweight: entity.lineweight,
         visible: entity.visible,
         geometry: to_wire_geometry(&entity.geometry),
     }
@@ -1030,6 +1274,7 @@ fn from_wire_entity(entity: WireEntity) -> Result<Entity, ExportError> {
         color: from_color(entity.color),
         linetype: entity.linetype,
         linetype_scale: entity.linetype_scale,
+        lineweight: entity.lineweight,
         visible: entity.visible,
         geometry: from_wire_geometry(entity.geometry)?,
     })
@@ -1151,16 +1396,30 @@ fn to_wire_geometry(geometry: &Geometry) -> WireGeometry {
             extrusion: pt(data.extrusion),
             attachment: data.attachment,
             line_spacing: data.line_spacing,
+            style: data.style.clone(),
         },
         Geometry::Hatch(hatch) => WireGeometry::Hatch {
             extrusion: pt(hatch.extrusion),
             elevation: hatch.elevation,
             solid_fill: hatch.solid_fill,
+            pattern_name: hatch.pattern_name.clone(),
+            pattern_scale: hatch.pattern_scale,
+            pattern_angle: hatch.pattern_angle,
+            pattern_type: hatch.pattern_type,
+            double: hatch.double,
             paths: hatch.paths.iter().map(to_hatch_path).collect(),
             pattern_lines: hatch.pattern_lines.iter().map(to_pattern).collect(),
         },
-        Geometry::Dimension { block_name } => WireGeometry::Dimension {
-            block_name: block_name.clone(),
+        Geometry::Dimension(data) => WireGeometry::Dimension {
+            block_name: data.block_name.clone(),
+            kind: dimension_kind_code(data.kind),
+            definition: pt(data.definition),
+            text_midpoint: pt(data.text_midpoint),
+            extension1: pt(data.extension1),
+            extension2: pt(data.extension2),
+            rotation: data.rotation,
+            text: data.text.clone(),
+            dimstyle: data.dimstyle.clone(),
         },
         Geometry::Solid { corners, extrusion } => WireGeometry::Solid {
             corners: corners.map(pt),
@@ -1172,6 +1431,26 @@ fn to_wire_geometry(geometry: &Geometry) -> WireGeometry {
         Geometry::MLine { vertices, closed } => WireGeometry::MLine {
             vertices: vertices.iter().copied().map(pt).collect(),
             closed: *closed,
+        },
+        Geometry::Image(frame) => WireGeometry::Image(to_raster(frame)),
+        Geometry::Wipeout(frame) => WireGeometry::Wipeout(to_raster(frame)),
+        Geometry::Viewport(viewport) => WireGeometry::Viewport {
+            center: pt(viewport.center),
+            width: viewport.width,
+            height: viewport.height,
+            view_center: [viewport.view_center.x, viewport.view_center.y],
+            view_height: viewport.view_height,
+            view_target: pt(viewport.view_target),
+            view_direction: pt(viewport.view_direction),
+            twist: viewport.twist,
+            lens_length: viewport.lens_length,
+            front_z: viewport.front_z,
+            back_z: viewport.back_z,
+            snap_angle: viewport.snap_angle,
+            circle_zoom: viewport.circle_zoom,
+            status: viewport.status,
+            id: viewport.id,
+            status_flag: viewport.status_flag,
         },
     }
 }
@@ -1292,6 +1571,7 @@ fn from_wire_geometry(geometry: WireGeometry) -> Result<Geometry, ExportError> {
             extrusion,
             attachment,
             line_spacing,
+            style,
         } => Geometry::MText(MTextData {
             insertion: from_pt(insertion),
             height,
@@ -1301,21 +1581,64 @@ fn from_wire_geometry(geometry: WireGeometry) -> Result<Geometry, ExportError> {
             extrusion: from_pt(extrusion),
             attachment,
             line_spacing,
+            style: style_or_standard(&style),
         }),
         WireGeometry::Hatch {
             extrusion,
             elevation,
             solid_fill,
+            pattern_name,
+            pattern_scale,
+            pattern_angle,
+            pattern_type,
+            double,
             paths,
             pattern_lines,
         } => Geometry::Hatch(HatchData {
             extrusion: from_pt(extrusion),
             elevation,
             solid_fill,
+            pattern_name: if pattern_name.trim().is_empty() {
+                if solid_fill {
+                    "SOLID".into()
+                } else {
+                    "ANSI31".into()
+                }
+            } else {
+                pattern_name
+            },
+            pattern_scale: if pattern_scale.is_finite() && pattern_scale > 1e-9 {
+                pattern_scale
+            } else {
+                1.0
+            },
+            pattern_angle,
+            pattern_type,
+            double,
             paths: paths.into_iter().map(from_hatch_path).collect(),
             pattern_lines: pattern_lines.into_iter().map(from_pattern).collect(),
         }),
-        WireGeometry::Dimension { block_name } => Geometry::Dimension { block_name },
+        WireGeometry::Dimension {
+            block_name,
+            kind,
+            definition,
+            text_midpoint,
+            extension1,
+            extension2,
+            rotation,
+            text,
+            dimstyle,
+        } => Geometry::Dimension(cad_core::DimensionData {
+            block_name,
+            kind: dimension_kind_from(kind),
+            definition: from_pt(definition),
+            text_midpoint: from_pt(text_midpoint),
+            extension1: from_pt(extension1),
+            extension2: from_pt(extension2),
+            rotation,
+            text,
+            dimstyle: style_or_standard(&dimstyle),
+        }),
         WireGeometry::Solid { corners, extrusion } => Geometry::Solid {
             corners: corners.map(from_pt),
             extrusion: from_pt(extrusion),
@@ -1327,6 +1650,43 @@ fn from_wire_geometry(geometry: WireGeometry) -> Result<Geometry, ExportError> {
             vertices: vertices.into_iter().map(from_pt).collect(),
             closed,
         },
+        WireGeometry::Image(frame) => Geometry::Image(from_raster(frame)),
+        WireGeometry::Wipeout(frame) => Geometry::Wipeout(from_raster(frame)),
+        WireGeometry::Viewport {
+            center,
+            width,
+            height,
+            view_center,
+            view_height,
+            view_target,
+            view_direction,
+            twist,
+            lens_length,
+            front_z,
+            back_z,
+            snap_angle,
+            circle_zoom,
+            status,
+            id,
+            status_flag,
+        } => Geometry::Viewport(cad_core::ViewportData {
+            center: from_pt(center),
+            width,
+            height,
+            view_center: cad_core::Point2::new(view_center[0], view_center[1]),
+            view_height,
+            view_target: from_pt(view_target),
+            view_direction: from_pt(view_direction),
+            twist,
+            lens_length,
+            front_z,
+            back_z,
+            snap_angle,
+            circle_zoom,
+            status,
+            id,
+            status_flag,
+        }),
     })
 }
 
@@ -2184,7 +2544,7 @@ fn from_size(size: WireSizeAuthoring) -> Result<SizeAuthoring, ExportError> {
     })
 }
 
-fn to_config(config: &InstanceConfiguration) -> WireConfig {
+pub(crate) fn to_config(config: &InstanceConfiguration) -> WireConfig {
     WireConfig {
         values: config
             .values
@@ -2204,7 +2564,7 @@ fn to_config(config: &InstanceConfiguration) -> WireConfig {
     }
 }
 
-fn from_config(config: WireConfig) -> InstanceConfiguration {
+pub(crate) fn from_config(config: WireConfig) -> InstanceConfiguration {
     let mut values = BTreeMap::new();
     for item in config.values {
         values.insert(
@@ -2251,6 +2611,18 @@ fn to_text(data: &TextData) -> WireText {
         alignment: pt(data.alignment),
         width_factor: data.width_factor,
         oblique: data.oblique,
+        style: data.style.clone(),
+        attribute_tag: data
+            .attribute
+            .as_ref()
+            .map(|info| info.tag.clone())
+            .unwrap_or_default(),
+        attribute_prompt: data
+            .attribute
+            .as_ref()
+            .map(|info| info.prompt.clone())
+            .unwrap_or_default(),
+        attribute_flags: data.attribute.as_ref().map(|info| info.flags).unwrap_or(0),
     }
 }
 
@@ -2271,6 +2643,75 @@ fn from_text(data: WireText) -> TextData {
             1.0
         },
         oblique: data.oblique,
+        style: style_or_standard(&data.style),
+        attribute: if data.attribute_tag.trim().is_empty() {
+            None
+        } else {
+            Some(cad_core::AttributeInfo {
+                tag: data.attribute_tag,
+                prompt: data.attribute_prompt,
+                flags: data.attribute_flags,
+            })
+        },
+    }
+}
+
+fn dimension_kind_code(kind: cad_core::DimensionKind) -> u8 {
+    match kind {
+        cad_core::DimensionKind::Linear => 0,
+        cad_core::DimensionKind::Aligned => 1,
+        cad_core::DimensionKind::Angular2Line => 2,
+        cad_core::DimensionKind::Diameter => 3,
+        cad_core::DimensionKind::Radius => 4,
+        cad_core::DimensionKind::Angular3Point => 5,
+        cad_core::DimensionKind::Ordinate => 6,
+    }
+}
+
+fn dimension_kind_from(kind: u8) -> cad_core::DimensionKind {
+    match kind {
+        1 => cad_core::DimensionKind::Aligned,
+        2 => cad_core::DimensionKind::Angular2Line,
+        3 => cad_core::DimensionKind::Diameter,
+        4 => cad_core::DimensionKind::Radius,
+        5 => cad_core::DimensionKind::Angular3Point,
+        6 => cad_core::DimensionKind::Ordinate,
+        _ => cad_core::DimensionKind::Linear,
+    }
+}
+
+fn to_raster(frame: &cad_core::RasterFrame) -> WireRaster {
+    WireRaster {
+        corner: pt(frame.corner),
+        u_vector: pt(frame.u_vector),
+        v_vector: pt(frame.v_vector),
+        size: [frame.size.x, frame.size.y],
+        clip: frame.clip.iter().map(|point| [point.x, point.y]).collect(),
+        path: frame.path.clone(),
+    }
+}
+
+fn from_raster(frame: WireRaster) -> cad_core::RasterFrame {
+    cad_core::RasterFrame {
+        corner: from_pt(frame.corner),
+        u_vector: from_pt(frame.u_vector),
+        v_vector: from_pt(frame.v_vector),
+        size: cad_core::Point2::new(frame.size[0], frame.size[1]),
+        clip: frame
+            .clip
+            .into_iter()
+            .map(|point| cad_core::Point2::new(point[0], point[1]))
+            .collect(),
+        path: frame.path,
+    }
+}
+
+fn style_or_standard(style: &str) -> String {
+    let trimmed = style.trim();
+    if trimmed.is_empty() {
+        "STANDARD".to_string()
+    } else {
+        trimmed.to_string()
     }
 }
 
@@ -2517,6 +2958,10 @@ mod tests {
             alignment: [9.0, 4.0, 0.0],
             width_factor: 0.8,
             oblique: 0.1,
+            style: "STANDARD".into(),
+            attribute_tag: String::new(),
+            attribute_prompt: String::new(),
+            attribute_flags: 0,
         };
         let json = serde_json::to_string(&wire).unwrap();
         let back: WireText = serde_json::from_str(&json).unwrap();
@@ -2544,6 +2989,70 @@ mod tests {
             }
             _ => panic!("expected mtext"),
         }
+        let old_layer = r#"{"name":"0","visible":true,"frozen":false,"color":{"kind":"Aci","index":7},"linetype":"CONTINUOUS"}"#;
+        let layer: WireLayer = serde_json::from_str(old_layer).unwrap();
+        assert!(layer.plot);
+        assert!(!layer.locked);
+        assert_eq!(layer.lineweight, -3);
+        let old_dim = r#"{"type":"Dimension","block_name":"*D1"}"#;
+        let dimension: WireGeometry = serde_json::from_str(old_dim).unwrap();
+        match dimension {
+            WireGeometry::Dimension {
+                block_name,
+                dimstyle,
+                kind,
+                ..
+            } => {
+                assert_eq!(block_name, "*D1");
+                assert_eq!(dimstyle, "STANDARD");
+                assert_eq!(kind, 0);
+            }
+            _ => panic!("expected dimension"),
+        }
+        let old_block =
+            r#"{"id":1,"name":"A","base_pt":[0.0,0.0,0.0],"content_revision":0,"entities":[]}"#;
+        let block: WireBlock = serde_json::from_str(old_block).unwrap();
+        assert!(block.xref_path.is_empty());
+        assert!(!block.xref_overlay);
+    }
+
+    #[test]
+    fn linetype_shape_roundtrip_and_old_json_defaults() {
+        let old = r#"{"name":"DASHED","dashes":[12.0,-6.0]}"#;
+        let loaded: WireLineType = serde_json::from_str(old).expect("old linetype");
+        assert!(loaded.shapes.is_empty());
+        let mut document = Document::default();
+        document.linetypes.insert(
+            "FENCE".into(),
+            LineType {
+                name: "FENCE".into(),
+                dashes: vec![0.25, -0.1],
+                shapes: vec![
+                    None,
+                    Some(cad_core::LineTypeShape {
+                        flag: 4,
+                        shapecode: 130,
+                        text: String::new(),
+                        scale: 0.1,
+                        rotation: 0.0,
+                        x_offset: -0.05,
+                        y_offset: 0.0,
+                        style: "STANDARD".into(),
+                        shape_file: String::new(),
+                    }),
+                ],
+            },
+        );
+        let back = from_wire_document(to_wire_document(&document)).expect("wire");
+        let shape = back.linetypes["FENCE"].shape_at(1).expect("shape");
+        assert_eq!(shape.flag, 4);
+        assert_eq!(shape.shapecode, 130);
+        assert!((shape.scale - 0.1).abs() < 1e-9);
+        assert_eq!(shape.style, "STANDARD");
+        assert!(shape.shape_file.is_empty());
+        let old_shape = r#"{"flag":4,"shapecode":130,"text":"","scale":1.0,"rotation":0.0,"x_offset":0.0,"y_offset":0.0,"style":"STANDARD"}"#;
+        let loaded: WireLineTypeShape = serde_json::from_str(old_shape).expect("old shape");
+        assert!(loaded.shape_file.is_empty());
     }
 
     #[test]

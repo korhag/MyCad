@@ -3,8 +3,12 @@
 use std::collections::HashMap;
 
 use crate::{
-    ocs_to_wcs, Document, Entity, EntityId, Extents2, Geometry, Point2, Point3, Transform2,
+    clamped_array_counts, nesting_too_deep, ocs_to_wcs, Document, Entity, EntityId, Extents2,
+    Geometry, Point2, Point3, Transform2,
 };
+
+/// Most snap features one pointer query may return.
+pub const MAX_SNAP_CANDIDATES: usize = 64;
 
 // ------------------------------------------------------------
 // Type: SnapKind
@@ -16,6 +20,30 @@ pub enum SnapKind {
     Endpoint,
     Midpoint,
     Center,
+    Quadrant,
+    Intersection,
+    Tangent,
+    Perpendicular,
+    Nearest,
+    Node,
+    Insertion,
+}
+
+impl SnapKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Endpoint => "Endpoint",
+            Self::Midpoint => "Midpoint",
+            Self::Center => "Center",
+            Self::Quadrant => "Quadrant",
+            Self::Intersection => "Intersection",
+            Self::Tangent => "Tangent",
+            Self::Perpendicular => "Perpendicular",
+            Self::Nearest => "Nearest",
+            Self::Node => "Node",
+            Self::Insertion => "Insertion",
+        }
+    }
 }
 
 // ------------------------------------------------------------
@@ -66,16 +94,25 @@ impl SnapIndex {
     }
 
     pub fn append_entity(&mut self, document: &Document, entity: &Entity) {
+        self.append_entity_with(document, entity, Transform2::identity(), entity.id);
+    }
+
+    // --------------------------------------------------------
+    // Method: append_entity_with
+    // Purpose: Add one entity's snaps under an explicit owner and
+    //          world transform. Block-edit members use their own id
+    //          and the open instance's world transform.
+    // --------------------------------------------------------
+    pub fn append_entity_with(
+        &mut self,
+        document: &Document,
+        entity: &Entity,
+        transform: Transform2,
+        owner: EntityId,
+    ) {
         let mut added = Vec::new();
         let mut stack = Vec::new();
-        collect_entity_features(
-            document,
-            entity,
-            entity.id,
-            Transform2::identity(),
-            &mut stack,
-            &mut added,
-        );
+        collect_entity_features(document, entity, owner, transform, &mut stack, &mut added);
         if added.is_empty() {
             return;
         }
@@ -94,6 +131,54 @@ impl SnapIndex {
         }
     }
 
+    // --------------------------------------------------------
+    // Method: for_block_edit
+    // Purpose: Clone the model index and re-key the open INSERT so
+    //          each member can be patched on its own.
+    // --------------------------------------------------------
+    pub fn for_block_edit(
+        model: &Self,
+        document: &Document,
+        instance_id: EntityId,
+        world_from_local: Transform2,
+    ) -> Self {
+        model
+            .clone()
+            .into_block_edit(document, instance_id, world_from_local)
+    }
+
+    pub fn into_block_edit(
+        mut self,
+        document: &Document,
+        instance_id: EntityId,
+        world_from_local: Transform2,
+    ) -> Self {
+        let Some(entity) = document.entity_by_id(instance_id) else {
+            return self;
+        };
+        let Geometry::Insert {
+            block_name,
+            column_count,
+            row_count,
+            ..
+        } = &entity.geometry
+        else {
+            return self;
+        };
+        if *column_count > 1 || *row_count > 1 {
+            return self;
+        }
+        let Some(block) = document.block_by_name(block_name) else {
+            return self;
+        };
+        let members: Vec<Entity> = block.entities.clone();
+        self.remove_entity(instance_id);
+        for child in &members {
+            self.append_entity_with(document, child, world_from_local, child.id);
+        }
+        self
+    }
+
     pub fn remove_entity(&mut self, id: EntityId) {
         let Some(slots) = self.owner_slots.remove(&id) else {
             return;
@@ -109,8 +194,18 @@ impl SnapIndex {
     }
 
     pub fn replace_entity(&mut self, document: &Document, entity: &Entity) {
-        self.remove_entity(entity.id);
-        self.append_entity(document, entity);
+        self.replace_entity_with(document, entity, Transform2::identity(), entity.id);
+    }
+
+    pub fn replace_entity_with(
+        &mut self,
+        document: &Document,
+        entity: &Entity,
+        transform: Transform2,
+        owner: EntityId,
+    ) {
+        self.remove_entity(owner);
+        self.append_entity_with(document, entity, transform, owner);
     }
 
     pub fn from_features(features: Vec<SnapFeature>) -> Self {
@@ -174,21 +269,33 @@ impl SnapIndex {
         if self.cells.is_empty() || !region.is_valid() {
             return;
         }
+        let center = region.center();
+        let mut best: Vec<(u64, SnapFeature)> = Vec::new();
         let (x0, y0) = self.cell(region.min);
         let (x1, y1) = self.cell(region.max);
         for y in y0.min(y1)..=y0.max(y1) {
             for x in x0.min(x1)..=x0.max(x1) {
-                out.extend(
-                    self.cells[y * self.cols + x]
-                        .iter()
-                        .copied()
-                        .filter(|&slot| self.alive.get(slot as usize).copied().unwrap_or(false))
-                        .filter_map(|slot| self.features.get(slot as usize))
-                        .copied()
-                        .filter(|feature| region.contains(feature.point)),
-                );
+                for slot in &self.cells[y * self.cols + x] {
+                    let slot = *slot as usize;
+                    if !self.alive.get(slot).copied().unwrap_or(false) {
+                        continue;
+                    }
+                    let Some(feature) = self.features.get(slot).copied() else {
+                        continue;
+                    };
+                    if !region.contains(feature.point) {
+                        continue;
+                    }
+                    keep_nearest(
+                        &mut best,
+                        distance_key(center.distance(feature.point)),
+                        feature,
+                    );
+                }
             }
         }
+        best.sort_by_key(|(distance, _)| *distance);
+        out.extend(best.into_iter().map(|(_, feature)| feature));
     }
 
     fn cell(&self, point: Point2) -> (usize, usize) {
@@ -226,18 +333,26 @@ fn collect_entity_features(
             row_spacing,
             ..
         } => {
-            if block_stack
-                .iter()
-                .any(|name| name.eq_ignore_ascii_case(block_name))
+            if nesting_too_deep(block_stack)
+                || block_stack
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(block_name))
             {
                 return;
             }
+            push(
+                out,
+                owner,
+                transform.apply(ocs_to_wcs(*insertion, *extrusion).xy()),
+                SnapKind::Insertion,
+            );
             let Some(block) = document.blocks.get(block_name) else {
                 return;
             };
             block_stack.push(block_name.clone());
-            for col in 0..(*column_count).max(1) {
-                for row in 0..(*row_count).max(1) {
+            let (cols, rows) = clamped_array_counts(*column_count, *row_count);
+            for col in 0..cols {
+                for row in 0..rows {
                     let array_offset = Transform2::translate(
                         col as f64 * *column_spacing,
                         row as f64 * *row_spacing,
@@ -258,10 +373,12 @@ fn collect_entity_features(
             }
             block_stack.pop();
         }
-        Geometry::Dimension { block_name } => {
-            if block_stack
-                .iter()
-                .any(|name| name.eq_ignore_ascii_case(block_name))
+        Geometry::Dimension(data) => {
+            let block_name = &data.block_name;
+            if nesting_too_deep(block_stack)
+                || block_stack
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(block_name))
             {
                 return;
             }
@@ -280,8 +397,13 @@ fn collect_entity_features(
             push(out, owner, end, SnapKind::Endpoint);
             push(out, owner, start.lerp(end, 0.5), SnapKind::Midpoint);
         }
+        Geometry::Point { position } => {
+            push(out, owner, transform.apply(position.xy()), SnapKind::Node);
+        }
         Geometry::Circle {
-            center, extrusion, ..
+            center,
+            radius,
+            extrusion,
         } => {
             push(
                 out,
@@ -289,6 +411,7 @@ fn collect_entity_features(
                 transform.apply(ocs_to_wcs(*center, *extrusion).xy()),
                 SnapKind::Center,
             );
+            push_quadrants(out, owner, transform, *center, *radius, *extrusion, None);
         }
         Geometry::Arc {
             center,
@@ -338,6 +461,15 @@ fn collect_entity_features(
                 owner,
                 point_at(*start_angle + sweep * 0.5),
                 SnapKind::Midpoint,
+            );
+            push_quadrants(
+                out,
+                owner,
+                transform,
+                *center,
+                *radius,
+                *extrusion,
+                Some((*start_angle, *end_angle)),
             );
         }
         Geometry::LwPolyline {
@@ -415,9 +547,64 @@ fn bulge_midpoint(start: Point2, end: Point2, bulge: f64) -> Option<Point2> {
     ))
 }
 
+fn push_quadrants(
+    out: &mut Vec<(SnapFeature, EntityId)>,
+    owner: EntityId,
+    transform: Transform2,
+    center: Point3,
+    radius: f64,
+    extrusion: Point3,
+    sweep: Option<(f64, f64)>,
+) {
+    if radius.abs() <= crate::GEOM_TOLERANCE {
+        return;
+    }
+    for step in 0..4 {
+        let angle = step as f64 * std::f64::consts::FRAC_PI_2;
+        let local = Point2::new(
+            center.x + radius * angle.cos(),
+            center.y + radius * angle.sin(),
+        );
+        if let Some((start, end)) = sweep {
+            if !crate::measure::angle_on_arc(local, center.xy(), start, end) {
+                continue;
+            }
+        }
+        let world =
+            transform.apply(ocs_to_wcs(Point3::new(local.x, local.y, center.z), extrusion).xy());
+        push(out, owner, world, SnapKind::Quadrant);
+    }
+}
+
 fn push(out: &mut Vec<(SnapFeature, EntityId)>, owner: EntityId, point: Point2, kind: SnapKind) {
     if point.is_finite() {
         out.push((SnapFeature { point, kind }, owner));
+    }
+}
+
+fn distance_key(distance: f64) -> u64 {
+    if distance.is_finite() {
+        distance.to_bits()
+    } else {
+        u64::MAX
+    }
+}
+
+fn keep_nearest<T>(best: &mut Vec<(u64, T)>, distance: u64, value: T) {
+    if best.len() < MAX_SNAP_CANDIDATES {
+        best.push((distance, value));
+        return;
+    }
+    let Some(worst) = best
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, (distance, _))| *distance)
+        .map(|(index, _)| index)
+    else {
+        return;
+    };
+    if distance < best[worst].0 {
+        best[worst] = (distance, value);
     }
 }
 
@@ -611,5 +798,154 @@ mod tests {
             &mut found,
         );
         assert!(found.is_empty());
+    }
+
+    #[test]
+    fn circle_exposes_center_and_four_quadrants() {
+        let mut document = Document::default();
+        document.model_space.push(Entity::new(Geometry::Circle {
+            center: Point3::from_xy(0.0, 0.0),
+            radius: 5.0,
+            extrusion: Point3::new(0.0, 0.0, 1.0),
+        }));
+        let index = SnapIndex::build(&document);
+        assert_eq!(index.len(), 5);
+        let mut found = Vec::new();
+        index.query(
+            Extents2::from_corners(Point2::new(4.9, -0.1), Point2::new(5.1, 0.1)),
+            &mut found,
+        );
+        assert!(found
+            .iter()
+            .any(|feature| feature.kind == SnapKind::Quadrant));
+        found.clear();
+        index.query(
+            Extents2::from_corners(Point2::new(-0.1, -0.1), Point2::new(0.1, 0.1)),
+            &mut found,
+        );
+        assert!(found.iter().any(|feature| feature.kind == SnapKind::Center));
+    }
+
+    #[test]
+    fn arc_quadrants_stay_inside_the_sweep() {
+        let mut document = Document::default();
+        document.model_space.push(Entity::new(Geometry::Arc {
+            center: Point3::from_xy(0.0, 0.0),
+            radius: 5.0,
+            start_angle: 0.0,
+            end_angle: std::f64::consts::FRAC_PI_2,
+            extrusion: Point3::new(0.0, 0.0, 1.0),
+        }));
+        let index = SnapIndex::build(&document);
+        let mut found = Vec::new();
+        index.query(
+            Extents2::from_corners(Point2::new(-20.0, -20.0), Point2::new(20.0, 20.0)),
+            &mut found,
+        );
+        let quadrants: Vec<_> = found
+            .iter()
+            .filter(|feature| feature.kind == SnapKind::Quadrant)
+            .collect();
+        assert_eq!(quadrants.len(), 2);
+        assert!(quadrants
+            .iter()
+            .any(|feature| feature.point.distance(Point2::new(5.0, 0.0)) < 1e-6));
+        assert!(quadrants
+            .iter()
+            .any(|feature| feature.point.distance(Point2::new(0.0, 5.0)) < 1e-6));
+    }
+
+    #[test]
+    fn point_and_insert_expose_node_and_insertion() {
+        let mut document = Document::default();
+        document.model_space.push(Entity::new(Geometry::Point {
+            position: Point3::from_xy(2.0, 3.0),
+        }));
+        document.blocks.insert(
+            "B".into(),
+            BlockDefinition {
+                name: "B".into(),
+                base_pt: Point3::from_xy(0.0, 0.0),
+                entities: Vec::new(),
+                ..Default::default()
+            },
+        );
+        document.model_space.push(Entity::new(Geometry::Insert {
+            block_name: "B".into(),
+            insertion: Point3::from_xy(8.0, 1.0),
+            scale: Point3::new(1.0, 1.0, 1.0),
+            rotation: 0.0,
+            extrusion: Point3::new(0.0, 0.0, 1.0),
+            attribs: Vec::new(),
+            column_count: 1,
+            row_count: 1,
+            column_spacing: 0.0,
+            row_spacing: 0.0,
+            configuration: None,
+        }));
+        let index = SnapIndex::build(&document);
+        let mut found = Vec::new();
+        index.query(
+            Extents2::from_corners(Point2::new(-1.0, -1.0), Point2::new(20.0, 20.0)),
+            &mut found,
+        );
+        assert!(found.iter().any(|feature| {
+            feature.kind == SnapKind::Node && feature.point.distance(Point2::new(2.0, 3.0)) < 1e-9
+        }));
+        assert!(found.iter().any(|feature| {
+            feature.kind == SnapKind::Insertion
+                && feature.point.distance(Point2::new(8.0, 1.0)) < 1e-9
+        }));
+    }
+
+    #[test]
+    fn query_keeps_only_the_nearest_candidates() {
+        let mut document = Document::default();
+        for index in 0..200 {
+            document.model_space.push(Entity::new(Geometry::Point {
+                position: Point3::from_xy(index as f64, 0.0),
+            }));
+        }
+        let index = SnapIndex::build(&document);
+        let mut found = Vec::new();
+        index.query(
+            Extents2::from_corners(Point2::new(-1.0, -1.0), Point2::new(200.0, 1.0)),
+            &mut found,
+        );
+        assert_eq!(found.len(), MAX_SNAP_CANDIDATES);
+        assert!(found
+            .iter()
+            .any(|feature| feature.point.distance(Point2::new(100.0, 0.0)) < 1e-6));
+    }
+
+    #[test]
+    fn huge_insert_array_stays_bounded() {
+        let mut document = Document::default();
+        document.blocks.insert(
+            "Cell".into(),
+            BlockDefinition::plain(
+                "Cell",
+                Point3::from_xy(0.0, 0.0),
+                vec![Entity::new(Geometry::Line {
+                    start: Point3::from_xy(0.0, 0.0),
+                    end: Point3::from_xy(1.0, 0.0),
+                })],
+            ),
+        );
+        document.model_space.push(Entity::new(Geometry::Insert {
+            block_name: "Cell".into(),
+            insertion: Point3::from_xy(0.0, 0.0),
+            scale: Point3::new(1.0, 1.0, 1.0),
+            rotation: 0.0,
+            extrusion: Point3::new(0.0, 0.0, 1.0),
+            attribs: Vec::new(),
+            column_count: u32::MAX,
+            row_count: u32::MAX,
+            column_spacing: 2.0,
+            row_spacing: 2.0,
+            configuration: None,
+        }));
+        let index = SnapIndex::build(&document);
+        assert!(index.len() <= crate::MAX_INSERT_ARRAY_CELLS as usize * 4);
     }
 }

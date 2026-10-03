@@ -9,11 +9,12 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cad_core::{
-    compare_documents, primitives_document, CompareTol, Document, DrawingUnits, Entity, Geometry,
-    Point3,
+    autocad_features_document, compare_documents, primitives_document, AttributeInfo,
+    BlockDefinition, CompareTol, Document, DrawingUnits, Entity, Geometry, PaperLayout, Point2,
+    Point3, TextData, TextStyle, ViewportData, ATTRIB_INVISIBLE,
 };
 use cad_io::{write_dxf, DxfExportOptions};
-use dwg_import::{convert_dxf_to_dwg, import_dwg, import_dxf, DwgOutputVersion};
+use dwg_import::{convert_dxf_to_dwg, import_dwg, import_dxf, write_dwg, DwgOutputVersion};
 
 fn stamp() -> u128 {
     SystemTime::now()
@@ -90,6 +91,39 @@ fn document_dxf_dwg_import_preserves_geometry() {
     };
     cleanup(&[&dxf, &dwg]);
     assert_geometry(&expected, &actual, "Document → DXF → DWG → import");
+}
+
+#[test]
+fn varying_z_polyline_survives_dxf_roundtrip() {
+    let mut expected = Document::default();
+    expected.add_entity(Entity::new(Geometry::Polyline {
+        vertices: vec![
+            cad_core::PolyVertex {
+                point: Point3::new(0.0, 0.0, 1.5),
+                bulge: 0.0,
+                vertex_id: Default::default(),
+            },
+            cad_core::PolyVertex {
+                point: Point3::new(10.0, 0.0, 4.5),
+                bulge: 0.0,
+                vertex_id: Default::default(),
+            },
+        ],
+        closed: false,
+        linetype_generation_continuous: false,
+    }));
+    expected.assign_missing_ids();
+    let dxf = temp_path("dxf");
+    write_dxf(&expected, &dxf, &DxfExportOptions::default()).expect("write DXF");
+    let actual = match import_dxf(&dxf) {
+        Ok(document) => document,
+        Err(err) => {
+            cleanup(&[&dxf]);
+            panic!("import_dxf failed: {err}");
+        }
+    };
+    cleanup(&[&dxf]);
+    assert_geometry(&expected, &actual, "3D POLYLINE → DXF → import");
 }
 
 fn inches_line_document() -> Document {
@@ -354,4 +388,243 @@ fn renamed_block_survives_dxf_and_dwg_roundtrip() {
         Geometry::Insert { block_name, .. } => assert_eq!(block_name, "Motor Drive"),
         other => panic!("{other:?}"),
     }
+}
+
+fn paper_sheet() -> Document {
+    let mut document = Document::default();
+    document.add_entity(Entity::new(Geometry::Line {
+        start: Point3::from_xy(0.0, 0.0),
+        end: Point3::from_xy(25.0, 0.0),
+    }));
+    document.layouts.push(PaperLayout {
+        name: "Sheet".into(),
+        block_name: "*PAPER_SPACE0".into(),
+        tab_order: 2,
+        paper_width: 420.0,
+        paper_height: 297.0,
+        left_margin: 10.0,
+        bottom_margin: 10.0,
+        right_margin: 10.0,
+        top_margin: 10.0,
+    });
+    document.blocks.insert(
+        "*PAPER_SPACE0".into(),
+        BlockDefinition {
+            name: "*PAPER_SPACE0".into(),
+            entities: vec![
+                Entity::new(Geometry::Line {
+                    start: Point3::from_xy(4.0, 8.0),
+                    end: Point3::from_xy(9.0, 8.0),
+                }),
+                Entity::new(Geometry::Viewport(ViewportData {
+                    center: Point3::from_xy(100.0, 50.0),
+                    width: 180.0,
+                    height: 120.0,
+                    view_center: Point2::new(10.0, 20.0),
+                    view_height: 80.0,
+                    ..ViewportData::default()
+                })),
+            ],
+            ..BlockDefinition::default()
+        },
+    );
+    document
+}
+
+#[test]
+fn paper_space_viewport_survives_dxf_roundtrip() {
+    let expected = paper_sheet();
+    let dxf = temp_path("dxf");
+    write_dxf(&expected, &dxf, &DxfExportOptions::default()).expect("write DXF");
+    let actual = match import_dxf(&dxf) {
+        Ok(document) => document,
+        Err(err) => {
+            cleanup(&[&dxf]);
+            panic!("import_dxf failed: {err}");
+        }
+    };
+    cleanup(&[&dxf]);
+    let sheet = actual
+        .layouts
+        .iter()
+        .find(|layout| layout.block_name.eq_ignore_ascii_case("*PAPER_SPACE0"))
+        .unwrap_or_else(|| panic!("layouts: {:?}", actual.layouts));
+    assert_eq!(sheet.name, "Sheet");
+    assert!(
+        (sheet.paper_width - 420.0).abs() < 1e-6,
+        "{}",
+        sheet.paper_width
+    );
+    assert!((sheet.paper_height - 297.0).abs() < 1e-6);
+    assert!((sheet.left_margin - 10.0).abs() < 1e-6);
+    let block = actual
+        .block_by_name("*PAPER_SPACE0")
+        .unwrap_or_else(|| panic!("blocks: {:?}", actual.blocks.keys().collect::<Vec<_>>()));
+    assert_eq!(
+        block.entities.len(),
+        2,
+        "{:?}",
+        actual.diagnostics.unsupported_counts
+    );
+    match &block.entities[1].geometry {
+        Geometry::Viewport(viewport) => {
+            assert!((viewport.center.x - 100.0).abs() < 1e-6);
+            assert!((viewport.width - 180.0).abs() < 1e-6);
+            assert!((viewport.height - 120.0).abs() < 1e-6);
+            assert!((viewport.view_center.x - 10.0).abs() < 1e-6);
+            assert!((viewport.view_height - 80.0).abs() < 1e-6);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+fn attribute_block() -> Document {
+    let mut document = Document::default();
+    document.units = DrawingUnits::Millimeters;
+    let mut definition = Entity::new(Geometry::Text(TextData {
+        insertion: Point3::from_xy(0.0, 0.0),
+        height: 2.5,
+        value: "Door".into(),
+        is_attrib_def: true,
+        attribute: Some(AttributeInfo {
+            tag: "NAME".into(),
+            prompt: "Name".into(),
+            flags: ATTRIB_INVISIBLE,
+        }),
+        ..TextData::default()
+    }));
+    definition.layer = "0".into();
+    document.blocks.insert(
+        "TAGGED".into(),
+        BlockDefinition {
+            name: "TAGGED".into(),
+            entities: vec![
+                Entity::new(Geometry::Line {
+                    start: Point3::from_xy(0.0, 0.0),
+                    end: Point3::from_xy(10.0, 0.0),
+                }),
+                definition,
+            ],
+            ..BlockDefinition::default()
+        },
+    );
+    document.add_entity(Entity::new(Geometry::Insert {
+        block_name: "TAGGED".into(),
+        insertion: Point3::from_xy(20.0, 5.0),
+        scale: Point3::new(1.0, 1.0, 1.0),
+        rotation: 0.0,
+        extrusion: Point3::new(0.0, 0.0, 1.0),
+        attribs: vec![TextData {
+            insertion: Point3::from_xy(20.0, 8.0),
+            height: 2.5,
+            value: "A1".into(),
+            attribute: Some(AttributeInfo {
+                tag: "NAME".into(),
+                prompt: String::new(),
+                flags: 0,
+            }),
+            ..TextData::default()
+        }],
+        column_count: 1,
+        row_count: 1,
+        column_spacing: 0.0,
+        row_spacing: 0.0,
+        configuration: None,
+    }));
+    document
+}
+
+#[test]
+fn attributes_survive_dxf_roundtrip() {
+    let expected = attribute_block();
+    let dxf = temp_path("dxf");
+    write_dxf(&expected, &dxf, &DxfExportOptions::default()).expect("write DXF");
+    let actual = match import_dxf(&dxf) {
+        Ok(document) => document,
+        Err(err) => {
+            cleanup(&[&dxf]);
+            panic!("import_dxf failed: {err}");
+        }
+    };
+    cleanup(&[&dxf]);
+    assert_geometry(&expected, &actual, "attributes");
+}
+
+#[test]
+fn autocad_features_survive_dxf_roundtrip() {
+    let expected = autocad_features_document();
+    let dxf = temp_path("dxf");
+    write_dxf(&expected, &dxf, &DxfExportOptions::default()).expect("write DXF");
+    let actual = match import_dxf(&dxf) {
+        Ok(document) => document,
+        Err(err) => {
+            cleanup(&[&dxf]);
+            panic!("import_dxf failed: {err}");
+        }
+    };
+    cleanup(&[&dxf]);
+    assert_geometry(&expected, &actual, "autocad features");
+}
+
+#[test]
+fn complex_linetypes_survive_dwg_roundtrip() {
+    let expected = autocad_features_document();
+    let dwg = temp_path("dwg");
+    if let Err(err) = write_dwg(&expected, &dwg) {
+        cleanup(&[&dwg]);
+        panic!("write_dwg failed: {err}");
+    }
+    let actual = match import_dwg(&dwg) {
+        Ok(document) => document,
+        Err(err) => {
+            cleanup(&[&dwg]);
+            panic!("import_dwg failed: {err}");
+        }
+    };
+    cleanup(&[&dwg]);
+    let mismatches = compare_documents(&expected, &actual, CompareTol::ROUND_TRIP);
+    let linetype_misses: Vec<_> = mismatches
+        .iter()
+        .filter(|miss| miss.path.contains("linetypes."))
+        .collect();
+    assert!(
+        linetype_misses.is_empty(),
+        "complex linetypes did not survive DWG: {linetype_misses:?}\nwarnings: {:?}",
+        actual.diagnostics.warnings
+    );
+}
+
+#[test]
+fn text_style_survives_dxf_roundtrip() {
+    let mut expected = Document::default();
+    expected.units = DrawingUnits::Millimeters;
+    expected.text_styles.insert(
+        "NOTES".into(),
+        TextStyle {
+            name: "NOTES".into(),
+            font_file: "romans.shx".into(),
+            bigfont_file: String::new(),
+            height: 0.0,
+            width_factor: 0.8,
+            oblique: 0.0,
+        },
+    );
+    expected.add_entity(Entity::new(Geometry::Text(TextData {
+        insertion: Point3::from_xy(1.0, 2.0),
+        height: 3.0,
+        value: "Styled".into(),
+        style: "NOTES".into(),
+        ..TextData::default()
+    })));
+    let dxf = temp_path("dxf");
+    write_dxf(&expected, &dxf, &DxfExportOptions::default()).expect("write DXF");
+    let actual = match import_dxf(&dxf) {
+        Ok(document) => document,
+        Err(err) => {
+            cleanup(&[&dxf]);
+            panic!("import_dxf failed: {err}");
+        }
+    };
+    cleanup(&[&dxf]);
+    assert_geometry(&expected, &actual, "text style");
 }

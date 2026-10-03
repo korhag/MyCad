@@ -7,6 +7,8 @@ use egui_phosphor::regular::{
     ARROWS_CLOCKWISE, ARROWS_OUT, ARROWS_OUT_CARDINAL, COPY, ERASER, FLIP_HORIZONTAL,
 };
 
+use cad_core::SnapKind;
+
 use crate::commands::{CommandKind, CommandState};
 
 const MENU_WIDTH: f32 = 208.0;
@@ -56,6 +58,9 @@ pub enum ContextAction {
     RotateByParameter,
     SavePreset,
     ConfigureBlock,
+    SnapOverride(SnapKind),
+    SnapNone,
+    OsnapSettings,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +73,7 @@ pub enum ContextKind {
     Erase,
     Entity,
     Empty,
+    Snap,
 }
 
 #[derive(Debug, Clone)]
@@ -104,6 +110,8 @@ pub fn kind_for_command(kind: CommandKind) -> Option<ContextKind> {
         CommandKind::Circle
         | CommandKind::Arc
         | CommandKind::Rectangle
+        | CommandKind::Ellipse
+        | CommandKind::Polygon
         | CommandKind::Distance
         | CommandKind::Angle
         | CommandKind::Radius
@@ -112,8 +120,12 @@ pub fn kind_for_command(kind: CommandKind) -> Option<ContextKind> {
         | CommandKind::Copy
         | CommandKind::Rotate
         | CommandKind::Mirror
-        | CommandKind::Scale => Some(ContextKind::Modify),
-        CommandKind::Erase => Some(ContextKind::Erase),
+        | CommandKind::Scale
+        | CommandKind::Stretch
+        | CommandKind::Offset => Some(ContextKind::Modify),
+        CommandKind::Point | CommandKind::Trim | CommandKind::Extend | CommandKind::Erase => {
+            Some(ContextKind::Erase)
+        }
         CommandKind::Idle => None,
     }
 }
@@ -199,6 +211,8 @@ pub fn show(
                                 ContextAction::UndoLast,
                             );
                             separator(ui);
+                            snap_submenu(ui, &mut action);
+                            separator(ui);
                             row(
                                 ui,
                                 None,
@@ -238,6 +252,8 @@ pub fn show(
                                 ContextAction::Close,
                             );
                             separator(ui);
+                            snap_submenu(ui, &mut action);
+                            separator(ui);
                             row(
                                 ui,
                                 None,
@@ -267,6 +283,8 @@ pub fn show(
                                 &mut action,
                                 ContextAction::UndoLast,
                             );
+                            separator(ui);
+                            snap_submenu(ui, &mut action);
                             row(
                                 ui,
                                 None,
@@ -287,6 +305,8 @@ pub fn show(
                                 &mut action,
                                 ContextAction::Back,
                             );
+                            separator(ui);
+                            snap_submenu(ui, &mut action);
                             row(
                                 ui,
                                 None,
@@ -320,6 +340,8 @@ pub fn show(
                                 &mut action,
                                 ContextAction::UndoLast,
                             );
+                            separator(ui);
+                            snap_submenu(ui, &mut action);
                             row(
                                 ui,
                                 None,
@@ -349,6 +371,9 @@ pub fn show(
                                 &mut action,
                                 ContextAction::Cancel,
                             );
+                        }
+                        ContextKind::Snap => {
+                            snap_rows(ui, &mut action);
                         }
                         ContextKind::Entity | ContextKind::Empty => {
                             idle_menu(
@@ -654,6 +679,57 @@ fn idle_menu(
     );
 }
 
+fn snap_submenu(ui: &mut Ui, action: &mut Option<ContextAction>) {
+    ui.menu_button("Snap Overrides", |ui| {
+        ui.set_min_width(188.0);
+        snap_rows(ui, action);
+    });
+}
+
+fn snap_rows(ui: &mut Ui, action: &mut Option<ContextAction>) {
+    for kind in [
+        SnapKind::Endpoint,
+        SnapKind::Midpoint,
+        SnapKind::Intersection,
+        SnapKind::Center,
+        SnapKind::Quadrant,
+        SnapKind::Tangent,
+        SnapKind::Perpendicular,
+        SnapKind::Nearest,
+        SnapKind::Node,
+        SnapKind::Insertion,
+    ] {
+        row(
+            ui,
+            None,
+            kind.label(),
+            None,
+            true,
+            action,
+            ContextAction::SnapOverride(kind),
+        );
+    }
+    separator(ui);
+    row(
+        ui,
+        None,
+        "None",
+        None,
+        true,
+        action,
+        ContextAction::SnapNone,
+    );
+    row(
+        ui,
+        None,
+        "Osnap Settings…",
+        None,
+        true,
+        action,
+        ContextAction::OsnapSettings,
+    );
+}
+
 fn modify_submenu(ui: &mut Ui, action: &mut Option<ContextAction>) {
     ui.menu_button("Modify", |ui| {
         ui.set_min_width(168.0);
@@ -726,7 +802,7 @@ fn title_case(label: &str) -> String {
 
 fn clamp_menu(pos: Pos2, screen: Rect) -> Pos2 {
     let width = MENU_WIDTH + 16.0;
-    let height = 220.0;
+    let height = 420.0;
     Pos2::new(
         pos.x.clamp(
             screen.min.x + 4.0,

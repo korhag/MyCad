@@ -174,6 +174,24 @@ const fn generate_aci_palette() -> [[u8; 3]; 256] {
     pal
 }
 
+pub fn nearest_aci(r: u8, g: u8, b: u8) -> u8 {
+    let mut best = 7_u8;
+    let mut best_distance = u32::MAX;
+    for index in 1..=255 {
+        let [pr, pg, pb] = ACI[index];
+        let distance =
+            u32::from(r.abs_diff(pr)) + u32::from(g.abs_diff(pg)) + u32::from(b.abs_diff(pb));
+        if distance < best_distance {
+            best = index as u8;
+            best_distance = distance;
+            if distance == 0 {
+                break;
+            }
+        }
+    }
+    best
+}
+
 pub fn aci_rgb(index: u8) -> Rgb {
     if index == 0 {
         return Rgb {
@@ -206,5 +224,11 @@ mod tests {
     fn explicit_aci_ignores_layer() {
         let rgb = CadColor::Aci(4).resolve(CadColor::Aci(1), CadColor::Aci(5));
         assert_eq!(rgb, aci_rgb(4));
+    }
+
+    #[test]
+    fn nearest_aci_matches_an_exact_palette_color() {
+        let red = aci_rgb(1);
+        assert_eq!(nearest_aci(red.r, red.g, red.b), 1);
     }
 }

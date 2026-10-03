@@ -167,12 +167,12 @@ pub struct Transaction {
 }
 
 // ------------------------------------------------------------
-// Enum: ModelSpaceChange
-// Purpose: Classify a transaction that only mutates model-space
-//          geometry so derived caches can update incrementally.
+// Enum: SpaceChange
+// Purpose: Classify a transaction that only mutates one entity
+//          space, so derived caches can update incrementally.
 // ------------------------------------------------------------
 #[derive(Debug, Clone)]
-pub enum ModelSpaceChange {
+pub enum SpaceChange {
     Inserted(Vec<Entity>),
     Removed(Vec<Entity>),
     Replaced(Vec<(Entity, Entity)>),
@@ -197,7 +197,12 @@ impl Transaction {
             .collect()
     }
 
-    pub fn model_space_change(&self) -> Option<ModelSpaceChange> {
+    pub fn model_space_change(&self) -> Option<SpaceChange> {
+        self.space_change(&EntitySpace::ModelSpace)
+    }
+
+    /// Edits that all land in `space` and are all inserts, all removals, or all replacements.
+    pub fn space_change(&self, space: &EntitySpace) -> Option<SpaceChange> {
         if self.edits.is_empty() {
             return None;
         }
@@ -206,27 +211,35 @@ impl Transaction {
         let mut replaced = Vec::new();
         for edit in &self.edits {
             match edit {
-                Edit::InsertEntity { space, entity, .. } if space.is_model() => {
+                Edit::InsertEntity {
+                    space: edit_space,
+                    entity,
+                    ..
+                } if edit_space.matches(space) => {
                     inserted.push(entity.clone());
                 }
-                Edit::RemoveEntity { space, entity, .. } if space.is_model() => {
+                Edit::RemoveEntity {
+                    space: edit_space,
+                    entity,
+                    ..
+                } if edit_space.matches(space) => {
                     removed.push(entity.clone());
                 }
                 Edit::ReplaceEntity {
-                    space,
+                    space: edit_space,
                     before,
                     after,
                     ..
-                } if space.is_model() => {
+                } if edit_space.matches(space) => {
                     replaced.push((before.clone(), after.clone()));
                 }
                 _ => return None,
             }
         }
         match (inserted.is_empty(), removed.is_empty(), replaced.is_empty()) {
-            (false, true, true) => Some(ModelSpaceChange::Inserted(inserted)),
-            (true, false, true) => Some(ModelSpaceChange::Removed(removed)),
-            (true, true, false) => Some(ModelSpaceChange::Replaced(replaced)),
+            (false, true, true) => Some(SpaceChange::Inserted(inserted)),
+            (true, false, true) => Some(SpaceChange::Removed(removed)),
+            (true, true, false) => Some(SpaceChange::Replaced(replaced)),
             _ => None,
         }
     }
@@ -441,6 +454,39 @@ mod tests {
             start: Point3::from_xy(x0, y0),
             end: Point3::from_xy(x1, y1),
         })
+    }
+
+    #[test]
+    fn space_change_reports_block_edits_and_rejects_mixed_spaces() {
+        let member = line(0.0, 0.0, 1.0, 0.0);
+        let block = EntitySpace::Block("Motor".into());
+        let inserted = Transaction {
+            edits: vec![Edit::InsertEntity {
+                space: block.clone(),
+                index: 1,
+                entity: member.clone(),
+            }],
+        };
+        match inserted.space_change(&block) {
+            Some(SpaceChange::Inserted(entities)) => assert_eq!(entities.len(), 1),
+            other => panic!("expected insert, got {other:?}"),
+        }
+        assert!(inserted.model_space_change().is_none());
+        let mixed = Transaction {
+            edits: vec![
+                Edit::InsertEntity {
+                    space: EntitySpace::ModelSpace,
+                    index: 0,
+                    entity: member.clone(),
+                },
+                Edit::InsertEntity {
+                    space: block,
+                    index: 1,
+                    entity: member,
+                },
+            ],
+        };
+        assert!(mixed.space_change(&EntitySpace::ModelSpace).is_none());
     }
 
     fn circle(x: f64, y: f64, radius: f64) -> Entity {

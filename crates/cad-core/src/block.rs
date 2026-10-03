@@ -10,6 +10,35 @@ use crate::transform::Transform2;
 
 pub const NON_UNIFORM_MEMBERSHIP_MESSAGE: &str = "Cannot move this object into the block because this block instance uses a non-uniform transform that this geometry type cannot yet preserve exactly.";
 
+/// Deepest INSERT chain a walker will follow. Deeper chains are skipped
+/// so a hostile drawing cannot overflow the stack.
+pub const MAX_BLOCK_DEPTH: usize = 64;
+
+/// Most cells one INSERT array may expand into.
+pub const MAX_INSERT_ARRAY_CELLS: u64 = 10_000;
+
+// ------------------------------------------------------------
+// Function: nesting_too_deep
+// Purpose: Stop an INSERT walk before it can overflow the stack.
+// ------------------------------------------------------------
+pub fn nesting_too_deep(stack: &[String]) -> bool {
+    stack.len() >= MAX_BLOCK_DEPTH
+}
+
+// ------------------------------------------------------------
+// Function: clamped_array_counts
+// Purpose: Bound a MINSERT so a corrupt count cannot hang the app.
+// ------------------------------------------------------------
+pub fn clamped_array_counts(column_count: u32, row_count: u32) -> (u32, u32) {
+    const MAX_AXIS: u32 = 256;
+    let cols = column_count.max(1).min(MAX_AXIS);
+    let mut rows = row_count.max(1).min(MAX_AXIS);
+    if cols as u64 * rows as u64 > MAX_INSERT_ARRAY_CELLS {
+        rows = ((MAX_INSERT_ARRAY_CELLS / cols as u64) as u32).max(1);
+    }
+    (cols, rows)
+}
+
 // ------------------------------------------------------------
 // Enum: BlockError
 // Purpose: Recoverable block-workflow failures shown in the status bar.
@@ -85,6 +114,45 @@ pub struct MakeUniqueResult {
     pub insert_space: EntitySpace,
     pub insert_index: usize,
     pub entity_map: std::collections::BTreeMap<EntityId, EntityId>,
+}
+
+/// `*PAPER_SPACE` and `*PAPER_SPACE0`, `*PAPER_SPACE1`, and the `$` forms.
+pub fn is_paper_layout_block(name: &str) -> bool {
+    let upper = name.trim().to_ascii_uppercase();
+    upper == "*PAPER_SPACE"
+        || upper == "$PAPER_SPACE"
+        || upper.starts_with("*PAPER_SPACE")
+        || upper.starts_with("$PAPER_SPACE")
+}
+
+pub fn paper_layout_block_order(name: &str) -> u32 {
+    let upper = name.trim().to_ascii_uppercase();
+    let suffix = upper
+        .trim_start_matches("$PAPER_SPACE")
+        .trim_start_matches("*PAPER_SPACE");
+    if suffix.is_empty() {
+        0
+    } else {
+        suffix
+            .parse::<u32>()
+            .unwrap_or(u32::MAX - 1)
+            .saturating_add(1)
+    }
+}
+
+pub fn sorted_paper_layout_blocks(document: &Document) -> Vec<String> {
+    let mut names: Vec<String> = document
+        .blocks
+        .keys()
+        .filter(|name| is_paper_layout_block(name))
+        .cloned()
+        .collect();
+    names.sort_by(|left, right| {
+        paper_layout_block_order(left)
+            .cmp(&paper_layout_block_order(right))
+            .then_with(|| left.cmp(right))
+    });
+    names
 }
 
 pub fn is_system_block_name(name: &str) -> bool {
@@ -194,23 +262,27 @@ pub struct BlockTreeChild {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BlockTreeIndex {
     children: BTreeMap<String, Vec<BlockTreeChild>>,
+    /// Insert count for each definition, keyed by lowercase name.
+    references: BTreeMap<String, usize>,
 }
 
 impl BlockTreeIndex {
     pub fn build(document: &Document) -> Self {
         let _span = crate::perf::span("BlockTreeIndex::build");
         let mut children = BTreeMap::new();
-        children.insert(
-            String::new(),
-            tally_block_children(&document.model_space, document),
-        );
+        let mut references = BTreeMap::new();
+        let model = tally_block_children(&document.model_space, document);
+        record_reference_counts(&model, &mut references);
+        children.insert(String::new(), model);
         for (name, definition) in &document.blocks {
-            children.insert(
-                name.to_ascii_lowercase(),
-                tally_block_children(&definition.entities, document),
-            );
+            let kids = tally_block_children(&definition.entities, document);
+            record_reference_counts(&kids, &mut references);
+            children.insert(name.to_ascii_lowercase(), kids);
         }
-        Self { children }
+        Self {
+            children,
+            references,
+        }
     }
 
     pub fn model_children(&self) -> &[BlockTreeChild] {
@@ -224,6 +296,15 @@ impl BlockTreeIndex {
             parent.to_ascii_lowercase()
         };
         self.children.get(&key).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// How many INSERT/DIMENSION references name this definition.
+    /// Same total as `count_block_references`, without another document walk.
+    pub fn reference_count(&self, name: &str) -> usize {
+        self.references
+            .get(&name.to_ascii_lowercase())
+            .copied()
+            .unwrap_or(0)
     }
 
     pub fn rename(&mut self, from: &str, to: &str) {
@@ -242,10 +323,21 @@ impl BlockTreeIndex {
             });
         }
         if from_key != to_key {
+            if let Some(count) = self.references.remove(&from_key) {
+                self.references.insert(to_key.clone(), count);
+            }
             if let Some(kids) = self.children.remove(&from_key) {
                 self.children.insert(to_key, kids);
             }
         }
+    }
+}
+
+fn record_reference_counts(children: &[BlockTreeChild], references: &mut BTreeMap<String, usize>) {
+    for child in children {
+        *references
+            .entry(child.name.to_ascii_lowercase())
+            .or_default() += child.count;
     }
 }
 
@@ -309,9 +401,8 @@ fn tally_block_children(entities: &[Entity], document: &Document) -> Vec<BlockTr
 
 fn referenced_block_name(entity: &Entity) -> Option<&str> {
     match &entity.geometry {
-        Geometry::Insert { block_name, .. } | Geometry::Dimension { block_name } => {
-            Some(block_name)
-        }
+        Geometry::Insert { block_name, .. } => Some(block_name),
+        Geometry::Dimension(data) => Some(&data.block_name),
         _ => None,
     }
 }
@@ -405,9 +496,14 @@ impl Document {
 fn rewrite_insert_names(entities: &mut [Entity], from: &str, to: &str) {
     for entity in entities {
         match &mut entity.geometry {
-            Geometry::Insert { block_name, .. } | Geometry::Dimension { block_name } => {
+            Geometry::Insert { block_name, .. } => {
                 if block_name.eq_ignore_ascii_case(from) {
                     *block_name = to.to_string();
+                }
+            }
+            Geometry::Dimension(data) => {
+                if data.block_name.eq_ignore_ascii_case(from) {
+                    data.block_name = to.to_string();
                 }
             }
             _ => {}
@@ -766,9 +862,8 @@ fn count_inserts(entities: &[Entity], name: &str) -> usize {
     entities
         .iter()
         .filter(|entity| match &entity.geometry {
-            Geometry::Insert { block_name, .. } | Geometry::Dimension { block_name } => {
-                block_name.eq_ignore_ascii_case(name)
-            }
+            Geometry::Insert { block_name, .. } => block_name.eq_ignore_ascii_case(name),
+            Geometry::Dimension(data) => data.block_name.eq_ignore_ascii_case(name),
             _ => false,
         })
         .count()
@@ -791,7 +886,8 @@ fn live_block_names(document: &Document) -> Vec<String> {
 fn push_referenced_names(entities: &[Entity], live: &mut Vec<String>) {
     for entity in entities {
         let name = match &entity.geometry {
-            Geometry::Insert { block_name, .. } | Geometry::Dimension { block_name } => block_name,
+            Geometry::Insert { block_name, .. } => block_name,
+            Geometry::Dimension(data) => &data.block_name,
             _ => continue,
         };
         if !live
@@ -840,6 +936,9 @@ fn geometry_survives_non_uniform(geometry: &Geometry) -> bool {
             | Geometry::Spline { .. }
             | Geometry::Leader { .. }
             | Geometry::MLine { .. }
+            | Geometry::Viewport(_)
+            | Geometry::Image(_)
+            | Geometry::Wipeout(_)
             | Geometry::Solid { .. }
             | Geometry::Insert { .. }
             | Geometry::Text(_)
@@ -1326,7 +1425,17 @@ mod tests {
         let nested = index.children_of("Machine");
         let motor = nested.iter().find(|child| child.name == "Motor").unwrap();
         assert_eq!(motor.count, 2);
+        assert_eq!(index.reference_count("Motor"), 2);
+        assert_eq!(
+            index.reference_count("Machine"),
+            count_block_references(&document, "Machine")
+        );
+        assert_eq!(index.reference_count("Missing"), 0);
         assert!(nested.iter().any(|child| child.name == "Machine"));
+        let mut renamed = index.clone();
+        renamed.rename("Motor", "Drive");
+        assert_eq!(renamed.reference_count("Drive"), 2);
+        assert_eq!(renamed.reference_count("Motor"), 0);
         let seen = vec!["Machine".to_string()];
         let cycle = nested.iter().any(|child| {
             child.name == "Machine"

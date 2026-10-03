@@ -2,21 +2,27 @@
 //! LibreDWG types never leave this module.
 
 use std::collections::BTreeMap;
-use std::ffi::c_void;
+use std::ffi::{c_void, CStr};
+use std::os::raw::c_char;
 use std::path::Path;
 
 use cad_core::{
-    default_extrusion, normalize_linetype_name, BlockDefinition, CadColor, Document, DrawingUnits,
+    default_extrusion, is_paper_layout_block, normalize_linetype_name, sorted_paper_layout_blocks,
+    AttributeInfo, BlockDefinition, CadColor, DimensionData, DimensionKind, Document, DrawingUnits,
     Entity, EntityId, Geometry, HatchData, HatchEdge, HatchPath, HatchPatternLine,
-    ImportDiagnostics, Layer, LineType, MTextData, Point3, PolyVertex, TextData, TextHAlign,
-    TextVAlign,
+    ImportDiagnostics, Layer, LineType, LineTypeShape, MTextData, PaperLayout, Point2, Point3,
+    PolyVertex, RasterFrame, TextData, TextHAlign, TextStyle, TextVAlign, ViewportData,
+    MAX_INSERT_ARRAY_CELLS,
 };
 
 use crate::dynapi::{
-    get_array_field, get_common_field, get_field, get_header_field, get_utf8_field, object_dxfname,
-    object_fixedtype, read_raw_array, resolve_handle_name, Point2D, Point3D, SplineControlPoint,
+    embedded_object, get_array_field, get_common_field, get_field, get_header_field,
+    get_utf8_field, object_dxfname, object_fixedtype, read_raw_array, resolve_handle_name, Point2D,
+    Point3D, SplineControlPoint,
 };
-use crate::ltype::{linetype_from_flags, parse_ltype_dashes, parse_ltype_dashes_r11, LtypeDash};
+use crate::ltype::{
+    linetype_from_flags, parse_ltype_dashes_r11, parse_ltype_records, DashRecord, LtypeDash,
+};
 
 const LWPOLYLINE_CLOSED_BIT1: u16 = 1;
 const LWPOLYLINE_CLOSED_BIT512: u16 = 512;
@@ -28,6 +34,7 @@ pub unsafe fn convert_document(
     mut diagnostics: ImportDiagnostics,
 ) -> Document {
     diagnostics.object_count = unsafe { libredwg_sys::dwg_get_num_objects(dwg) } as u64;
+    crate::classes::record_unhandled_classes(dwg, &mut diagnostics);
     if let Some(version) = get_header_field::<i32>(dwg, "version") {
         if diagnostics.dwg_version.is_empty() || diagnostics.dwg_version == "unknown" {
             diagnostics.dwg_version = crate::version_label(version);
@@ -36,6 +43,7 @@ pub unsafe fn convert_document(
 
     let mut layers = BTreeMap::new();
     let mut linetypes = BTreeMap::new();
+    let mut text_styles = BTreeMap::new();
     let mut blocks = BTreeMap::new();
     let mut model_space = Vec::new();
 
@@ -51,9 +59,14 @@ pub unsafe fn convert_document(
             if let Some(layer) = convert_layer(dwg, ptr) {
                 layers.insert(layer.name.clone(), layer);
             }
+        } else if fixedtype == libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_STYLE {
+            let ptr = unsafe { libredwg_sys::uncad_object_object_ptr(obj) };
+            if let Some(style) = convert_style(ptr) {
+                text_styles.insert(style.name.clone(), style);
+            }
         } else if fixedtype == libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_LTYPE {
             let ptr = unsafe { libredwg_sys::uncad_object_object_ptr(obj) };
-            if let Some(lt) = convert_ltype(ptr, &mut diagnostics) {
+            if let Some(lt) = convert_ltype(dwg, ptr, &mut diagnostics) {
                 linetypes.insert(lt.name.clone(), lt);
             }
         }
@@ -85,6 +98,11 @@ pub unsafe fn convert_document(
                 name,
                 base_pt,
                 entities,
+                xref_path: get_utf8_field(object_ptr, "BLOCK_HEADER", "xref_pname")
+                    .unwrap_or_default(),
+                xref_overlay: get_field::<u8>(object_ptr, "BLOCK_HEADER", "xrefoverlaid")
+                    .unwrap_or(0)
+                    != 0,
                 ..Default::default()
             },
         );
@@ -121,7 +139,10 @@ pub unsafe fn convert_document(
     document.source_path = Some(path.to_path_buf());
     document.layers = layers;
     document.linetypes = linetypes;
+    document.text_styles = text_styles;
     document.blocks = blocks;
+    document.layouts = unsafe { import_paper_layouts(dwg) };
+    ensure_layouts_for_paper_blocks(&mut document);
     document.model_space = model_space;
     document.diagnostics = diagnostics;
     document.ltscale = ltscale;
@@ -130,17 +151,6 @@ pub unsafe fn convert_document(
     document.apply_current_layer(clayer.as_deref());
     document.assign_missing_ids();
     document.diagnostics.extents = document.compute_extents();
-    if document
-        .model_space
-        .iter()
-        .chain(document.blocks.values().flat_map(|b| b.entities.iter()))
-        .any(|e| matches!(e.geometry, Geometry::Hatch(ref h) if !h.solid_fill && !h.pattern_lines.is_empty()))
-    {
-        document.diagnostics.warnings.push(
-            "Hatch pattern fills are drawn as boundaries in this milestone (solid hatches are filled)."
-                .into(),
-        );
-    }
     document
 }
 
@@ -148,9 +158,165 @@ fn is_model_space(name: &str) -> bool {
     name.eq_ignore_ascii_case("*MODEL_SPACE")
 }
 
-fn is_paper_space(name: &str) -> bool {
-    let upper = name.to_ascii_uppercase();
-    upper == "*PAPER_SPACE" || upper.starts_with("*PAPER_SPACE")
+fn c_string(ptr: *const c_char) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
+    unsafe { CStr::from_ptr(ptr) }
+        .to_string_lossy()
+        .trim()
+        .to_string()
+}
+
+unsafe fn import_paper_layouts(dwg: *mut libredwg_sys::Dwg_Data) -> Vec<PaperLayout> {
+    let mut layouts = Vec::new();
+    let num_objects = unsafe { libredwg_sys::dwg_get_num_objects(dwg) };
+    for index in 0..num_objects {
+        let obj = unsafe { libredwg_sys::dwg_get_object(dwg, index) };
+        if obj.is_null() || object_fixedtype(obj) != libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_LAYOUT {
+            continue;
+        }
+        let object_ptr = unsafe { libredwg_sys::uncad_object_object_ptr(obj) };
+        if object_ptr.is_null() {
+            continue;
+        }
+        let name = get_utf8_field(object_ptr, "LAYOUT", "layout_name").unwrap_or_default();
+        if name.trim().is_empty() || name.eq_ignore_ascii_case("Model") {
+            continue;
+        }
+        let block_name =
+            get_field::<*mut libredwg_sys::Dwg_Object_Ref>(object_ptr, "LAYOUT", "block_header")
+                .and_then(resolve_block_name)
+                .unwrap_or_default();
+        if !is_paper_layout_block(&block_name) {
+            continue;
+        }
+        let tab_order = get_field::<u16>(object_ptr, "LAYOUT", "tab_order")
+            .map(i32::from)
+            .unwrap_or(layouts.len() as i32 + 1);
+        let mut layout = PaperLayout::sheet(name, block_name, tab_order);
+        if let Some(plot) = embedded_object(object_ptr, "LAYOUT", "plotsettings") {
+            if let Some(width) =
+                finite_positive(get_field::<f64>(plot, "PLOTSETTINGS", "paper_width"))
+            {
+                layout.paper_width = width;
+            }
+            if let Some(height) =
+                finite_positive(get_field::<f64>(plot, "PLOTSETTINGS", "paper_height"))
+            {
+                layout.paper_height = height;
+            }
+            layout.left_margin =
+                finite_non_negative(get_field::<f64>(plot, "PLOTSETTINGS", "left_margin"))
+                    .unwrap_or(layout.left_margin);
+            layout.bottom_margin =
+                finite_non_negative(get_field::<f64>(plot, "PLOTSETTINGS", "bottom_margin"))
+                    .unwrap_or(layout.bottom_margin);
+            layout.right_margin =
+                finite_non_negative(get_field::<f64>(plot, "PLOTSETTINGS", "right_margin"))
+                    .unwrap_or(layout.right_margin);
+            layout.top_margin =
+                finite_non_negative(get_field::<f64>(plot, "PLOTSETTINGS", "top_margin"))
+                    .unwrap_or(layout.top_margin);
+        }
+        layouts.push(layout);
+    }
+    layouts.sort_by_key(|layout| layout.tab_order);
+    layouts
+}
+
+fn ensure_layouts_for_paper_blocks(document: &mut Document) {
+    let mut next = document
+        .layouts
+        .iter()
+        .map(|layout| layout.tab_order)
+        .max()
+        .unwrap_or(0);
+    for name in sorted_paper_layout_blocks(document) {
+        if document
+            .layouts
+            .iter()
+            .any(|layout| layout.block_name.eq_ignore_ascii_case(&name))
+        {
+            continue;
+        }
+        next += 1;
+        document
+            .layouts
+            .push(PaperLayout::sheet(format!("Layout{next}"), name, next));
+    }
+}
+
+fn finite_above_zero(value: Option<f64>) -> Option<f64> {
+    value.filter(|value| value.is_finite() && *value > 1e-9)
+}
+
+fn finite_positive(value: Option<f64>) -> Option<f64> {
+    value.filter(|value| value.is_finite() && *value > 1.0)
+}
+
+fn finite_non_negative(value: Option<f64>) -> Option<f64> {
+    value.filter(|value| value.is_finite() && *value >= 0.0)
+}
+
+fn viewport_from(entity_ptr: *mut c_void) -> ViewportData {
+    let mut viewport = ViewportData::default();
+    if let Some(center) = pt_field(entity_ptr, "VIEWPORT", "center") {
+        viewport.center = center;
+    }
+    if let Some(width) = finite_above_zero(get_field::<f64>(entity_ptr, "VIEWPORT", "width")) {
+        viewport.width = width;
+    }
+    if let Some(height) = finite_above_zero(get_field::<f64>(entity_ptr, "VIEWPORT", "height")) {
+        viewport.height = height;
+    }
+    viewport.view_center = get_field::<Point2D>(entity_ptr, "VIEWPORT", "VIEWCTR")
+        .map(|point| Point2::new(point.x, point.y))
+        .unwrap_or_else(|| viewport.center.xy());
+    if let Some(height) = finite_above_zero(get_field::<f64>(entity_ptr, "VIEWPORT", "VIEWSIZE")) {
+        viewport.view_height = height;
+    }
+    if let Some(target) = pt_field(entity_ptr, "VIEWPORT", "view_target") {
+        viewport.view_target = target;
+    }
+    if let Some(direction) = get_field::<Point3D>(entity_ptr, "VIEWPORT", "VIEWDIR") {
+        viewport.view_direction = pt3(direction);
+    }
+    if let Some(twist) =
+        get_field::<f64>(entity_ptr, "VIEWPORT", "VIEWTWIST").filter(|v| v.is_finite())
+    {
+        viewport.twist = twist;
+    }
+    if let Some(lens) = finite_above_zero(get_field::<f64>(entity_ptr, "VIEWPORT", "LENSLENGTH")) {
+        viewport.lens_length = lens;
+    }
+    if let Some(front) =
+        get_field::<f64>(entity_ptr, "VIEWPORT", "FRONTZ").filter(|v| v.is_finite())
+    {
+        viewport.front_z = front;
+    }
+    if let Some(back) = get_field::<f64>(entity_ptr, "VIEWPORT", "BACKZ").filter(|v| v.is_finite())
+    {
+        viewport.back_z = back;
+    }
+    if let Some(angle) =
+        get_field::<f64>(entity_ptr, "VIEWPORT", "SNAPANG").filter(|v| v.is_finite())
+    {
+        viewport.snap_angle = angle;
+    }
+    if let Some(zoom) = get_field::<u16>(entity_ptr, "VIEWPORT", "circle_zoom") {
+        viewport.circle_zoom = i32::from(zoom);
+    }
+    if let Some(status) = get_field::<u16>(entity_ptr, "VIEWPORT", "on_off") {
+        viewport.status = i32::from(status);
+    }
+    if let Some(id) = get_field::<u16>(entity_ptr, "VIEWPORT", "id") {
+        viewport.id = i32::from(id);
+    }
+    if let Some(flag) = get_field::<u32>(entity_ptr, "VIEWPORT", "status_flag") {
+        viewport.status_flag = flag as i32;
+    }
+    viewport
 }
 
 unsafe fn fill_named_blocks_from_sequences(
@@ -175,7 +341,7 @@ unsafe fn fill_named_blocks_from_sequences(
             base_pt = pt_field(entity_ptr, "BLOCK", "base_pt").unwrap_or_default();
         } else if fixedtype == libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_ENDBLK {
             if let Some(name) = current_name.take() {
-                if !is_model_space(&name) && !is_paper_space(&name) {
+                if !is_model_space(&name) {
                     match blocks.get_mut(&name) {
                         Some(block) if block.entities.is_empty() => {
                             block.entities = std::mem::take(&mut collected);
@@ -208,7 +374,7 @@ unsafe fn fill_named_blocks_from_sequences(
             }
         } else if current_name
             .as_deref()
-            .is_some_and(|name| !is_model_space(name) && !is_paper_space(name))
+            .is_some_and(|name| !is_model_space(name))
         {
             let name = current_name.as_deref().unwrap();
             let needs_fill = blocks
@@ -235,7 +401,7 @@ fn find_block_key(blocks: &BTreeMap<String, BlockDefinition>, name: &str) -> Opt
 fn convert_layer(dwg: *mut libredwg_sys::Dwg_Data, object_ptr: *mut c_void) -> Option<Layer> {
     let name = get_utf8_field(object_ptr, "LAYER", "name")?;
     let color = get_field::<libredwg_sys::Dwg_Color>(object_ptr, "LAYER", "color");
-    let aci = color.map(|c| resolve_layer_aci(c)).unwrap_or(7);
+    let color = color.map(resolve_layer_color).unwrap_or(CadColor::Aci(7));
     let off = get_field::<u8>(object_ptr, "LAYER", "off").unwrap_or(0) != 0;
     let frozen = get_field::<u8>(object_ptr, "LAYER", "frozen").unwrap_or(0) != 0
         || get_field::<u8>(object_ptr, "LAYER", "flag")
@@ -250,42 +416,197 @@ fn convert_layer(dwg: *mut libredwg_sys::Dwg_Data, object_ptr: *mut c_void) -> O
         name,
         visible: !off,
         frozen,
-        color: CadColor::from_aci_index(aci),
+        locked: get_field::<u8>(object_ptr, "LAYER", "locked").unwrap_or(0) != 0,
+        plot: get_field::<u8>(object_ptr, "LAYER", "plotflag").unwrap_or(1) != 0,
+        color,
         linetype,
+        lineweight: layer_lineweight(object_ptr),
     })
 }
 
-fn resolve_layer_aci(color: libredwg_sys::Dwg_Color) -> i16 {
-    if color.index == 256
-        && color.method == libredwg_sys::DWG_COLOR_METHOD_DWG_COLOR_METHOD_TRUECOLOR
-    {
-        (color.rgb & 0xff) as i16
-    } else if color.index == 0 {
-        7
+fn layer_lineweight(object_ptr: *mut c_void) -> i16 {
+    get_field::<i8>(object_ptr, "LAYER", "linewt")
+        .map(i16::from)
+        .or_else(|| get_field::<u8>(object_ptr, "LAYER", "linewt").map(i16::from))
+        .map(lineweight_from_index)
+        .unwrap_or(cad_core::LINEWEIGHT_DEFAULT)
+}
+
+fn entity_lineweight(entity_ptr: *mut c_void) -> i16 {
+    get_common_field::<i8>(entity_ptr, "linewt")
+        .map(i16::from)
+        .or_else(|| get_common_field::<u8>(entity_ptr, "linewt").map(i16::from))
+        .map(lineweight_from_index)
+        .unwrap_or(cad_core::LINEWEIGHT_BYLAYER)
+}
+
+/// LibreDWG stores DXF group 370 as an index into the lineweight table.
+/// Values outside that table are already hundredths of a millimetre.
+fn lineweight_from_index(raw: i16) -> i16 {
+    const TABLE: [i16; 32] = [
+        0, 5, 9, 13, 15, 18, 20, 25, 30, 35, 40, 50, 53, 60, 70, 80, 90, 100, 106, 120, 140, 158,
+        200, 211, 0, 0, 0, 0, 0, -1, -2, -3,
+    ];
+    usize::try_from(raw)
+        .ok()
+        .and_then(|index| TABLE.get(index).copied())
+        .unwrap_or(raw)
+}
+
+fn resolve_layer_color(color: libredwg_sys::Dwg_Color) -> CadColor {
+    let rgb = color.rgb & 0x00ff_ffff;
+    // Group 420 is stored as method ACI (0xC2) with the true color in the
+    // low 24 bits. A layer that only has group 62 leaves those bits at 0.
+    let true_color = rgb != 0
+        && (color.method == libredwg_sys::DWG_COLOR_METHOD_DWG_COLOR_METHOD_TRUECOLOR
+            || color.method == libredwg_sys::DWG_COLOR_METHOD_DWG_COLOR_METHOD_ACI);
+    if true_color {
+        return CadColor::Rgb {
+            r: ((rgb >> 16) & 0xff) as u8,
+            g: ((rgb >> 8) & 0xff) as u8,
+            b: (rgb & 0xff) as u8,
+        };
+    }
+    if color.index == 0 {
+        CadColor::Aci(7)
     } else {
-        color.index
+        CadColor::from_aci_index(color.index)
     }
 }
 
-fn convert_ltype(object_ptr: *mut c_void, diagnostics: &mut ImportDiagnostics) -> Option<LineType> {
+fn convert_style(object_ptr: *mut c_void) -> Option<TextStyle> {
+    let name = get_utf8_field(object_ptr, "STYLE", "name")?;
+    if name.trim().is_empty() {
+        return None;
+    }
+    let flag = get_field::<u8>(object_ptr, "STYLE", "flag").unwrap_or(0);
+    let shape = get_field::<u8>(object_ptr, "STYLE", "is_shape").unwrap_or(0) != 0;
+    if flag & 1 != 0 || shape {
+        return None;
+    }
+    let width = get_field::<f64>(object_ptr, "STYLE", "width_factor")
+        .filter(|value| value.is_finite() && *value > 1e-9)
+        .unwrap_or(1.0);
+    Some(TextStyle {
+        name,
+        font_file: get_utf8_field(object_ptr, "STYLE", "font_file").unwrap_or_else(|| "txt".into()),
+        bigfont_file: get_utf8_field(object_ptr, "STYLE", "bigfont_file").unwrap_or_default(),
+        height: get_field::<f64>(object_ptr, "STYLE", "text_size")
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .unwrap_or(0.0),
+        width_factor: width,
+        oblique: get_field::<f64>(object_ptr, "STYLE", "oblique_angle").unwrap_or(0.0),
+    })
+}
+
+fn resolved_style(dwg: *mut libredwg_sys::Dwg_Data, entity_ptr: *mut c_void, dxf: &str) -> String {
+    get_field::<*mut libredwg_sys::Dwg_Object_Ref>(entity_ptr, dxf, "style")
+        .and_then(|handle| resolve_handle_name(dwg, handle))
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| "STANDARD".to_string())
+}
+
+fn convert_ltype(
+    dwg: *mut libredwg_sys::Dwg_Data,
+    object_ptr: *mut c_void,
+    diagnostics: &mut ImportDiagnostics,
+) -> Option<LineType> {
     let raw_name = get_utf8_field(object_ptr, "LTYPE", "name")?;
     let num = get_field::<u8>(object_ptr, "LTYPE", "numdashes").unwrap_or(0);
     let ptr =
         get_field::<*const LtypeDash>(object_ptr, "LTYPE", "dashes").unwrap_or(std::ptr::null());
     let parsed = if !ptr.is_null() && num > 0 {
         let slice = unsafe { std::slice::from_raw_parts(ptr, num as usize) };
-        let elements: Vec<(f64, u16)> = slice.iter().map(|d| (d.length, d.shape_flag)).collect();
-        parse_ltype_dashes(&raw_name, &elements)
+        let records: Vec<DashRecord> = slice.iter().map(|dash| dash_record(dwg, dash)).collect();
+        parse_ltype_records(&raw_name, &records)
     } else {
         let r11 = get_field::<[f64; 12]>(object_ptr, "LTYPE", "dashes_r11").unwrap_or([0.0; 12]);
         let pattern_len = get_field::<f64>(object_ptr, "LTYPE", "pattern_len");
         parse_ltype_dashes_r11(&raw_name, &r11, pattern_len)
     };
-    diagnostics.warnings.extend(parsed.warnings);
+    for warning in parsed.warnings {
+        diagnostics.note_lossy(warning);
+    }
+    if parsed.shapes.iter().flatten().any(shape_has_no_font) {
+        diagnostics.note_lossy(format!(
+            "LTYPE '{}': a complex dash has no style or shape file",
+            parsed.name
+        ));
+    }
     Some(LineType {
         name: parsed.name,
         dashes: parsed.dashes,
+        shapes: parsed.shapes,
     })
+}
+
+fn dash_record(dwg: *mut libredwg_sys::Dwg_Data, dash: &LtypeDash) -> DashRecord {
+    let shape = if dash.shape_flag == 0 {
+        None
+    } else {
+        let (style, shape_file) = shape_style(dwg, dash.style);
+        Some(LineTypeShape {
+            flag: dash.shape_flag,
+            shapecode: dash.complex_shapecode,
+            text: c_string(dash.text),
+            scale: finite_or(dash.scale, 1.0),
+            rotation: finite_or(dash.rotation, 0.0),
+            x_offset: finite_or(dash.x_offset, 0.0),
+            y_offset: finite_or(dash.y_offset, 0.0),
+            style,
+            shape_file,
+        })
+    };
+    DashRecord {
+        length: dash.length,
+        shape,
+    }
+}
+
+fn shape_has_no_font(shape: &LineTypeShape) -> bool {
+    shape.flag != 0 && shape.style.trim().is_empty() && shape.shape_file.trim().is_empty()
+}
+
+fn shape_style(
+    dwg: *mut libredwg_sys::Dwg_Data,
+    style_ref: *mut libredwg_sys::Dwg_Object_Ref,
+) -> (String, String) {
+    if style_ref.is_null() {
+        return (String::new(), String::new());
+    }
+    let object = unsafe { libredwg_sys::dwg_ref_object(dwg, style_ref) };
+    if object.is_null() {
+        return (
+            resolve_handle_name(dwg, style_ref).unwrap_or_default(),
+            String::new(),
+        );
+    }
+    let ptr = unsafe { libredwg_sys::uncad_object_object_ptr(object) };
+    if ptr.is_null() {
+        return (
+            resolve_handle_name(dwg, style_ref).unwrap_or_default(),
+            String::new(),
+        );
+    }
+    let flag = get_field::<u8>(ptr, "STYLE", "flag").unwrap_or(0);
+    let is_shape = get_field::<u8>(ptr, "STYLE", "is_shape").unwrap_or(0) != 0;
+    let font = get_utf8_field(ptr, "STYLE", "font_file").unwrap_or_default();
+    if flag & 1 != 0 || is_shape {
+        return (String::new(), font);
+    }
+    let name = get_utf8_field(ptr, "STYLE", "name")
+        .filter(|name| !name.trim().is_empty())
+        .or_else(|| resolve_handle_name(dwg, style_ref))
+        .unwrap_or_default();
+    (name, String::new())
+}
+
+fn finite_or(value: f64, fallback: f64) -> f64 {
+    if value.is_finite() {
+        value
+    } else {
+        fallback
+    }
 }
 
 fn block_record_name(block_header_object_ptr: *mut c_void) -> Option<String> {
@@ -380,7 +701,7 @@ unsafe fn convert_one(
     let linetype_scale = get_common_field::<f64>(entity_ptr, "ltype_scale").unwrap_or(1.0);
     let invisible = get_common_field::<u16>(entity_ptr, "invisible").unwrap_or(0) != 0;
 
-    let geometry = match convert_geometry(dwg, obj, entity_ptr, fixedtype) {
+    let geometry = match convert_geometry(dwg, obj, entity_ptr, fixedtype, diagnostics) {
         Some(g) => g,
         None => {
             diagnostics.bump_unsupported(&type_name);
@@ -394,6 +715,7 @@ unsafe fn convert_one(
         color,
         linetype,
         linetype_scale,
+        lineweight: entity_lineweight(entity_ptr),
         visible: !invisible,
         geometry,
     })
@@ -418,10 +740,11 @@ fn entity_color(entity_ptr: *mut c_void) -> CadColor {
 }
 
 unsafe fn convert_geometry(
-    _dwg: *mut libredwg_sys::Dwg_Data,
+    dwg: *mut libredwg_sys::Dwg_Data,
     obj: *mut libredwg_sys::Dwg_Object,
     entity_ptr: *mut c_void,
     fixedtype: libredwg_sys::DWG_OBJECT_TYPE,
+    diagnostics: &mut ImportDiagnostics,
 ) -> Option<Geometry> {
     Some(match fixedtype {
         libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_LINE => {
@@ -563,17 +886,7 @@ unsafe fn convert_geometry(
                             .filter(|name| !name.is_empty())
                     })
                     .unwrap_or_default();
-            let mut attribs = Vec::new();
-            let mut sub = unsafe { libredwg_sys::get_first_owned_subentity(obj) };
-            while !sub.is_null() {
-                if object_fixedtype(sub) == libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_ATTRIB {
-                    let ap = unsafe { libredwg_sys::uncad_object_entity_ptr(sub) };
-                    if let Some(text) = attrib_text(ap) {
-                        attribs.push(text);
-                    }
-                }
-                sub = unsafe { libredwg_sys::get_next_owned_subentity(obj, sub) };
-            }
+            let attribs = insert_attribs(dwg, obj, entity_ptr, dxf);
             Geometry::Insert {
                 block_name,
                 insertion: pt_field(entity_ptr, dxf, "ins_pt")?,
@@ -585,11 +898,13 @@ unsafe fn convert_geometry(
                     get_field::<u16>(entity_ptr, dxf, "num_cols")
                         .map(|n| n as u32)
                         .or_else(|| get_field::<u32>(entity_ptr, dxf, "num_cols")),
+                    diagnostics,
                 ),
                 row_count: insert_array_count(
                     get_field::<u16>(entity_ptr, dxf, "num_rows")
                         .map(|n| n as u32)
                         .or_else(|| get_field::<u32>(entity_ptr, dxf, "num_rows")),
+                    diagnostics,
                 ),
                 column_spacing: get_field::<f64>(entity_ptr, dxf, "col_spacing").unwrap_or(0.0),
                 row_spacing: get_field::<f64>(entity_ptr, dxf, "row_spacing").unwrap_or(0.0),
@@ -611,9 +926,13 @@ unsafe fn convert_geometry(
                 alignment,
                 width_factor,
                 oblique,
+                style: resolved_style(dwg, entity_ptr, "TEXT"),
+                ..Default::default()
             })
         }
-        libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_ATTRIB => Geometry::Text(attrib_text(entity_ptr)?),
+        libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_ATTRIB => {
+            Geometry::Text(attrib_text(dwg, entity_ptr)?)
+        }
         libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_ATTDEF => {
             let (halign, valign, alignment, width_factor, oblique) =
                 text_layout(entity_ptr, "ATTDEF");
@@ -629,6 +948,9 @@ unsafe fn convert_geometry(
                 alignment,
                 width_factor,
                 oblique,
+                attribute: attribute_fields(entity_ptr, "ATTDEF", true),
+                style: resolved_style(dwg, entity_ptr, "ATTDEF"),
+                ..Default::default()
             })
         }
         libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_MTEXT => {
@@ -652,6 +974,8 @@ unsafe fn convert_geometry(
                 line_spacing: get_field::<f64>(entity_ptr, "MTEXT", "linespace_factor")
                     .filter(|v| v.is_finite() && *v > 1e-9)
                     .unwrap_or(1.0),
+                style: resolved_style(dwg, entity_ptr, "MTEXT"),
+                ..Default::default()
             })
         }
         libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_HATCH => convert_hatch(entity_ptr)?,
@@ -683,13 +1007,7 @@ unsafe fn convert_geometry(
         | libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_DIMENSION_DIAMETER
         | libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_ARC_DIMENSION => {
             let dxfname = dimension_dxfname(fixedtype);
-            Geometry::Dimension {
-                block_name: get_field::<*mut libredwg_sys::Dwg_Object_Ref>(
-                    entity_ptr, dxfname, "block",
-                )
-                .and_then(resolve_block_name)
-                .unwrap_or_default(),
-            }
+            Geometry::Dimension(dimension_data(dwg, entity_ptr, dxfname, fixedtype))
         }
         libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_LEADER => Geometry::Leader {
             vertices: get_array_field::<u32, Point3D>(entity_ptr, "LEADER", "num_points", "points")
@@ -697,6 +1015,9 @@ unsafe fn convert_geometry(
                 .map(pt3)
                 .collect(),
         },
+        libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_VIEWPORT => {
+            Geometry::Viewport(viewport_from(entity_ptr))
+        }
         libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_MLINE => {
             let verts: Vec<libredwg_sys::Dwg_MLINE_vertex> =
                 get_array_field::<u16, _>(entity_ptr, "MLINE", "num_verts", "verts");
@@ -747,11 +1068,50 @@ unsafe fn convert_geometry(
                 linetype_generation_continuous: false,
             }
         }
+        libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_IMAGE => {
+            Geometry::Image(raster_frame(dwg, entity_ptr, "IMAGE"))
+        }
+        libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_WIPEOUT => {
+            Geometry::Wipeout(raster_frame(dwg, entity_ptr, "WIPEOUT"))
+        }
         _ => return None,
     })
 }
 
-fn attrib_text(entity_ptr: *mut c_void) -> Option<TextData> {
+fn raster_frame(
+    dwg: *mut libredwg_sys::Dwg_Data,
+    entity_ptr: *mut c_void,
+    dxf: &str,
+) -> RasterFrame {
+    let size =
+        get_field::<Point2D>(entity_ptr, dxf, "image_size").unwrap_or(Point2D { x: 1.0, y: 1.0 });
+    RasterFrame {
+        corner: pt_field(entity_ptr, dxf, "pt0").unwrap_or_default(),
+        u_vector: pt_field(entity_ptr, dxf, "uvec").unwrap_or(Point3::from_xy(1.0, 0.0)),
+        v_vector: pt_field(entity_ptr, dxf, "vvec").unwrap_or(Point3::from_xy(0.0, 1.0)),
+        size: Point2::new(size.x, size.y),
+        clip: Vec::new(),
+        path: image_def_path(dwg, entity_ptr, dxf),
+    }
+}
+
+fn image_def_path(dwg: *mut libredwg_sys::Dwg_Data, entity_ptr: *mut c_void, dxf: &str) -> String {
+    let Some(handle) = get_field::<*mut libredwg_sys::Dwg_Object_Ref>(entity_ptr, dxf, "imagedef")
+    else {
+        return String::new();
+    };
+    if handle.is_null() {
+        return String::new();
+    }
+    let object = unsafe { libredwg_sys::dwg_ref_object(dwg, handle) };
+    if object.is_null() {
+        return String::new();
+    }
+    let object_ptr = unsafe { libredwg_sys::uncad_object_object_ptr(object) };
+    get_utf8_field(object_ptr, "IMAGEDEF", "file_path").unwrap_or_default()
+}
+
+fn attrib_text(dwg: *mut libredwg_sys::Dwg_Data, entity_ptr: *mut c_void) -> Option<TextData> {
     let (halign, valign, alignment, width_factor, oblique) = text_layout(entity_ptr, "ATTRIB");
     Some(TextData {
         insertion: pt_field(entity_ptr, "ATTRIB", "ins_pt")?,
@@ -765,7 +1125,83 @@ fn attrib_text(entity_ptr: *mut c_void) -> Option<TextData> {
         alignment,
         width_factor,
         oblique,
+        attribute: attribute_fields(entity_ptr, "ATTRIB", false),
+        style: resolved_style(dwg, entity_ptr, "ATTRIB"),
+        ..Default::default()
     })
+}
+
+fn insert_attribs(
+    dwg: *mut libredwg_sys::Dwg_Data,
+    obj: *mut libredwg_sys::Dwg_Object,
+    entity_ptr: *mut c_void,
+    dxf: &str,
+) -> Vec<TextData> {
+    let mut attribs = Vec::new();
+    let mut sub = unsafe { libredwg_sys::get_first_owned_subentity(obj) };
+    if sub.is_null() {
+        if let Some(first) =
+            get_field::<*mut libredwg_sys::Dwg_Object_Ref>(entity_ptr, dxf, "first_attrib")
+        {
+            if !first.is_null() {
+                sub = unsafe { libredwg_sys::dwg_ref_object(dwg, first) };
+            }
+        }
+    }
+    while !sub.is_null() {
+        if object_fixedtype(sub) == libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_ATTRIB {
+            let ap = unsafe { libredwg_sys::uncad_object_entity_ptr(sub) };
+            if let Some(text) = attrib_text(dwg, ap) {
+                attribs.push(text);
+            }
+        }
+        let next = unsafe { libredwg_sys::get_next_owned_subentity(obj, sub) };
+        if next.is_null() {
+            break;
+        }
+        sub = next;
+    }
+    if !attribs.is_empty() {
+        return attribs;
+    }
+    let refs: Vec<*mut libredwg_sys::Dwg_Object_Ref> =
+        get_array_field::<u32, _>(entity_ptr, dxf, "num_owned", "attribs");
+    for href in refs {
+        if href.is_null() {
+            continue;
+        }
+        let owned = unsafe { libredwg_sys::dwg_ref_object(dwg, href) };
+        if owned.is_null()
+            || object_fixedtype(owned) != libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_ATTRIB
+        {
+            continue;
+        }
+        let ap = unsafe { libredwg_sys::uncad_object_entity_ptr(owned) };
+        if let Some(text) = attrib_text(dwg, ap) {
+            attribs.push(text);
+        }
+    }
+    attribs
+}
+
+fn attribute_fields(
+    entity_ptr: *mut c_void,
+    dxf: &str,
+    with_prompt: bool,
+) -> Option<AttributeInfo> {
+    let tag = get_utf8_field(entity_ptr, dxf, "tag").unwrap_or_default();
+    if tag.trim().is_empty() {
+        return None;
+    }
+    let flags = get_field::<u8>(entity_ptr, dxf, "flags")
+        .map(i16::from)
+        .unwrap_or(0);
+    let prompt = if with_prompt {
+        get_utf8_field(entity_ptr, dxf, "prompt").unwrap_or_default()
+    } else {
+        String::new()
+    };
+    Some(AttributeInfo { tag, prompt, flags })
 }
 
 fn text_layout(entity_ptr: *mut c_void, dxf: &str) -> (TextHAlign, TextVAlign, Point3, f64, f64) {
@@ -791,10 +1227,27 @@ fn convert_hatch(entity_ptr: *mut c_void) -> Option<Geometry> {
         get_array_field::<u32, _>(entity_ptr, "HATCH", "num_paths", "paths");
     let deflines: Vec<libredwg_sys::Dwg_HATCH_DefLine> =
         get_array_field::<u16, _>(entity_ptr, "HATCH", "num_deflines", "deflines");
+    let pattern_name = get_utf8_field(entity_ptr, "HATCH", "name")
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| {
+            if solid_fill {
+                "SOLID".into()
+            } else {
+                "ANSI31".into()
+            }
+        });
     Some(Geometry::Hatch(HatchData {
         extrusion: extrusion_of(entity_ptr, "HATCH"),
         elevation: get_field::<f64>(entity_ptr, "HATCH", "elevation").unwrap_or(0.0),
         solid_fill,
+        pattern_name,
+        pattern_scale: get_field::<f64>(entity_ptr, "HATCH", "scale_spacing")
+            .filter(|value| value.is_finite() && *value > 1e-9)
+            .unwrap_or(1.0),
+        pattern_angle: get_field::<f64>(entity_ptr, "HATCH", "angle").unwrap_or(0.0),
+        pattern_type: get_field::<i16>(entity_ptr, "HATCH", "pattern_type")
+            .unwrap_or(if solid_fill { 1 } else { 0 }),
+        double: get_field::<u8>(entity_ptr, "HATCH", "double_flag").unwrap_or(0) != 0,
         paths: paths.iter().map(convert_hatch_path).collect(),
         pattern_lines: deflines.iter().map(convert_hatch_defline).collect(),
     }))
@@ -865,6 +1318,41 @@ fn convert_hatch_defline(defline: &libredwg_sys::Dwg_HATCH_DefLine) -> HatchPatt
     }
 }
 
+fn dimension_data(
+    dwg: *mut libredwg_sys::Dwg_Data,
+    entity_ptr: *mut c_void,
+    dxfname: &str,
+    fixedtype: libredwg_sys::DWG_OBJECT_TYPE,
+) -> DimensionData {
+    let kind = match fixedtype {
+        libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_DIMENSION_ALIGNED => DimensionKind::Aligned,
+        libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_DIMENSION_ANG2LN => DimensionKind::Angular2Line,
+        libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_DIMENSION_ANG3PT
+        | libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_ARC_DIMENSION => DimensionKind::Angular3Point,
+        libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_DIMENSION_DIAMETER => DimensionKind::Diameter,
+        libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_DIMENSION_RADIUS => DimensionKind::Radius,
+        libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_DIMENSION_ORDINATE => DimensionKind::Ordinate,
+        _ => DimensionKind::Linear,
+    };
+    DimensionData {
+        block_name: get_field::<*mut libredwg_sys::Dwg_Object_Ref>(entity_ptr, dxfname, "block")
+            .and_then(resolve_block_name)
+            .unwrap_or_default(),
+        kind,
+        definition: pt_field(entity_ptr, dxfname, "def_pt").unwrap_or_default(),
+        text_midpoint: pt_field(entity_ptr, dxfname, "text_midpt").unwrap_or_default(),
+        extension1: pt_field(entity_ptr, dxfname, "xline1_pt").unwrap_or_default(),
+        extension2: pt_field(entity_ptr, dxfname, "xline2_pt").unwrap_or_default(),
+        rotation: get_field::<f64>(entity_ptr, dxfname, "dim_rotation").unwrap_or(0.0),
+        text: get_utf8_field(entity_ptr, dxfname, "user_text").unwrap_or_default(),
+        dimstyle: get_field::<*mut libredwg_sys::Dwg_Object_Ref>(entity_ptr, dxfname, "dimstyle")
+            .and_then(|handle| resolve_handle_name(dwg, handle))
+            .filter(|name| !name.trim().is_empty())
+            .or_else(|| get_utf8_field(entity_ptr, dxfname, "dimstyle"))
+            .unwrap_or_else(|| "STANDARD".into()),
+    }
+}
+
 fn dimension_dxfname(fixedtype: libredwg_sys::DWG_OBJECT_TYPE) -> &'static str {
     match fixedtype {
         libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_DIMENSION_ORDINATE => "DIMENSION_ORDINATE",
@@ -879,8 +1367,17 @@ fn dimension_dxfname(fixedtype: libredwg_sys::DWG_OBJECT_TYPE) -> &'static str {
     }
 }
 
-fn insert_array_count(value: Option<u32>) -> u32 {
-    value.filter(|count| *count > 0).unwrap_or(1)
+fn insert_array_count(value: Option<u32>, diagnostics: &mut ImportDiagnostics) -> u32 {
+    const MAX_AXIS: u32 = 256;
+    let count = value.filter(|count| *count > 0).unwrap_or(1);
+    if count > MAX_AXIS || count as u64 > MAX_INSERT_ARRAY_CELLS {
+        diagnostics
+            .warnings
+            .push("INSERT array was reduced so the drawing stays responsive".into());
+        count.min(MAX_AXIS)
+    } else {
+        count
+    }
 }
 
 // ------------------------------------------------------------
@@ -954,6 +1451,26 @@ unsafe fn polyline_2d_vertices(
 }
 
 unsafe fn polyline_3d_vertices(obj: *mut libredwg_sys::Dwg_Object) -> Vec<PolyVertex> {
+    // LibreDWG's R2000 get_points walk stops before the last vertex. The
+    // owned-subentity list includes it.
+    let mut verts = Vec::new();
+    let mut sub = unsafe { libredwg_sys::get_first_owned_subentity(obj) };
+    while !sub.is_null() {
+        if object_fixedtype(sub) == libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_VERTEX_3D {
+            let vertex = unsafe { libredwg_sys::uncad_object_entity_ptr(sub) };
+            if let Some(point) = get_field::<Point3D>(vertex, "VERTEX_3D", "point") {
+                verts.push(PolyVertex {
+                    point: pt3(point),
+                    bulge: 0.0,
+                    vertex_id: Default::default(),
+                });
+            }
+        }
+        sub = unsafe { libredwg_sys::get_next_owned_subentity(obj, sub) };
+    }
+    if !verts.is_empty() {
+        return verts;
+    }
     let mut error = 0i32;
     let points_ptr = unsafe { libredwg_sys::dwg_object_polyline_3d_get_points(obj, &mut error) };
     let num_points = unsafe { libredwg_sys::dwg_object_polyline_3d_get_numpoints(obj, &mut error) };
@@ -996,6 +1513,7 @@ mod tests {
                 frozen: true,
                 color: CadColor::Aci(1),
                 linetype: "CONTINUOUS".into(),
+                ..Layer::default()
             },
         );
         document.apply_current_layer(Some("FROZEN"));

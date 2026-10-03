@@ -86,6 +86,7 @@ pub fn convert_dxf_to_dwg(
         });
     }
 
+    crate::ltype::restore_linetype_strings_area(dwg.as_mut());
     set_header_version(dwg.as_mut(), version.libredwg());
     let write_error = unsafe {
         libredwg_sys::dwg_write_file(
@@ -283,9 +284,12 @@ mod tests {
                 ..Default::default()
             },
         );
-        document.add_entity(cad_core::Entity::new(cad_core::Geometry::Dimension {
-            block_name: "*D1".into(),
-        }));
+        document.add_entity(cad_core::Entity::new(cad_core::Geometry::Dimension(
+            cad_core::DimensionData {
+                block_name: "*D1".into(),
+                ..cad_core::DimensionData::default()
+            },
+        )));
         document
     }
 
@@ -319,20 +323,134 @@ mod tests {
     }
 
     #[test]
-    fn write_dwg_keeps_dxf_fallback_warnings() {
+    fn write_dwg_keeps_a_dimension_entity() {
         let dir = std::env::temp_dir();
         let dest = dir.join(format!("mycad-write-dwg-dim-{}.dwg", stamp()));
         let result = write_dwg(&dimension_document(), &dest);
+        let bytes = fs::read(&dest).unwrap_or_default();
         let _ = fs::remove_file(&dest);
         match result {
             Ok(report) => {
-                assert!(report
-                    .warnings
-                    .iter()
-                    .any(|warning| warning.contains("visible block geometry")));
+                assert!(bytes.starts_with(b"AC10"), "DWG magic was {bytes:?}");
+                assert!(
+                    report
+                        .warnings
+                        .iter()
+                        .all(|warning| !warning.contains("visible block geometry")),
+                    "dimension was exploded: {:?}",
+                    report.warnings
+                );
             }
-            Err(DwgWriteError::Convert(ExportError::Critical { .. })) => {}
             Err(other) => panic!("unexpected write_dwg error: {other}"),
+        }
+    }
+
+    #[test]
+    fn dwg_roundtrip_restores_dynamic_blocks_from_the_companion() {
+        use cad_core::{
+            export_materialized, identity_insert, BehaviorKind, BlockDefinition, CompositionRule,
+            DynamicBehavior, DynamicDefinition, Entity, EvaluationCache, EvaluationRequest,
+            FollowRole, Geometry, GeometryTarget, InstanceConfiguration, NumericParameter,
+            ParameterDef, ParameterValue, Point2, Point3,
+        };
+        use cad_io::{apply_companion, companion_path, read_companion, write_companion};
+
+        let mut source = Document::default();
+        let param = source.allocate_parameter_id();
+        let mut line = Entity::new(Geometry::Line {
+            start: Point3::from_xy(0.0, 0.0),
+            end: Point3::from_xy(800.0, 0.0),
+        });
+        line.id = source.allocate_id();
+        let mut numeric = NumericParameter::length(800.0);
+        numeric.reference = 800.0;
+        let mut definition = BlockDefinition::plain(
+            "AdjustableFrame",
+            Point3::from_xy(0.0, 0.0),
+            vec![line.clone()],
+        );
+        definition.dynamic = Some(DynamicDefinition {
+            parameters: vec![ParameterDef::number(param, "Span", numeric)],
+            behaviors: vec![DynamicBehavior {
+                id: source.allocate_action_id(),
+                kind: BehaviorKind::Stretch,
+                parameter: param,
+                targets: vec![GeometryTarget::LineEnd(line.id)],
+                local_direction: Point2::new(1.0, 0.0),
+                reference_value: 800.0,
+                multiplier: 1.0,
+                composition: CompositionRule::Additive,
+                follow: FollowRole::Second,
+                name: None,
+            }],
+            ..Default::default()
+        });
+        source.replace_block_definition(definition);
+        let mut insert = Entity::new(identity_insert(
+            "AdjustableFrame".into(),
+            Point3::from_xy(12.0, 4.0),
+        ));
+        let mut config = InstanceConfiguration::default();
+        config.set(param, ParameterValue::Number(1200.0));
+        insert.geometry.set_insert_configuration(Some(config));
+        source.add_entity(insert);
+        let request = EvaluationRequest {
+            generation: source.content_generation(),
+        };
+        let exported =
+            export_materialized(&source, &mut EvaluationCache::default(), request).expect("export");
+        let dest = std::env::temp_dir().join(format!("mycad-companion-roundtrip-{}.dwg", stamp()));
+        let sidecar = companion_path(&dest);
+        match write_dwg(&exported.document, &dest) {
+            Ok(_) => {
+                write_companion(
+                    &sidecar,
+                    &source,
+                    &exported.document,
+                    &exported.links,
+                    &exported.generated_blocks,
+                )
+                .expect("companion");
+                let mut loaded = crate::import_dwg(&dest).expect("import");
+                let companion = read_companion(&sidecar).expect("read companion");
+                let report = apply_companion(&mut loaded, companion);
+                let _ = fs::remove_file(&dest);
+                let _ = fs::remove_file(&sidecar);
+                assert_eq!(report.skipped, 0, "{report:?}");
+                assert!(report.restored >= 1, "{report:?}");
+                let definition = loaded
+                    .block_by_name("AdjustableFrame")
+                    .expect("dynamic definition");
+                assert!(definition.is_dynamic(), "{report:?}");
+                let Geometry::Insert {
+                    block_name,
+                    insertion,
+                    ..
+                } = &loaded.model_space[0].geometry
+                else {
+                    panic!("insert");
+                };
+                assert!(block_name.eq_ignore_ascii_case("AdjustableFrame"));
+                assert!((insertion.x - 12.0).abs() < 1e-3);
+                assert!((insertion.y - 4.0).abs() < 1e-3);
+                let param_id = definition.dynamic.as_ref().unwrap().parameters[0].id;
+                let span = loaded.model_space[0]
+                    .geometry
+                    .insert_configuration()
+                    .and_then(|config| config.get(param_id))
+                    .and_then(|value| value.as_number())
+                    .expect("span");
+                assert!((span - 1200.0).abs() < 1e-6);
+            }
+            Err(DwgWriteError::Convert(ExportError::Critical { .. })) => {
+                let _ = fs::remove_file(&dest);
+                let _ = fs::remove_file(&sidecar);
+            }
+            Err(other) => {
+                let _ = fs::remove_file(&dest);
+                let _ = fs::remove_file(&sidecar);
+                panic!("unexpected write_dwg error: {other}");
+            }
         }
     }
 }

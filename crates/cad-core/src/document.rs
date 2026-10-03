@@ -24,13 +24,54 @@ pub struct Layer {
     pub name: String,
     pub visible: bool,
     pub frozen: bool,
+    pub locked: bool,
+    pub plot: bool,
     pub color: CadColor,
     pub linetype: String,
+    pub lineweight: i16,
+}
+
+impl Default for Layer {
+    fn default() -> Self {
+        Self {
+            name: "0".into(),
+            visible: true,
+            frozen: false,
+            locked: false,
+            plot: true,
+            color: CadColor::Aci(7),
+            linetype: "CONTINUOUS".into(),
+            lineweight: crate::LINEWEIGHT_DEFAULT,
+        }
+    }
 }
 
 impl Layer {
     pub fn is_plottable(&self) -> bool {
-        self.visible && !self.frozen
+        self.visible && !self.frozen && self.plot
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextStyle {
+    pub name: String,
+    pub font_file: String,
+    pub bigfont_file: String,
+    pub height: f64,
+    pub width_factor: f64,
+    pub oblique: f64,
+}
+
+impl TextStyle {
+    pub fn standard() -> Self {
+        Self {
+            name: "STANDARD".into(),
+            font_file: "txt".into(),
+            bigfont_file: String::new(),
+            height: 0.0,
+            width_factor: 1.0,
+            oblique: 0.0,
+        }
     }
 }
 
@@ -42,6 +83,8 @@ pub struct BlockDefinition {
     pub entities: Vec<Entity>,
     pub dynamic: Option<DynamicDefinition>,
     pub content_revision: u64,
+    pub xref_path: String,
+    pub xref_overlay: bool,
 }
 
 impl Default for BlockDefinition {
@@ -53,6 +96,8 @@ impl Default for BlockDefinition {
             entities: Vec::new(),
             dynamic: None,
             content_revision: 0,
+            xref_path: String::new(),
+            xref_overlay: false,
         }
     }
 }
@@ -144,6 +189,11 @@ pub struct ImportDiagnostics {
     pub import_time: Duration,
     pub render_prepare_time: Duration,
     pub warnings: Vec<String>,
+    /// Classes LibreDWG could not read, with how many objects used each one.
+    /// These stay in Diagnostics and do not open the save dialog.
+    pub unhandled_classes: BTreeMap<String, u64>,
+    /// Content a save still cannot keep, besides unsupported entity counts.
+    pub lossy_notes: Vec<String>,
     pub object_count: u64,
 }
 
@@ -163,9 +213,72 @@ impl ImportDiagnostics {
         self.unsupported_counts.values().copied().sum()
     }
 
+    /// Entities a save still cannot keep. Paper space is written with the layouts.
+    pub fn lossy_total(&self) -> u64 {
+        self.unsupported_total()
+    }
+
+    /// True when Save should offer Save a Copy.
+    ///
+    /// Unsupported entities and content that could not be stored count.
+    /// Skipped classes and header extent notes stay in Diagnostics.
+    pub fn has_save_loss(&self) -> bool {
+        self.unsupported_total() > 0 || !self.lossy_notes.is_empty()
+    }
+
+    pub fn note_lossy(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        if message.trim().is_empty() {
+            return;
+        }
+        if !self.warnings.iter().any(|warning| warning == &message) {
+            self.warnings.push(message.clone());
+        }
+        if !self.lossy_notes.iter().any(|warning| warning == &message) {
+            self.lossy_notes.push(message);
+        }
+    }
+
+    pub fn record_unhandled_class(&mut self, name: &str) {
+        let name = name.trim();
+        if name.is_empty() || is_generic_class_name(name) {
+            return;
+        }
+        *self.unhandled_classes.entry(name.to_string()).or_insert(0) += 1;
+    }
+
+    pub fn finish_unhandled_classes(&mut self) {
+        if self.unhandled_classes.is_empty() {
+            return;
+        }
+        let listed = self
+            .unhandled_classes
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let message = format!("Unhandled classes: {listed}");
+        if !self.warnings.iter().any(|warning| warning == &message) {
+            self.warnings.push(message);
+        }
+    }
+
     pub fn entity_total(&self) -> u64 {
         self.entity_counts.values().copied().sum()
     }
+}
+
+fn is_generic_class_name(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_uppercase().as_str(),
+        "UNKNOWN"
+            | "UNKNOWN_ENT"
+            | "UNKNOWN_OBJ"
+            | "PROXY_ENTITY"
+            | "PROXY_OBJECT"
+            | "ACAD_PROXY_ENTITY"
+            | "ACAD_PROXY_OBJECT"
+    )
 }
 
 // ------------------------------------------------------------
@@ -294,6 +407,40 @@ impl DrawingUnits {
 }
 
 // ------------------------------------------------------------
+// Type: PaperLayout
+// Purpose: One paper-space sheet. Model space is not stored here.
+//          Plot size is millimetres; the block holds the sheet entities.
+// ------------------------------------------------------------
+#[derive(Debug, Clone, PartialEq)]
+pub struct PaperLayout {
+    pub name: String,
+    pub block_name: String,
+    pub tab_order: i32,
+    pub paper_width: f64,
+    pub paper_height: f64,
+    pub left_margin: f64,
+    pub bottom_margin: f64,
+    pub right_margin: f64,
+    pub top_margin: f64,
+}
+
+impl PaperLayout {
+    pub fn sheet(name: impl Into<String>, block_name: impl Into<String>, tab_order: i32) -> Self {
+        Self {
+            name: name.into(),
+            block_name: block_name.into(),
+            tab_order,
+            paper_width: 210.0,
+            paper_height: 297.0,
+            left_margin: 7.5,
+            bottom_margin: 7.5,
+            right_margin: 7.5,
+            top_margin: 7.5,
+        }
+    }
+}
+
+// ------------------------------------------------------------
 // Type: Document
 // Purpose: Application CAD model. Future DXF import and editing
 //          talk to this type, never to LibreDWG structures.
@@ -303,7 +450,9 @@ pub struct Document {
     pub source_path: Option<PathBuf>,
     pub layers: BTreeMap<String, Layer>,
     pub linetypes: BTreeMap<String, LineType>,
+    pub text_styles: BTreeMap<String, TextStyle>,
     pub blocks: BTreeMap<String, BlockDefinition>,
+    pub layouts: Vec<PaperLayout>,
     pub model_space: Vec<Entity>,
     pub diagnostics: ImportDiagnostics,
     pub ltscale: f64,
@@ -329,7 +478,9 @@ impl Default for Document {
             source_path: None,
             layers: BTreeMap::new(),
             linetypes: BTreeMap::new(),
+            text_styles: BTreeMap::new(),
             blocks: BTreeMap::new(),
+            layouts: Vec::new(),
             model_space: Vec::new(),
             diagnostics: ImportDiagnostics::default(),
             ltscale: 1.0,
@@ -354,6 +505,14 @@ impl Default for Document {
 }
 
 impl Document {
+    pub fn paper_space_entity_count(&self) -> usize {
+        self.blocks
+            .iter()
+            .filter(|(name, _)| crate::is_paper_layout_block(name))
+            .map(|(_, block)| block.entities.len())
+            .sum()
+    }
+
     pub fn file_name(&self) -> String {
         self.source_path
             .as_ref()
@@ -367,8 +526,11 @@ impl Document {
             name: "0".into(),
             visible: true,
             frozen: false,
+            locked: false,
+            plot: true,
             color: CadColor::Aci(7),
             linetype: "CONTINUOUS".into(),
+            lineweight: crate::LINEWEIGHT_DEFAULT,
         });
     }
 
@@ -992,6 +1154,12 @@ impl Document {
         self.current_layer = "0".into();
     }
 
+    pub fn entity_on_locked_layer(&self, id: EntityId) -> bool {
+        self.entity_by_id(id)
+            .and_then(|entity| self.layer(&entity.layer))
+            .is_some_and(|layer| layer.locked)
+    }
+
     pub fn layer(&self, name: &str) -> Option<&Layer> {
         self.layers.get(name).or_else(|| self.layers.get("0"))
     }
@@ -1174,9 +1342,10 @@ fn collect_entity_points(
             attribs,
             configuration: _,
         } => {
-            if block_stack
-                .iter()
-                .any(|n| n.eq_ignore_ascii_case(block_name))
+            if crate::nesting_too_deep(block_stack)
+                || block_stack
+                    .iter()
+                    .any(|n| n.eq_ignore_ascii_case(block_name))
             {
                 return;
             }
@@ -1184,8 +1353,7 @@ fn collect_entity_points(
                 return;
             };
             block_stack.push(block_name.clone());
-            let cols = (*column_count).max(1);
-            let rows = (*row_count).max(1);
+            let (cols, rows) = crate::clamped_array_counts(*column_count, *row_count);
             for col in 0..cols {
                 for row in 0..rows {
                     let extra = Transform2::translate(
@@ -1211,11 +1379,13 @@ fn collect_entity_points(
             }
             block_stack.pop();
         }
-        crate::entity::Geometry::Dimension { block_name } => {
+        crate::entity::Geometry::Dimension(data) => {
+            let block_name = &data.block_name;
             if let Some(block) = document.blocks.get(block_name) {
-                if block_stack
-                    .iter()
-                    .any(|n| n.eq_ignore_ascii_case(block_name))
+                if crate::nesting_too_deep(block_stack)
+                    || block_stack
+                        .iter()
+                        .any(|n| n.eq_ignore_ascii_case(block_name))
                 {
                     return;
                 }
@@ -1275,6 +1445,16 @@ fn collect_entity_points(
         | crate::entity::Geometry::MLine { vertices, .. } => {
             for p in vertices {
                 visit(transform.apply(p.xy()));
+            }
+        }
+        crate::entity::Geometry::Viewport(viewport) => {
+            for corner in viewport.corners() {
+                visit(transform.apply(corner.xy()));
+            }
+        }
+        crate::entity::Geometry::Image(frame) | crate::entity::Geometry::Wipeout(frame) => {
+            for corner in frame.corners() {
+                visit(transform.apply(corner.xy()));
             }
         }
         crate::entity::Geometry::Hatch(hatch) => {
@@ -1357,6 +1537,37 @@ mod tests {
     }
 
     #[test]
+    fn unhandled_class_names_are_not_a_save_loss() {
+        let mut diagnostics = ImportDiagnostics::default();
+        diagnostics.record_unhandled_class("ACDB_DYNAMICBLOCKPURGEPREVENTER");
+        diagnostics.record_unhandled_class("ACDB_DYNAMICBLOCKPURGEPREVENTER");
+        diagnostics.record_unhandled_class("UNKNOWN_ENT");
+        diagnostics.record_unhandled_class("  ");
+        diagnostics.finish_unhandled_classes();
+        assert_eq!(
+            diagnostics.unhandled_classes["ACDB_DYNAMICBLOCKPURGEPREVENTER"],
+            2
+        );
+        assert!(!diagnostics.unhandled_classes.contains_key("UNKNOWN_ENT"));
+        assert!(!diagnostics.has_save_loss());
+        assert!(diagnostics.lossy_notes.is_empty());
+        assert!(diagnostics
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("ACDB_DYNAMICBLOCKPURGEPREVENTER")));
+        assert_eq!(diagnostics.unsupported_total(), 0);
+    }
+
+    #[test]
+    fn header_notes_are_not_a_save_loss() {
+        let mut diagnostics = ImportDiagnostics::default();
+        diagnostics
+            .warnings
+            .push("HEADER EXTMIN 0.000000,0.000000,0.000000".into());
+        assert!(!diagnostics.has_save_loss());
+    }
+
+    #[test]
     fn extents_include_nested_insert() {
         let mut document = Document::default();
         document.layers.insert(
@@ -1367,6 +1578,7 @@ mod tests {
                 frozen: false,
                 color: CadColor::Aci(7),
                 linetype: "CONTINUOUS".into(),
+                ..Layer::default()
             },
         );
         document.blocks.insert(
@@ -1408,6 +1620,7 @@ mod tests {
                 frozen: false,
                 color: CadColor::Aci(7),
                 linetype: "CONTINUOUS".into(),
+                ..Layer::default()
             },
         );
         document.blocks.insert(
@@ -1450,6 +1663,7 @@ mod tests {
                 frozen: false,
                 color: CadColor::Aci(7),
                 linetype: "CONTINUOUS".into(),
+                ..Layer::default()
             },
         );
         let mut entity = line(0.0, 0.0, 50.0, 50.0);
@@ -1469,6 +1683,7 @@ mod tests {
                 frozen: false,
                 color: CadColor::Aci(7),
                 linetype: "CONTINUOUS".into(),
+                ..Layer::default()
             },
         );
         document.model_space.push(Entity::new(Geometry::LwPolyline {
@@ -1504,6 +1719,7 @@ mod tests {
                 frozen: false,
                 color: CadColor::Aci(7),
                 linetype: "CONTINUOUS".into(),
+                ..Layer::default()
             },
         );
         document.model_space.push(line(0.0, 0.0, 10.0, 0.0));
@@ -1553,6 +1769,7 @@ mod tests {
                 frozen: true,
                 color: CadColor::Aci(1),
                 linetype: "CONTINUOUS".into(),
+                ..Layer::default()
             },
         );
         assert!(!document.set_current_layer("FROZEN"));
@@ -1573,6 +1790,7 @@ mod tests {
                 frozen: false,
                 color: CadColor::Aci(1),
                 linetype: "CONTINUOUS".into(),
+                ..Layer::default()
             },
         );
         assert!(document.set_current_layer("WALL"));

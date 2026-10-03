@@ -80,6 +80,13 @@ pub enum CommandKind {
     Mirror,
     Scale,
     Erase,
+    Ellipse,
+    Polygon,
+    Point,
+    Stretch,
+    Trim,
+    Extend,
+    Offset,
 }
 
 impl CommandKind {
@@ -109,6 +116,13 @@ impl CommandKind {
             Self::Mirror => "MIRROR",
             Self::Scale => "SCALE",
             Self::Erase => "ERASE",
+            Self::Ellipse => "ELLIPSE",
+            Self::Polygon => "POLYGON",
+            Self::Point => "POINT",
+            Self::Stretch => "STRETCH",
+            Self::Trim => "TRIM",
+            Self::Extend => "EXTEND",
+            Self::Offset => "OFFSET",
         }
     }
 
@@ -153,6 +167,23 @@ pub enum CommandOutput {
     Modify {
         transform: EntityTransform,
         copies: bool,
+    },
+    Trim {
+        pick: Point2,
+    },
+    Extend {
+        pick: Point2,
+    },
+    Offset {
+        entity: EntityId,
+        side: Point2,
+        distance: f64,
+    },
+    Stretch {
+        corner_a: Point2,
+        corner_b: Point2,
+        dx: f64,
+        dy: f64,
     },
     Rejected(&'static str),
 }
@@ -211,6 +242,53 @@ pub struct RectangleState {
     pub first: Option<Point2>,
 }
 
+pub const MAX_POLYGON_SIDES: u32 = 1024;
+pub const DEFAULT_POLYGON_SIDES: u32 = 4;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EllipseState {
+    pub center: Option<Point2>,
+    pub major_end: Option<Point2>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PolygonState {
+    pub sides: u32,
+    pub center: Option<Point2>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StretchPhase {
+    FirstCorner,
+    SecondCorner,
+    Base,
+    Destination,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StretchState {
+    pub phase: StretchPhase,
+    pub first: Option<Point2>,
+    pub second: Option<Point2>,
+    pub base: Option<Point2>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OffsetPhase {
+    DistanceFirst,
+    DistanceSecond,
+    Select,
+    Side,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OffsetState {
+    pub phase: OffsetPhase,
+    pub distance: Option<f64>,
+    pub anchor: Option<Point2>,
+    pub target: Option<EntityId>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct DistanceState {
     pub first: Option<Point2>,
@@ -254,6 +332,13 @@ pub enum CommandState {
     Radius,
     Area(AreaState),
     Modify(ModifyState),
+    Ellipse(EllipseState),
+    Polygon(PolygonState),
+    Point,
+    Stretch(StretchState),
+    Trim,
+    Extend,
+    Offset(OffsetState),
 }
 
 impl CommandState {
@@ -270,6 +355,13 @@ impl CommandState {
             Self::Radius => CommandKind::Radius,
             Self::Area(_) => CommandKind::Area,
             Self::Modify(state) => state.kind.command_kind(),
+            Self::Ellipse(_) => CommandKind::Ellipse,
+            Self::Polygon(_) => CommandKind::Polygon,
+            Self::Point => CommandKind::Point,
+            Self::Stretch(_) => CommandKind::Stretch,
+            Self::Trim => CommandKind::Trim,
+            Self::Extend => CommandKind::Extend,
+            Self::Offset(_) => CommandKind::Offset,
         }
     }
 
@@ -323,6 +415,10 @@ impl CommandState {
                 ..
             }) => false,
             Self::Idle => false,
+            Self::Offset(OffsetState {
+                phase: OffsetPhase::Select,
+                ..
+            }) => false,
             _ => true,
         }
     }
@@ -366,6 +462,115 @@ impl CommandState {
 
     pub fn start_area(&mut self) {
         *self = Self::Area(AreaState::Prompt);
+    }
+
+    pub fn start_ellipse(&mut self) {
+        *self = Self::Ellipse(EllipseState {
+            center: None,
+            major_end: None,
+        });
+    }
+
+    pub fn start_polygon(&mut self, sides: u32) {
+        *self = Self::Polygon(PolygonState {
+            sides: clamp_polygon_sides(sides),
+            center: None,
+        });
+    }
+
+    pub fn start_point(&mut self) {
+        *self = Self::Point;
+    }
+
+    pub fn start_stretch(&mut self) {
+        *self = Self::Stretch(StretchState {
+            phase: StretchPhase::FirstCorner,
+            first: None,
+            second: None,
+            base: None,
+        });
+    }
+
+    pub fn start_trim(&mut self) {
+        *self = Self::Trim;
+    }
+
+    pub fn start_extend(&mut self) {
+        *self = Self::Extend;
+    }
+
+    pub fn start_offset(&mut self) {
+        *self = Self::Offset(OffsetState {
+            phase: OffsetPhase::DistanceFirst,
+            distance: None,
+            anchor: None,
+            target: None,
+        });
+    }
+
+    pub fn set_offset_target(&mut self, id: EntityId) -> bool {
+        let Self::Offset(state) = self else {
+            return false;
+        };
+        if state.phase != OffsetPhase::Select || state.distance.is_none() {
+            return false;
+        }
+        state.target = Some(id);
+        state.phase = OffsetPhase::Side;
+        true
+    }
+
+    pub fn repeat_offset(&mut self) {
+        let Self::Offset(state) = self else {
+            return;
+        };
+        state.phase = OffsetPhase::Select;
+        state.target = None;
+    }
+
+    pub fn polygon_sides(&self) -> u32 {
+        match self {
+            Self::Polygon(state) => state.sides,
+            _ => DEFAULT_POLYGON_SIDES,
+        }
+    }
+
+    pub fn is_offset_select(&self) -> bool {
+        matches!(
+            self,
+            Self::Offset(OffsetState {
+                phase: OffsetPhase::Select,
+                ..
+            })
+        )
+    }
+
+    pub fn stretch_motion(&self, current: Option<Point2>) -> Option<(Point2, Point2, f64, f64)> {
+        let Self::Stretch(state) = self else {
+            return None;
+        };
+        if state.phase != StretchPhase::Destination {
+            return None;
+        }
+        let base = state.base?;
+        let current = current?;
+        Some((
+            state.first?,
+            state.second?,
+            current.x - base.x,
+            current.y - base.y,
+        ))
+    }
+
+    pub fn stretch_window(&self, current: Option<Point2>) -> Option<(Point2, Point2)> {
+        let Self::Stretch(state) = self else {
+            return None;
+        };
+        match state.phase {
+            StretchPhase::FirstCorner => None,
+            StretchPhase::SecondCorner => Some((state.first?, current?)),
+            StretchPhase::Base | StretchPhase::Destination => Some((state.first?, state.second?)),
+        }
     }
 
     pub fn start_modify(&mut self, kind: ModifyKind, selected: Vec<EntityId>) {
@@ -458,7 +663,17 @@ impl CommandState {
             Self::Angle(AngleState::ThreePoint { vertex, ray }) => ray.or(*vertex),
             Self::Area(AreaState::Points { vertices }) => vertices.last().copied(),
             Self::Modify(state) => state.base,
-            Self::Idle | Self::Angle(_) | Self::Radius | Self::Area(_) => None,
+            Self::Ellipse(state) => state.major_end.or(state.center),
+            Self::Polygon(state) => state.center,
+            Self::Stretch(state) => state.base.or(state.first),
+            Self::Offset(state) => state.anchor,
+            Self::Idle
+            | Self::Angle(_)
+            | Self::Radius
+            | Self::Area(_)
+            | Self::Point
+            | Self::Trim
+            | Self::Extend => None,
         }
     }
 
@@ -474,6 +689,20 @@ impl CommandState {
                 ModifyPhase::ScaleFactor => DynamicLayout::Factor,
                 _ => DynamicLayout::Hidden,
             },
+            Self::Ellipse(state) if state.center.is_some() && state.major_end.is_none() => {
+                DynamicLayout::LengthAngle
+            }
+            Self::Ellipse(state) if state.major_end.is_some() => DynamicLayout::Distance,
+            Self::Polygon(state) if state.center.is_none() => DynamicLayout::Count,
+            Self::Polygon(_) => DynamicLayout::LengthAngle,
+            Self::Stretch(StretchState {
+                phase: StretchPhase::Destination,
+                ..
+            }) => DynamicLayout::LengthAngle,
+            Self::Offset(OffsetState {
+                phase: OffsetPhase::DistanceFirst | OffsetPhase::DistanceSecond,
+                ..
+            }) => DynamicLayout::Distance,
             _ => DynamicLayout::Hidden,
         }
     }
@@ -494,6 +723,11 @@ impl CommandState {
                 targets,
                 ..
             }) => !targets.is_empty(),
+            Self::Point | Self::Trim | Self::Extend => true,
+            Self::Offset(OffsetState {
+                phase: OffsetPhase::Select | OffsetPhase::Side,
+                ..
+            }) => true,
             _ => false,
         }
     }
@@ -527,6 +761,10 @@ impl CommandState {
             }
             Self::Area(AreaState::Points { .. }) => true,
             Self::Modify(state) => state.phase != ModifyPhase::Selecting,
+            Self::Ellipse(state) => state.center.is_some(),
+            Self::Polygon(state) => state.center.is_some(),
+            Self::Stretch(state) => state.phase != StretchPhase::FirstCorner,
+            Self::Offset(state) => state.phase != OffsetPhase::DistanceFirst,
             _ => false,
         }
     }
@@ -549,6 +787,20 @@ impl CommandState {
                 true
             }
             Self::Modify(state) => back_modify(state),
+            Self::Ellipse(state) if state.major_end.is_some() => {
+                state.major_end = None;
+                true
+            }
+            Self::Ellipse(state) if state.center.is_some() => {
+                state.center = None;
+                true
+            }
+            Self::Polygon(state) if state.center.is_some() => {
+                state.center = None;
+                true
+            }
+            Self::Stretch(state) => back_stretch(state),
+            Self::Offset(state) => back_offset(state),
             _ => false,
         }
     }
@@ -592,11 +844,34 @@ impl CommandState {
                 true
             }
             Self::Modify(state) => back_modify(state),
+            Self::Ellipse(state) if state.major_end.is_some() => {
+                state.major_end = None;
+                true
+            }
+            Self::Ellipse(state) if state.center.is_some() => {
+                state.center = None;
+                true
+            }
+            Self::Polygon(state) if state.center.is_some() => {
+                state.center = None;
+                true
+            }
+            Self::Stretch(state) => back_stretch(state),
+            Self::Offset(state) => back_offset(state),
             _ => false,
         }
     }
 
     pub fn accept_point(&mut self, point: Point2) -> CommandOutput {
+        self.accept_draft_point(point, None, None)
+    }
+
+    pub fn accept_draft_point(
+        &mut self,
+        point: Point2,
+        typed_distance: Option<f64>,
+        typed_count: Option<f64>,
+    ) -> CommandOutput {
         if !point.is_finite() {
             return CommandOutput::Rejected("Point is not finite");
         }
@@ -608,6 +883,8 @@ impl CommandState {
                 | Self::Distance(_)
                 | Self::Angle(AngleState::ThreePoint { ray: Some(_), .. })
                 | Self::Polyline(_)
+                | Self::Ellipse(_)
+                | Self::Polygon(_)
         );
         let output = match self {
             Self::Idle => CommandOutput::None,
@@ -621,6 +898,13 @@ impl CommandState {
             Self::Area(state) => accept_area_point(state, point),
             Self::Modify(state) => accept_modify_point(state, point, None, None),
             Self::Radius => CommandOutput::Rejected("Select a Circle or Arc"),
+            Self::Ellipse(state) => accept_ellipse_point(state, point, typed_distance),
+            Self::Polygon(state) => accept_polygon_point(state, point, typed_count),
+            Self::Point => CommandOutput::Geometry(point_geometry(point)),
+            Self::Stretch(state) => accept_stretch_point(state, point),
+            Self::Trim => CommandOutput::Trim { pick: point },
+            Self::Extend => CommandOutput::Extend { pick: point },
+            Self::Offset(state) => accept_offset_point(state, point, typed_distance),
         };
         if completes
             && matches!(
@@ -809,6 +1093,10 @@ impl CommandState {
                 let current = current?;
                 rectangle_preview(first, current)
             }
+            Self::Ellipse(state) => preview_ellipse(state, current),
+            Self::Polygon(state) => preview_polygon(state, current),
+            Self::Stretch(_) => None,
+            Self::Point | Self::Trim | Self::Extend | Self::Offset(_) => None,
         }
     }
 
@@ -846,6 +1134,20 @@ impl CommandState {
             }
             Self::Area(AreaState::Points { .. }) => "AREA • Specify next point, or Enter to finish",
             Self::Modify(state) => modify_prompt(state),
+            Self::Ellipse(state) if state.center.is_none() => "ELLIPSE • Specify center point",
+            Self::Ellipse(state) if state.major_end.is_none() => {
+                "ELLIPSE • Specify endpoint of axis"
+            }
+            Self::Ellipse(_) => "ELLIPSE • Specify distance to other axis",
+            Self::Polygon(state) if state.center.is_none() => {
+                "POLYGON • Enter number of sides, then specify center"
+            }
+            Self::Polygon(_) => "POLYGON • Specify a vertex",
+            Self::Point => "POINT • Specify a point, or Esc to finish",
+            Self::Stretch(state) => stretch_prompt(state),
+            Self::Trim => "TRIM • Click the part to remove, or Esc to finish",
+            Self::Extend => "EXTEND • Click the end to extend, or Esc to finish",
+            Self::Offset(state) => offset_prompt(state),
         }
     }
 }
@@ -931,7 +1233,9 @@ fn accept_modify_point(
             CommandOutput::None
         }
         ModifyPhase::Destination => {
-            let base = state.base.expect("base point");
+            let Some(base) = state.base else {
+                return CommandOutput::Rejected("Base point is missing");
+            };
             CommandOutput::Modify {
                 transform: EntityTransform::Translate {
                     dx: point.x - base.x,
@@ -941,7 +1245,9 @@ fn accept_modify_point(
             }
         }
         ModifyPhase::Angle => {
-            let base = state.base.expect("base point");
+            let Some(base) = state.base else {
+                return CommandOutput::Rejected("Base point is missing");
+            };
             let radians = typed_angle_deg
                 .map(|deg| deg.to_radians())
                 .unwrap_or_else(|| (point.y - base.y).atan2(point.x - base.x));
@@ -951,7 +1257,9 @@ fn accept_modify_point(
             }
         }
         ModifyPhase::MirrorSecond => {
-            let axis_start = state.base.expect("axis start");
+            let Some(axis_start) = state.base else {
+                return CommandOutput::Rejected("Base point is missing");
+            };
             CommandOutput::Modify {
                 transform: EntityTransform::Mirror {
                     axis_start,
@@ -961,7 +1269,9 @@ fn accept_modify_point(
             }
         }
         ModifyPhase::ScaleFactor => {
-            let base = state.base.expect("base point");
+            let Some(base) = state.base else {
+                return CommandOutput::Rejected("Base point is missing");
+            };
             let factor = typed_factor
                 .unwrap_or_else(|| base.distance(point) / state.reference_radius.max(1.0));
             CommandOutput::Modify {
@@ -1223,6 +1533,341 @@ pub fn rectangle_geometry(first: Point2, opposite: Point2) -> Option<Geometry> {
         &rectangle_corners(first, opposite),
         true,
     ))
+}
+
+pub fn clamp_polygon_sides(sides: u32) -> u32 {
+    sides.clamp(3, MAX_POLYGON_SIDES)
+}
+
+pub fn command_for_name(name: &str) -> Option<CommandKind> {
+    match name.trim().to_ascii_uppercase().as_str() {
+        "L" | "LINE" => Some(CommandKind::Line),
+        "P" | "PL" | "PLINE" | "POLYLINE" => Some(CommandKind::Polyline),
+        "C" | "CIRCLE" => Some(CommandKind::Circle),
+        "A" | "ARC" => Some(CommandKind::Arc),
+        "R" | "REC" | "RECTANG" | "RECTANGLE" => Some(CommandKind::Rectangle),
+        "EL" | "ELLIPSE" => Some(CommandKind::Ellipse),
+        "POL" | "POLYGON" => Some(CommandKind::Polygon),
+        "PO" | "POINT" => Some(CommandKind::Point),
+        "M" | "MOVE" => Some(CommandKind::Move),
+        "CO" | "CP" | "COPY" => Some(CommandKind::Copy),
+        "RO" | "ROTATE" => Some(CommandKind::Rotate),
+        "MI" | "MIRROR" => Some(CommandKind::Mirror),
+        "SC" | "SCALE" => Some(CommandKind::Scale),
+        "E" | "ERASE" => Some(CommandKind::Erase),
+        "S" | "STRETCH" => Some(CommandKind::Stretch),
+        "TR" | "TRIM" => Some(CommandKind::Trim),
+        "EX" | "EXTEND" => Some(CommandKind::Extend),
+        "O" | "OFFSET" => Some(CommandKind::Offset),
+        "D" | "DI" | "DIST" | "DISTANCE" => Some(CommandKind::Distance),
+        "AA" | "ANG" | "ANGLE" => Some(CommandKind::Angle),
+        "RAD" | "RADIUS" => Some(CommandKind::Radius),
+        "AREA" => Some(CommandKind::Area),
+        _ => None,
+    }
+}
+
+fn point_geometry(point: Point2) -> Geometry {
+    Geometry::Point {
+        position: Point3::from_xy(point.x, point.y),
+    }
+}
+
+fn accept_ellipse_point(
+    state: &mut EllipseState,
+    point: Point2,
+    typed_distance: Option<f64>,
+) -> CommandOutput {
+    match (state.center, state.major_end) {
+        (None, _) => {
+            state.center = Some(point);
+            CommandOutput::None
+        }
+        (Some(center), None) => {
+            if center.distance(point) <= GEOM_TOLERANCE {
+                return CommandOutput::Rejected("Axis length must be greater than zero");
+            }
+            state.major_end = Some(point);
+            CommandOutput::None
+        }
+        (Some(center), Some(major_end)) => {
+            let minor = typed_distance.unwrap_or_else(|| center.distance(point));
+            match ellipse_geometry(center, major_end, minor) {
+                Some(geometry) => CommandOutput::Geometry(geometry),
+                None => CommandOutput::Rejected("Ellipse axes must be greater than zero"),
+            }
+        }
+    }
+}
+
+fn accept_polygon_point(
+    state: &mut PolygonState,
+    point: Point2,
+    typed_count: Option<f64>,
+) -> CommandOutput {
+    if let Some(count) = typed_count {
+        if !(3.0..=f64::from(MAX_POLYGON_SIDES)).contains(&count) {
+            return CommandOutput::Rejected("Polygon sides must be from 3 to 1024");
+        }
+        state.sides = clamp_polygon_sides(count.round() as u32);
+    }
+    match state.center {
+        None => {
+            state.center = Some(point);
+            CommandOutput::None
+        }
+        Some(center) => {
+            if center.distance(point) <= GEOM_TOLERANCE {
+                return CommandOutput::Rejected("Radius must be greater than zero");
+            }
+            CommandOutput::Geometry(polygon_geometry(center, point, state.sides))
+        }
+    }
+}
+
+fn accept_stretch_point(state: &mut StretchState, point: Point2) -> CommandOutput {
+    match state.phase {
+        StretchPhase::FirstCorner => {
+            state.first = Some(point);
+            state.phase = StretchPhase::SecondCorner;
+            CommandOutput::None
+        }
+        StretchPhase::SecondCorner => {
+            let Some(first) = state.first else {
+                return CommandOutput::Rejected("First corner is missing");
+            };
+            if first.distance(point) <= GEOM_TOLERANCE {
+                return CommandOutput::Rejected("Crossing window is too small");
+            }
+            state.second = Some(point);
+            state.phase = StretchPhase::Base;
+            CommandOutput::None
+        }
+        StretchPhase::Base => {
+            state.base = Some(point);
+            state.phase = StretchPhase::Destination;
+            CommandOutput::None
+        }
+        StretchPhase::Destination => {
+            let (Some(corner_a), Some(corner_b), Some(base)) =
+                (state.first, state.second, state.base)
+            else {
+                return CommandOutput::Rejected("Stretch window is missing");
+            };
+            CommandOutput::Stretch {
+                corner_a,
+                corner_b,
+                dx: point.x - base.x,
+                dy: point.y - base.y,
+            }
+        }
+    }
+}
+
+fn accept_offset_point(
+    state: &mut OffsetState,
+    point: Point2,
+    typed_distance: Option<f64>,
+) -> CommandOutput {
+    if let Some(distance) = typed_distance {
+        if !distance.is_finite() || distance <= GEOM_TOLERANCE {
+            return CommandOutput::Rejected("Offset distance must be greater than zero");
+        }
+        if matches!(
+            state.phase,
+            OffsetPhase::DistanceFirst | OffsetPhase::DistanceSecond
+        ) {
+            state.distance = Some(distance);
+            state.phase = OffsetPhase::Select;
+            state.anchor = None;
+            return CommandOutput::None;
+        }
+    }
+    match state.phase {
+        OffsetPhase::DistanceFirst => {
+            state.anchor = Some(point);
+            state.phase = OffsetPhase::DistanceSecond;
+            CommandOutput::None
+        }
+        OffsetPhase::DistanceSecond => {
+            let Some(anchor) = state.anchor else {
+                return CommandOutput::Rejected("First point is missing");
+            };
+            let distance = anchor.distance(point);
+            if distance <= GEOM_TOLERANCE {
+                return CommandOutput::Rejected("Offset distance must be greater than zero");
+            }
+            state.distance = Some(distance);
+            state.phase = OffsetPhase::Select;
+            CommandOutput::None
+        }
+        OffsetPhase::Select => CommandOutput::Rejected("Select an object to offset"),
+        OffsetPhase::Side => {
+            let (Some(entity), Some(distance)) = (state.target, state.distance) else {
+                return CommandOutput::Rejected("Select an object to offset");
+            };
+            CommandOutput::Offset {
+                entity,
+                side: point,
+                distance,
+            }
+        }
+    }
+}
+
+fn back_stretch(state: &mut StretchState) -> bool {
+    match state.phase {
+        StretchPhase::FirstCorner => false,
+        StretchPhase::SecondCorner => {
+            state.phase = StretchPhase::FirstCorner;
+            state.first = None;
+            true
+        }
+        StretchPhase::Base => {
+            state.phase = StretchPhase::SecondCorner;
+            state.second = None;
+            true
+        }
+        StretchPhase::Destination => {
+            state.phase = StretchPhase::Base;
+            state.base = None;
+            true
+        }
+    }
+}
+
+fn back_offset(state: &mut OffsetState) -> bool {
+    match state.phase {
+        OffsetPhase::DistanceFirst => false,
+        OffsetPhase::DistanceSecond => {
+            state.phase = OffsetPhase::DistanceFirst;
+            state.anchor = None;
+            true
+        }
+        OffsetPhase::Select => {
+            state.phase = OffsetPhase::DistanceFirst;
+            state.distance = None;
+            state.anchor = None;
+            state.target = None;
+            true
+        }
+        OffsetPhase::Side => {
+            state.phase = OffsetPhase::Select;
+            state.target = None;
+            true
+        }
+    }
+}
+
+fn stretch_prompt(state: &StretchState) -> &'static str {
+    match state.phase {
+        StretchPhase::FirstCorner => "STRETCH • Specify first corner of crossing window",
+        StretchPhase::SecondCorner => "STRETCH • Specify opposite corner",
+        StretchPhase::Base => "STRETCH • Specify base point",
+        StretchPhase::Destination => "STRETCH • Specify destination point",
+    }
+}
+
+fn offset_prompt(state: &OffsetState) -> &'static str {
+    match state.phase {
+        OffsetPhase::DistanceFirst => "OFFSET • Specify offset distance",
+        OffsetPhase::DistanceSecond => "OFFSET • Specify second point",
+        OffsetPhase::Select => "OFFSET • Select object to offset, or Esc to finish",
+        OffsetPhase::Side => "OFFSET • Specify point on side to offset",
+    }
+}
+
+fn ellipse_geometry(center: Point2, major_end: Point2, minor_len: f64) -> Option<Geometry> {
+    let major = major_end - center;
+    let major_len = (major.x * major.x + major.y * major.y).sqrt();
+    if major_len <= GEOM_TOLERANCE || !minor_len.is_finite() || minor_len <= GEOM_TOLERANCE {
+        return None;
+    }
+    let (axis, ratio) = if minor_len > major_len {
+        let scale = minor_len / major_len;
+        (
+            Point2::new(-major.y, major.x) * scale,
+            major_len / minor_len,
+        )
+    } else {
+        (major, minor_len / major_len)
+    };
+    Some(Geometry::Ellipse {
+        center: Point3::from_xy(center.x, center.y),
+        major_axis: Point3::from_xy(axis.x, axis.y),
+        axis_ratio: ratio,
+        start_param: 0.0,
+        end_param: std::f64::consts::TAU,
+        extrusion: default_extrusion(),
+    })
+}
+
+fn polygon_geometry(center: Point2, vertex: Point2, sides: u32) -> Geometry {
+    lwpolyline_geometry(&polygon_vertices(center, vertex, sides), true)
+}
+
+fn polygon_vertices(center: Point2, vertex: Point2, sides: u32) -> Vec<Point2> {
+    let sides = clamp_polygon_sides(sides);
+    let radius = center.distance(vertex);
+    let base = (vertex.y - center.y).atan2(vertex.x - center.x);
+    (0..sides)
+        .map(|index| {
+            let angle = base + std::f64::consts::TAU * f64::from(index) / f64::from(sides);
+            Point2::new(
+                center.x + radius * angle.cos(),
+                center.y + radius * angle.sin(),
+            )
+        })
+        .collect()
+}
+
+fn preview_ellipse(state: &EllipseState, current: Option<Point2>) -> Option<PreviewGeometry> {
+    let center = state.center?;
+    let current = current?;
+    if let Some(major_end) = state.major_end {
+        let minor = center.distance(current);
+        let geometry = ellipse_geometry(center, major_end, minor)?;
+        let Geometry::Ellipse {
+            center,
+            major_axis,
+            axis_ratio,
+            start_param,
+            end_param,
+            extrusion,
+        } = geometry
+        else {
+            return None;
+        };
+        let points = cad_core::ellipse_points(
+            center,
+            major_axis,
+            axis_ratio,
+            start_param,
+            end_param,
+            extrusion,
+            48,
+        );
+        return Some(PreviewGeometry::Polyline {
+            vertices: points,
+            next: None,
+            closed: true,
+        });
+    }
+    (center.distance(current) > GEOM_TOLERANCE)
+        .then_some(PreviewGeometry::LineSegment([center, current]))
+}
+
+fn preview_polygon(state: &PolygonState, current: Option<Point2>) -> Option<PreviewGeometry> {
+    let center = state.center?;
+    let current = current?;
+    if center.distance(current) <= GEOM_TOLERANCE {
+        return None;
+    }
+    Some(PreviewGeometry::Polyline {
+        vertices: polygon_vertices(center, current, state.sides),
+        next: None,
+        closed: true,
+    })
 }
 
 #[cfg(test)]
@@ -1751,5 +2396,78 @@ mod tests {
         };
         assert!((factor - 2.5).abs() < 1e-12);
         assert!(!copies);
+    }
+
+    #[test]
+    fn aliases_cover_draw_and_modify_names() {
+        assert_eq!(command_for_name("tr"), Some(CommandKind::Trim));
+        assert_eq!(command_for_name("EL"), Some(CommandKind::Ellipse));
+        assert_eq!(command_for_name("pol"), Some(CommandKind::Polygon));
+        assert_eq!(command_for_name("po"), Some(CommandKind::Point));
+        assert_eq!(command_for_name("s"), Some(CommandKind::Stretch));
+        assert_eq!(command_for_name("sc"), Some(CommandKind::Scale));
+        assert_eq!(command_for_name("co"), Some(CommandKind::Copy));
+        assert_eq!(command_for_name("aa"), Some(CommandKind::Angle));
+        assert_eq!(command_for_name("nope"), None);
+    }
+
+    #[test]
+    fn polygon_and_point_commit_geometry() {
+        let mut command = CommandState::Idle;
+        command.start_polygon(4);
+        assert!(matches!(
+            command.accept_draft_point(Point2::new(0.0, 0.0), None, Some(6.0)),
+            CommandOutput::None
+        ));
+        assert_eq!(command.polygon_sides(), 6);
+        let CommandOutput::Geometry(Geometry::LwPolyline {
+            vertices, closed, ..
+        }) = command.accept_point(Point2::new(2.0, 0.0))
+        else {
+            panic!("polygon");
+        };
+        assert!(closed);
+        assert_eq!(vertices.len(), 6);
+        assert!(command.is_idle());
+
+        command.start_point();
+        assert!(matches!(
+            command.accept_point(Point2::new(1.0, 1.0)),
+            CommandOutput::Geometry(Geometry::Point { .. })
+        ));
+        assert_eq!(command.kind(), CommandKind::Point);
+    }
+
+    #[test]
+    fn stretch_window_then_displacement() {
+        let mut command = CommandState::Idle;
+        command.start_stretch();
+        command.accept_point(Point2::new(0.0, 0.0));
+        command.accept_point(Point2::new(4.0, 2.0));
+        command.accept_point(Point2::new(1.0, 1.0));
+        let CommandOutput::Stretch { dx, dy, .. } = command.accept_point(Point2::new(3.0, 5.0))
+        else {
+            panic!("stretch");
+        };
+        assert!((dx - 2.0).abs() < 1e-12);
+        assert!((dy - 4.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn trim_stays_active_and_offset_uses_typed_distance() {
+        let mut command = CommandState::Idle;
+        command.start_trim();
+        assert!(matches!(
+            command.accept_point(Point2::new(1.0, 2.0)),
+            CommandOutput::Trim { .. }
+        ));
+        assert_eq!(command.kind(), CommandKind::Trim);
+
+        command.start_offset();
+        assert!(matches!(
+            command.accept_draft_point(Point2::new(0.0, 0.0), Some(3.0), None),
+            CommandOutput::None
+        ));
+        assert!(command.is_offset_select());
     }
 }

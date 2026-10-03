@@ -514,7 +514,7 @@ pub fn convert_and_enter(app: &mut MyCadApp, instance_id: EntityId, mode: Conver
         crate::workspace::WorkspaceTab::DynamicBlock,
     );
     app.status = "Editing dynamic block".into();
-    app.refresh_derived();
+    app.schedule_full_refresh();
 }
 
 pub fn revert_unique_conversion(app: &mut MyCadApp) {
@@ -564,7 +564,7 @@ pub fn discard_authoring(app: &mut MyCadApp) {
     }
     revert_unique_conversion(app);
     app.status = "Discarded dynamic-block authoring".into();
-    app.refresh_derived();
+    app.schedule_full_refresh();
 }
 
 pub fn add_size_parameter(
@@ -786,8 +786,10 @@ fn replace_parameter_kind(
     parameter.display_order = display_order;
     parameter.description = description;
     cad_core::validate_parameter_def(parameter).map_err(|err| err.to_string())?;
-    cad_core::validate_definition(after.dynamic.as_ref().unwrap(), &after.entities)
-        .map_err(|err| err.to_string())?;
+    let Some(dynamic) = after.dynamic.as_ref() else {
+        return Err("Block is not dynamic".into());
+    };
+    cad_core::validate_definition(dynamic, &after.entities).map_err(|err| err.to_string())?;
     document.replace_block_definition(after.clone());
     history.record(Edit::ReplaceBlockDefinition {
         name: block_name.to_string(),
@@ -921,8 +923,10 @@ pub fn attach_behavior(
             follow: follow_from_multiplier(multiplier),
             name: None,
         });
-    cad_core::validate_definition(after.dynamic.as_ref().unwrap(), &after.entities)
-        .map_err(|err| err.to_string())?;
+    let Some(dynamic) = after.dynamic.as_ref() else {
+        return Err("Block is not dynamic".into());
+    };
+    cad_core::validate_definition(dynamic, &after.entities).map_err(|err| err.to_string())?;
     document.replace_block_definition(after.clone());
     history.record(Edit::ReplaceBlockDefinition {
         name: block_name.to_string(),
@@ -1938,9 +1942,16 @@ fn show_parameter_editor(
             ui.radio_value(&mut anchor, AnchorPolicy::FirstFixed, "Keep first side fixed");
             ui.radio_value(&mut anchor, AnchorPolicy::SecondFixed, "Keep second side fixed");
             ui.radio_value(&mut anchor, AnchorPolicy::CenterFixed, "Keep center fixed");
-            if anchor != size.anchor {
-                draft.numeric.size.as_mut().unwrap().anchor = anchor;
-                draft.dirty = true;
+            if draft
+                .numeric
+                .size
+                .as_ref()
+                .is_some_and(|size| anchor != size.anchor)
+            {
+                if let Some(size) = draft.numeric.size.as_mut() {
+                    size.anchor = anchor;
+                    draft.dirty = true;
+                }
             }
             if ui.small_button("Move dimension label").clicked() {
                 if let Some(authoring) = app.dynamic_authoring.as_mut() {
@@ -4100,9 +4111,12 @@ fn add_nested_mapping(app: &mut MyCadApp, nested: EntityId) {
                 mapping: cad_core::NestedMapping::Direct,
             });
         }
-        if let Err(err) =
-            cad_core::validate_definition(after.dynamic.as_ref().unwrap(), &after.entities)
-        {
+        let Some(dynamic) = after.dynamic.as_ref() else {
+            app.history.commit_open();
+            app.status = "Block is not dynamic".into();
+            return;
+        };
+        if let Err(err) = cad_core::validate_definition(dynamic, &after.entities) {
             app.history.commit_open();
             app.status = err.to_string();
             return;

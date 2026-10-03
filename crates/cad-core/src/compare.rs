@@ -1,13 +1,14 @@
 //! Compare two native documents with CAD tolerances.
 
 use crate::color::{aci_rgb, CadColor};
-use crate::document::{BlockDefinition, Document, DrawingUnits, Layer};
+use crate::document::{BlockDefinition, Document, DrawingUnits, Layer, TextStyle};
 use crate::entity::{
     Entity, Geometry, HatchData, HatchEdge, HatchPath, MTextData, PolyVertex, TextData,
+    ViewportData,
 };
 use crate::extents::Extents2;
 use crate::geom::{Point2, Point3};
-use crate::linetype::{normalize_linetype_name, LineType};
+use crate::linetype::{normalize_linetype_name, LineType, LineTypeShape};
 
 const TAU: f64 = std::f64::consts::TAU;
 const PI: f64 = std::f64::consts::PI;
@@ -68,6 +69,12 @@ pub fn compare_documents(expected: &Document, actual: &Document, tol: CompareTol
         });
     }
     compare_layers(&expected.layers, &actual.layers, &mut mismatches);
+    compare_styles(
+        &expected.text_styles,
+        &actual.text_styles,
+        tol,
+        &mut mismatches,
+    );
     compare_linetypes(&expected.linetypes, &actual.linetypes, tol, &mut mismatches);
     compare_extents(
         expected.compute_extents(),
@@ -112,6 +119,24 @@ fn compare_layers(
             });
             continue;
         };
+        if layer.locked != got.locked {
+            out.push(Mismatch {
+                path: format!("layers.{name}.locked"),
+                message: format!("expected {} got {}", layer.locked, got.locked),
+            });
+        }
+        if layer.plot != got.plot {
+            out.push(Mismatch {
+                path: format!("layers.{name}.plot"),
+                message: format!("expected {} got {}", layer.plot, got.plot),
+            });
+        }
+        if layer.lineweight != got.lineweight {
+            out.push(Mismatch {
+                path: format!("layers.{name}.lineweight"),
+                message: format!("expected {} got {}", layer.lineweight, got.lineweight),
+            });
+        }
         if layer.visible != got.visible {
             out.push(Mismatch {
                 path: format!("layers.{name}.visible"),
@@ -151,6 +176,47 @@ fn find_layer<'a>(
     })
 }
 
+fn compare_styles(
+    expected: &std::collections::BTreeMap<String, TextStyle>,
+    actual: &std::collections::BTreeMap<String, TextStyle>,
+    tol: CompareTol,
+    out: &mut Vec<Mismatch>,
+) {
+    for (name, style) in expected {
+        let Some(got) = actual
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, style)| style)
+        else {
+            out.push(Mismatch {
+                path: format!("text_styles.{name}"),
+                message: "missing text style".into(),
+            });
+            continue;
+        };
+        if !style.font_file.eq_ignore_ascii_case(&got.font_file) {
+            out.push(Mismatch {
+                path: format!("text_styles.{name}.font"),
+                message: format!("expected {} got {}", style.font_file, got.font_file),
+            });
+        }
+        scalar_field(
+            &format!("text_styles.{name}.height"),
+            style.height,
+            got.height,
+            tol.coord,
+            out,
+        );
+        scalar_field(
+            &format!("text_styles.{name}.width_factor"),
+            style.width_factor,
+            got.width_factor,
+            tol.coord,
+            out,
+        );
+    }
+}
+
 fn compare_linetypes(
     expected: &std::collections::BTreeMap<String, LineType>,
     actual: &std::collections::BTreeMap<String, LineType>,
@@ -184,6 +250,99 @@ fn compare_linetypes(
                 });
             }
         }
+        let count = linetype.shapes.len().max(got.shapes.len());
+        for index in 0..count {
+            compare_linetype_shape(
+                &format!("linetypes.{name}.shapes[{index}]"),
+                linetype.shape_at(index),
+                got.shape_at(index),
+                tol,
+                out,
+            );
+        }
+    }
+}
+
+fn compare_linetype_shape(
+    path: &str,
+    expected: Option<&LineTypeShape>,
+    actual: Option<&LineTypeShape>,
+    tol: CompareTol,
+    out: &mut Vec<Mismatch>,
+) {
+    match (expected, actual) {
+        (None, None) => {}
+        (Some(expected), Some(actual)) => {
+            if expected.flag != actual.flag {
+                out.push(Mismatch {
+                    path: format!("{path}.flag"),
+                    message: format!("expected {} got {}", expected.flag, actual.flag),
+                });
+            }
+            if expected.shapecode != actual.shapecode {
+                out.push(Mismatch {
+                    path: format!("{path}.shapecode"),
+                    message: format!("expected {} got {}", expected.shapecode, actual.shapecode),
+                });
+            }
+            if expected.text != actual.text {
+                out.push(Mismatch {
+                    path: format!("{path}.text"),
+                    message: format!("expected '{}' got '{}'", expected.text, actual.text),
+                });
+            }
+            if !expected.style.eq_ignore_ascii_case(&actual.style) {
+                out.push(Mismatch {
+                    path: format!("{path}.style"),
+                    message: format!("expected '{}' got '{}'", expected.style, actual.style),
+                });
+            }
+            if !expected.shape_file.eq_ignore_ascii_case(&actual.shape_file) {
+                out.push(Mismatch {
+                    path: format!("{path}.shape_file"),
+                    message: format!(
+                        "expected '{}' got '{}'",
+                        expected.shape_file, actual.shape_file
+                    ),
+                });
+            }
+            scalar_field(
+                &format!("{path}.scale"),
+                expected.scale,
+                actual.scale,
+                tol.coord,
+                out,
+            );
+            scalar_field(
+                &format!("{path}.x_offset"),
+                expected.x_offset,
+                actual.x_offset,
+                tol.coord,
+                out,
+            );
+            scalar_field(
+                &format!("{path}.y_offset"),
+                expected.y_offset,
+                actual.y_offset,
+                tol.coord,
+                out,
+            );
+            angle_field(
+                &format!("{path}.rotation"),
+                expected.rotation,
+                actual.rotation,
+                tol.angle,
+                out,
+            );
+        }
+        (Some(_), None) => out.push(Mismatch {
+            path: path.into(),
+            message: "missing complex dash".into(),
+        }),
+        (None, Some(_)) => out.push(Mismatch {
+            path: path.into(),
+            message: "unexpected complex dash".into(),
+        }),
     }
 }
 
@@ -244,6 +403,15 @@ fn compare_blocks(
             tol,
             out,
         );
+        if block.xref_path != got.xref_path || block.xref_overlay != got.xref_overlay {
+            out.push(Mismatch {
+                path: format!("blocks.{name}.xref"),
+                message: format!(
+                    "expected {} overlay {} got {} overlay {}",
+                    block.xref_path, block.xref_overlay, got.xref_path, got.xref_overlay
+                ),
+            });
+        }
         compare_entities(
             &format!("blocks.{name}.entities"),
             &block.entities,
@@ -477,6 +645,7 @@ fn compare_geometry(
                 row_count: rc0,
                 column_spacing: cs0,
                 row_spacing: rs0,
+                attribs: attribs0,
                 ..
             },
             Geometry::Insert {
@@ -489,6 +658,7 @@ fn compare_geometry(
                 row_count: rc1,
                 column_spacing: cs1,
                 row_spacing: rs1,
+                attribs: attribs1,
                 ..
             },
         ) => {
@@ -516,6 +686,20 @@ fn compare_geometry(
                 out,
             );
             scalar_field(&format!("{path}.row_spacing"), *rs0, *rs1, tol.coord, out);
+            if attribs0.len() != attribs1.len() {
+                out.push(Mismatch {
+                    path: format!("{path}.attribs"),
+                    message: format!(
+                        "expected {} attributes got {}",
+                        attribs0.len(),
+                        attribs1.len()
+                    ),
+                });
+            } else {
+                for (index, (left, right)) in attribs0.iter().zip(attribs1.iter()).enumerate() {
+                    compare_text(&format!("{path}.attribs[{index}]"), left, right, tol, out);
+                }
+            }
         }
         (Geometry::Text(a), Geometry::Text(b)) => compare_text(path, a, b, tol, out),
         (Geometry::MText(a), Geometry::MText(b)) => compare_mtext(path, a, b, tol, out),
@@ -538,6 +722,76 @@ fn compare_geometry(
         (Geometry::Leader { vertices: a }, Geometry::Leader { vertices: b }) => {
             points_field(&format!("{path}.vertices"), a, b, tol, out);
         }
+        (
+            Geometry::MLine {
+                vertices: a,
+                closed: closed_a,
+            },
+            Geometry::MLine {
+                vertices: b,
+                closed: closed_b,
+            },
+        ) => {
+            points_field(&format!("{path}.vertices"), a, b, tol, out);
+            if closed_a != closed_b {
+                out.push(Mismatch {
+                    path: format!("{path}.closed"),
+                    message: format!("expected {closed_a} got {closed_b}"),
+                });
+            }
+        }
+        (Geometry::Viewport(a), Geometry::Viewport(b)) => compare_viewport(path, a, b, tol, out),
+        (Geometry::Image(a), Geometry::Image(b)) | (Geometry::Wipeout(a), Geometry::Wipeout(b)) => {
+            point3_field(&format!("{path}.corner"), a.corner, b.corner, tol, out);
+            point3_field(&format!("{path}.u"), a.u_vector, b.u_vector, tol, out);
+            point3_field(&format!("{path}.v"), a.v_vector, b.v_vector, tol, out);
+            if a.path != b.path {
+                out.push(Mismatch {
+                    path: format!("{path}.path"),
+                    message: format!("expected {} got {}", a.path, b.path),
+                });
+            }
+        }
+        (Geometry::Dimension(a), Geometry::Dimension(b)) => {
+            if !a.block_name.eq_ignore_ascii_case(&b.block_name) {
+                out.push(Mismatch {
+                    path: format!("{path}.block_name"),
+                    message: format!("expected {} got {}", a.block_name, b.block_name),
+                });
+            }
+            if a.kind != b.kind {
+                out.push(Mismatch {
+                    path: format!("{path}.kind"),
+                    message: format!("expected {:?} got {:?}", a.kind, b.kind),
+                });
+            }
+            point3_field(
+                &format!("{path}.definition"),
+                a.definition,
+                b.definition,
+                tol,
+                out,
+            );
+            point3_field(
+                &format!("{path}.text"),
+                a.text_midpoint,
+                b.text_midpoint,
+                tol,
+                out,
+            );
+            if a.text != b.text {
+                out.push(Mismatch {
+                    path: format!("{path}.override"),
+                    message: format!("expected {:?} got {:?}", a.text, b.text),
+                });
+            }
+            if !a.dimstyle.eq_ignore_ascii_case(&b.dimstyle) {
+                out.push(Mismatch {
+                    path: format!("{path}.dimstyle"),
+                    message: format!("expected {} got {}", a.dimstyle, b.dimstyle),
+                });
+            }
+        }
         _ => out.push(Mismatch {
             path: path.into(),
             message: format!(
@@ -546,6 +800,126 @@ fn compare_geometry(
                 actual.type_name()
             ),
         }),
+    }
+}
+
+fn compare_viewport(
+    path: &str,
+    expected: &ViewportData,
+    actual: &ViewportData,
+    tol: CompareTol,
+    out: &mut Vec<Mismatch>,
+) {
+    point3_field(
+        &format!("{path}.center"),
+        expected.center,
+        actual.center,
+        tol,
+        out,
+    );
+    scalar_field(
+        &format!("{path}.width"),
+        expected.width,
+        actual.width,
+        tol.coord,
+        out,
+    );
+    scalar_field(
+        &format!("{path}.height"),
+        expected.height,
+        actual.height,
+        tol.coord,
+        out,
+    );
+    scalar_field(
+        &format!("{path}.view_center.x"),
+        expected.view_center.x,
+        actual.view_center.x,
+        tol.coord,
+        out,
+    );
+    scalar_field(
+        &format!("{path}.view_center.y"),
+        expected.view_center.y,
+        actual.view_center.y,
+        tol.coord,
+        out,
+    );
+    scalar_field(
+        &format!("{path}.view_height"),
+        expected.view_height,
+        actual.view_height,
+        tol.coord,
+        out,
+    );
+    point3_field(
+        &format!("{path}.view_target"),
+        expected.view_target,
+        actual.view_target,
+        tol,
+        out,
+    );
+    point3_field(
+        &format!("{path}.view_direction"),
+        expected.view_direction,
+        actual.view_direction,
+        tol,
+        out,
+    );
+    angle_field(
+        &format!("{path}.twist"),
+        expected.twist,
+        actual.twist,
+        tol.angle,
+        out,
+    );
+    scalar_field(
+        &format!("{path}.lens_length"),
+        expected.lens_length,
+        actual.lens_length,
+        tol.coord,
+        out,
+    );
+    scalar_field(
+        &format!("{path}.front_z"),
+        expected.front_z,
+        actual.front_z,
+        tol.coord,
+        out,
+    );
+    scalar_field(
+        &format!("{path}.back_z"),
+        expected.back_z,
+        actual.back_z,
+        tol.coord,
+        out,
+    );
+    angle_field(
+        &format!("{path}.snap_angle"),
+        expected.snap_angle,
+        actual.snap_angle,
+        tol.angle,
+        out,
+    );
+    if expected.circle_zoom != actual.circle_zoom
+        || expected.status != actual.status
+        || expected.id != actual.id
+        || expected.status_flag != actual.status_flag
+    {
+        out.push(Mismatch {
+            path: format!("{path}.flags"),
+            message: format!(
+                "expected zoom {} status {} id {} flag {} got zoom {} status {} id {} flag {}",
+                expected.circle_zoom,
+                expected.status,
+                expected.id,
+                expected.status_flag,
+                actual.circle_zoom,
+                actual.status,
+                actual.id,
+                actual.status_flag
+            ),
+        });
     }
 }
 
@@ -622,6 +996,48 @@ fn compare_text(path: &str, a: &TextData, b: &TextData, tol: CompareTol, out: &m
         tol.angle,
         out,
     );
+    if !a.style.eq_ignore_ascii_case(&b.style) {
+        out.push(Mismatch {
+            path: format!("{path}.style"),
+            message: format!("expected {} got {}", a.style, b.style),
+        });
+    }
+    match (&a.attribute, &b.attribute) {
+        (None, None) => {}
+        (Some(left), Some(right)) => {
+            if !left.tag.eq_ignore_ascii_case(&right.tag) {
+                out.push(Mismatch {
+                    path: format!("{path}.tag"),
+                    message: format!("expected {} got {}", left.tag, right.tag),
+                });
+            }
+            if left.prompt != right.prompt {
+                out.push(Mismatch {
+                    path: format!("{path}.prompt"),
+                    message: format!("expected {:?} got {:?}", left.prompt, right.prompt),
+                });
+            }
+            if left.flags != right.flags {
+                out.push(Mismatch {
+                    path: format!("{path}.flags"),
+                    message: format!("expected {} got {}", left.flags, right.flags),
+                });
+            }
+        }
+        (left, right) => out.push(Mismatch {
+            path: format!("{path}.attribute"),
+            message: format!(
+                "expected {} got {}",
+                left.as_ref()
+                    .map(|info| info.tag.as_str())
+                    .unwrap_or("none"),
+                right
+                    .as_ref()
+                    .map(|info| info.tag.as_str())
+                    .unwrap_or("none")
+            ),
+        }),
+    }
 }
 
 fn compare_mtext(
@@ -681,6 +1097,12 @@ fn compare_hatch(
     tol: CompareTol,
     out: &mut Vec<Mismatch>,
 ) {
+    if !a.pattern_name.eq_ignore_ascii_case(&b.pattern_name) {
+        out.push(Mismatch {
+            path: format!("{path}.pattern_name"),
+            message: format!("expected {} got {}", a.pattern_name, b.pattern_name),
+        });
+    }
     if a.solid_fill != b.solid_fill {
         out.push(Mismatch {
             path: format!("{path}.solid_fill"),
@@ -696,6 +1118,62 @@ fn compare_hatch(
     }
     for (index, (left, right)) in a.paths.iter().zip(b.paths.iter()).enumerate() {
         compare_hatch_path(&format!("{path}.paths[{index}]"), left, right, tol, out);
+    }
+    if a.pattern_lines.len() != b.pattern_lines.len() {
+        out.push(Mismatch {
+            path: format!("{path}.pattern_lines"),
+            message: format!(
+                "expected {} pattern lines got {}",
+                a.pattern_lines.len(),
+                b.pattern_lines.len()
+            ),
+        });
+        return;
+    }
+    for (index, (left, right)) in a
+        .pattern_lines
+        .iter()
+        .zip(b.pattern_lines.iter())
+        .enumerate()
+    {
+        let item = format!("{path}.pattern_lines[{index}]");
+        angle_field(
+            &format!("{item}.angle"),
+            left.angle,
+            right.angle,
+            tol.angle,
+            out,
+        );
+        point3_field(&format!("{item}.base"), left.base, right.base, tol, out);
+        point3_field(
+            &format!("{item}.offset"),
+            left.offset,
+            right.offset,
+            tol,
+            out,
+        );
+        if left.dashes.len() != right.dashes.len() {
+            out.push(Mismatch {
+                path: format!("{item}.dashes"),
+                message: format!(
+                    "expected {} dashes got {}",
+                    left.dashes.len(),
+                    right.dashes.len()
+                ),
+            });
+        } else {
+            for (dash_index, (dash_a, dash_b)) in
+                left.dashes.iter().zip(right.dashes.iter()).enumerate()
+            {
+                scalar_field(
+                    &format!("{item}.dashes[{dash_index}]"),
+                    *dash_a,
+                    *dash_b,
+                    tol.coord,
+                    out,
+                );
+            }
+        }
     }
 }
 
@@ -994,6 +1472,36 @@ mod tests {
             end: Point3::from_xy(1.0, 2.0),
         }));
         assert!(compare_documents(&document, &document, CompareTol::ROUND_TRIP).is_empty());
+    }
+
+    #[test]
+    fn polyline_z_is_compared() {
+        let mut expected = Document::default();
+        expected.add_entity(Entity::new(Geometry::Polyline {
+            vertices: vec![
+                crate::entity::PolyVertex {
+                    point: Point3::new(0.0, 0.0, 1.0),
+                    bulge: 0.0,
+                    vertex_id: Default::default(),
+                },
+                crate::entity::PolyVertex {
+                    point: Point3::new(2.0, 0.0, 4.0),
+                    bulge: 0.0,
+                    vertex_id: Default::default(),
+                },
+            ],
+            closed: false,
+            linetype_generation_continuous: false,
+        }));
+        let mut actual = expected.clone();
+        if let Geometry::Polyline { vertices, .. } = &mut actual.model_space[0].geometry {
+            vertices[1].point.z = 9.0;
+        }
+        let mismatches = compare_documents(&expected, &actual, CompareTol::ROUND_TRIP);
+        assert!(
+            mismatches.iter().any(|item| item.path.contains("vertices")),
+            "{mismatches:?}"
+        );
     }
 
     #[test]

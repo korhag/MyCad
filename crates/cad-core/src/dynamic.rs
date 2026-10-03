@@ -2576,6 +2576,9 @@ fn geometry_can_move(geometry: &Geometry) -> bool {
             | Geometry::Solid { .. }
             | Geometry::Leader { .. }
             | Geometry::MLine { .. }
+            | Geometry::Viewport(_)
+            | Geometry::Image(_)
+            | Geometry::Wipeout(_)
     )
 }
 

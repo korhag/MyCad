@@ -7,6 +7,18 @@ use eframe::egui::{self, Color32, FontId, Pos2, Rect, Stroke, Vec2};
 // Enum: DynamicLayout
 // Purpose: Which numeric fields a drawing stage exposes.
 // ------------------------------------------------------------
+// ------------------------------------------------------------
+// Type: AlongPath
+// Purpose: A polar or object-snap tracking ray. A typed length is
+//          measured from `origin` along `angle_rad`, not from the
+//          command base.
+// ------------------------------------------------------------
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AlongPath {
+    pub origin: Point2,
+    pub angle_rad: f64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DynamicLayout {
     #[default]
@@ -16,6 +28,8 @@ pub enum DynamicLayout {
     WidthHeight,
     Angle,
     Factor,
+    Distance,
+    Count,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,6 +40,8 @@ enum FieldKind {
     Width,
     Height,
     Factor,
+    Distance,
+    Count,
 }
 
 impl FieldKind {
@@ -37,6 +53,8 @@ impl FieldKind {
             Self::Width => "Width",
             Self::Height => "Height",
             Self::Factor => "Factor",
+            Self::Distance => "Distance",
+            Self::Count => "Sides",
         }
     }
 
@@ -154,17 +172,34 @@ impl DynamicInput {
             .any(|field| field.locked || (field.typed && !field.buffer.is_empty()))
     }
 
-    pub fn constrain(&self, base: Option<Point2>, resolved: Point2) -> Point2 {
-        let Some(base) = base else {
-            return resolved;
-        };
+    #[cfg(test)]
+    fn constrain(&self, base: Option<Point2>, resolved: Point2) -> Point2 {
+        self.constrain_along(base, resolved, None)
+    }
+
+    pub fn constrain_along(
+        &self,
+        base: Option<Point2>,
+        resolved: Point2,
+        along: Option<AlongPath>,
+    ) -> Point2 {
         match self.layout {
-            DynamicLayout::Hidden => resolved,
-            DynamicLayout::LengthAngle => constrain_length_angle(&self.fields, base, resolved),
-            DynamicLayout::Radius => constrain_radius(&self.fields, base, resolved),
-            DynamicLayout::WidthHeight => constrain_width_height(&self.fields, base, resolved),
-            DynamicLayout::Angle => constrain_angle_only(&self.fields, base, resolved),
-            DynamicLayout::Factor => resolved,
+            DynamicLayout::LengthAngle => {
+                constrain_length_angle(&self.fields, base, resolved, along)
+            }
+            DynamicLayout::Hidden | DynamicLayout::Factor | DynamicLayout::Count => resolved,
+            DynamicLayout::Radius => base
+                .map(|base| constrain_radius(&self.fields, base, resolved))
+                .unwrap_or(resolved),
+            DynamicLayout::Distance => base
+                .map(|base| constrain_distance(&self.fields, base, resolved))
+                .unwrap_or(resolved),
+            DynamicLayout::WidthHeight => base
+                .map(|base| constrain_width_height(&self.fields, base, resolved))
+                .unwrap_or(resolved),
+            DynamicLayout::Angle => base
+                .map(|base| constrain_angle_only(&self.fields, base, resolved))
+                .unwrap_or(resolved),
         }
     }
 
@@ -174,6 +209,14 @@ impl DynamicInput {
 
     pub fn typed_factor(&self) -> Option<f64> {
         field_value(&self.fields, FieldKind::Factor)
+    }
+
+    pub fn typed_distance(&self) -> Option<f64> {
+        field_value(&self.fields, FieldKind::Distance)
+    }
+
+    pub fn typed_count(&self) -> Option<f64> {
+        field_value(&self.fields, FieldKind::Count)
     }
 
     pub fn consume(
@@ -369,6 +412,8 @@ pub struct LiveValues {
     pub width: f64,
     pub height: f64,
     pub factor: f64,
+    pub distance: f64,
+    pub count: f64,
 }
 
 impl LiveValues {
@@ -393,11 +438,18 @@ impl LiveValues {
             width,
             height,
             factor: 1.0,
+            distance: length,
+            count: 4.0,
         }
     }
 
     pub fn with_factor(mut self, factor: f64) -> Self {
         self.factor = factor;
+        self
+    }
+
+    pub fn with_count(mut self, count: f64) -> Self {
+        self.count = count;
         self
     }
 }
@@ -414,6 +466,8 @@ fn fields_for(layout: DynamicLayout) -> Vec<Field> {
         }
         DynamicLayout::Angle => vec![Field::new(FieldKind::Angle)],
         DynamicLayout::Factor => vec![Field::new(FieldKind::Factor)],
+        DynamicLayout::Distance => vec![Field::new(FieldKind::Distance)],
+        DynamicLayout::Count => vec![Field::new(FieldKind::Count)],
     }
 }
 
@@ -425,6 +479,8 @@ fn live_for(kind: FieldKind, live: LiveValues) -> f64 {
         FieldKind::Width => live.width,
         FieldKind::Height => live.height,
         FieldKind::Factor => live.factor,
+        FieldKind::Distance => live.distance,
+        FieldKind::Count => live.count,
     }
 }
 
@@ -435,13 +491,29 @@ fn field_value(fields: &[Field], kind: FieldKind) -> Option<f64> {
         .and_then(Field::constrained_value)
 }
 
-fn constrain_length_angle(fields: &[Field], base: Point2, resolved: Point2) -> Point2 {
+fn constrain_length_angle(
+    fields: &[Field],
+    base: Option<Point2>,
+    resolved: Point2,
+    along: Option<AlongPath>,
+) -> Point2 {
+    let length = field_value(fields, FieldKind::Length);
+    let angle = field_value(fields, FieldKind::Angle);
+    if let (Some(length), None, Some(path)) = (length, angle, along) {
+        if length.is_finite() && length > GEOM_TOLERANCE && path.angle_rad.is_finite() {
+            return Point2::new(
+                path.origin.x + length * path.angle_rad.cos(),
+                path.origin.y + length * path.angle_rad.sin(),
+            );
+        }
+    }
+    let Some(base) = base else {
+        return resolved;
+    };
     let raw_dx = resolved.x - base.x;
     let raw_dy = resolved.y - base.y;
     let raw_len = base.distance(resolved);
     let raw_angle = raw_dy.atan2(raw_dx);
-    let length = field_value(fields, FieldKind::Length);
-    let angle = field_value(fields, FieldKind::Angle);
     if length.is_none() && angle.is_none() {
         return resolved;
     }
@@ -466,8 +538,21 @@ fn constrain_angle_only(fields: &[Field], base: Point2, resolved: Point2) -> Poi
 }
 
 fn constrain_radius(fields: &[Field], center: Point2, resolved: Point2) -> Point2 {
+    constrain_positive_length(fields, FieldKind::Radius, center, resolved)
+}
+
+fn constrain_distance(fields: &[Field], center: Point2, resolved: Point2) -> Point2 {
+    constrain_positive_length(fields, FieldKind::Distance, center, resolved)
+}
+
+fn constrain_positive_length(
+    fields: &[Field],
+    kind: FieldKind,
+    center: Point2,
+    resolved: Point2,
+) -> Point2 {
     let raw = center.distance(resolved);
-    let radius = field_value(fields, FieldKind::Radius).unwrap_or(raw);
+    let radius = field_value(fields, kind).unwrap_or(raw);
     if !radius.is_finite() || radius <= GEOM_TOLERANCE {
         return resolved;
     }
@@ -544,6 +629,8 @@ fn invalid_message(kind: FieldKind) -> &'static str {
         FieldKind::Width => "Width must be a positive number",
         FieldKind::Height => "Height must be a positive number",
         FieldKind::Factor => "Scale factor must be greater than zero",
+        FieldKind::Distance => "Distance must be a positive number",
+        FieldKind::Count => "Sides must be a positive number",
     }
 }
 
@@ -702,6 +789,24 @@ mod tests {
         let snap = Point2::new(5.0, 0.0);
         let point = input.constrain(Some(base), snap);
         assert!(point.distance(snap) <= GEOM_TOLERANCE);
+    }
+
+    #[test]
+    fn typed_length_follows_the_tracking_origin() {
+        let mut input = length_angle();
+        let length = input.fields.get_mut(0).expect("length");
+        length.buffer = "80".into();
+        length.typed = true;
+        let point = input.constrain_along(
+            Some(Point2::new(0.0, 0.0)),
+            Point2::new(10.0, 5.0),
+            Some(AlongPath {
+                origin: Point2::new(0.0, 5.0),
+                angle_rad: 0.0,
+            }),
+        );
+        assert!((point.x - 80.0).abs() < 1e-9);
+        assert!((point.y - 5.0).abs() < 1e-9);
     }
 
     #[test]

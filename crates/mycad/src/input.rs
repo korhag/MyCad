@@ -97,15 +97,6 @@ impl MouseButtonKind {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn to_egui(self) -> PointerButton {
-        match self {
-            Self::Left => PointerButton::Primary,
-            Self::Middle => PointerButton::Middle,
-            Self::Right => PointerButton::Secondary,
-        }
-    }
-
     pub fn label(self) -> &'static str {
         match self {
             Self::Left => "Left",
@@ -547,17 +538,6 @@ impl InputMap {
         self.bindings_for(action)
             .iter()
             .any(|binding| binding.matches_key(input))
-    }
-
-    #[allow(dead_code)]
-    pub fn pointer_button_for_drag(&self, action: InputAction) -> Option<PointerButton> {
-        self.bindings_for(action).iter().find_map(|binding| {
-            if binding.gesture == Gesture::Drag {
-                binding.mouse.map(MouseButtonKind::to_egui)
-            } else {
-                None
-            }
-        })
     }
 }
 
