@@ -5,9 +5,15 @@ All notable changes to MyCad are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project versions with [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Workspace version is `0.40.0` (`Cargo.toml`).
+Workspace version is `0.40.1` (`Cargo.toml`).
 
 ## [Unreleased]
+
+## [0.40.1] - 2026-10-04
+
+### Fixed
+
+- Black and near-black lines and fills draw as light gray on the dark viewport, so they stay visible. The stored color, the Properties panel, and PDF export are unchanged.
 
 ## [0.40.0] - 2026-10-03
 

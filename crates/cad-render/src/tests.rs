@@ -5,7 +5,7 @@ use crate::{
 use cad_core::Point2;
 use cad_core::{
     BlockDefinition, CadColor, Document, Entity, EntityId, Extents2, Geometry, Layer, Point3,
-    PolyVertex, Transform2,
+    PolyVertex, Rgb, Transform2,
 };
 use cad_viewport::Camera2;
 
@@ -61,6 +61,24 @@ fn tessellates_line_into_two_vertices() {
     assert_eq!(list.line_count(), 1);
     assert_eq!(list.picks.len(), 1);
     assert_eq!(list.picks[0].entity_id, EntityId(0));
+}
+
+#[test]
+fn black_line_draws_as_light_gray() {
+    let mut document = Document::default();
+    layer0(&mut document);
+    let mut line = Entity::new(Geometry::Line {
+        start: Point3::from_xy(0.0, 0.0),
+        end: Point3::from_xy(10.0, 0.0),
+    });
+    line.color = CadColor::Rgb { r: 0, g: 0, b: 0 };
+    document.model_space.push(line);
+    let list = tessellate_document(&document);
+    let expected = Rgb::DARK_BACKGROUND_SUBSTITUTE.to_array();
+    assert!(!list.line_vertices.is_empty());
+    for vertex in &list.line_vertices {
+        assert_eq!(vertex.color, expected);
+    }
 }
 
 #[test]

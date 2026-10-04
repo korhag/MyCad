@@ -63,6 +63,17 @@ pub struct Rgb {
 }
 
 impl Rgb {
+    /// Relative luminance below which a color disappears on the dark viewport.
+    /// ACI 250 is 51,51,51 (luma 0.20) and is lifted; ACI 251 is 80,80,80 and stays.
+    pub const DARK_BACKGROUND_MIN_LUMA: f32 = 0.22;
+
+    /// Light gray drawn in place of black and near-black. Display only.
+    pub const DARK_BACKGROUND_SUBSTITUTE: Self = Self {
+        r: 215,
+        g: 215,
+        b: 215,
+    };
+
     pub fn to_array(self) -> [f32; 4] {
         [
             self.r as f32 / 255.0,
@@ -72,13 +83,31 @@ impl Rgb {
         ]
     }
 
+    /// Rec. 601 luma in 0..=1. Shared by contrast substitution and block-edit dimming.
+    pub fn luma(self) -> f32 {
+        let r = self.r as f32 / 255.0;
+        let g = self.g as f32 / 255.0;
+        let b = self.b as f32 / 255.0;
+        0.299 * r + 0.587 * g + 0.114 * b
+    }
+
+    /// View-only swap so black and near-black stay visible on the dark viewport.
+    /// Stored colors, PDF export, and the Properties panel are unchanged.
+    pub fn readable_on_dark_background(self) -> Self {
+        if self.luma() < Self::DARK_BACKGROUND_MIN_LUMA {
+            Self::DARK_BACKGROUND_SUBSTITUTE
+        } else {
+            self
+        }
+    }
+
     /// View-only dim used while a block is edited in place.
     /// Desaturates and keeps about 30% intensity so context stays snappable.
     pub fn dim_for_block_context(self) -> Self {
         let r = self.r as f32 / 255.0;
         let g = self.g as f32 / 255.0;
         let b = self.b as f32 / 255.0;
-        let gray = 0.299 * r + 0.587 * g + 0.114 * b;
+        let gray = self.luma();
         let mix = 0.22;
         let intensity = 0.32;
         let to_u8 = |channel: f32| {
@@ -230,5 +259,28 @@ mod tests {
     fn nearest_aci_matches_an_exact_palette_color() {
         let red = aci_rgb(1);
         assert_eq!(nearest_aci(red.r, red.g, red.b), 1);
+    }
+
+    #[test]
+    fn black_and_aci_250_become_light_gray_on_a_dark_background() {
+        let black = Rgb { r: 0, g: 0, b: 0 };
+        let aci_250 = aci_rgb(250);
+        assert!(aci_250.luma() < Rgb::DARK_BACKGROUND_MIN_LUMA);
+        assert_eq!(
+            black.readable_on_dark_background(),
+            Rgb::DARK_BACKGROUND_SUBSTITUTE
+        );
+        assert_eq!(
+            aci_250.readable_on_dark_background(),
+            Rgb::DARK_BACKGROUND_SUBSTITUTE
+        );
+    }
+
+    #[test]
+    fn readable_colors_are_left_unchanged_on_a_dark_background() {
+        for color in [aci_rgb(1), aci_rgb(7), aci_rgb(8)] {
+            assert!(color.luma() >= Rgb::DARK_BACKGROUND_MIN_LUMA);
+            assert_eq!(color.readable_on_dark_background(), color);
+        }
     }
 }

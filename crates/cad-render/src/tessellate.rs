@@ -384,6 +384,19 @@ struct TessSink<'a> {
     chord_tolerance: f64,
 }
 
+impl TessSink<'_> {
+    /// Contrast substitution first, then the block-edit dim, so black context
+    /// geometry dims to the same gray as white geometry.
+    fn display_rgb(&self, rgb: Rgb) -> Rgb {
+        let rgb = rgb.readable_on_dark_background();
+        if self.dim {
+            rgb.dim_for_block_context()
+        } else {
+            rgb
+        }
+    }
+}
+
 impl VectorSink for TessSink<'_> {
     fn path(
         &mut self,
@@ -398,11 +411,7 @@ impl VectorSink for TessSink<'_> {
         if let Some(pick) = self.pick.as_mut() {
             pick.add_stroke(pick_pts, closed);
         }
-        let rgb = if self.dim {
-            rgb.dim_for_block_context()
-        } else {
-            rgb
-        };
+        let rgb = self.display_rgb(rgb);
         if linetype.is_continuous() {
             emit_solid_polyline(self.list, pick_pts, closed, rgb);
             return;
@@ -423,20 +432,12 @@ impl VectorSink for TessSink<'_> {
         if let Some(pick) = self.pick.as_mut() {
             pick.add_fill(pts);
         }
-        let rgb = if self.dim {
-            rgb.dim_for_block_context()
-        } else {
-            rgb
-        };
+        let rgb = self.display_rgb(rgb);
         emit_triangles(self.list, &triangulate_polygon(pts), rgb);
     }
 
     fn fill_even_odd(&mut self, contours: &[Vec<Point2>], rgb: Rgb) {
-        let rgb = if self.dim {
-            rgb.dim_for_block_context()
-        } else {
-            rgb
-        };
+        let rgb = self.display_rgb(rgb);
         for contour in contours {
             if let Some(pick) = self.pick.as_mut() {
                 pick.add_fill(contour);
