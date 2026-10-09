@@ -11,6 +11,18 @@ use eframe::egui::{self, RichText, Ui};
 use crate::app::MyCadApp;
 use crate::block_edit::insert_is_editable;
 
+#[derive(Clone, Debug)]
+pub(crate) struct PropertySummary {
+    pub selection: u64,
+    pub content: u64,
+    pub count: usize,
+    pub types: Vec<(String, usize)>,
+    pub layers: Vec<(String, usize)>,
+    pub shared_layer: String,
+    pub shared_color: String,
+    pub shared_linetype: String,
+}
+
 pub fn show(ui: &mut Ui, app: &mut MyCadApp) {
     let _span = cad_core::perf::span("properties");
     ui.heading("Properties");
@@ -54,7 +66,17 @@ pub fn show(ui: &mut Ui, app: &mut MyCadApp) {
                 show_single(ui, document, entity, references);
             }
         } else {
-            show_multiple(ui, document, selection);
+            let content = document.content_generation();
+            let selection_gen = app.selection.generation();
+            let stale = app.property_summary.as_ref().is_none_or(|summary| {
+                summary.selection != selection_gen || summary.content != content
+            });
+            if stale {
+                app.property_summary = Some(summarize(document, selection, selection_gen, content));
+            }
+            if let Some(summary) = app.property_summary.as_ref() {
+                paint_summary(ui, summary);
+            }
         }
         edit_block
     };
@@ -64,17 +86,7 @@ pub fn show(ui: &mut Ui, app: &mut MyCadApp) {
             app.edit_named_block(&name);
         }
     }
-    if app.selection.len() == 1 {
-        if let Some(entity) = app
-            .document
-            .as_ref()
-            .and_then(|document| document.entity_by_id(app.selection.ids()[0]).cloned())
-        {
-            crate::dynamic_block::show_instance_parameters(ui, app, &entity);
-        }
-    } else {
-        crate::dynamic_block::show_selected_instance_parameters(ui, app);
-    }
+    crate::dynamic_block::show_selected_instance_parameters(ui, app);
 }
 
 fn show_single(ui: &mut Ui, document: &Document, entity: &Entity, references: Option<usize>) {
@@ -109,27 +121,50 @@ fn show_single(ui: &mut Ui, document: &Document, entity: &Entity, references: Op
         });
 }
 
-fn show_multiple(ui: &mut Ui, document: &Document, ids: &[cad_core::EntityId]) {
+fn summarize(
+    document: &Document,
+    ids: &[cad_core::EntityId],
+    selection: u64,
+    content: u64,
+) -> PropertySummary {
     let entities: Vec<&Entity> = ids
         .iter()
         .filter_map(|id| document.entity_by_id(*id))
         .collect();
-    ui.label(RichText::new(format!("{} selected", entities.len())).strong());
-    ui.add_space(6.0);
-
     let mut types: BTreeMap<&str, usize> = BTreeMap::new();
     let mut layers: BTreeMap<&str, usize> = BTreeMap::new();
     for entity in &entities {
         *types.entry(entity.geometry.type_name()).or_insert(0) += 1;
         *layers.entry(entity.layer.as_str()).or_insert(0) += 1;
     }
+    PropertySummary {
+        selection,
+        content,
+        count: entities.len(),
+        types: types
+            .into_iter()
+            .map(|(name, count)| (name.to_string(), count))
+            .collect(),
+        layers: layers
+            .into_iter()
+            .map(|(name, count)| (name.to_string(), count))
+            .collect(),
+        shared_layer: shared_text(entities.iter().map(|entity| entity.layer.as_str())),
+        shared_color: shared_text(entities.iter().map(|entity| color_label(document, entity))),
+        shared_linetype: shared_text(entities.iter().map(|entity| entity.linetype.as_str())),
+    }
+}
+
+fn paint_summary(ui: &mut Ui, summary: &PropertySummary) {
+    ui.label(RichText::new(format!("{} selected", summary.count)).strong());
+    ui.add_space(6.0);
     ui.label(RichText::new("Types").small().weak());
-    for (name, count) in types {
+    for (name, count) in &summary.types {
         ui.monospace(format!("{name}  {count}"));
     }
     ui.add_space(6.0);
     ui.label(RichText::new("Layers").small().weak());
-    for (name, count) in layers {
+    for (name, count) in &summary.layers {
         ui.monospace(format!("{name}  {count}"));
     }
     ui.add_space(10.0);
@@ -138,21 +173,9 @@ fn show_multiple(ui: &mut Ui, document: &Document, ids: &[cad_core::EntityId]) {
         .num_columns(2)
         .spacing([12.0, 4.0])
         .show(ui, |ui| {
-            kv(
-                ui,
-                "Layer",
-                shared_text(entities.iter().map(|e| e.layer.as_str())),
-            );
-            kv(
-                ui,
-                "Color",
-                shared_text(entities.iter().map(|e| color_label(document, e))),
-            );
-            kv(
-                ui,
-                "Linetype",
-                shared_text(entities.iter().map(|e| e.linetype.as_str())),
-            );
+            kv(ui, "Layer", summary.shared_layer.clone());
+            kv(ui, "Color", summary.shared_color.clone());
+            kv(ui, "Linetype", summary.shared_linetype.clone());
         });
 }
 

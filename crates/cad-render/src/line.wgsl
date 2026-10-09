@@ -28,5 +28,7 @@ fn vs_main(in: VertexInput) -> VertexOutput {
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    return in.color;
+    let straight = in.color;
+    let premul = vec4<f32>(straight.rgb * straight.a, straight.a);
+    return mix(straight, premul, uniforms.overlay_params.y);
 }

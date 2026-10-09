@@ -253,6 +253,9 @@ impl SnapIndex {
             let (x, y) = index.cell(point);
             index.cells[y * index.cols + x].push(slot as u32);
         }
+        crate::perf::reserve_vec_headroom(&mut index.features);
+        crate::perf::reserve_vec_headroom(&mut index.alive);
+        crate::perf::reserve_map_headroom(&mut index.owner_slots);
         index
     }
 

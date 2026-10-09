@@ -26,8 +26,8 @@ use cad_io::{
     PDF_STROKE_WEIGHTS,
 };
 use cad_render::{
-    tessellate_document, tessellate_document_for_block_edit, BlockEditView, BlockEditViewFrame,
-    CadFrame, CadGpu, DisplayList, GpuUpload, OverlayBatches, SelectBoxMode,
+    tessellate_document, tessellate_document_for_block_edit, upload_for_ranges, BlockEditView,
+    BlockEditViewFrame, CadFrame, CadGpu, DisplayList, GpuUpload, OverlayBatches, SelectBoxMode,
 };
 use cad_viewport::Camera2;
 use dwg_import::{write_dwg, DwgWriteError, ExportError as DwgExportError, ImportError};
@@ -54,6 +54,8 @@ use crate::selection::{box_pick_entities_into, pick_entity, Selection, Selection
 use crate::settings::{scroll_to_zoom_factor, AppSettings, RgbColor};
 use crate::settings_ui::{self, CaptureTarget, SettingsAction, SettingsTab};
 use crate::theme;
+use crate::view_motion::ViewMotion;
+use crate::wheel_zoom::{wheel_zoom_delta, WheelZoomAccelerator};
 use crate::workspace::{self, WorkspaceTab};
 
 const SELECTION_OVERLAY_COLOR: [f32; 4] = [255.0 / 255.0, 196.0 / 255.0, 72.0 / 255.0, 1.0];
@@ -274,6 +276,21 @@ impl ViewCache {
     fn clear(&mut self) {
         self.entries.clear();
     }
+
+    /// Drop pictures that still share the live buffers. `Arc::make_mut`
+    /// would otherwise copy every vertex and snap on the next edit.
+    fn detach_aliasing(
+        &mut self,
+        display: &Arc<DisplayList>,
+        snaps: &Arc<SnapIndex>,
+        measures: &Arc<MeasureIndex>,
+    ) {
+        self.entries.retain(|entry| {
+            !Arc::ptr_eq(&entry.display, display)
+                && !Arc::ptr_eq(&entry.snaps, snaps)
+                && !Arc::ptr_eq(&entry.measures, measures)
+        });
+    }
 }
 
 fn tessellate_block_view(
@@ -338,6 +355,38 @@ struct BoxSelectDrag {
     current: egui::Pos2,
     op: SelectionOp,
     candidates: Vec<cad_core::EntityId>,
+    candidate_stamp: u64,
+}
+
+struct OverlayCache {
+    key: (u64, u64),
+    batches: OverlayBatches,
+}
+
+struct StatusText {
+    file_dirty: bool,
+    file_path: Option<PathBuf>,
+    file_loading: Option<PathBuf>,
+    file_label: String,
+    cursor_x: i64,
+    cursor_y: i64,
+    cursor_set: bool,
+    cursor_label: String,
+}
+
+impl Default for StatusText {
+    fn default() -> Self {
+        Self {
+            file_dirty: false,
+            file_path: None,
+            file_loading: None,
+            file_label: "(no file)".into(),
+            cursor_x: 0,
+            cursor_y: 0,
+            cursor_set: false,
+            cursor_label: "X          —  Y          —".into(),
+        }
+    }
 }
 
 enum PendingDiscard {
@@ -366,6 +415,50 @@ struct KeyChord {
     new_drawing: bool,
     save: bool,
     save_as: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct StretchPreviewKey {
+    generation: u64,
+    ax: u64,
+    ay: u64,
+    bx: u64,
+    by: u64,
+    dx: u64,
+    dy: u64,
+    depth: usize,
+    instance: Option<EntityId>,
+}
+
+struct StretchPreviewCache {
+    key: StretchPreviewKey,
+    segments: Vec<[Point2; 2]>,
+}
+
+fn viewport_pixels(ui: &Ui, rect: Rect) -> [u32; 2] {
+    cad_render::viewport_pixel_size(
+        [rect.min.x, rect.min.y],
+        [rect.max.x, rect.max.y],
+        ui.ctx().pixels_per_point(),
+    )
+}
+
+fn quantize_status_coord(value: f64) -> i64 {
+    let scaled = (value * 1000.0).round();
+    if !scaled.is_finite() {
+        return 0;
+    }
+    scaled.clamp(i64::MIN as f64, i64::MAX as f64) as i64
+}
+
+fn viewport_clear_color() -> [f32; 4] {
+    let color = egui::Color32::from_rgb(10, 14, 12);
+    [
+        color.r() as f32 / 255.0,
+        color.g() as f32 / 255.0,
+        color.b() as f32 / 255.0,
+        1.0,
+    ]
 }
 
 // ------------------------------------------------------------
@@ -414,6 +507,8 @@ pub struct MyCadApp {
     source_written_by_mycad: bool,
     pdf_plot: PdfPlotUi,
     pub(crate) last_pointer: Option<egui::Pos2>,
+    wheel_zoom: WheelZoomAccelerator,
+    view_motion: ViewMotion,
     box_select: Option<BoxSelectDrag>,
     command_snaps: Vec<SnapFeature>,
     pub(crate) block_edit: BlockEditSession,
@@ -455,6 +550,17 @@ pub struct MyCadApp {
     last_eval_ok: bool,
     last_context_world: Option<Point2>,
     pub(crate) status: String,
+    window_title_sent: String,
+    stretch_preview: Option<StretchPreviewCache>,
+    pub(crate) layer_chips: Option<(u64, crate::ribbon::LayerState)>,
+    selection_overlay: Option<OverlayCache>,
+    box_overlay: Option<OverlayCache>,
+    modify_overlay: Option<OverlayCache>,
+    pub(crate) home_ribbon: Option<(CommandKind, bool, bool, Vec<crate::ribbon::RibbonGroup>)>,
+    pub(crate) property_summary: Option<crate::properties::PropertySummary>,
+    status_text: StatusText,
+    brand: Option<crate::brand::BrandTextures>,
+    splash: Option<crate::brand::SplashState>,
 }
 
 impl MyCadApp {
@@ -469,6 +575,8 @@ impl MyCadApp {
         }
         let settings = AppSettings::load(cc.storage);
         let mut app = Self::from_settings(settings, initial_path);
+        app.brand = crate::brand::BrandTextures::load(&cc.egui_ctx);
+        app.splash = Some(crate::brand::SplashState::start());
         workspace::sanitize_dock_state(&mut app.dock_state);
         if let Some(path) = app.pending_open.take() {
             app.start_load(path);
@@ -519,6 +627,8 @@ impl MyCadApp {
             source_written_by_mycad: false,
             pdf_plot: PdfPlotUi::Closed,
             last_pointer: None,
+            wheel_zoom: WheelZoomAccelerator::default(),
+            view_motion: ViewMotion::default(),
             box_select: None,
             command_snaps: Vec::new(),
             block_edit: BlockEditSession::default(),
@@ -551,6 +661,17 @@ impl MyCadApp {
             last_eval_ok: true,
             last_context_world: None,
             status: "Ready".to_string(),
+            window_title_sent: String::new(),
+            stretch_preview: None,
+            layer_chips: None,
+            selection_overlay: None,
+            box_overlay: None,
+            modify_overlay: None,
+            home_ribbon: None,
+            property_summary: None,
+            status_text: StatusText::default(),
+            brand: None,
+            splash: None,
         }
     }
 
@@ -1605,44 +1726,52 @@ impl MyCadApp {
         let spawned = thread::Builder::new()
             .name(thread_name.into())
             .spawn(move || {
-                let finished = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // The worker owns `snapshot`. Drop it before sending so the UI
+                // thread can mark the drawing saved without copying it.
+                let finished = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
                     let dest = path;
+                    let prepared = export_snapshot(&snapshot);
+                    let document = prepared
+                        .as_ref()
+                        .map(|exported| &exported.document)
+                        .unwrap_or(&snapshot);
                     let result = match kind {
                         IoKind::SavingDxf => {
                             let _span = cad_core::perf::span("write_dxf");
-                            let prepared = export_snapshot(&snapshot);
-                            write_dxf(&prepared.document, &dest, &DxfExportOptions::default())
-                                .map(|report| sync_companion(&snapshot, &prepared, &dest, report))
+                            write_dxf(document, &dest, &DxfExportOptions::default())
+                                .map(|report| {
+                                    sync_companion(&snapshot, prepared.as_ref(), &dest, report)
+                                })
                                 .map_err(|err| format_save_failed(&err))
                         }
                         IoKind::SavingDwg => {
                             let _span = cad_core::perf::span("write_dwg");
-                            let prepared = export_snapshot(&snapshot);
-                            write_dwg(&prepared.document, &dest)
-                                .map(|report| sync_companion(&snapshot, &prepared, &dest, report))
+                            write_dwg(document, &dest)
+                                .map(|report| {
+                                    sync_companion(&snapshot, prepared.as_ref(), &dest, report)
+                                })
                                 .map_err(|err| format_save_failed(format_dwg_write_error(&err)))
                         }
                         IoKind::ExportingPdf => {
                             let _span = cad_core::perf::span("export_pdf");
-                            let prepared = export_snapshot(&snapshot);
-                            export_pdf(&prepared.document, &dest, &pdf_options.unwrap_or_default())
+                            export_pdf(document, &dest, &pdf_options.unwrap_or_default())
                                 .map_err(|err| format_save_failed(&err))
                         }
                     };
-                    let _ = tx.send(match result {
-                        Ok(report) => IoMsg::Success {
-                            kind,
-                            path: dest,
-                            report,
-                        },
-                        Err(message) => IoMsg::Failure { message },
-                    });
+                    result.map(|report| (dest, report))
                 }));
-                if finished.is_err() {
-                    let _ = tx.send(IoMsg::Failure {
+                let message = match finished {
+                    Ok(Ok((dest, report))) => IoMsg::Success {
+                        kind,
+                        path: dest,
+                        report,
+                    },
+                    Ok(Err(message)) => IoMsg::Failure { message },
+                    Err(_) => IoMsg::Failure {
                         message: "Saving the drawing failed unexpectedly".into(),
-                    });
-                }
+                    },
+                };
+                let _ = tx.send(message);
             });
         if spawned.is_err() {
             self.io_rx = None;
@@ -1953,6 +2082,38 @@ impl MyCadApp {
         if let Some(document) = self.document.as_ref() {
             self.geometry_generation = Some(document.content_generation());
         }
+    }
+
+    /// Make the on-screen picture unique, then borrow it for an incremental edit.
+    ///
+    /// Cached views for older generations are discarded on the next publish.
+    /// Dropping them first keeps `Arc::make_mut` from cloning the drawing.
+    fn live_view_mut(
+        &mut self,
+    ) -> Option<(
+        Arc<Document>,
+        &mut DisplayList,
+        &mut SnapIndex,
+        &mut MeasureIndex,
+    )> {
+        if let Some(generation) = self
+            .document
+            .as_ref()
+            .map(|document| document.content_generation())
+        {
+            self.view_cache.retain_generation(generation);
+        } else {
+            self.view_cache.clear();
+        }
+        self.view_cache
+            .detach_aliasing(&self.display, &self.snaps, &self.measures);
+        let document = Arc::clone(self.document.as_ref()?);
+        Some((
+            document,
+            Arc::make_mut(&mut self.display),
+            Arc::make_mut(&mut self.snaps),
+            Arc::make_mut(&mut self.measures),
+        ))
     }
 
     fn spawn_view_tessellation(&mut self) {
@@ -2378,15 +2539,22 @@ impl MyCadApp {
                 let result = catch_worker(|| {
                     let _span = cad_core::perf::span("preview_worker");
                     let mut cache = EvaluationCache::default();
-                    let mut source = (*document).clone();
+                    let mut source = Some((*document).clone());
                     drop(document);
-                    source.recompute_cached_extents();
+                    let dynamic = source.as_ref().is_some_and(document_has_dynamic_content);
+                    let keep_source = dynamic || authoring.is_some();
+                    if let Some(source) = source.as_mut() {
+                        source.recompute_cached_extents();
+                    }
+                    let cached_extents = source
+                        .as_ref()
+                        .and_then(|source| source.diagnostics.extents);
                     let request = EvaluationRequest {
                         generation: document_generation,
                     };
-                    let evaluated = if document_has_dynamic_content(&source) {
+                    let evaluated = if dynamic {
                         materialize_evaluated_with(
-                            &source,
+                            source.as_ref().expect("source"),
                             &mut cache,
                             request,
                             if overrides.is_empty() {
@@ -2395,15 +2563,18 @@ impl MyCadApp {
                                 Some(&overrides)
                             },
                         )
+                    } else if keep_source {
+                        Ok(source.as_ref().expect("source").clone())
                     } else {
-                        Ok(source.clone())
+                        Ok(source.take().expect("source"))
                     };
                     match evaluated {
                         Ok(mut evaluated) => {
                             if let Some(authoring) = authoring.as_ref() {
-                                if let Some(test) = authoring.test_config(&source) {
+                                let source = source.as_ref().expect("authoring keeps the source");
+                                if let Some(test) = authoring.test_config(source) {
                                     if let Err(err) = apply_definition_preview(
-                                        &source,
+                                        source,
                                         &mut evaluated,
                                         &authoring.block_name,
                                         &test,
@@ -2435,7 +2606,11 @@ impl MyCadApp {
                                         measures.into_block_edit(&evaluated, id, world_from_local);
                                 }
                             }
-                            let extents = evaluated.compute_extents();
+                            let extents = if keep_source {
+                                evaluated.compute_extents()
+                            } else {
+                                cached_extents
+                            };
                             let _ = tx.send(PreviewMsg::Ready {
                                 document_generation,
                                 session_generation,
@@ -2526,6 +2701,7 @@ impl MyCadApp {
                 if !current || !frames_match {
                     if !current {
                         self.status = "Discarded superseded preview".into();
+                        self.preview_pending = true;
                     }
                     self.view_pending = false;
                 } else {
@@ -2637,123 +2813,32 @@ impl MyCadApp {
     }
 
     fn patch_block_inserted(&mut self, entities: &[Entity]) {
-        if !self.block_indexes_ready {
-            self.schedule_full_refresh();
-            return;
-        }
-        let transform = self.block_edit.world_from_local();
-        let Some(document) = self.document.as_ref() else {
-            return;
-        };
-        let (line_start, fill_start, appended_any) = {
-            let display = Arc::make_mut(&mut self.display);
-            let mut line_start = display.line_vertices.len() as u32;
-            let mut fill_start = display.triangle_vertices.len() as u32;
-            let mut appended_any = false;
-            for entity in entities {
-                if let Some(range) = display.append_entity_with(document, entity, transform, false)
-                {
-                    if !appended_any {
-                        line_start = range.line_start;
-                        fill_start = range.fill_start;
-                        appended_any = true;
-                    }
-                }
-            }
-            (line_start, fill_start, appended_any)
-        };
-        {
-            let snaps = Arc::make_mut(&mut self.snaps);
-            for entity in entities {
-                snaps.append_entity_with(document, entity, transform, entity.id);
-            }
-        }
-        {
-            let measures = Arc::make_mut(&mut self.measures);
-            for entity in entities {
-                measures.append_entity_with(document, entity, transform, entity.id);
-            }
-        }
-        self.block_reconcile_pending = true;
-        self.finish_block_patch(
-            entities.iter().any(entity_affects_block_tree),
-            if appended_any {
-                GpuUpload::Append {
-                    line_start,
-                    fill_start,
-                }
-            } else {
-                GpuUpload::Full
-            },
-        );
+        self.patch_block_changes(&[], &[], entities);
     }
 
     fn patch_block_removed(&mut self, entities: &[Entity]) {
-        if !self.block_indexes_ready {
-            self.schedule_full_refresh();
-            return;
-        }
-        {
-            let display = Arc::make_mut(&mut self.display);
-            for entity in entities {
-                display.remove_entity(entity.id);
-            }
-        }
-        {
-            let snaps = Arc::make_mut(&mut self.snaps);
-            for entity in entities {
-                snaps.remove_entity(entity.id);
-            }
-        }
-        {
-            let measures = Arc::make_mut(&mut self.measures);
-            for entity in entities {
-                measures.remove_entity(entity.id);
-            }
-        }
-        self.block_reconcile_pending = true;
-        self.finish_block_patch(
-            entities.iter().any(entity_affects_block_tree),
-            GpuUpload::Full,
-        );
+        self.patch_block_changes(entities, &[], &[]);
     }
 
-    fn patch_block_replaced(&mut self, pairs: &[(Entity, Entity)]) {
+    fn patch_block_changes(
+        &mut self,
+        removed: &[Entity],
+        replaced: &[(Entity, Entity)],
+        created: &[Entity],
+    ) {
+        if removed.is_empty() && replaced.is_empty() && created.is_empty() {
+            return;
+        }
         if !self.block_indexes_ready {
             self.schedule_full_refresh();
             return;
         }
         let transform = self.block_edit.world_from_local();
-        let Some(document) = self.document.as_ref() else {
-            return;
-        };
-        {
-            let display = Arc::make_mut(&mut self.display);
-            for (_, after) in pairs {
-                let current = document.entity_by_id(after.id).unwrap_or(after);
-                display.replace_entity_with(document, current, transform);
-            }
-        }
-        {
-            let snaps = Arc::make_mut(&mut self.snaps);
-            for (_, after) in pairs {
-                let current = document.entity_by_id(after.id).unwrap_or(after);
-                snaps.replace_entity_with(document, current, transform, current.id);
-            }
-        }
-        {
-            let measures = Arc::make_mut(&mut self.measures);
-            for (_, after) in pairs {
-                let current = document.entity_by_id(after.id).unwrap_or(after);
-                measures.replace_entity_with(document, current, transform, current.id);
-            }
-        }
+        let upload = self.patch_live_indexes(transform, true, removed, replaced, created);
         self.block_reconcile_pending = true;
         self.finish_block_patch(
-            pairs.iter().any(|(before, after)| {
-                entity_affects_block_tree(before) || entity_affects_block_tree(after)
-            }),
-            GpuUpload::Full,
+            entities_affect_block_tree(removed, replaced, created),
+            upload,
         );
     }
 
@@ -2775,21 +2860,25 @@ impl MyCadApp {
             self.schedule_full_refresh();
             return;
         }
-        if self.block_edit.is_active() {
-            let space = self.block_edit.active_space();
-            match applied.space_change(&space) {
-                Some(SpaceChange::Inserted(entities)) => self.patch_block_inserted(&entities),
-                Some(SpaceChange::Removed(entities)) => self.patch_block_removed(&entities),
-                Some(SpaceChange::Replaced(pairs)) => self.patch_block_replaced(&pairs),
-                None => self.schedule_full_refresh(),
-            }
+        let block_edit = self.block_edit.is_active();
+        let change = if block_edit {
+            applied.space_change(&self.block_edit.active_space())
+        } else {
+            applied.model_space_change()
+        };
+        let Some(SpaceChange {
+            removed,
+            replaced,
+            inserted,
+        }) = change
+        else {
+            self.schedule_full_refresh();
             return;
-        }
-        match applied.model_space_change() {
-            Some(SpaceChange::Inserted(entities)) => self.patch_inserted(&entities),
-            Some(SpaceChange::Removed(entities)) => self.patch_removed(&entities),
-            Some(SpaceChange::Replaced(pairs)) => self.patch_replaced(&pairs),
-            None => self.schedule_full_refresh(),
+        };
+        if block_edit {
+            self.patch_block_changes(&removed, &replaced, &inserted);
+        } else {
+            self.patch_model_changes(&removed, &replaced, &inserted);
         }
     }
 
@@ -2798,58 +2887,7 @@ impl MyCadApp {
             self.patch_block_inserted(entities);
             return;
         }
-        {
-            let Some(document) = self.document.as_mut().map(Arc::make_mut) else {
-                return;
-            };
-            for entity in entities {
-                document.expand_extents_for(entity);
-            }
-        }
-        let Some(document) = self.document.as_ref() else {
-            return;
-        };
-        let (line_start, fill_start, appended_any) = {
-            let display = Arc::make_mut(&mut self.display);
-            let mut line_start = display.line_vertices.len() as u32;
-            let mut fill_start = display.triangle_vertices.len() as u32;
-            let mut appended_any = false;
-            for entity in entities {
-                if let Some(range) = display.append_entity(document, entity) {
-                    if !appended_any {
-                        line_start = range.line_start;
-                        fill_start = range.fill_start;
-                        appended_any = true;
-                    }
-                }
-            }
-            (line_start, fill_start, appended_any)
-        };
-        {
-            let snaps = Arc::make_mut(&mut self.snaps);
-            for entity in entities {
-                snaps.append_entity(document, entity);
-            }
-        }
-        {
-            let measures = Arc::make_mut(&mut self.measures);
-            for entity in entities {
-                measures.append_entity(document, entity);
-            }
-        }
-        if entities.iter().any(entity_affects_block_tree) {
-            self.rebuild_block_tree();
-        } else {
-            self.mark_block_tree_current();
-        }
-        self.bump_display(if appended_any {
-            GpuUpload::Append {
-                line_start,
-                fill_start,
-            }
-        } else {
-            GpuUpload::Full
-        });
+        self.patch_model_changes(&[], &[], entities);
     }
 
     fn patch_removed(&mut self, entities: &[Entity]) {
@@ -2857,85 +2895,122 @@ impl MyCadApp {
             self.patch_block_removed(entities);
             return;
         }
-        {
-            let Some(document) = self.document.as_mut().map(Arc::make_mut) else {
-                return;
-            };
-            for entity in entities {
-                document.note_entity_removed_from_extents(entity);
-            }
-        }
-        {
-            let display = Arc::make_mut(&mut self.display);
-            for entity in entities {
-                display.remove_entity(entity.id);
-            }
-        }
-        {
-            let snaps = Arc::make_mut(&mut self.snaps);
-            for entity in entities {
-                snaps.remove_entity(entity.id);
-            }
-        }
-        {
-            let measures = Arc::make_mut(&mut self.measures);
-            for entity in entities {
-                measures.remove_entity(entity.id);
-            }
-        }
-        if entities.iter().any(entity_affects_block_tree) {
-            self.rebuild_block_tree();
-        } else {
-            self.mark_block_tree_current();
-        }
-        self.bump_display(GpuUpload::Full);
+        self.patch_model_changes(entities, &[], &[]);
     }
 
-    fn patch_replaced(&mut self, pairs: &[(Entity, Entity)]) {
-        if self.block_edit.is_active() {
-            self.patch_block_replaced(pairs);
+    fn patch_model_changes(
+        &mut self,
+        removed: &[Entity],
+        replaced: &[(Entity, Entity)],
+        created: &[Entity],
+    ) {
+        if removed.is_empty() && replaced.is_empty() && created.is_empty() {
             return;
         }
-        {
-            let Some(document) = self.document.as_mut().map(Arc::make_mut) else {
-                return;
-            };
-            for (before, after) in pairs {
+        if let Some(document) = self.document.as_mut().map(Arc::make_mut) {
+            for entity in removed {
+                document.note_entity_removed_from_extents(entity);
+            }
+            for (before, after) in replaced {
                 document.note_entity_replaced_in_extents(before, after);
             }
-        }
-        let Some(document) = self.document.as_ref() else {
-            return;
-        };
-        {
-            let display = Arc::make_mut(&mut self.display);
-            for (_, after) in pairs {
-                let current = document.entity_by_id(after.id).unwrap_or(after);
-                display.replace_entity(document, current);
+            for entity in created {
+                document.expand_extents_for(entity);
             }
         }
-        {
-            let snaps = Arc::make_mut(&mut self.snaps);
-            for (_, after) in pairs {
-                let current = document.entity_by_id(after.id).unwrap_or(after);
-                snaps.replace_entity(document, current);
-            }
-        }
-        {
-            let measures = Arc::make_mut(&mut self.measures);
-            for (_, after) in pairs {
-                let current = document.entity_by_id(after.id).unwrap_or(after);
-                measures.replace_entity(document, current);
-            }
-        }
-        if pairs.iter().any(|(before, after)| {
-            entity_affects_block_tree(before) || entity_affects_block_tree(after)
-        }) {
+        let upload =
+            self.patch_live_indexes(Transform2::identity(), false, removed, replaced, created);
+        if entities_affect_block_tree(removed, replaced, created) {
             self.rebuild_block_tree();
         } else {
             self.mark_block_tree_current();
         }
-        self.bump_display(GpuUpload::Full);
+        self.bump_display(upload);
+    }
+
+    fn patch_live_indexes(
+        &mut self,
+        transform: Transform2,
+        in_block: bool,
+        removed: &[Entity],
+        replaced: &[(Entity, Entity)],
+        created: &[Entity],
+    ) -> GpuUpload {
+        let Some((document, display, snaps, measures)) = self.live_view_mut() else {
+            return GpuUpload::Full;
+        };
+        let mut lines = Vec::new();
+        let mut fills = Vec::new();
+        for entity in removed {
+            if let Some(touched) = display.remove_entity(entity.id) {
+                touched.push_ranges(&mut lines, &mut fills);
+            }
+            snaps.remove_entity(entity.id);
+            measures.remove_entity(entity.id);
+        }
+        for (_, after) in replaced {
+            let current = document.entity_by_id(after.id).unwrap_or(after);
+            let touched = if in_block {
+                display.replace_entity_with(&document, current, transform)
+            } else {
+                display.replace_entity(&document, current)
+            };
+            if let Some(touched) = touched {
+                touched.push_ranges(&mut lines, &mut fills);
+            }
+            if in_block {
+                snaps.replace_entity_with(&document, current, transform, current.id);
+                measures.replace_entity_with(&document, current, transform, current.id);
+            } else {
+                snaps.replace_entity(&document, current);
+                measures.replace_entity(&document, current);
+            }
+        }
+        let mut line_start = display.line_vertices.len() as u32;
+        let mut fill_start = display.triangle_vertices.len() as u32;
+        let mut appended_any = false;
+        for entity in created {
+            let range = if in_block {
+                display.append_entity_with(&document, entity, transform, false)
+            } else {
+                display.append_entity(&document, entity)
+            };
+            if let Some(range) = range {
+                if !appended_any {
+                    line_start = range.line_start;
+                    fill_start = range.fill_start;
+                    appended_any = true;
+                }
+            }
+            if in_block {
+                snaps.append_entity_with(&document, entity, transform, entity.id);
+                measures.append_entity_with(&document, entity, transform, entity.id);
+            } else {
+                snaps.append_entity(&document, entity);
+                measures.append_entity(&document, entity);
+            }
+        }
+        if appended_any {
+            let line_end = display.line_vertices.len() as u32;
+            let fill_end = display.triangle_vertices.len() as u32;
+            if line_end > line_start {
+                lines.push(line_start..line_end);
+            }
+            if fill_end > fill_start {
+                fills.push(fill_start..fill_end);
+            }
+        }
+        if removed.is_empty() && replaced.is_empty() {
+            return if appended_any {
+                GpuUpload::Append {
+                    line_start,
+                    fill_start,
+                }
+            } else {
+                GpuUpload::Full
+            };
+        }
+        upload_for_ranges(&mut lines, &mut fills)
     }
 
     fn bump_display(&mut self, upload: GpuUpload) {
@@ -3013,13 +3088,15 @@ impl MyCadApp {
             self.status = format!("{type_name} added");
             return;
         }
-        let Some(document) = self.document.as_ref() else {
-            return;
+        let appended = {
+            let Some((document, display, snaps, measures)) = self.live_view_mut() else {
+                return;
+            };
+            let appended = display.append_entity(&document, &entity);
+            snaps.append_entity(&document, &entity);
+            measures.append_entity(&document, &entity);
+            appended
         };
-        let display = Arc::make_mut(&mut self.display);
-        let appended = display.append_entity(document, &entity);
-        Arc::make_mut(&mut self.snaps).append_entity(document, &entity);
-        Arc::make_mut(&mut self.measures).append_entity(document, &entity);
         self.measurement = None;
         self.gpu_upload = match appended {
             Some(range) => GpuUpload::Append {
@@ -3252,21 +3329,21 @@ impl MyCadApp {
                 self.history.record(edit);
                 removed_entities.push(entity);
             }
-            for (space, before, after) in replaced {
-                let Some(index) = document.entity_index_in(&space, before.id) else {
+            for (space, before, after) in &replaced {
+                let Some(index) = document.entity_index_in(space, before.id) else {
                     continue;
                 };
-                let _ = document.replace_entity_in(&space, before.id, after.clone());
+                let _ = document.replace_entity_in(space, before.id, after.clone());
                 self.history.record(Edit::ReplaceEntity {
-                    space,
+                    space: space.clone(),
                     index,
                     before: before.clone(),
                     after: after.clone(),
                 });
-                replaced_pairs.push((before, after));
+                replaced_pairs.push((before.clone(), after.clone()));
             }
-            for (space, entity) in created {
-                let Some(entity) = document.add_entity_to(&space, entity) else {
+            for (space, entity) in &created {
+                let Some(entity) = document.add_entity_to(space, entity.clone()) else {
                     continue;
                 };
                 if space.is_model() {
@@ -3276,9 +3353,9 @@ impl MyCadApp {
                     document.diagnostics.object_count =
                         document.diagnostics.object_count.saturating_add(1);
                 }
-                let index = document.entity_index_in(&space, entity.id).unwrap_or(0);
+                let index = document.entity_index_in(space, entity.id).unwrap_or(0);
                 self.history.record(Edit::InsertEntity {
-                    space,
+                    space: space.clone(),
                     index,
                     entity: entity.clone(),
                 });
@@ -3299,32 +3376,22 @@ impl MyCadApp {
             self.selection
                 .remove_all(removed_entities.iter().map(|entity| entity.id));
         }
-        let kinds = [
-            !removed_entities.is_empty(),
-            !replaced_pairs.is_empty(),
-            !created_entities.is_empty(),
-        ]
-        .into_iter()
-        .filter(|present| *present)
-        .count();
-        if kinds > 1 || !model_only {
+        let in_active_space = if self.block_edit.is_active() {
+            let space = self.block_edit.active_space();
+            removed.iter().all(|(entry, _)| *entry == space)
+                && replaced.iter().all(|(entry, _, _)| *entry == space)
+                && created.iter().all(|(entry, _)| *entry == space)
+        } else {
+            model_only
+        };
+        if !in_active_space {
             self.schedule_full_refresh();
             return;
         }
         if self.block_edit.is_active() {
-            if !removed_entities.is_empty() {
-                self.patch_block_removed(&removed_entities);
-            } else if !replaced_pairs.is_empty() {
-                self.patch_block_replaced(&replaced_pairs);
-            } else if !created_entities.is_empty() {
-                self.patch_block_inserted(&created_entities);
-            }
-        } else if !removed_entities.is_empty() {
-            self.patch_removed(&removed_entities);
-        } else if !replaced_pairs.is_empty() {
-            self.patch_replaced(&replaced_pairs);
-        } else if !created_entities.is_empty() {
-            self.patch_inserted(&created_entities);
+            self.patch_block_changes(&removed_entities, &replaced_pairs, &created_entities);
+        } else {
+            self.patch_model_changes(&removed_entities, &replaced_pairs, &created_entities);
         }
     }
 
@@ -4763,24 +4830,22 @@ impl MyCadApp {
             ui.id().with("cad-viewport"),
             egui::Sense::click_and_drag(),
         );
-        if self.capture.is_none() {
+        let splash_dismiss =
+            self.splash.is_some() && ui.input(|input| crate::brand::input_dismisses_splash(input));
+        if self.capture.is_none() && !splash_dismiss {
             handle_viewport_input(self, ui, &response, rect);
         }
 
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(10, 14, 12));
-        if self.document.is_none() && self.loading_path.is_none() {
-            painter.text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                "File → Open   or   pass a DWG on the command line",
-                egui::FontId::proportional(16.0),
-                egui::Color32::from_rgb(140, 160, 140),
-            );
-        }
 
         let aspect = (rect.width() as f64 / rect.height().max(1.0) as f64).max(1e-6);
-        let selection_overlay = self.display.overlay_batches(self.selection.ids());
+        let selection_overlay = self.selection_overlay_batches();
+        let preview_world = self.command.preview_transform(
+            self.drafting.current_point,
+            self.dynamic_input.typed_angle_deg(),
+            self.dynamic_input.typed_factor(),
+        );
         let mut preview_overlay = OverlayBatches::default();
         let mut preview_color = RgbColor::WINDOW.to_gpu();
         let mut preview_model = Transform2::identity_mat4();
@@ -4797,19 +4862,46 @@ impl MyCadApp {
                 SelectBoxMode::Window => colors.window_selection,
                 SelectBoxMode::Crossing => colors.crossing_selection,
             };
-            preview_overlay = self.display.overlay_batches(&drag.candidates);
+            let key = (self.display_generation, drag.candidate_stamp);
+            if self
+                .box_overlay
+                .as_ref()
+                .is_none_or(|cached| cached.key != key)
+            {
+                let candidates = drag.candidates.clone();
+                let batches = self.display.overlay_batches(&candidates);
+                self.box_overlay = Some(OverlayCache { key, batches });
+            }
+            if let Some(cached) = &self.box_overlay {
+                preview_overlay = cached.batches.clone();
+            }
             preview_color = color.to_gpu();
             box_rect = Some((drag.start, drag.current, color));
-        } else if let Some(world) = self.command.preview_transform(
-            self.drafting.current_point,
-            self.dynamic_input.typed_angle_deg(),
-            self.dynamic_input.typed_factor(),
-        ) {
+        } else if let Some(world) = preview_world {
             if let Ok(matrix) = world.to_matrix() {
-                preview_overlay = self.display.overlay_batches(self.command.modify_targets());
+                let targets = self.command.modify_targets();
+                let key = (self.display_generation, Self::id_fingerprint(targets));
+                if self
+                    .modify_overlay
+                    .as_ref()
+                    .is_none_or(|cached| cached.key != key)
+                {
+                    let batches = self.display.overlay_batches(targets);
+                    self.modify_overlay = Some(OverlayCache { key, batches });
+                }
+                if let Some(cached) = &self.modify_overlay {
+                    preview_overlay = cached.batches.clone();
+                }
                 preview_color = [0.55, 0.95, 0.85, 1.0];
                 preview_model = matrix.to_local_origin(self.display.origin).to_mat4();
             }
+        }
+        let viewport_px = viewport_pixels(ui, rect);
+        let now = ui.input(|input| input.time);
+        let settling = self.view_motion.update(&self.camera, viewport_px, now);
+        if let Some(remaining) = settling {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_secs_f64(remaining));
         }
         painter.add(egui_wgpu::Callback::new_paint_callback(
             rect,
@@ -4825,8 +4917,19 @@ impl MyCadApp {
                 preview: preview_overlay,
                 preview_color,
                 preview_model,
+                viewport_px,
+                samples: crate::settings::sanitize_viewport_msaa(if self.show_settings {
+                    self.settings_draft.viewport_msaa
+                } else {
+                    self.settings.viewport_msaa
+                }),
+                clear_color: viewport_clear_color(),
+                interactive: settling.is_some(),
             },
         ));
+        if response.hovered() && self.command.requests_point() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+        }
         if let Some((start, current, color)) = box_rect {
             workspace::paint_box_select_rect(
                 &painter,
@@ -4900,28 +5003,7 @@ impl MyCadApp {
         if let Some((corner_a, corner_b, dx, dy)) =
             self.command.stretch_motion(self.drafting.current_point)
         {
-            if let Some(document) = self.document.as_ref() {
-                let window = Extents2::from_corners(corner_a, corner_b);
-                if let Ok(hits) = crate::edit_tools::stretch_hits(
-                    document,
-                    &self.measures,
-                    &self.block_edit.active_space(),
-                    self.block_edit.world_from_local(),
-                    window,
-                    dx,
-                    dy,
-                ) {
-                    let mut segments = Vec::new();
-                    for hit in hits {
-                        crate::edit_tools::preview_segments(
-                            &hit.after_world,
-                            cad_core::MAX_STRETCH_PREVIEW,
-                            &mut segments,
-                        );
-                    }
-                    crate::drafting::paint_segments(&painter, rect, self.camera, &segments);
-                }
-            }
+            self.paint_cached_stretch(&painter, rect, corner_a, corner_b, dx, dy);
         }
         let units = self
             .document
@@ -4942,16 +5024,102 @@ impl MyCadApp {
             let mut live =
                 LiveValues::from_points(self.command.base_point(), self.drafting.current_point)
                     .with_count(f64::from(self.command.polygon_sides()));
-            if let Some(EntityTransform::UniformScale { factor, .. }) =
-                self.command.preview_transform(
-                    self.drafting.current_point,
-                    self.dynamic_input.typed_angle_deg(),
-                    self.dynamic_input.typed_factor(),
-                )
-            {
+            if let Some(EntityTransform::UniformScale { factor, .. }) = preview_world {
                 live = live.with_factor(factor);
             }
             self.dynamic_input.paint(&painter, rect, cursor, live);
+        }
+        self.paint_branding(ui, &painter, rect, splash_dismiss);
+    }
+
+    fn paint_branding(&mut self, ui: &Ui, painter: &egui::Painter, rect: Rect, dismiss: bool) {
+        let loading = self.loading_path.is_some();
+        let opacity = self
+            .splash
+            .as_mut()
+            .and_then(|splash| splash.opacity(loading, dismiss));
+        if opacity.is_none() {
+            self.splash = None;
+        } else {
+            ui.ctx().request_repaint();
+        }
+        if let Some(opacity) = opacity {
+            if let Some(brand) = &self.brand {
+                crate::brand::paint_splash(painter, rect, &brand.splash, opacity);
+            }
+            return;
+        }
+        if self.document.is_some() || self.loading_path.is_some() {
+            return;
+        }
+        if let Some(brand) = &self.brand {
+            crate::brand::paint_empty_viewport(painter, rect, &brand.icon);
+        } else {
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "File → Open   or   pass a DWG on the command line",
+                egui::FontId::proportional(16.0),
+                egui::Color32::from_rgb(140, 160, 140),
+            );
+        }
+    }
+
+    fn paint_cached_stretch(
+        &mut self,
+        painter: &egui::Painter,
+        rect: Rect,
+        corner_a: Point2,
+        corner_b: Point2,
+        dx: f64,
+        dy: f64,
+    ) {
+        let key = StretchPreviewKey {
+            generation: self
+                .document
+                .as_ref()
+                .map(|document| document.content_generation())
+                .unwrap_or(0),
+            ax: corner_a.x.to_bits(),
+            ay: corner_a.y.to_bits(),
+            bx: corner_b.x.to_bits(),
+            by: corner_b.y.to_bits(),
+            dx: dx.to_bits(),
+            dy: dy.to_bits(),
+            depth: self.block_edit.stack.len(),
+            instance: self.block_edit.current().map(|frame| frame.instance_id),
+        };
+        let fresh = self
+            .stretch_preview
+            .as_ref()
+            .map(|cache| cache.key != key)
+            .unwrap_or(true);
+        if fresh {
+            let mut segments = Vec::new();
+            if let Some(document) = self.document.as_ref() {
+                let window = Extents2::from_corners(corner_a, corner_b);
+                if let Ok(hits) = crate::edit_tools::stretch_hits(
+                    document,
+                    &self.measures,
+                    &self.block_edit.active_space(),
+                    self.block_edit.world_from_local(),
+                    window,
+                    dx,
+                    dy,
+                ) {
+                    for hit in hits {
+                        crate::edit_tools::preview_segments(
+                            &hit.after_world,
+                            cad_core::MAX_STRETCH_PREVIEW,
+                            &mut segments,
+                        );
+                    }
+                }
+            }
+            self.stretch_preview = Some(StretchPreviewCache { key, segments });
+        }
+        if let Some(cache) = &self.stretch_preview {
+            crate::drafting::paint_segments(painter, rect, self.camera, &cache.segments);
         }
     }
 
@@ -4969,28 +5137,122 @@ impl MyCadApp {
         }
     }
 
+    fn sync_window_title(&mut self, ctx: &egui::Context) {
+        let title = self.window_title();
+        if title == self.window_title_sent {
+            return;
+        }
+        self.window_title_sent = title.clone();
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+    }
+
     fn window_title(&self) -> String {
         match &self.document {
             Some(document) => {
                 let mark = if self.is_dirty() { "*" } else { "" };
-                format!("MyCad — {}{mark}", document.file_name())
+                format!(
+                    "{} — {}{mark}",
+                    crate::brand::APP_NAME,
+                    document.file_name()
+                )
             }
-            None if self.is_dirty() => "MyCad — (untitled)*".into(),
-            None => "MyCad".into(),
+            None if self.is_dirty() => format!("{} — (untitled)*", crate::brand::APP_NAME),
+            None => crate::brand::APP_NAME.into(),
         }
     }
 
-    fn status_file_label(&self) -> String {
-        let name = self
-            .document
+    fn selection_overlay_batches(&mut self) -> OverlayBatches {
+        let key = (self.display_generation, self.selection.generation());
+        if self
+            .selection_overlay
             .as_ref()
-            .map(|document| document.file_name())
-            .or_else(|| self.loading_path.as_ref().map(|path| file_name(path)))
-            .unwrap_or_else(|| "(no file)".into());
-        if self.is_dirty() {
-            format!("{name}*")
-        } else {
-            name
+            .is_some_and(|cached| cached.key == key)
+        {
+            return self
+                .selection_overlay
+                .as_ref()
+                .map(|cached| cached.batches.clone())
+                .unwrap_or_default();
+        }
+        let batches = self.display.overlay_batches(self.selection.ids());
+        self.selection_overlay = Some(OverlayCache {
+            key,
+            batches: batches.clone(),
+        });
+        batches
+    }
+
+    fn id_fingerprint(ids: &[EntityId]) -> u64 {
+        ids.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, id| {
+            hash.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(id.0)
+        })
+    }
+
+    fn refresh_status_text(&mut self) {
+        let dirty = self.is_dirty();
+        let path_same = match (
+            &self.status_text.file_path,
+            self.document
+                .as_ref()
+                .and_then(|document| document.source_path.as_deref()),
+        ) {
+            (None, None) => true,
+            (Some(cached), Some(path)) => cached.as_path() == path,
+            _ => false,
+        };
+        let loading_same = match (&self.status_text.file_loading, self.loading_path.as_deref()) {
+            (None, None) => true,
+            (Some(cached), Some(path)) => cached.as_path() == path,
+            _ => false,
+        };
+        if self.status_text.file_dirty != dirty || !path_same || !loading_same {
+            let name = self
+                .document
+                .as_ref()
+                .map(|document| document.file_name())
+                .or_else(|| self.loading_path.as_ref().map(|path| file_name(path)))
+                .unwrap_or_else(|| "(no file)".into());
+            self.status_text.file_label = if dirty { format!("{name}*") } else { name };
+            self.status_text.file_dirty = dirty;
+            self.status_text.file_path = self
+                .document
+                .as_ref()
+                .and_then(|document| document.source_path.clone());
+            self.status_text.file_loading = self.loading_path.clone();
+        }
+        let quantized = self
+            .cursor_world
+            .filter(|point| point.is_finite())
+            .map(|point| {
+                (
+                    quantize_status_coord(point.x),
+                    quantize_status_coord(point.y),
+                )
+            });
+        let changed = match quantized {
+            Some((x, y)) => {
+                !self.status_text.cursor_set
+                    || self.status_text.cursor_x != x
+                    || self.status_text.cursor_y != y
+            }
+            None => self.status_text.cursor_set,
+        };
+        if changed {
+            self.status_text.cursor_label = match quantized {
+                Some((x, y)) => {
+                    format!(
+                        "X {:>10.3}  Y {:>10.3}",
+                        x as f64 / 1000.0,
+                        y as f64 / 1000.0
+                    )
+                }
+                None => "X          —  Y          —".into(),
+            };
+            self.status_text.cursor_set = quantized.is_some();
+            if let Some((x, y)) = quantized {
+                self.status_text.cursor_x = x;
+                self.status_text.cursor_y = y;
+            }
         }
     }
 
@@ -5481,7 +5743,7 @@ impl eframe::App for MyCadApp {
                 self.pending_discard = Some(PendingDiscard::Quit);
             }
         }
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.window_title()));
+        self.sync_window_title(ctx);
         if self.pdf_plot.is_picking() && ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
             self.cancel_plot_window_pick();
             self.input_consumed_escape = true;
@@ -5661,7 +5923,10 @@ impl eframe::App for MyCadApp {
         egui::TopBottomPanel::top("menu").show(ctx, |ui| {
             ui.add_space(2.0);
             ui.horizontal(|ui| {
-                ui.heading("MyCad");
+                if let Some(brand) = &self.brand {
+                    crate::brand::show_menu_mark(ui, &brand.icon);
+                }
+                ui.heading(crate::brand::APP_NAME);
                 let has_drawing = self.document.is_some();
                 let can_save = has_drawing && !self.io_busy();
                 if save_quick_access_button(ui, can_save).clicked() {
@@ -5885,9 +6150,10 @@ impl eframe::App for MyCadApp {
             ui.add_space(2.0);
         });
 
+        self.refresh_status_text();
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.monospace(self.status_file_label());
+                ui.monospace(&self.status_text.file_label);
                 ui.separator();
                 ui.label(&self.status).on_hover_text(self.command.prompt());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -5993,11 +6259,7 @@ impl eframe::App for MyCadApp {
                         self.toggle_ortho();
                     }
                     ui.separator();
-                    let coordinate = self
-                        .cursor_world
-                        .map(|point| format!("X {:>10.3}  Y {:>10.3}", point.x, point.y))
-                        .unwrap_or_else(|| "X          —  Y          —".into());
-                    ui.monospace(coordinate);
+                    ui.monospace(&self.status_text.cursor_label);
                     if let Some(err) = &self.error {
                         ui.separator();
                         ui.colored_label(egui::Color32::from_rgb(220, 120, 90), err);
@@ -6192,7 +6454,6 @@ fn handle_viewport_input(app: &mut MyCadApp, ui: &Ui, response: &egui::Response,
     let origin = Point2::new(rect.min.x as f64, rect.min.y as f64);
     let size = Point2::new(rect.width() as f64, rect.height() as f64);
     consider_block_prefetch(app, ui, response, origin, size);
-    let bindings = app.settings.bindings.clone();
     let modifiers = ui.input(|i| i.modifiers);
     let typing = crate::input::text_field_has_focus(ui.ctx());
 
@@ -6312,12 +6573,22 @@ fn handle_viewport_input(app: &mut MyCadApp, ui: &Ui, response: &egui::Response,
 
     if !typing
         && !app.input_consumed_escape
-        && ui.input(|i| bindings.key_pressed(InputAction::SelectClear, i))
+        && ui.input(|i| {
+            app.settings
+                .bindings
+                .key_pressed(InputAction::SelectClear, i)
+        })
         && app.box_select.take().is_none()
     {
         app.selection.clear();
     }
-    if !typing && ui.input(|i| bindings.key_pressed(InputAction::ZoomExtents, i)) {
+    if !typing
+        && ui.input(|i| {
+            app.settings
+                .bindings
+                .key_pressed(InputAction::ZoomExtents, i)
+        })
+    {
         app.zoom_extents(size.x, size.y);
     }
 
@@ -6334,7 +6605,11 @@ fn handle_viewport_input(app: &mut MyCadApp, ui: &Ui, response: &egui::Response,
             PointerButton::Middle,
             PointerButton::Secondary,
         ] {
-            if response.dragged_by(button) && bindings.dragged(InputAction::Pan, button, modifiers)
+            if response.dragged_by(button)
+                && app
+                    .settings
+                    .bindings
+                    .dragged(InputAction::Pan, button, modifiers)
             {
                 panning = true;
                 if let (Some(prev), Some(now)) =
@@ -6376,7 +6651,10 @@ fn handle_viewport_input(app: &mut MyCadApp, ui: &Ui, response: &egui::Response,
             PointerButton::Secondary,
         ] {
             if response.clicked_by(button)
-                && bindings.clicked(InputAction::ContextMenu, button, modifiers)
+                && app
+                    .settings
+                    .bindings
+                    .clicked(InputAction::ContextMenu, button, modifiers)
             {
                 let pos = response
                     .interact_pointer_pos()
@@ -6408,7 +6686,10 @@ fn handle_viewport_input(app: &mut MyCadApp, ui: &Ui, response: &egui::Response,
             PointerButton::Secondary,
         ] {
             if response.double_clicked_by(button)
-                && bindings.double_clicked(InputAction::ZoomExtents, button, modifiers)
+                && app
+                    .settings
+                    .bindings
+                    .double_clicked(InputAction::ZoomExtents, button, modifiers)
             {
                 let hit = response.interact_pointer_pos().and_then(|pos| {
                     pick_entity(
@@ -6439,14 +6720,25 @@ fn handle_viewport_input(app: &mut MyCadApp, ui: &Ui, response: &egui::Response,
             });
             let hit = world_hit.flatten();
             if app.command.is_erase_picking()
-                && (bindings.clicked(InputAction::SelectReplace, button, modifiers)
-                    || bindings.clicked(InputAction::SelectAdd, button, modifiers)
-                    || bindings.clicked(InputAction::SelectRemove, button, modifiers))
+                && (app
+                    .settings
+                    .bindings
+                    .clicked(InputAction::SelectReplace, button, modifiers)
+                    || app
+                        .settings
+                        .bindings
+                        .clicked(InputAction::SelectAdd, button, modifiers)
+                    || app
+                        .settings
+                        .bindings
+                        .clicked(InputAction::SelectRemove, button, modifiers))
             {
                 if let Some(id) = hit {
                     app.erase_ids(&[id], true);
                 }
-            } else if let Some(op) = selection_op_for_click(&bindings, button, modifiers) {
+            } else if let Some(op) =
+                selection_op_for_click(&app.settings.bindings, button, modifiers)
+            {
                 app.selection.apply_click(hit, op);
                 crate::blocks::reveal_selected_insert(app);
             }
@@ -6456,7 +6748,18 @@ fn handle_viewport_input(app: &mut MyCadApp, ui: &Ui, response: &egui::Response,
     app.last_pointer = ui.input(|i| i.pointer.latest_pos());
 
     if !box_active && response.hovered() {
-        let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+        let smooth_zoom = app.settings.smooth_zoom;
+        let (scroll, time, clicks) = ui.input(|i| {
+            (
+                wheel_zoom_delta(smooth_zoom, i.smooth_scroll_delta.y, i.raw_scroll_delta.y),
+                i.time,
+                line_wheel_clicks(&i.events),
+            )
+        });
+        let prefs = app.settings.wheel_acceleration.clone();
+        for (sign, count) in clicks {
+            app.wheel_zoom.register_clicks(sign, count, time, &prefs);
+        }
         if scroll.abs() > 0.0 {
             if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
                 let world = app.camera.screen_to_world(
@@ -6464,11 +6767,49 @@ fn handle_viewport_input(app: &mut MyCadApp, ui: &Ui, response: &egui::Response,
                     origin,
                     size,
                 );
-                let factor = scroll_to_zoom_factor(scroll as f64, app.settings.zoom_speed);
+                let multiplier = app.wheel_zoom.multiplier(time, &prefs);
+                let factor =
+                    scroll_to_zoom_factor(scroll as f64 * multiplier, app.settings.zoom_speed);
                 app.camera.zoom_at(world, factor);
             }
         }
     }
+}
+
+// ------------------------------------------------------------
+// Function: line_wheel_clicks
+// Purpose: Group this frame's notched mouse-wheel events by direction.
+//          Point and page units (touchpads, pixel scrolling) are ignored
+//          so they do not race the streak up to the cap.
+// ------------------------------------------------------------
+fn line_wheel_clicks(events: &[egui::Event]) -> Vec<(f32, u32)> {
+    let mut groups: Vec<(f32, u32)> = Vec::new();
+    for event in events {
+        let egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta,
+            ..
+        } = event
+        else {
+            continue;
+        };
+        let sign = if delta.y > 0.0 {
+            1.0
+        } else if delta.y < 0.0 {
+            -1.0
+        } else {
+            continue;
+        };
+        let count = delta.y.abs().round().max(1.0) as u32;
+        if let Some((last_sign, last_count)) = groups.last_mut() {
+            if *last_sign == sign {
+                *last_count = last_count.saturating_add(count);
+                continue;
+            }
+        }
+        groups.push((sign, count));
+    }
+    groups
 }
 
 fn update_box_select(
@@ -6479,7 +6820,6 @@ fn update_box_select(
     size: Point2,
     modifiers: egui::Modifiers,
 ) {
-    let bindings = app.settings.bindings.clone();
     let mut started_this_frame = false;
     if app.box_select.is_none() {
         for button in [
@@ -6494,10 +6834,15 @@ fn update_box_select(
             if !dragging {
                 continue;
             }
-            if bindings.dragged(InputAction::Pan, button, modifiers) {
+            if app
+                .settings
+                .bindings
+                .dragged(InputAction::Pan, button, modifiers)
+            {
                 continue;
             }
-            let Some(op) = selection_op_for_pointer(&bindings, button, modifiers) else {
+            let Some(op) = selection_op_for_pointer(&app.settings.bindings, button, modifiers)
+            else {
                 continue;
             };
             let Some(start) = ui
@@ -6514,6 +6859,7 @@ fn update_box_select(
                 current,
                 op,
                 candidates: Vec::new(),
+                candidate_stamp: 0,
             });
             started_this_frame = true;
             break;
@@ -6555,6 +6901,7 @@ fn update_box_select(
             &mut candidates,
         );
         if let Some(drag) = app.box_select.as_mut() {
+            drag.candidate_stamp = drag.candidate_stamp.wrapping_add(1);
             drag.candidates = candidates;
         }
     }
@@ -6637,13 +6984,10 @@ fn drawing_stem_name(document: &Document, extension: &str) -> String {
 }
 
 fn drawing_copy_name(document: &Document, extension: &str) -> String {
-    let stem = drawing_stem(document);
-    let stem = if stem.ends_with("-MyCad") {
-        stem
-    } else {
-        format!("{stem}-MyCad")
-    };
-    format!("{stem}.{extension}")
+    format!(
+        "{}.{extension}",
+        crate::brand::saved_copy_stem(&drawing_stem(document))
+    )
 }
 
 fn with_save_extension(path: PathBuf, prefer_dwg: bool) -> PathBuf {
@@ -6668,7 +7012,7 @@ fn in_place_cad_path(document: &Document, written_by_mycad: bool) -> Option<&Pat
     let path = document.source_path.as_deref()?;
     match CadFileFormat::from_path(path) {
         Some(CadFileFormat::Dxf) => Some(path),
-        Some(CadFileFormat::Dwg) if written_by_mycad || is_mycad_saved_dwg(path) => Some(path),
+        Some(CadFileFormat::Dwg) if written_by_mycad || is_saved_copy_dwg(path) => Some(path),
         _ => None,
     }
 }
@@ -6696,30 +7040,38 @@ fn add_save_filters(dialog: rfd::FileDialog, prefer_dwg: bool) -> rfd::FileDialo
     }
 }
 
-fn export_snapshot(document: &Document) -> MaterializedExport {
-    let empty = || MaterializedExport {
-        document: document.clone(),
-        links: Vec::new(),
-        generated_blocks: Vec::new(),
-    };
+fn export_snapshot(document: &Document) -> Option<MaterializedExport> {
     if !document_has_dynamic_content(document) {
-        return empty();
+        return None;
     }
     let request = EvaluationRequest {
         generation: document.content_generation(),
     };
-    export_materialized(document, &mut EvaluationCache::default(), request)
-        .unwrap_or_else(|_| empty())
+    Some(
+        export_materialized(document, &mut EvaluationCache::default(), request).unwrap_or_else(
+            |_| MaterializedExport {
+                document: document.clone(),
+                links: Vec::new(),
+                generated_blocks: Vec::new(),
+            },
+        ),
+    )
 }
 
 fn sync_companion(
     source: &Document,
-    prepared: &MaterializedExport,
+    prepared: Option<&MaterializedExport>,
     dest: &Path,
     mut report: SaveReport,
 ) -> SaveReport {
     let path = companion_path(dest);
     if document_has_dynamic_content(source) {
+        let Some(prepared) = prepared else {
+            report
+                .warnings
+                .push("companion file was not written: dynamic blocks were not exported".into());
+            return report;
+        };
         if let Err(err) = write_companion(
             &path,
             source,
@@ -6763,10 +7115,10 @@ fn apply_open_companion(path: &Path, document: &mut Document) -> Option<String> 
     }
 }
 
-fn is_mycad_saved_dwg(path: &Path) -> bool {
+fn is_saved_copy_dwg(path: &Path) -> bool {
     path.file_stem()
         .and_then(|stem| stem.to_str())
-        .is_some_and(|stem| stem.ends_with("-MyCad"))
+        .is_some_and(crate::brand::has_saved_copy_suffix)
 }
 
 fn needs_lossy_save_warning(document: &Document) -> bool {
@@ -6796,7 +7148,8 @@ fn lossy_save_message(diagnostics: &cad_core::ImportDiagnostics) -> String {
             "entities"
         };
         lines.push(format!(
-            "This drawing contains {unsupported} {noun} that MyCad cannot fully preserve."
+            "This drawing contains {unsupported} {noun} that {} cannot fully preserve.",
+            crate::brand::APP_NAME
         ));
         let listed = diagnostics
             .unsupported_counts
@@ -6811,16 +7164,20 @@ fn lossy_save_message(diagnostics: &cad_core::ImportDiagnostics) -> String {
     for note in &diagnostics.lossy_notes {
         lines.push(note.clone());
     }
-    lines.push(
-        "The original file is not overwritten. Save a Copy writes a -MyCad drawing that AutoCAD can open without that content.".into(),
-    );
+    lines.push(format!(
+        "The original file is not overwritten. Save a Copy writes a {} drawing that AutoCAD can open without that content.",
+        crate::brand::SAVED_COPY_SUFFIXES[0]
+    ));
     lines.join("\n")
 }
 
 fn format_save_status(path: &Path, report: &SaveReport, omitted_classes: usize) -> String {
     let name = file_name(path);
     let mut status = if companion_update_failed(report) {
-        format!("Saved {name}, but the MyCad companion file was not updated")
+        format!(
+            "Saved {name}, but the {} companion file was not updated",
+            crate::brand::APP_NAME
+        )
     } else if CadFileFormat::from_path(path) == Some(CadFileFormat::Dwg)
         && !report.warnings.is_empty()
     {
@@ -6899,6 +7256,18 @@ fn entity_affects_block_tree(entity: &Entity) -> bool {
     )
 }
 
+fn entities_affect_block_tree(
+    removed: &[Entity],
+    replaced: &[(Entity, Entity)],
+    created: &[Entity],
+) -> bool {
+    removed.iter().any(entity_affects_block_tree)
+        || created.iter().any(entity_affects_block_tree)
+        || replaced.iter().any(|(before, after)| {
+            entity_affects_block_tree(before) || entity_affects_block_tree(after)
+        })
+}
+
 fn line_segment(entity: &Entity) -> Option<(Point2, Point2)> {
     match entity.geometry {
         Geometry::Line { start, end } => Some((start.xy(), end.xy())),
@@ -6967,7 +7336,7 @@ const OPEN_DRAWING_EXTENSIONS: &[&str] = &["mycad", "MYCAD", "dwg", "DWG"];
 fn open_file_dialog() -> rfd::FileDialog {
     rfd::FileDialog::new()
         .add_filter("Drawing files", OPEN_DRAWING_EXTENSIONS)
-        .add_filter("MyCAD drawings", &["mycad", "MYCAD"])
+        .add_filter("EntoCAD drawings", &["mycad", "MYCAD"])
         .add_filter("DWG drawings", &["dwg", "DWG"])
         .add_filter("All files", &["*"])
 }
@@ -6990,22 +7359,33 @@ mod save_as_tests {
     fn dwg_source_suggests_a_mycad_copy_name() {
         let mut document = Document::default();
         document.source_path = Some(PathBuf::from("plant.dwg"));
-        assert_eq!(suggested_save_name(&document, true), "plant-MyCad.dwg");
+        assert_eq!(suggested_save_name(&document, true), "plant-EntoCAD.dwg");
         assert_eq!(suggested_save_name(&document, false), "plant.dxf");
     }
 
     #[test]
-    fn existing_mycad_suffix_is_not_repeated() {
+    fn existing_saved_copy_suffix_is_not_repeated() {
+        let mut document = Document::default();
+        document.source_path = Some(PathBuf::from("plant-EntoCAD.dwg"));
+        assert_eq!(suggested_save_name(&document, true), "plant-EntoCAD.dwg");
+    }
+
+    #[test]
+    fn legacy_mycad_suffix_is_not_repeated() {
         let mut document = Document::default();
         document.source_path = Some(PathBuf::from("plant-MyCad.dwg"));
         assert_eq!(suggested_save_name(&document, true), "plant-MyCad.dwg");
+        assert_eq!(
+            in_place_cad_path(&document, false),
+            Some(Path::new("plant-MyCad.dwg"))
+        );
     }
 
     #[test]
     fn untitled_drawing_uses_a_generic_dxf_name() {
         let document = Document::default();
         assert_eq!(suggested_save_name(&document, false), "drawing.dxf");
-        assert_eq!(suggested_save_name(&document, true), "drawing-MyCad.dwg");
+        assert_eq!(suggested_save_name(&document, true), "drawing-EntoCAD.dwg");
     }
 
     #[test]
@@ -7038,10 +7418,10 @@ mod save_as_tests {
     #[test]
     fn mycad_dwg_copy_can_save_in_place() {
         let mut document = Document::default();
-        document.source_path = Some(PathBuf::from("plant-MyCad.dwg"));
+        document.source_path = Some(PathBuf::from("plant-EntoCAD.dwg"));
         assert_eq!(
             in_place_cad_path(&document, false),
-            Some(Path::new("plant-MyCad.dwg"))
+            Some(Path::new("plant-EntoCAD.dwg"))
         );
     }
 
@@ -7102,7 +7482,7 @@ mod save_as_tests {
         });
         document.replace_block_definition(definition);
         assert!(save_prefers_dwg(&document));
-        assert_eq!(suggested_save_name(&document, true), "drawing-MyCad.dwg");
+        assert_eq!(suggested_save_name(&document, true), "drawing-EntoCAD.dwg");
     }
 
     #[test]
@@ -7216,7 +7596,7 @@ mod save_as_tests {
         assert!(message.contains("2 VIEWPORT"));
         assert!(message.contains("1 MULTILEADER"));
         assert!(message.contains("not overwritten"));
-        assert!(message.contains("-MyCad"));
+        assert!(message.contains("-EntoCAD"));
         assert!(needs_lossy_save_warning(&document));
         assert!(!needs_lossy_save_warning(&Document::default()));
     }
@@ -7524,6 +7904,67 @@ mod interaction_tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn drawing_a_line_does_not_copy_the_picture() {
+        let mut app = MyCadApp::for_test();
+        app.refresh_derived();
+        let display = std::sync::Arc::as_ptr(&app.display);
+        let snaps = std::sync::Arc::as_ptr(&app.snaps);
+        let measures = std::sync::Arc::as_ptr(&app.measures);
+        app.start_line_command();
+        app.accept_command_point(Point2::new(0.0, 0.0));
+        app.accept_command_point(Point2::new(4.0, 1.0));
+        assert_eq!(model_count(&app), 1);
+        assert_eq!(std::sync::Arc::as_ptr(&app.display), display);
+        assert_eq!(std::sync::Arc::as_ptr(&app.snaps), snaps);
+        assert_eq!(std::sync::Arc::as_ptr(&app.measures), measures);
+    }
+
+    #[test]
+    fn trim_split_does_not_rebuild_the_drawing() {
+        let mut app = MyCadApp::for_test();
+        add_line(&mut app, 0.0, 0.0, 10.0, 0.0);
+        add_line(&mut app, 3.0, -2.0, 3.0, 2.0);
+        add_line(&mut app, 7.0, -2.0, 7.0, 2.0);
+        app.full_refresh_count = 0;
+        app.start_trim_command();
+        app.accept_command_point(Point2::new(5.0, 0.0));
+        assert_eq!(app.full_refresh_count, 0, "{}", app.status);
+        assert_eq!(model_count(&app), 4, "{}", app.status);
+        app.undo();
+        assert_eq!(model_count(&app), 3);
+        assert_eq!(app.full_refresh_count, 0, "undo must patch");
+        app.redo();
+        assert_eq!(model_count(&app), 4);
+        assert_eq!(app.full_refresh_count, 0, "redo must patch");
+    }
+
+    #[test]
+    fn a_stale_preview_result_requeues_the_rebuild() {
+        let mut app = MyCadApp::for_test();
+        let _ = app.ensure_document();
+        app.refresh_derived();
+        let stale = app.document.as_ref().unwrap().content_generation();
+        app.ensure_document().unwrap().bump_generation();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        app.preview_rx = Some(receiver);
+        sender
+            .send(PreviewMsg::Ready {
+                document_generation: stale,
+                session_generation: 0,
+                preview_generation: 0,
+                view_frames: Vec::new(),
+                display: Box::new(cad_render::DisplayList::default()),
+                snaps: Box::new(cad_core::SnapIndex::default()),
+                measures: Box::new(cad_core::MeasureIndex::default()),
+                extents: None,
+            })
+            .unwrap();
+        app.poll_preview(&egui::Context::default());
+        assert!(app.status.contains("Discarded"));
+        assert!(app.preview_rx.is_some());
     }
 
     #[test]

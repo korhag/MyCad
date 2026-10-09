@@ -213,18 +213,36 @@ impl AreaMeasurement {
     }
 
     pub fn from_points(points: &[Point2]) -> Result<Self, MeasureError> {
-        if points.len() < 3 {
+        Self::from_points_with(points, None)
+    }
+
+    // --------------------------------------------------------
+    // Method: from_points_with
+    // Purpose: Measure a point list plus one live cursor point
+    //          without cloning the caller's vertices first.
+    // --------------------------------------------------------
+    pub fn from_points_with(
+        points: &[Point2],
+        extra: Option<Point2>,
+    ) -> Result<Self, MeasureError> {
+        let extra_count = usize::from(extra.is_some());
+        if points.len() + extra_count < 3 {
             return Err(MeasureError::OpenBoundary);
         }
-        let vertices: Vec<PolyVertex> = points
-            .iter()
-            .map(|p| PolyVertex {
-                point: crate::geom::Point3::from_xy(p.x, p.y),
-                bulge: 0.0,
-                vertex_id: Default::default(),
-            })
-            .collect();
+        let mut vertices = Vec::with_capacity(points.len() + extra_count);
+        vertices.extend(points.iter().copied().map(point_vertex));
+        if let Some(extra) = extra {
+            vertices.push(point_vertex(extra));
+        }
         Self::from_polyline(&vertices, true)
+    }
+}
+
+fn point_vertex(point: Point2) -> PolyVertex {
+    PolyVertex {
+        point: crate::geom::Point3::from_xy(point.x, point.y),
+        bulge: 0.0,
+        vertex_id: Default::default(),
     }
 }
 

@@ -194,10 +194,10 @@ pub enum CommandOutput {
 //          written into the document.
 // ------------------------------------------------------------
 #[derive(Debug, Clone, PartialEq)]
-pub enum PreviewGeometry {
+pub enum PreviewGeometry<'a> {
     LineSegment([Point2; 2]),
     Polyline {
-        vertices: Vec<Point2>,
+        vertices: std::borrow::Cow<'a, [Point2]>,
         next: Option<Point2>,
         closed: bool,
     },
@@ -1028,11 +1028,7 @@ impl CommandState {
             }) => cad_core::AngleMeasurement::from_directions(*vertex, *ray, current?)
                 .map(MeasurementResult::Angle),
             Self::Area(AreaState::Points { vertices }) if vertices.len() >= 2 => {
-                let mut pts = vertices.clone();
-                if let Some(current) = current {
-                    pts.push(current);
-                }
-                cad_core::AreaMeasurement::from_points(&pts)
+                cad_core::AreaMeasurement::from_points_with(vertices, current)
                     .ok()
                     .map(MeasurementResult::Area)
             }
@@ -1058,7 +1054,7 @@ impl CommandState {
         }
     }
 
-    pub fn preview(&self, current: Option<Point2>) -> Option<PreviewGeometry> {
+    pub fn preview(&self, current: Option<Point2>) -> Option<PreviewGeometry<'_>> {
         match self {
             Self::Idle
             | Self::Distance(_)
@@ -1076,7 +1072,7 @@ impl CommandState {
                     return None;
                 }
                 Some(PreviewGeometry::Polyline {
-                    vertices: state.vertices.clone(),
+                    vertices: std::borrow::Cow::Borrowed(&state.vertices),
                     next: current,
                     closed: false,
                 })
@@ -1443,7 +1439,7 @@ fn accept_area_point(state: &mut AreaState, point: Point2) -> CommandOutput {
     }
 }
 
-fn preview_arc(state: &ArcState, current: Option<Point2>) -> Option<PreviewGeometry> {
+fn preview_arc(state: &ArcState, current: Option<Point2>) -> Option<PreviewGeometry<'_>> {
     let start = state.start?;
     let mid = state.mid?;
     let end = current?;
@@ -1455,7 +1451,7 @@ fn preview_arc(state: &ArcState, current: Option<Point2>) -> Option<PreviewGeome
             end_angle: arc.end_angle,
         }),
         Err(_) => Some(PreviewGeometry::Polyline {
-            vertices: vec![start, mid],
+            vertices: std::borrow::Cow::Owned(vec![start, mid]),
             next: Some(end),
             closed: false,
         }),
@@ -1512,7 +1508,7 @@ pub fn rectangle_corners(first: Point2, opposite: Point2) -> [Point2; 4] {
     ]
 }
 
-fn rectangle_preview(first: Point2, opposite: Point2) -> Option<PreviewGeometry> {
+fn rectangle_preview(first: Point2, opposite: Point2) -> Option<PreviewGeometry<'static>> {
     if (opposite.x - first.x).abs() <= GEOM_TOLERANCE
         || (opposite.y - first.y).abs() <= GEOM_TOLERANCE
     {
@@ -1821,7 +1817,7 @@ fn polygon_vertices(center: Point2, vertex: Point2, sides: u32) -> Vec<Point2> {
         .collect()
 }
 
-fn preview_ellipse(state: &EllipseState, current: Option<Point2>) -> Option<PreviewGeometry> {
+fn preview_ellipse(state: &EllipseState, current: Option<Point2>) -> Option<PreviewGeometry<'_>> {
     let center = state.center?;
     let current = current?;
     if let Some(major_end) = state.major_end {
@@ -1848,7 +1844,7 @@ fn preview_ellipse(state: &EllipseState, current: Option<Point2>) -> Option<Prev
             48,
         );
         return Some(PreviewGeometry::Polyline {
-            vertices: points,
+            vertices: std::borrow::Cow::Owned(points),
             next: None,
             closed: true,
         });
@@ -1857,14 +1853,14 @@ fn preview_ellipse(state: &EllipseState, current: Option<Point2>) -> Option<Prev
         .then_some(PreviewGeometry::LineSegment([center, current]))
 }
 
-fn preview_polygon(state: &PolygonState, current: Option<Point2>) -> Option<PreviewGeometry> {
+fn preview_polygon(state: &PolygonState, current: Option<Point2>) -> Option<PreviewGeometry<'_>> {
     let center = state.center?;
     let current = current?;
     if center.distance(current) <= GEOM_TOLERANCE {
         return None;
     }
     Some(PreviewGeometry::Polyline {
-        vertices: polygon_vertices(center, current, state.sides),
+        vertices: std::borrow::Cow::Owned(polygon_vertices(center, current, state.sides)),
         next: None,
         closed: true,
     })

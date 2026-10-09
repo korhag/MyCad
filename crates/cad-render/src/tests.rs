@@ -41,6 +41,7 @@ fn pick_world(document: &Document, world: Point2) -> Option<EntityId> {
     let screen = camera.world_to_screen(world, origin, size);
     hit_test(
         &list.picks,
+        Some(list.spatial()),
         &camera,
         screen,
         origin,
@@ -959,6 +960,7 @@ fn pick_from_list(list: &DisplayList, world: Point2) -> Option<EntityId> {
     let screen = camera.world_to_screen(world, origin, size);
     hit_test(
         &list.picks,
+        Some(list.spatial()),
         &camera,
         screen,
         origin,
@@ -1067,7 +1069,7 @@ fn replace_line_overwrites_vertices_and_picks() {
         *end = Point3::from_xy(10.0, 8.0);
     }
     document.replace_entity_in(&cad_core::EntitySpace::ModelSpace, first.id, moved.clone());
-    assert!(list.replace_entity(&document, &moved));
+    assert!(list.replace_entity(&document, &moved).is_some());
     assert_eq!(pick_from_list(&list, Point2::new(5.0, 0.0)), None);
     assert_eq!(pick_from_list(&list, Point2::new(5.0, 8.0)), Some(first.id));
     assert_eq!(
@@ -1093,7 +1095,7 @@ fn remove_line_hides_pick_and_keeps_neighbors() {
     document.diagnostics.extents = document.compute_extents();
     let mut list = tessellate_document(&document);
     document.remove_entity_from(&cad_core::EntitySpace::ModelSpace, first.id);
-    assert!(list.remove_entity(first.id));
+    assert!(list.remove_entity(first.id).is_some());
     assert_eq!(pick_from_list(&list, Point2::new(5.0, 0.0)), None);
     assert_eq!(
         pick_from_list(&list, Point2::new(5.0, 4.0)),
@@ -1317,4 +1319,48 @@ fn a_two_hundred_deep_block_chain_does_not_overflow() {
     let _snaps = cad_core::SnapIndex::build(&document);
     let _measures = cad_core::MeasureIndex::build(&document);
     let _extents = document.compute_extents();
+}
+
+#[test]
+fn spatial_hit_test_matches_the_linear_scan() {
+    let mut document = Document::default();
+    layer0(&mut document);
+    document.add_entity(Entity::new(Geometry::Line {
+        start: Point3::from_xy(0.0, 0.0),
+        end: Point3::from_xy(10.0, 0.0),
+    }));
+    document.add_entity(Entity::new(Geometry::Line {
+        start: Point3::from_xy(0.0, 5.0),
+        end: Point3::from_xy(10.0, 5.0),
+    }));
+    let list = tessellate_document(&document);
+    assert!(!list.spatial().is_empty());
+    let camera = camera_looking_at(Point2::new(5.0, 2.5), 20.0);
+    let (origin, size) = vp();
+    for world in [
+        Point2::new(5.0, 0.0),
+        Point2::new(2.0, 5.0),
+        Point2::new(5.0, 2.5),
+    ] {
+        let screen = camera.world_to_screen(world, origin, size);
+        let spatial = hit_test(
+            &list.picks,
+            Some(list.spatial()),
+            &camera,
+            screen,
+            origin,
+            size,
+            DEFAULT_PICK_TOLERANCE_PX,
+        );
+        let linear = hit_test(
+            &list.picks,
+            None,
+            &camera,
+            screen,
+            origin,
+            size,
+            DEFAULT_PICK_TOLERANCE_PX,
+        );
+        assert_eq!(spatial, linear, "{world:?}");
+    }
 }

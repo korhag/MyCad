@@ -1,4 +1,4 @@
-//! Sidecar data MyCad keeps next to a DWG or DXF.
+//! Sidecar data EntoCAD keeps next to a DWG or DXF.
 //!
 //! `Plant.dwg` stays a normal static-block drawing. `Plant.dwg.mycad` stores
 //! the dynamic block definitions and which flattened block stands for which
@@ -48,7 +48,7 @@ struct CompanionInstance {
 // Type: CompanionReport
 // Purpose: How many inserts became dynamic again, and how many
 //          flattened blocks were left alone because they no longer
-//          match the file MyCad wrote.
+//          match the file EntoCAD wrote.
 // ------------------------------------------------------------
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompanionReport {
@@ -69,10 +69,10 @@ impl CompanionReport {
             parts.push(format!("Restored {} dynamic {noun}", self.restored));
         }
         if self.skipped == 1 {
-            parts.push("1 block edited outside MyCad stays static".into());
+            parts.push("1 block edited outside EntoCAD stays static".into());
         } else if self.skipped > 1 {
             parts.push(format!(
-                "{} blocks edited outside MyCad stay static",
+                "{} blocks edited outside EntoCAD stay static",
                 self.skipped
             ));
         }
@@ -249,7 +249,7 @@ fn parse_companion_bytes(bytes: &[u8]) -> Result<Companion, ExportError> {
         ));
     }
     let wire: WireCompanion = serde_json::from_slice(bytes)
-        .map_err(|err| ExportError::Validation(format!("invalid MyCAD companion: {err}")))?;
+        .map_err(|err| ExportError::Validation(format!("invalid EntoCAD companion: {err}")))?;
     if wire.format != COMPANION_FORMAT {
         return Err(ExportError::Unsupported(format!(
             "expected format '{COMPANION_FORMAT}', found '{}'",
@@ -258,7 +258,7 @@ fn parse_companion_bytes(bytes: &[u8]) -> Result<Companion, ExportError> {
     }
     if wire.schema != COMPANION_SCHEMA {
         return Err(ExportError::Unsupported(format!(
-            "unsupported MyCAD companion schema {} (this build reads {COMPANION_SCHEMA})",
+            "unsupported EntoCAD companion schema {} (this build reads {COMPANION_SCHEMA})",
             wire.schema
         )));
     }
@@ -801,8 +801,12 @@ fn entity_points(geometry: &Geometry) -> Vec<(f64, f64)> {
                                     add!(*center);
                                     add!(*major_endpoint);
                                 }
-                                HatchEdge::Spline { control_points } => {
-                                    for point in control_points {
+                                HatchEdge::Spline {
+                                    control_points,
+                                    fit_points,
+                                    ..
+                                } => {
+                                    for point in control_points.iter().chain(fit_points.iter()) {
                                         add!(*point);
                                     }
                                 }
@@ -1091,7 +1095,7 @@ mod tests {
         assert!(imported.block_by_name(&export_name).is_some());
         assert_eq!(
             report.status_line().as_deref(),
-            Some("Restored 1 dynamic block • 1 block edited outside MyCad stays static")
+            Some("Restored 1 dynamic block • 1 block edited outside EntoCAD stays static")
         );
     }
 
@@ -1108,6 +1112,6 @@ mod tests {
         let err = parse_companion_bytes(json.as_bytes()).unwrap_err();
         assert!(err
             .to_string()
-            .contains("unsupported MyCAD companion schema"));
+            .contains("unsupported EntoCAD companion schema"));
     }
 }

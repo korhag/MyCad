@@ -44,8 +44,15 @@ pub(crate) fn restore_linetype_strings_area(dwg: *mut libredwg_sys::Dwg_Data) {
         }
         if dxfname == "LTYPE" {
             copy_dash_text(ptr);
+            repair_linetype(ptr);
         } else if dxfname == "STYLE" {
             mark_shape_style(ptr);
+            set_u8(ptr, "STYLE", "is_xref_ref", 1);
+        } else if matches!(
+            dxfname.as_str(),
+            "LAYER" | "DIMSTYLE" | "APPID" | "VPORT" | "VIEW" | "UCS" | "BLOCK_HEADER"
+        ) {
+            set_u8(ptr, &dxfname, "is_xref_ref", 1);
         }
     }
 }
@@ -81,6 +88,69 @@ fn mark_shape_style(style: *mut c_void) {
             &value as *const u8 as *const c_void,
             false,
         );
+    }
+}
+
+fn set_u8(object: *mut c_void, dxfname: &str, field: &str, value: u8) {
+    let Ok(c_dxf) = std::ffi::CString::new(dxfname) else {
+        return;
+    };
+    let Ok(c_field) = std::ffi::CString::new(field) else {
+        return;
+    };
+    unsafe {
+        dwg_dynapi_entity_set_value(
+            object,
+            c_dxf.as_ptr(),
+            c_field.as_ptr(),
+            &value as *const u8 as *const c_void,
+            false,
+        );
+    }
+}
+
+fn set_f64(object: *mut c_void, dxfname: &str, field: &str, value: f64) {
+    let Ok(c_dxf) = std::ffi::CString::new(dxfname) else {
+        return;
+    };
+    let Ok(c_field) = std::ffi::CString::new(field) else {
+        return;
+    };
+    unsafe {
+        dwg_dynapi_entity_set_value(
+            object,
+            c_dxf.as_ptr(),
+            c_field.as_ptr(),
+            &value as *const f64 as *const c_void,
+            false,
+        );
+    }
+}
+
+/// R2000 table records store this bit as 1. A zero shifts the fields after
+/// the name, and AutoCAD then reads a plain linetype as having a dash whose
+/// shape index is 0.
+fn repair_linetype(ltype: *mut c_void) {
+    use crate::dynapi::{get_field, get_utf8_field};
+    set_u8(ltype, "LTYPE", "is_xref_ref", 1);
+    let name = get_utf8_field(ltype, "LTYPE", "name").unwrap_or_default();
+    let upper = name.to_ascii_uppercase();
+    if matches!(upper.as_str(), "CONTINUOUS" | "BYLAYER" | "BYBLOCK") {
+        set_u8(ltype, "LTYPE", "numdashes", 0);
+        set_f64(ltype, "LTYPE", "pattern_len", 0.0);
+        return;
+    }
+    let num = get_field::<u8>(ltype, "LTYPE", "numdashes").unwrap_or(0);
+    let dashes =
+        get_field::<*mut LtypeDash>(ltype, "LTYPE", "dashes").unwrap_or(std::ptr::null_mut());
+    if num == 0 || dashes.is_null() {
+        return;
+    }
+    for index in 0..num {
+        let dash = unsafe { &mut *dashes.add(usize::from(index)) };
+        if dash.shape_flag == 0 && dash.scale == 0.0 {
+            dash.scale = 1.0;
+        }
     }
 }
 

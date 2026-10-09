@@ -1,8 +1,8 @@
 //! Drafting aids shared by point-based commands and the status bar.
 
 use cad_core::{
-    edge_snaps, Extents2, MeasureIndex, MeasurePrimitive, Point2, Point3, SnapFeature, SnapIndex,
-    SnapKind, GEOM_TOLERANCE,
+    edge_snaps, Extents2, MeasureIndex, Point2, Point3, SnapFeature, SnapIndex, SnapKind,
+    GEOM_TOLERANCE,
 };
 use cad_viewport::Camera2;
 use eframe::egui::{self, Color32, Pos2, Rect, Stroke};
@@ -222,7 +222,9 @@ pub struct DraftingState {
     pub tracked_points: Vec<TrackedSnap>,
     pub tracking_hint: Option<TrackingHint>,
     nearby: Vec<SnapFeature>,
-    edge_buf: Vec<MeasurePrimitive>,
+    edge_slots: Vec<usize>,
+    candidates: Vec<SnapFeature>,
+    edge_snaps_buf: Vec<SnapFeature>,
     hover_snap: Option<SnapFeature>,
     hover_since: f64,
     dwell_armed: bool,
@@ -323,7 +325,9 @@ impl DraftingState {
             tracked_points: Vec::new(),
             tracking_hint: None,
             nearby: Vec::new(),
-            edge_buf: Vec::new(),
+            edge_slots: Vec::new(),
+            candidates: Vec::new(),
+            edge_snaps_buf: Vec::new(),
             hover_snap: None,
             hover_since: 0.0,
             dwell_armed: false,
@@ -379,50 +383,62 @@ impl DraftingState {
     ) -> Point2 {
         let preferences = self.preferences;
         let snap_override = self.snap_override;
-        let reused = if self.dwell_armed {
-            None
-        } else {
-            self.snap_cache
-                .as_ref()
-                .filter(|cache| {
-                    cache.matches(
-                        raw,
-                        base,
-                        shift_held,
-                        camera,
-                        viewport_height,
-                        &sources,
-                        preferences,
-                        snap_override,
-                    )
-                })
-                .map(|cache| (cache.result, cache.acquired, cache.tracking.clone()))
-        };
+        let reused = self
+            .snap_cache
+            .as_ref()
+            .filter(|cache| {
+                cache.matches(
+                    raw,
+                    base,
+                    shift_held,
+                    camera,
+                    viewport_height,
+                    &sources,
+                    preferences,
+                    snap_override,
+                )
+            })
+            .map(|cache| (cache.result, cache.acquired, cache.tracking.clone()));
         if let Some((result, acquired, tracking)) = reused {
             self.command_base_point = base;
             self.acquired_snap = acquired;
             self.tracking_hint = tracking;
-            self.current_point = Some(result);
-            return result;
+            let armed = self.dwell_armed;
+            self.update_dwell(time);
+            let dwell_finished = armed && !self.dwell_armed;
+            if !dwell_finished {
+                self.current_point = Some(result);
+                return result;
+            }
+            self.tracking_hint = None;
+            let resolved = self.resolve_from_acquisition(
+                raw,
+                base,
+                shift_held,
+                world_aperture(camera, viewport_height),
+            );
+            self.current_point = Some(resolved);
+            self.snap_cache = Some(SnapResolveCache::capture(
+                raw,
+                base,
+                shift_held,
+                camera,
+                viewport_height,
+                &sources,
+                self,
+                resolved,
+            ));
+            return resolved;
         }
         self.command_base_point = base;
         self.acquired_snap = None;
         self.tracking_hint = None;
-        let world_aperture = SNAP_APERTURE_PX / camera.pixels_per_world(viewport_height).max(1e-15);
+        let aperture = world_aperture(camera, viewport_height);
         if self.snaps_enabled() {
-            self.collect_snaps(raw, base, world_aperture, sources);
+            self.collect_snaps(raw, base, aperture, sources);
         }
         self.update_dwell(time);
-
-        let ortho_now = self.preferences.ortho_enabled ^ shift_held;
-        let resolved = if let Some(feature) = self.acquired_snap {
-            feature.point
-        } else if !ortho_now {
-            self.acquire_tracking(raw, base, world_aperture)
-                .unwrap_or(raw)
-        } else {
-            base.map(|base| constrain_ortho(base, raw)).unwrap_or(raw)
-        };
+        let resolved = self.resolve_from_acquisition(raw, base, shift_held, aperture);
         self.current_point = Some(resolved);
         self.snap_cache = Some(SnapResolveCache::capture(
             raw,
@@ -472,34 +488,64 @@ impl DraftingState {
         }
         self.nearby
             .retain(|feature| !is_current_base(feature.point, base));
-        let mut candidates: Vec<SnapFeature> = self
-            .nearby
-            .iter()
-            .copied()
-            .filter(|feature| self.kind_allowed(feature.kind))
-            .filter(|feature| raw.distance(feature.point) <= world_aperture)
-            .collect();
+        self.candidates.clear();
+        for feature in self.nearby.iter().copied() {
+            if self.kind_allowed(feature.kind) && raw.distance(feature.point) <= world_aperture {
+                self.candidates.push(feature);
+            }
+        }
 
-        sources.edges.query(region, &mut self.edge_buf);
-        let mut edges = Vec::new();
-        edge_snaps(&self.edge_buf, raw, base, world_aperture, &mut edges);
-        candidates.extend(edges.into_iter().filter(|feature| {
-            self.kind_allowed(feature.kind) && !is_current_base(feature.point, base)
-        }));
+        sources.edges.query_slots(region, &mut self.edge_slots);
+        let slots = std::mem::take(&mut self.edge_slots);
+        edge_snaps(
+            slots
+                .iter()
+                .filter_map(|slot| sources.edges.primitive(*slot)),
+            raw,
+            base,
+            world_aperture,
+            &mut self.edge_snaps_buf,
+        );
+        self.edge_slots = slots;
+        for feature in self.edge_snaps_buf.iter().copied() {
+            if self.kind_allowed(feature.kind) && !is_current_base(feature.point, base) {
+                self.candidates.push(feature);
+            }
+        }
 
         if self.snap_override != Some(OneShotSnap::Kind(SnapKind::Nearest)) {
-            let stronger = candidates
+            let stronger = self
+                .candidates
                 .iter()
                 .any(|feature| feature.kind != SnapKind::Nearest);
             if stronger {
-                candidates.retain(|feature| feature.kind != SnapKind::Nearest);
+                self.candidates
+                    .retain(|feature| feature.kind != SnapKind::Nearest);
             }
         }
-        self.acquired_snap = candidates.into_iter().min_by(|left, right| {
+        self.acquired_snap = self.candidates.iter().copied().min_by(|left, right| {
             raw.distance(left.point)
                 .total_cmp(&raw.distance(right.point))
                 .then(snap_rank(left.kind).cmp(&snap_rank(right.kind)))
         });
+    }
+
+    fn resolve_from_acquisition(
+        &mut self,
+        raw: Point2,
+        base: Option<Point2>,
+        shift_held: bool,
+        world_aperture: f64,
+    ) -> Point2 {
+        let ortho_now = self.preferences.ortho_enabled ^ shift_held;
+        if let Some(feature) = self.acquired_snap {
+            feature.point
+        } else if !ortho_now {
+            self.acquire_tracking(raw, base, world_aperture)
+                .unwrap_or(raw)
+        } else {
+            base.map(|base| constrain_ortho(base, raw)).unwrap_or(raw)
+        }
     }
 
     fn update_dwell(&mut self, time: f64) {
@@ -619,6 +665,10 @@ impl DraftingState {
         });
         Some(point)
     }
+}
+
+fn world_aperture(camera: &Camera2, viewport_height: f64) -> f64 {
+    SNAP_APERTURE_PX / camera.pixels_per_world(viewport_height).max(1e-15)
 }
 
 fn is_current_base(point: Point2, base: Option<Point2>) -> bool {
@@ -770,7 +820,7 @@ pub fn paint_overlay(
     painter: &egui::Painter,
     rect: Rect,
     camera: Camera2,
-    preview: Option<PreviewGeometry>,
+    preview: Option<PreviewGeometry<'_>>,
     acquired_snap: Option<SnapFeature>,
     start_marker: Option<Point2>,
     close_hint: bool,
@@ -789,7 +839,7 @@ pub fn paint_overlay(
         paint_preview(painter, &to_screen, preview, stroke);
     }
     if let Some(hint) = tracking {
-        paint_tracking(painter, &to_screen, camera, hint);
+        paint_tracking(painter, &to_screen, camera, rect, hint);
     }
     for tracked in tracked {
         paint_track_cross(painter, to_screen(tracked.feature.point));
@@ -816,6 +866,7 @@ fn paint_tracking(
     painter: &egui::Painter,
     to_screen: &impl Fn(Point2) -> Pos2,
     camera: Camera2,
+    viewport: Rect,
     hint: &TrackingHint,
 ) {
     let color = Color32::from_rgb(120, 200, 190);
@@ -825,7 +876,10 @@ fn paint_tracking(
         let dir = dir_from_deg(ray.angle_deg);
         let start = Point2::new(ray.origin.x - dir.x * span, ray.origin.y - dir.y * span);
         let end = Point2::new(ray.origin.x + dir.x * span, ray.origin.y + dir.y * span);
-        paint_dashed(painter, to_screen(start), to_screen(end), stroke);
+        let Some((from, to)) = clip_segment(to_screen(start), to_screen(end), viewport) else {
+            continue;
+        };
+        paint_dashed(painter, from, to, stroke);
     }
     let screen = to_screen(hint.point);
     for (index, ray) in hint.rays.iter().enumerate() {
@@ -857,6 +911,66 @@ fn format_angle(deg: f64) -> String {
     } else {
         format!("{deg:.1}")
     }
+}
+
+fn clip_segment(start: Pos2, end: Pos2, bounds: Rect) -> Option<(Pos2, Pos2)> {
+    const INSIDE: u8 = 0;
+    const LEFT: u8 = 1;
+    const RIGHT: u8 = 2;
+    const BOTTOM: u8 = 4;
+    const TOP: u8 = 8;
+    let code = |point: Pos2| -> u8 {
+        let mut bits = INSIDE;
+        if point.x < bounds.min.x {
+            bits |= LEFT;
+        } else if point.x > bounds.max.x {
+            bits |= RIGHT;
+        }
+        if point.y < bounds.min.y {
+            bits |= BOTTOM;
+        } else if point.y > bounds.max.y {
+            bits |= TOP;
+        }
+        bits
+    };
+    let mut a = start;
+    let mut b = end;
+    let mut code_a = code(a);
+    let mut code_b = code(b);
+    for _ in 0..8 {
+        if code_a | code_b == 0 {
+            return Some((a, b));
+        }
+        if code_a & code_b != 0 {
+            return None;
+        }
+        let out = if code_a != 0 { code_a } else { code_b };
+        let dx = b.x - a.x;
+        let dy = b.y - a.y;
+        let point = if out & TOP != 0 && dy.abs() > f32::EPSILON {
+            let t = (bounds.max.y - a.y) / dy;
+            Pos2::new(a.x + t * dx, bounds.max.y)
+        } else if out & BOTTOM != 0 && dy.abs() > f32::EPSILON {
+            let t = (bounds.min.y - a.y) / dy;
+            Pos2::new(a.x + t * dx, bounds.min.y)
+        } else if out & RIGHT != 0 && dx.abs() > f32::EPSILON {
+            let t = (bounds.max.x - a.x) / dx;
+            Pos2::new(bounds.max.x, a.y + t * dy)
+        } else if out & LEFT != 0 && dx.abs() > f32::EPSILON {
+            let t = (bounds.min.x - a.x) / dx;
+            Pos2::new(bounds.min.x, a.y + t * dy)
+        } else {
+            return None;
+        };
+        if out == code_a {
+            a = point;
+            code_a = code(a);
+        } else {
+            b = point;
+            code_b = code(b);
+        }
+    }
+    None
 }
 
 fn paint_dashed(painter: &egui::Painter, start: Pos2, end: Pos2, stroke: Stroke) {
@@ -990,7 +1104,7 @@ pub fn paint_crossing_window(
 fn paint_preview(
     painter: &egui::Painter,
     to_screen: &impl Fn(Point2) -> Pos2,
-    preview: PreviewGeometry,
+    preview: PreviewGeometry<'_>,
     stroke: Stroke,
 ) {
     match preview {

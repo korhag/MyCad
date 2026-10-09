@@ -7,7 +7,9 @@ use eframe::egui::{self, Color32, RichText};
 use crate::app::MyCadApp;
 use crate::input::{capture_binding, InputAction};
 use crate::settings::{
-    sanitize_zoom_speed, AppSettings, RgbColor, DEFAULT_ZOOM_SPEED, ZOOM_SPEED_MAX, ZOOM_SPEED_MIN,
+    sanitize_viewport_msaa, sanitize_wheel_accel_strength, sanitize_zoom_speed, AppSettings,
+    RgbColor, DEFAULT_WHEEL_ACCEL_STRENGTH, DEFAULT_ZOOM_SPEED, WHEEL_ACCEL_STRENGTH_MAX,
+    WHEEL_ACCEL_STRENGTH_MIN, ZOOM_SPEED_MAX, ZOOM_SPEED_MIN,
 };
 
 #[derive(Clone, Copy)]
@@ -171,6 +173,58 @@ fn viewport_tab(ui: &mut egui::Ui, app: &mut MyCadApp) {
     {
         app.settings_draft.reset_zoom_speed();
     }
+    ui.add_space(12.0);
+    ui.checkbox(&mut app.settings_draft.smooth_zoom, "Smooth zoom");
+    ui.weak("Eases each wheel click over a tenth of a second. Off jumps at once.");
+    ui.add_space(12.0);
+    ui.checkbox(
+        &mut app.settings_draft.wheel_acceleration.enabled,
+        "Accelerate wheel zoom",
+    );
+    ui.add_enabled_ui(app.settings_draft.wheel_acceleration.enabled, |ui| {
+        ui.label("Acceleration strength");
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::Slider::new(
+                    &mut app.settings_draft.wheel_acceleration.strength,
+                    WHEEL_ACCEL_STRENGTH_MIN..=WHEEL_ACCEL_STRENGTH_MAX,
+                )
+                .show_value(false),
+            );
+            ui.add(
+                egui::DragValue::new(&mut app.settings_draft.wheel_acceleration.strength)
+                    .speed(0.05)
+                    .range(WHEEL_ACCEL_STRENGTH_MIN..=WHEEL_ACCEL_STRENGTH_MAX)
+                    .suffix("×")
+                    .max_decimals(2),
+            );
+        });
+    });
+    app.settings_draft.wheel_acceleration.strength =
+        sanitize_wheel_accel_strength(app.settings_draft.wheel_acceleration.strength);
+    ui.weak("Fast consecutive wheel clicks zoom further; a single click stays precise.");
+    ui.add_space(8.0);
+    let acceleration_changed = !app.settings_draft.wheel_acceleration.enabled
+        || (app.settings_draft.wheel_acceleration.strength - DEFAULT_WHEEL_ACCEL_STRENGTH).abs()
+            > 1e-9;
+    if ui
+        .add_enabled(
+            acceleration_changed,
+            egui::Button::new("Reset wheel acceleration"),
+        )
+        .clicked()
+    {
+        app.settings_draft.reset_wheel_acceleration();
+    }
+    ui.add_space(12.0);
+    ui.label("Antialiasing");
+    ui.horizontal(|ui| {
+        for (samples, label) in [(1, "Off"), (2, "2×"), (4, "4×")] {
+            ui.selectable_value(&mut app.settings_draft.viewport_msaa, samples, label);
+        }
+    });
+    app.settings_draft.viewport_msaa = sanitize_viewport_msaa(app.settings_draft.viewport_msaa);
+    ui.weak("Smooths the drawing. Off is fastest while you sketch.");
     ui.add_space(16.0);
     ui.separator();
     ui.heading("Drafting");
@@ -396,8 +450,8 @@ fn export_settings(app: &mut MyCadApp) {
     match snapshot.to_portable_json() {
         Ok(json) => {
             if let Some(path) = rfd::FileDialog::new()
-                .add_filter("MyCad settings", &["json"])
-                .set_file_name("mycad-settings.json")
+                .add_filter("EntoCAD settings", &["json"])
+                .set_file_name("entocad-settings.json")
                 .save_file()
             {
                 match fs::write(&path, json) {
@@ -416,7 +470,7 @@ fn export_settings(app: &mut MyCadApp) {
 
 fn import_settings(app: &mut MyCadApp) {
     let Some(path) = rfd::FileDialog::new()
-        .add_filter("MyCad settings", &["json"])
+        .add_filter("EntoCAD settings", &["json"])
         .add_filter("All files", &["*"])
         .pick_file()
     else {

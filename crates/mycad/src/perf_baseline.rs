@@ -10,7 +10,10 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use cad_core::perf::threshold_label;
-use cad_core::{BlockTreeIndex, Document, EntityId, Geometry, MeasureIndex, Point2, SnapIndex};
+use cad_core::{
+    edge_snaps, BlockTreeIndex, Document, Entity, EntityId, Geometry, MeasureIndex, Point2, Point3,
+    SnapIndex,
+};
 use cad_io::{export_pdf, write_dxf, DxfExportOptions, PdfExportOptions};
 use cad_render::{
     tessellate_document, tessellate_document_for_block_edit, BlockEditView, BlockEditViewFrame,
@@ -137,6 +140,7 @@ pub fn run_cpu_baseline(document: &Document, io: bool) -> BaselineReport {
     ));
 
     time_interaction(&display, extents, document, &mut samples);
+    time_incremental_edits(document, &mut samples);
     time_refresh_derived_proxy(document, &mut samples);
     time_block_edit(document, &mut samples);
     time_block_member_patch(document, &mut samples);
@@ -183,6 +187,9 @@ fn time_interaction(
         let world = pick.bounds.center();
         let screen = camera.world_to_screen(world, origin, size);
         timed("click_picking", samples, || {
+            pick_entity(display, &camera, screen, origin, size);
+        });
+        timed("hover hit_test", samples, || {
             pick_entity(display, &camera, screen, origin, size);
         });
 
@@ -368,6 +375,71 @@ fn time_dense_osnap(document: &Document, samples: &mut Vec<Sample>) {
         measures.query(region, &mut edges);
         (points.len(), edges.len())
     });
+    timed("dense intersection snaps", samples, || {
+        let mut edges = Vec::new();
+        measures.query(region, &mut edges);
+        let mut found = Vec::new();
+        edge_snaps(&edges, center, None, half, &mut found);
+        found.len()
+    });
+}
+
+fn time_incremental_edits(document: &Document, samples: &mut Vec<Sample>) {
+    let mut owned = document.clone();
+    let mut display = tessellate_document(&owned);
+    let mut snaps = SnapIndex::build(&owned);
+    let mut measures = MeasureIndex::build(&owned);
+    let line = owned.add_entity(Entity::new(Geometry::Line {
+        start: Point3::from_xy(0.0, 0.0),
+        end: Point3::from_xy(10.0, 0.0),
+    }));
+    let display_before = std::ptr::from_ref(&display);
+    let snaps_before = std::ptr::from_ref(&snaps);
+    let measures_before = std::ptr::from_ref(&measures);
+    timed("incremental LINE append", samples, || {
+        display.append_entity(&owned, &line);
+        snaps.append_entity(&owned, &line);
+        measures.append_entity(&owned, &line);
+    });
+    assert_eq!(std::ptr::from_ref(&display), display_before);
+    assert_eq!(std::ptr::from_ref(&snaps), snaps_before);
+    assert_eq!(std::ptr::from_ref(&measures), measures_before);
+
+    let mut left = line.clone();
+    left.geometry = Geometry::Line {
+        start: Point3::from_xy(0.0, 0.0),
+        end: Point3::from_xy(4.0, 0.0),
+    };
+    let right = owned.add_entity(Entity::new(Geometry::Line {
+        start: Point3::from_xy(6.0, 0.0),
+        end: Point3::from_xy(10.0, 0.0),
+    }));
+    timed("trim split patch", samples, || {
+        display.replace_entity(&owned, &left);
+        snaps.replace_entity(&owned, &left);
+        measures.replace_entity(&owned, &left);
+        display.append_entity(&owned, &right);
+        snaps.append_entity(&owned, &right);
+        measures.append_entity(&owned, &right);
+    });
+
+    let selected: Vec<EntityId> = owned
+        .model_space
+        .iter()
+        .take(64)
+        .map(|entity| entity.id)
+        .collect();
+    let cached = display.overlay_batches(&selected);
+    timed("selection overlay cached hit", samples, || cached.clone());
+
+    timed("trim split undo", samples, || {
+        display.remove_entity(right.id);
+        snaps.remove_entity(right.id);
+        measures.remove_entity(right.id);
+        display.replace_entity(&owned, &line);
+        snaps.replace_entity(&owned, &line);
+        measures.replace_entity(&owned, &line);
+    });
 }
 
 fn time_save_export(document: &Document, samples: &mut Vec<Sample>) {
@@ -481,6 +553,12 @@ mod tests {
             "tessellate_document_for_block_edit",
             "block_edit member patch",
             "dense aperture osnap query",
+            "hover hit_test",
+            "incremental LINE append",
+            "trim split patch",
+            "dense intersection snaps",
+            "selection overlay cached hit",
+            "trim split undo",
         ] {
             assert!(names.contains(&required), "missing {required} in {names:?}");
         }
@@ -488,5 +566,24 @@ mod tests {
             .samples
             .iter()
             .all(|sample| sample.elapsed < Duration::from_secs(5)));
+        for name in [
+            "hover hit_test",
+            "incremental LINE append",
+            "trim split patch",
+            "dense intersection snaps",
+            "selection overlay cached hit",
+            "trim split undo",
+        ] {
+            let sample = report
+                .samples
+                .iter()
+                .find(|sample| sample.name == name)
+                .unwrap_or_else(|| panic!("missing {name}"));
+            assert!(
+                sample.elapsed < Duration::from_millis(33),
+                "{name} took {:.2} ms",
+                sample.millis()
+            );
+        }
     }
 }

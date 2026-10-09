@@ -504,6 +504,7 @@ impl<'a> AuditCtx<'a> {
 }
 
 pub fn print_geometry_audit(document: &Document) {
+    print_hatch_gap_audit(document);
     let mut ctx = AuditCtx {
         document,
         stack: Vec::new(),
@@ -978,4 +979,156 @@ fn collect_linetype_usage(
         }
         stack.pop();
     }
+}
+
+// ------------------------------------------------------------
+// Function: print_hatch_gap_audit
+// Purpose: Compare clockwise HATCH arc endpoints as stored with the
+//          same angles negated. The smaller gap is the reading that
+//          closes loops. Negate only if the mirrored total is smaller.
+// ------------------------------------------------------------
+fn print_hatch_gap_audit(document: &Document) {
+    let mut stored = GapTotals::default();
+    let mut mirrored = GapTotals::default();
+    let mut consider = |entities: &[Entity]| {
+        for entity in entities {
+            let Geometry::Hatch(hatch) = &entity.geometry else {
+                continue;
+            };
+            for path in &hatch.paths {
+                let cad_core::HatchPath::Edges(edges) = path else {
+                    continue;
+                };
+                if !edges.iter().any(edge_is_clockwise_curve) {
+                    continue;
+                }
+                stored.add(loop_gap(edges, false));
+                mirrored.add(loop_gap(edges, true));
+            }
+        }
+    };
+    consider(&document.model_space);
+    for block in document.blocks.values() {
+        consider(&block.entities);
+    }
+    println!(
+        "hatch_cw_loops {} stored_gap_sum {:.3} stored_worst {:.3} mirrored_gap_sum {:.3} mirrored_worst {:.3}",
+        stored.loops, stored.sum, stored.worst, mirrored.sum, mirrored.worst
+    );
+}
+
+#[derive(Default)]
+struct GapTotals {
+    loops: usize,
+    sum: f64,
+    worst: f64,
+}
+
+impl GapTotals {
+    fn add(&mut self, gap: f64) {
+        if !gap.is_finite() {
+            return;
+        }
+        self.loops += 1;
+        self.sum += gap;
+        self.worst = self.worst.max(gap);
+    }
+}
+
+fn edge_is_clockwise_curve(edge: &cad_core::HatchEdge) -> bool {
+    match edge {
+        cad_core::HatchEdge::Arc { is_ccw, .. } | cad_core::HatchEdge::Ellipse { is_ccw, .. } => {
+            !is_ccw
+        }
+        _ => false,
+    }
+}
+
+fn loop_gap(edges: &[cad_core::HatchEdge], mirror_clockwise: bool) -> f64 {
+    let ends: Vec<(Point2, Point2)> = edges
+        .iter()
+        .filter_map(|edge| edge_ends(edge, mirror_clockwise))
+        .collect();
+    if ends.len() < 2 {
+        return 0.0;
+    }
+    let mut gap = 0.0;
+    for pair in ends.windows(2) {
+        gap += pair[0].1.distance(pair[1].0);
+    }
+    gap += ends
+        .last()
+        .map(|end| end.1)
+        .unwrap_or(Point2::new(0.0, 0.0))
+        .distance(ends[0].0);
+    gap
+}
+
+fn edge_ends(edge: &cad_core::HatchEdge, mirror_clockwise: bool) -> Option<(Point2, Point2)> {
+    match edge {
+        cad_core::HatchEdge::Line { start, end } => Some((start.xy(), end.xy())),
+        cad_core::HatchEdge::Arc {
+            center,
+            radius,
+            start_angle,
+            end_angle,
+            is_ccw,
+        } => {
+            let (start_angle, end_angle) =
+                oriented_angles(*start_angle, *end_angle, *is_ccw, mirror_clockwise);
+            Some((
+                polar(center.xy(), *radius, start_angle),
+                polar(center.xy(), *radius, end_angle),
+            ))
+        }
+        cad_core::HatchEdge::Ellipse {
+            center,
+            major_endpoint,
+            axis_ratio,
+            start_angle,
+            end_angle,
+            is_ccw,
+        } => {
+            let (start_angle, end_angle) =
+                oriented_angles(*start_angle, *end_angle, *is_ccw, mirror_clockwise);
+            let major = major_endpoint.xy();
+            let major_len = major.x.hypot(major.y).max(1e-15);
+            let major_dir = Point2::new(major.x / major_len, major.y / major_len);
+            let minor_dir = Point2::new(-major_dir.y, major_dir.x);
+            let minor_len = major_len * axis_ratio.abs().max(1e-15);
+            let at = |angle: f64| {
+                center.xy()
+                    + major_dir * (major_len * angle.cos())
+                    + minor_dir * (minor_len * angle.sin())
+            };
+            Some((at(start_angle), at(end_angle)))
+        }
+        cad_core::HatchEdge::Spline {
+            control_points,
+            fit_points,
+            ..
+        } => {
+            let points = if control_points.len() >= 2 {
+                control_points
+            } else {
+                fit_points
+            };
+            Some((points.first()?.xy(), points.last()?.xy()))
+        }
+    }
+}
+
+fn oriented_angles(start: f64, end: f64, is_ccw: bool, mirror_clockwise: bool) -> (f64, f64) {
+    if mirror_clockwise && !is_ccw {
+        (-start, -end)
+    } else {
+        (start, end)
+    }
+}
+
+fn polar(center: Point2, radius: f64, angle: f64) -> Point2 {
+    Point2::new(
+        center.x + radius * angle.cos(),
+        center.y + radius * angle.sin(),
+    )
 }

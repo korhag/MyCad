@@ -1,4 +1,4 @@
-# MyCad
+# EntoCAD
 
 Linux-first 2D CAD application written in Rust. Milestone 1 is a native DWG
 viewer: open a production drawing, display it in a wgpu viewport, and pan/zoom
@@ -107,7 +107,7 @@ cargo clean --release
 cargo build --release -p mycad
 ```
 
-**Window does not open.** If MyCad prints `MyCad failed to start`, update the
+**Window does not open.** If EntoCAD prints `EntoCAD failed to start`, update the
 GPU driver. To force a graphics backend (useful in a virtual machine or over
 Remote Desktop):
 
@@ -124,7 +124,7 @@ WGPU_BACKEND=vulkan cargo run -p mycad
 
 ### Checking a saved file with ODA File Converter
 
-AutoCAD is not required to build MyCad. To check that a saved DXF or DWG passes an audit, install the free [ODA File Converter](https://www.opendesign.com/guestfiles/oda_file_converter) and point the test at it:
+AutoCAD is not required to build EntoCAD. To check that a saved DXF or DWG passes an audit, install the free [ODA File Converter](https://www.opendesign.com/guestfiles/oda_file_converter) and point the test at it:
 
 ```powershell
 $env:MYCAD_ODA_FILE_CONVERTER = "C:\Program Files\ODA\ODAFileConverter\ODAFileConverter.exe"
@@ -135,10 +135,10 @@ The test is skipped when that variable is unset. It converts the written DXF and
 
 ## Usage
 
-- **File → New** (`Ctrl+N`) starts an empty drawing in millimetres on layer 0. If the current drawing has unsaved edits, MyCad asks before replacing it. The first save uses Save As.
-- **File → Open** (`Ctrl+O`) to pick a DWG. If `Plant.dwg.mycad` sits beside it, MyCad loads the dynamic blocks stored there. Opening the companion file itself opens the DWG.
-- **File → Save** (`Ctrl+S`) overwrites a previously saved DXF in place. An opened DWG always goes through Save As with a `*-MyCad.dwg` copy name so the original file is not overwritten. A compact Save icon on the menu bar (tooltip **Save** / **Ctrl+S**) runs the same command. Successful saves report in the status bar (`Saved Plant.dxf`, `Saved Plant.dwg`, or `DWG saved with 3 compatibility warnings`) without a dialog. When the original drawing had classes that were not carried over, the status bar also names how many and points at Diagnostics.
-- **File → Save As…** (`Ctrl+Shift+S`) writes AutoCAD 2000 DXF or **DWG AutoCAD 2000**. DWG save goes through the DXF writer, then LibreDWG. The DWG stays a normal drawing: dynamic blocks are written as ordinary static blocks, so AutoCAD opens them without MyCad. MyCad also writes `Plant.dwg.mycad` next to the drawing and uses it to restore those dynamic blocks on the next open. A block edited outside MyCad stays static. Older `.mycad` drawings still open; new drawings are not saved in that format. Paper space and extra sheets are written as layouts, including VIEWPORT entities and the sheet size. Block attributes, text styles, layer lock/plot/lineweight, hatch pattern names, dimensions, external-reference paths, and complex linetype shapes are written with the drawing. TrueType font names are saved; the viewport still draws the stroke font. An external reference is not loaded. An image or wipeout is drawn as its frame and saved as a closed polyline, because a real IMAGE object does not survive the DWG writer. If the drawing has entities MyCad cannot fully keep, or a complex linetype that could not be stored, a prompt lists them and asks to **Save a Copy**. Classes that were not carried over are listed in Diagnostics instead of that prompt. The original file is never overwritten. The copy is named `*-MyCad`.
+- **File → New** (`Ctrl+N`) starts an empty drawing in millimetres on layer 0. If the current drawing has unsaved edits, EntoCAD asks before replacing it. The first save uses Save As.
+- **File → Open** (`Ctrl+O`) to pick a DWG. If `Plant.dwg.mycad` sits beside it, EntoCAD loads the dynamic blocks stored there. Opening the companion file itself opens the DWG.
+- **File → Save** (`Ctrl+S`) overwrites a previously saved DXF in place. An opened DWG always goes through Save As with a `*-EntoCAD.dwg` copy name so the original file is not overwritten. A compact Save icon on the menu bar (tooltip **Save** / **Ctrl+S**) runs the same command. Successful saves report in the status bar (`Saved Plant.dxf`, `Saved Plant.dwg`, or `DWG saved with 3 compatibility warnings`) without a dialog. When the original drawing had classes that were not carried over, the status bar also names how many and points at Diagnostics.
+- **File → Save As…** (`Ctrl+Shift+S`) writes AutoCAD 2000 DXF or **DWG AutoCAD 2000**. DWG save goes through the DXF writer, then LibreDWG. The DWG stays a normal drawing: dynamic blocks are written as ordinary static blocks, so AutoCAD opens them without EntoCAD. EntoCAD also writes `Plant.dwg.mycad` next to the drawing and uses it to restore those dynamic blocks on the next open. A block edited outside EntoCAD stays static. Older `.mycad` drawings still open; new drawings are not saved in that format. Paper space and extra sheets are written as layouts, including VIEWPORT entities and the sheet size. Block attributes, text styles, layer lock/plot/lineweight, hatch pattern names, dimensions, external-reference paths, and complex linetype shapes are written with the drawing. TrueType font names are saved; the viewport still draws the stroke font. An external reference is not loaded. An image or wipeout is drawn as its frame and saved as a closed polyline, because a real IMAGE object does not survive the DWG writer. If the drawing has entities EntoCAD cannot fully keep, or a complex linetype that could not be stored, a prompt lists them and asks to **Save a Copy**. Classes that were not carried over are listed in Diagnostics instead of that prompt. The original file is never overwritten. The copy is named `*-EntoCAD`.
 - **File → Export → PDF…** opens a plot dialog, then writes a vector PDF of plottable model-space geometry (not a viewport screenshot). Paper A4–A0, portrait or landscape, extents, fit to page, color or monochrome, and 5/10/15 mm margins. The drawing path and dirty state are unchanged. A finished export reports `Exported Plant.pdf` in the status bar.
 - Pass a path on the command line for repeatable testing.
 - **Left-click** an entity to select it (line, circle, polyline, block insert, and other drawable types). Nested block geometry selects the parent block.

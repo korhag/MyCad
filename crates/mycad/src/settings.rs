@@ -16,6 +16,15 @@ pub const DEFAULT_ZOOM_SPEED: f64 = 1.0;
 pub const ZOOM_SPEED_MIN: f64 = 0.25;
 pub const ZOOM_SPEED_MAX: f64 = 10.0;
 pub const ZOOM_SCROLL_BASE: f64 = 1.001;
+pub const DEFAULT_WHEEL_ACCEL_STRENGTH: f64 = 1.0;
+pub const WHEEL_ACCEL_STRENGTH_MIN: f64 = 0.25;
+pub const WHEEL_ACCEL_STRENGTH_MAX: f64 = 3.0;
+/// Same-direction clicks closer than this continue one streak.
+pub const WHEEL_ACCEL_WINDOW_SECS: f64 = 0.25;
+/// Added to the zoom multiplier for each click after the first, at strength 1.
+pub const WHEEL_ACCEL_STEP: f64 = 0.35;
+pub const WHEEL_ACCEL_MAX_MULTIPLIER: f64 = 5.0;
+pub const DEFAULT_VIEWPORT_MSAA: u32 = 4;
 pub const BOX_FILL_ALPHA: u8 = 40;
 
 // ------------------------------------------------------------
@@ -141,6 +150,33 @@ impl ThumbnailRefreshPolicySetting {
 }
 
 // ------------------------------------------------------------
+// Type: WheelAccelerationSettings
+// Purpose: Consecutive same-direction wheel clicks zoom further.
+//          A single click stays at 1× so precise steps are unchanged.
+// ------------------------------------------------------------
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WheelAccelerationSettings {
+    pub enabled: bool,
+    pub strength: f64,
+}
+
+impl Default for WheelAccelerationSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            strength: DEFAULT_WHEEL_ACCEL_STRENGTH,
+        }
+    }
+}
+
+impl WheelAccelerationSettings {
+    pub fn sanitize(&mut self) {
+        self.strength = sanitize_wheel_accel_strength(self.strength);
+    }
+}
+
+// ------------------------------------------------------------
 // Type: AppSettings
 // Purpose: User preferences that survive restart and can be copied
 //          between machines as JSON. New fields must carry
@@ -167,6 +203,30 @@ pub struct AppSettings {
     pub compact_home_height_applied: bool,
     #[serde(default)]
     pub library_preview: LibraryPreviewSettings,
+    #[serde(default)]
+    pub wheel_acceleration: WheelAccelerationSettings,
+    /// Offscreen viewport samples. The window itself stays at one sample.
+    #[serde(default = "default_viewport_msaa")]
+    pub viewport_msaa: u32,
+    /// Ease each wheel click instead of jumping to the new zoom.
+    #[serde(default = "default_smooth_zoom")]
+    pub smooth_zoom: bool,
+}
+
+fn default_viewport_msaa() -> u32 {
+    DEFAULT_VIEWPORT_MSAA
+}
+
+fn default_smooth_zoom() -> bool {
+    true
+}
+
+pub fn sanitize_viewport_msaa(value: u32) -> u32 {
+    match value {
+        1 => 1,
+        2 => 2,
+        _ => DEFAULT_VIEWPORT_MSAA,
+    }
 }
 
 impl Default for AppSettings {
@@ -183,6 +243,9 @@ impl Default for AppSettings {
             responsive_ribbon_recovered: false,
             compact_home_height_applied: false,
             library_preview: LibraryPreviewSettings::default(),
+            wheel_acceleration: WheelAccelerationSettings::default(),
+            viewport_msaa: DEFAULT_VIEWPORT_MSAA,
+            smooth_zoom: default_smooth_zoom(),
         }
     }
 }
@@ -204,6 +267,8 @@ impl AppSettings {
 
     pub fn sanitize(&mut self) {
         self.zoom_speed = sanitize_zoom_speed(self.zoom_speed);
+        self.wheel_acceleration.sanitize();
+        self.viewport_msaa = sanitize_viewport_msaa(self.viewport_msaa);
         self.bindings.sanitize();
         let mut state = decode_dock_layout(self.dock_layout.as_ref());
         self.home_layout_migrated = migrate_home_tab(&mut state, self.home_layout_migrated);
@@ -230,6 +295,10 @@ impl AppSettings {
         self.zoom_speed = DEFAULT_ZOOM_SPEED;
     }
 
+    pub fn reset_wheel_acceleration(&mut self) {
+        self.wheel_acceleration = WheelAccelerationSettings::default();
+    }
+
     pub fn to_portable_json(&self) -> Result<String, String> {
         let mut settings = self.clone();
         settings.sanitize();
@@ -249,7 +318,8 @@ impl AppSettings {
             .unwrap_or(0) as u32;
         if version > SETTINGS_SCHEMA_VERSION {
             return Err(format!(
-                "Settings file version {version} is newer than this MyCad build (supports {SETTINGS_SCHEMA_VERSION})."
+                "Settings file version {version} is newer than this {} build (supports {SETTINGS_SCHEMA_VERSION}).",
+                crate::brand::APP_NAME
             ));
         }
         let file: SettingsFile = serde_json::from_value(value)
@@ -273,6 +343,14 @@ pub fn sanitize_zoom_speed(value: f64) -> f64 {
         value.clamp(ZOOM_SPEED_MIN, ZOOM_SPEED_MAX)
     } else {
         DEFAULT_ZOOM_SPEED
+    }
+}
+
+pub fn sanitize_wheel_accel_strength(value: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(WHEEL_ACCEL_STRENGTH_MIN, WHEEL_ACCEL_STRENGTH_MAX)
+    } else {
+        DEFAULT_WHEEL_ACCEL_STRENGTH
     }
 }
 
@@ -349,6 +427,7 @@ mod tests {
     fn missing_fields_use_defaults() {
         let decoded = AppSettings::from_portable_json("{\"schema_version\":1}").expect("empty");
         assert!((decoded.zoom_speed - DEFAULT_ZOOM_SPEED).abs() < 1e-15);
+        assert!(decoded.smooth_zoom);
         assert!(!decoded
             .bindings
             .bindings_for(InputAction::SelectReplace)
@@ -614,5 +693,40 @@ mod tests {
         core.generate_missing = false;
         assert!(!core.generation_allowed());
         assert!(!core.hover_may_decode_source());
+    }
+
+    #[test]
+    fn sanitize_wheel_accel_clamps_and_replaces_non_finite() {
+        assert!((sanitize_wheel_accel_strength(0.1) - WHEEL_ACCEL_STRENGTH_MIN).abs() < 1e-15);
+        assert!((sanitize_wheel_accel_strength(1.5) - 1.5).abs() < 1e-15);
+        assert!((sanitize_wheel_accel_strength(9.0) - WHEEL_ACCEL_STRENGTH_MAX).abs() < 1e-15);
+        assert!(
+            (sanitize_wheel_accel_strength(f64::NAN) - DEFAULT_WHEEL_ACCEL_STRENGTH).abs() < 1e-15
+        );
+        assert!(
+            (sanitize_wheel_accel_strength(f64::INFINITY) - DEFAULT_WHEEL_ACCEL_STRENGTH).abs()
+                < 1e-15
+        );
+    }
+
+    #[test]
+    fn json_round_trip_preserves_wheel_acceleration() {
+        let mut settings = AppSettings::default();
+        settings.wheel_acceleration.enabled = false;
+        settings.wheel_acceleration.strength = 2.25;
+        let json = settings.to_portable_json().expect("encode");
+        let decoded = AppSettings::from_portable_json(&json).expect("decode");
+        assert!(!decoded.wheel_acceleration.enabled);
+        assert!((decoded.wheel_acceleration.strength - 2.25).abs() < 1e-12);
+    }
+
+    #[test]
+    fn old_zoom_only_json_uses_default_wheel_acceleration() {
+        let decoded = AppSettings::from_portable_json("{\"zoom_speed\":2.5}").expect("legacy");
+        assert_eq!(
+            decoded.wheel_acceleration,
+            WheelAccelerationSettings::default()
+        );
+        assert!((decoded.zoom_speed - 2.5).abs() < 1e-12);
     }
 }

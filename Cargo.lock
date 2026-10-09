@@ -452,14 +452,14 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "cad-core"
-version = "0.40.1"
+version = "0.44.2"
 dependencies = [
  "thiserror 2.0.20",
 ]
 
 [[package]]
 name = "cad-io"
-version = "0.40.1"
+version = "0.44.2"
 dependencies = [
  "cad-core",
  "serde",
@@ -469,7 +469,7 @@ dependencies = [
 
 [[package]]
 name = "cad-render"
-version = "0.40.1"
+version = "0.44.2"
 dependencies = [
  "bytemuck",
  "cad-core",
@@ -481,7 +481,7 @@ dependencies = [
 
 [[package]]
 name = "cad-viewport"
-version = "0.40.1"
+version = "0.44.2"
 dependencies = [
  "cad-core",
 ]
@@ -768,7 +768,7 @@ dependencies = [
 
 [[package]]
 name = "dwg-import"
-version = "0.40.1"
+version = "0.44.2"
 dependencies = [
  "cad-core",
  "cad-io",
@@ -1728,8 +1728,6 @@ dependencies = [
 [[package]]
 name = "libredwg-sys"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "544185fcd431d3c26fa6105c7b6f1d9cbf122f1ffbb4d426f901dddd0612af04"
 dependencies = [
  "bindgen",
  "cc",
@@ -1860,7 +1858,7 @@ dependencies = [
 
 [[package]]
 name = "mycad"
-version = "0.40.1"
+version = "0.44.2"
 dependencies = [
  "cad-core",
  "cad-io",
@@ -1872,10 +1870,12 @@ dependencies = [
  "egui-phosphor",
  "egui-wgpu",
  "egui_dock",
+ "image",
  "rfd",
  "ron",
  "serde",
  "serde_json",
+ "winresource",
 ]
 
 [[package]]
@@ -2831,6 +2831,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_spanned"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6662b5879511e06e8999a8a235d848113e942c9124f211511b16466ee2995f26"
+dependencies = [
+ "serde_core",
+]
+
+[[package]]
 name = "shlex"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3130,6 +3139,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "toml"
+version = "1.1.6+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "920602543f0911ab71da12c50d59701da54c196d1a2bf5cb4b75667f137a406a"
+dependencies = [
+ "indexmap",
+ "serde_core",
+ "serde_spanned",
+ "toml_datetime",
+ "toml_parser",
+ "toml_writer",
+ "winnow",
+]
+
+[[package]]
 name = "toml_datetime"
 version = "1.1.1+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3158,6 +3182,12 @@ checksum = "1d38ac1cf9b95face32296c0a3ede1fdc270627c9d9c02a7274dd6d960dc4d56"
 dependencies = [
  "winnow",
 ]
+
+[[package]]
+name = "toml_writer"
+version = "1.1.2+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
 
 [[package]]
 name = "tracing"
@@ -3999,6 +4029,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "winresource"
+version = "0.1.31"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0986a8b1d586b7d3e4fe3d9ea39fb451ae22869dcea4aa109d287a374d866087"
+dependencies = [
+ "toml",
+ "version_check",
 ]
 
 [[package]]

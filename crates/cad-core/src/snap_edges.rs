@@ -10,6 +10,9 @@ use crate::measure_index::MeasurePrimitive;
 use crate::snap::{SnapFeature, SnapKind};
 
 const DEDUP_EPS: f64 = 1e-6;
+const MAX_EDGE_CURVES: usize = 64;
+/// Intersection tests actually run after the bounding-box reject.
+pub const MAX_INTERSECTION_PAIRS: usize = 256;
 
 // ------------------------------------------------------------
 // Function: edge_snaps
@@ -18,8 +21,8 @@ const DEDUP_EPS: f64 = 1e-6;
 //          resulting point (a center, a tangent, a foot) may be
 //          farther away than the aperture.
 // ------------------------------------------------------------
-pub fn edge_snaps(
-    primitives: &[MeasurePrimitive],
+pub fn edge_snaps<'a>(
+    primitives: impl IntoIterator<Item = &'a MeasurePrimitive>,
     cursor: Point2,
     base: Option<Point2>,
     aperture: f64,
@@ -30,7 +33,7 @@ pub fn edge_snaps(
         return;
     }
     let mut curves = Vec::new();
-    for primitive in primitives.iter().take(64) {
+    for primitive in primitives.into_iter().take(MAX_EDGE_CURVES) {
         if let Some(curve) = curve_from(primitive) {
             curves.push(curve);
         }
@@ -58,13 +61,26 @@ pub fn edge_snaps(
         }
     }
 
+    let mut hits = Vec::new();
+    let mut pairs = 0usize;
     for left in 0..curves.len() {
         for right in (left + 1)..curves.len() {
-            for point in curves[left].intersections(&curves[right]) {
-                if cursor.distance(point) <= aperture {
-                    emit(out, point, SnapKind::Intersection);
+            if pairs >= MAX_INTERSECTION_PAIRS {
+                break;
+            }
+            if !curves[left].bounds().intersects(curves[right].bounds()) {
+                continue;
+            }
+            pairs += 1;
+            curves[left].collect_hits(&curves[right], false, &mut hits);
+            for hit in &hits {
+                if cursor.distance(hit.point) <= aperture {
+                    emit(out, hit.point, SnapKind::Intersection);
                 }
             }
+        }
+        if pairs >= MAX_INTERSECTION_PAIRS {
+            break;
         }
     }
 }

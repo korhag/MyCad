@@ -926,6 +926,8 @@ impl Document {
 
     pub fn rebuild_entity_index(&mut self) {
         self.entity_locations = self.scan_entity_locations();
+        crate::perf::reserve_map_headroom(&mut self.entity_locations);
+        crate::perf::reserve_vec_headroom(&mut self.model_space);
     }
 
     pub fn entity_index_is_consistent(&self) -> bool {
@@ -1486,8 +1488,12 @@ fn collect_entity_points(
                                     visit(transform.apply(center.xy()));
                                     visit(transform.apply(major_endpoint.xy()));
                                 }
-                                crate::entity::HatchEdge::Spline { control_points } => {
-                                    for p in control_points {
+                                crate::entity::HatchEdge::Spline {
+                                    control_points,
+                                    fit_points,
+                                    ..
+                                } => {
+                                    for p in control_points.iter().chain(fit_points.iter()) {
                                         visit(transform.apply(p.xy()));
                                     }
                                 }

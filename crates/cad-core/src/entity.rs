@@ -1,11 +1,16 @@
 //! Native CAD entities. These types must not mention LibreDWG.
 
-use crate::color::CadColor;
+use crate::color::{CadColor, Rgb};
 use crate::dynamic::InstanceConfiguration;
 use crate::geom::{Point2, Point3};
 use crate::ids::VertexId;
 
 pub const MAX_HATCH_PATTERN_SEGMENTS: usize = 4000;
+/// Parallel lines drawn for one pattern family. A denser family is
+/// thinned so the hatch still covers the whole boundary.
+pub const MAX_HATCH_PATTERN_LINES: usize = 256;
+/// A clipped span that would need more dashes than this is drawn solid.
+pub const MAX_HATCH_DASHES_PER_SPAN: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DimensionKind {
@@ -567,6 +572,9 @@ pub struct HatchData {
     pub pattern_angle: f64,
     pub pattern_type: i16,
     pub double: bool,
+    /// 0 = normal (odd parity), 1 = outermost, 2 = ignore holes.
+    pub style: i16,
+    pub gradient: Option<HatchGradient>,
     pub paths: Vec<HatchPath>,
     pub pattern_lines: Vec<HatchPatternLine>,
 }
@@ -582,10 +590,28 @@ impl Default for HatchData {
             pattern_angle: 0.0,
             pattern_type: 1,
             double: false,
+            style: 0,
+            gradient: None,
             paths: Vec::new(),
             pattern_lines: Vec::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HatchGradient {
+    pub name: String,
+    pub angle: f64,
+    pub shift: f64,
+    pub single_color: bool,
+    pub tint: f64,
+    pub stops: Vec<GradientStop>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GradientStop {
+    pub shift: f64,
+    pub color: Rgb,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -619,8 +645,27 @@ pub enum HatchEdge {
         is_ccw: bool,
     },
     Spline {
+        degree: u32,
+        periodic: bool,
+        knots: Vec<f64>,
+        weights: Vec<f64>,
         control_points: Vec<Point3>,
+        fit_points: Vec<Point3>,
     },
+}
+
+impl HatchEdge {
+    /// A cubic spline through `control_points` when the file omitted the knot data.
+    pub fn spline(control_points: Vec<Point3>) -> Self {
+        Self::Spline {
+            degree: 3,
+            periodic: false,
+            knots: Vec::new(),
+            weights: Vec::new(),
+            control_points,
+            fit_points: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

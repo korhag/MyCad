@@ -1,4 +1,4 @@
-//! Versioned native MyCAD drawing and block-asset persistence.
+//! Versioned native EntoCAD drawing and block-asset persistence.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -7,14 +7,14 @@ use cad_core::{
     validate_definition, ActionId, AnchorDef, AnchorFollow, AnchorId, AnchorPolicy,
     BlockDefinition, BlockDefinitionId, BooleanParameter, CadColor, ChoiceOption, ChoiceParameter,
     CompatibilityRule, CompositionRule, Document, DrawingUnits, DynamicBehavior, DynamicDefinition,
-    Entity, EntityId, FollowRole, Geometry, GeometryGroup, GeometryTarget, HatchData, HatchEdge,
-    HatchPath, HatchPatternLine, InstanceConfiguration, Layer, LineType, MTextData, MeasureMode,
-    NestedInput, NestedMapping, NumericDomain, NumericParameter, NumericQuantity, OccurrencePath,
-    OptionId, ParameterCondition, ParameterDef, ParameterId, ParameterKind, ParameterUnit,
-    ParameterValue, PlacementBehavior, Point2, Point3, PolyVertex, Preset, PresetId,
-    ReflectionBehavior, RotationBehavior, RotationSource, SizeAuthoring, StepOrigin, StepPolicy,
-    TextBinding, TextBindingMode, TextData, TextHAlign, TextParameter, TextReflectPolicy,
-    TextToken, TextVAlign, VertexId, VisibilityGroup, MAX_BLOCK_DEPTH,
+    Entity, EntityId, FollowRole, Geometry, GeometryGroup, GeometryTarget, GradientStop, HatchData,
+    HatchEdge, HatchGradient, HatchPath, HatchPatternLine, InstanceConfiguration, Layer, LineType,
+    MTextData, MeasureMode, NestedInput, NestedMapping, NumericDomain, NumericParameter,
+    NumericQuantity, OccurrencePath, OptionId, ParameterCondition, ParameterDef, ParameterId,
+    ParameterKind, ParameterUnit, ParameterValue, PlacementBehavior, Point2, Point3, PolyVertex,
+    Preset, PresetId, ReflectionBehavior, Rgb, RotationBehavior, RotationSource, SizeAuthoring,
+    StepOrigin, StepPolicy, TextBinding, TextBindingMode, TextData, TextHAlign, TextParameter,
+    TextReflectPolicy, TextToken, TextVAlign, VertexId, VisibilityGroup, MAX_BLOCK_DEPTH,
 };
 use serde::{Deserialize, Serialize};
 
@@ -294,6 +294,10 @@ enum WireGeometry {
         pattern_type: i16,
         #[serde(default)]
         double: bool,
+        #[serde(default)]
+        style: i16,
+        #[serde(default)]
+        gradient: Option<WireGradient>,
         paths: Vec<WireHatchPath>,
         pattern_lines: Vec<WirePatternLine>,
     },
@@ -436,8 +440,44 @@ enum WireHatchEdge {
         is_ccw: bool,
     },
     Spline {
+        #[serde(default = "default_hatch_spline_degree")]
+        degree: u32,
+        #[serde(default)]
+        periodic: bool,
+        #[serde(default)]
+        knots: Vec<f64>,
+        #[serde(default)]
+        weights: Vec<f64>,
         control_points: Vec<[f64; 3]>,
+        #[serde(default)]
+        fit_points: Vec<[f64; 3]>,
     },
+}
+
+fn default_hatch_spline_degree() -> u32 {
+    3
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WireGradient {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    angle: f64,
+    #[serde(default)]
+    shift: f64,
+    #[serde(default)]
+    single_color: bool,
+    #[serde(default = "default_width_factor")]
+    tint: f64,
+    #[serde(default)]
+    stops: Vec<WireGradientStop>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WireGradientStop {
+    shift: f64,
+    rgb: [u8; 3],
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -822,7 +862,7 @@ pub fn parse_mycad_bytes(bytes: &[u8]) -> Result<Document, ExportError> {
         return Err(ExportError::Validation("drawing is too large".into()));
     }
     let wire: WireFile = serde_json::from_slice(bytes)
-        .map_err(|err| ExportError::Validation(format!("invalid MyCAD drawing: {err}")))?;
+        .map_err(|err| ExportError::Validation(format!("invalid EntoCAD drawing: {err}")))?;
     if wire.format != MYCAD_FORMAT {
         return Err(ExportError::Unsupported(format!(
             "expected format '{MYCAD_FORMAT}', found '{}'",
@@ -831,7 +871,7 @@ pub fn parse_mycad_bytes(bytes: &[u8]) -> Result<Document, ExportError> {
     }
     if wire.schema != MYCAD_SCHEMA {
         return Err(ExportError::Unsupported(format!(
-            "unsupported MyCAD schema {} (this build reads {MYCAD_SCHEMA})",
+            "unsupported EntoCAD schema {} (this build reads {MYCAD_SCHEMA})",
             wire.schema
         )));
     }
@@ -862,7 +902,7 @@ pub fn write_mycadblock(
 pub fn read_mycadblock(path: &Path) -> Result<BlockAsset, ExportError> {
     let bytes = std::fs::read(path).map_err(|source| ExportError::io(path, source))?;
     let wire: WireBlockFile = serde_json::from_slice(&bytes)
-        .map_err(|err| ExportError::Validation(format!("invalid MyCAD block: {err}")))?;
+        .map_err(|err| ExportError::Validation(format!("invalid EntoCAD block: {err}")))?;
     if wire.format != MYCAD_BLOCK_FORMAT {
         return Err(ExportError::Unsupported(format!(
             "expected format '{MYCAD_BLOCK_FORMAT}', found '{}'",
@@ -871,7 +911,7 @@ pub fn read_mycadblock(path: &Path) -> Result<BlockAsset, ExportError> {
     }
     if wire.schema != MYCAD_SCHEMA {
         return Err(ExportError::Unsupported(format!(
-            "unsupported MyCAD block schema {}",
+            "unsupported EntoCAD block schema {}",
             wire.schema
         )));
     }
@@ -1407,6 +1447,8 @@ fn to_wire_geometry(geometry: &Geometry) -> WireGeometry {
             pattern_angle: hatch.pattern_angle,
             pattern_type: hatch.pattern_type,
             double: hatch.double,
+            style: hatch.style,
+            gradient: hatch.gradient.as_ref().map(to_gradient),
             paths: hatch.paths.iter().map(to_hatch_path).collect(),
             pattern_lines: hatch.pattern_lines.iter().map(to_pattern).collect(),
         },
@@ -1592,6 +1634,8 @@ fn from_wire_geometry(geometry: WireGeometry) -> Result<Geometry, ExportError> {
             pattern_angle,
             pattern_type,
             double,
+            style,
+            gradient,
             paths,
             pattern_lines,
         } => Geometry::Hatch(HatchData {
@@ -1615,6 +1659,8 @@ fn from_wire_geometry(geometry: WireGeometry) -> Result<Geometry, ExportError> {
             pattern_angle,
             pattern_type,
             double,
+            style,
+            gradient: gradient.map(from_gradient),
             paths: paths.into_iter().map(from_hatch_path).collect(),
             pattern_lines: pattern_lines.into_iter().map(from_pattern).collect(),
         }),
@@ -2789,8 +2835,20 @@ fn to_hatch_edge(edge: &HatchEdge) -> WireHatchEdge {
             end_angle: *end_angle,
             is_ccw: *is_ccw,
         },
-        HatchEdge::Spline { control_points } => WireHatchEdge::Spline {
+        HatchEdge::Spline {
+            degree,
+            periodic,
+            knots,
+            weights,
+            control_points,
+            fit_points,
+        } => WireHatchEdge::Spline {
+            degree: *degree,
+            periodic: *periodic,
+            knots: knots.clone(),
+            weights: weights.clone(),
             control_points: control_points.iter().copied().map(pt).collect(),
+            fit_points: fit_points.iter().copied().map(pt).collect(),
         },
     }
 }
@@ -2829,9 +2887,65 @@ fn from_hatch_edge(edge: WireHatchEdge) -> HatchEdge {
             end_angle,
             is_ccw,
         },
-        WireHatchEdge::Spline { control_points } => HatchEdge::Spline {
+        WireHatchEdge::Spline {
+            degree,
+            periodic,
+            knots,
+            weights,
+            control_points,
+            fit_points,
+        } => HatchEdge::Spline {
+            degree: degree.max(1),
+            periodic,
+            knots,
+            weights,
             control_points: control_points.into_iter().map(from_pt).collect(),
+            fit_points: fit_points.into_iter().map(from_pt).collect(),
         },
+    }
+}
+
+fn to_gradient(gradient: &HatchGradient) -> WireGradient {
+    WireGradient {
+        name: gradient.name.clone(),
+        angle: gradient.angle,
+        shift: gradient.shift,
+        single_color: gradient.single_color,
+        tint: gradient.tint,
+        stops: gradient
+            .stops
+            .iter()
+            .map(|stop| WireGradientStop {
+                shift: stop.shift,
+                rgb: [stop.color.r, stop.color.g, stop.color.b],
+            })
+            .collect(),
+    }
+}
+
+fn from_gradient(gradient: WireGradient) -> HatchGradient {
+    HatchGradient {
+        name: gradient.name,
+        angle: gradient.angle,
+        shift: gradient.shift,
+        single_color: gradient.single_color,
+        tint: if gradient.tint.is_finite() {
+            gradient.tint
+        } else {
+            1.0
+        },
+        stops: gradient
+            .stops
+            .into_iter()
+            .map(|stop| GradientStop {
+                shift: stop.shift,
+                color: Rgb {
+                    r: stop.rgb[0],
+                    g: stop.rgb[1],
+                    b: stop.rgb[2],
+                },
+            })
+            .collect(),
     }
 }
 
@@ -3424,7 +3538,7 @@ mod tests {
     fn unsupported_schema_is_rejected() {
         let json = r#"{"format":"mycad","schema":99,"document":{"units":0,"ltscale":1,"current_layer":"0","next_entity_id":1,"next_definition_id":1,"next_parameter_id":1,"next_option_id":1,"next_action_id":1,"content_generation":1,"saved_revision":0,"layers":[],"linetypes":[],"blocks":[],"model_space":[]}}"#;
         let err = parse_mycad_bytes(json.as_bytes()).unwrap_err();
-        assert!(err.to_string().contains("unsupported MyCAD schema"));
+        assert!(err.to_string().contains("unsupported EntoCAD schema"));
     }
 
     #[test]

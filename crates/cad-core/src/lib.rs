@@ -26,6 +26,7 @@ pub mod linetype;
 pub mod measure;
 pub mod measure_index;
 pub mod perf;
+pub mod polygon;
 pub mod snap;
 pub mod snap_edges;
 pub mod stroke_font;
@@ -84,9 +85,10 @@ pub use dynamic_model::{
 };
 pub use entity::{
     default_extrusion, AttributeInfo, DimensionData, DimensionKind, Entity, EntityId, Geometry,
-    HatchData, HatchEdge, HatchPath, HatchPatternLine, MTextData, PolyVertex, RasterFrame,
-    TextData, TextHAlign, TextVAlign, ViewportData, ATTRIB_CONSTANT, ATTRIB_INVISIBLE,
-    ATTRIB_PRESET, ATTRIB_VERIFY, LINEWEIGHT_BYBLOCK, LINEWEIGHT_BYLAYER, LINEWEIGHT_DEFAULT,
+    GradientStop, HatchData, HatchEdge, HatchGradient, HatchPath, HatchPatternLine, MTextData,
+    PolyVertex, RasterFrame, TextData, TextHAlign, TextVAlign, ViewportData, ATTRIB_CONSTANT,
+    ATTRIB_INVISIBLE, ATTRIB_PRESET, ATTRIB_VERIFY, LINEWEIGHT_BYBLOCK, LINEWEIGHT_BYLAYER,
+    LINEWEIGHT_DEFAULT, MAX_HATCH_DASHES_PER_SPAN, MAX_HATCH_PATTERN_LINES,
     MAX_HATCH_PATTERN_SEGMENTS,
 };
 pub use entity_transform::{
@@ -105,7 +107,10 @@ pub use geom::{
     arc_from_three_points, ocs_to_wcs, ArcFromPointsError, Point2, Point3, ThreePointArc,
     GEOM_TOLERANCE,
 };
-pub use hatch::{hatch_path_points, hatch_path_points_with_tolerance};
+pub use hatch::{
+    hatch_fill_contours, hatch_path_points, hatch_path_points_with_tolerance,
+    hatch_pattern_segments, GradientRamp,
+};
 pub use ids::{ActionId, AnchorId, BlockDefinitionId, OptionId, ParameterId, PresetId, VertexId};
 pub use linetype::{
     is_byblock_name, is_bylayer_name, is_continuous_name, normalize_linetype_name, LineType,
@@ -121,6 +126,7 @@ pub use measure_index::{
     area_from_primitive, radius_from_primitive, straight_of, MeasureGeom, MeasureIndex,
     MeasurePrimitive, MeasureRole, MEASURE_APERTURE_PX,
 };
+pub use polygon::{contour_contains, contour_depths, point_in_polygon};
 pub use snap::{SnapFeature, SnapIndex, SnapKind, MAX_SNAP_CANDIDATES};
 pub use snap_edges::edge_snaps;
 pub use stroke_font::{

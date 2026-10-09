@@ -5,8 +5,8 @@ use std::collections::HashMap;
 
 use cad_core::dash::{generate_path_dashes_with_tolerance, scaled_pattern, PathSeg};
 use cad_core::{
-    vectorize_entity, CadColor, Document, Entity, EntityId, Extents2, LineType, Point2, Rgb,
-    Transform2, VectorSink, VectorVisibility,
+    vectorize_entity, CadColor, Document, Entity, EntityId, Extents2, GradientRamp, LineType,
+    Point2, Rgb, Transform2, VectorSink, VectorVisibility,
 };
 
 use crate::pick::{box_select_into, EntityPick, SelectBoxMode, SpatialIndex};
@@ -29,6 +29,63 @@ pub struct EntityDrawRange {
     pub line_end: u32,
     pub fill_start: u32,
     pub fill_end: u32,
+}
+
+/// A half-open span of GPU vertices rewritten by one edit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VertexSpan {
+    pub start: u32,
+    pub end: u32,
+}
+
+impl VertexSpan {
+    pub const EMPTY: Self = Self { start: 0, end: 0 };
+
+    pub fn new(start: u32, end: u32) -> Self {
+        if end <= start {
+            Self::EMPTY
+        } else {
+            Self { start, end }
+        }
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.end <= self.start
+    }
+}
+
+/// Vertex spans a remove or replace must upload. In-place edits fill
+/// `lines`/`fills`. A size change also appends a tail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TouchedVertices {
+    pub lines: VertexSpan,
+    pub fills: VertexSpan,
+    pub appended_lines: VertexSpan,
+    pub appended_fills: VertexSpan,
+}
+
+impl TouchedVertices {
+    fn rewritten(lines: VertexSpan, fills: VertexSpan) -> Self {
+        Self {
+            lines,
+            fills,
+            appended_lines: VertexSpan::EMPTY,
+            appended_fills: VertexSpan::EMPTY,
+        }
+    }
+
+    pub fn push_ranges(self, lines: &mut Vec<std::ops::Range<u32>>, fills: &mut Vec<std::ops::Range<u32>>) {
+        push_span(lines, self.lines);
+        push_span(lines, self.appended_lines);
+        push_span(fills, self.fills);
+        push_span(fills, self.appended_fills);
+    }
+}
+
+fn push_span(out: &mut Vec<std::ops::Range<u32>>, span: VertexSpan) {
+    if !span.is_empty() {
+        out.push(span.start..span.end);
+    }
 }
 
 // ------------------------------------------------------------
@@ -109,6 +166,25 @@ impl DisplayList {
         overlay_batches(self, ids)
     }
 
+    // --------------------------------------------------------
+    // Method: finish_build
+    // Purpose: Index the picks and keep edit headroom, so the first
+    //          appended entity does not copy the whole list.
+    // --------------------------------------------------------
+    fn finish_build(&mut self) {
+        self.spatial = SpatialIndex::build(
+            self.picks
+                .iter()
+                .enumerate()
+                .map(|(slot, pick)| (slot as u32, pick.bounds)),
+        );
+        cad_core::perf::reserve_vec_headroom(&mut self.line_vertices);
+        cad_core::perf::reserve_vec_headroom(&mut self.triangle_vertices);
+        cad_core::perf::reserve_vec_headroom(&mut self.picks);
+        cad_core::perf::reserve_vec_headroom(&mut self.draw_ranges);
+        cad_core::perf::reserve_map_headroom(&mut self.pick_of);
+    }
+
     pub fn append_entity(
         &mut self,
         document: &Document,
@@ -157,7 +233,11 @@ impl DisplayList {
         })
     }
 
-    pub fn replace_entity(&mut self, document: &Document, entity: &Entity) -> bool {
+    pub fn replace_entity(
+        &mut self,
+        document: &Document,
+        entity: &Entity,
+    ) -> Option<TouchedVertices> {
         self.replace_entity_with(document, entity, Transform2::identity())
     }
 
@@ -166,11 +246,11 @@ impl DisplayList {
         document: &Document,
         entity: &Entity,
         transform: Transform2,
-    ) -> bool {
+    ) -> Option<TouchedVertices> {
         if !self.pick_of.contains_key(&entity.id) {
             return self
                 .append_entity_with(document, entity, transform, false)
-                .is_some();
+                .map(|range| self.touched_tail(range));
         }
         let mut scratch = DisplayList {
             origin: self.origin,
@@ -190,17 +270,11 @@ impl DisplayList {
         if scratch.picks.len() == before {
             return self.remove_entity(entity.id);
         }
-        let Some(&slot) = self.pick_of.get(&entity.id) else {
-            return false;
-        };
+        let &slot = self.pick_of.get(&entity.id)?;
         let old_range = self.draw_ranges[slot as usize];
         let old_bounds = self.picks[slot as usize].bounds;
-        let Some(new_pick) = scratch.picks.pop() else {
-            return false;
-        };
-        let Some(new_range) = scratch.draw_ranges.pop() else {
-            return false;
-        };
+        let new_pick = scratch.picks.pop()?;
+        let new_range = scratch.draw_ranges.pop()?;
         let new_line_count = new_range.line_end - new_range.line_start;
         let new_fill_count = new_range.fill_end - new_range.fill_start;
         let old_line_count = old_range.line_end - old_range.line_start;
@@ -215,7 +289,10 @@ impl DisplayList {
                 .copy_from_slice(&scratch.triangle_vertices);
             self.picks[slot as usize] = new_pick;
             self.spatial.insert(slot, self.picks[slot as usize].bounds);
-            return true;
+            return Some(TouchedVertices::rewritten(
+                VertexSpan::new(old_range.line_start, old_range.line_end),
+                VertexSpan::new(old_range.fill_start, old_range.fill_end),
+            ));
         }
         collapse_vertices(
             &mut self.line_vertices,
@@ -240,13 +317,16 @@ impl DisplayList {
         };
         self.picks[slot as usize] = new_pick;
         self.spatial.insert(slot, self.picks[slot as usize].bounds);
-        true
+        Some(TouchedVertices {
+            lines: VertexSpan::new(old_range.line_start, old_range.line_end),
+            fills: VertexSpan::new(old_range.fill_start, old_range.fill_end),
+            appended_lines: VertexSpan::new(line_start, self.line_vertices.len() as u32),
+            appended_fills: VertexSpan::new(fill_start, self.triangle_vertices.len() as u32),
+        })
     }
 
-    pub fn remove_entity(&mut self, entity_id: EntityId) -> bool {
-        let Some(&slot) = self.pick_of.get(&entity_id) else {
-            return false;
-        };
+    pub fn remove_entity(&mut self, entity_id: EntityId) -> Option<TouchedVertices> {
+        let &slot = self.pick_of.get(&entity_id)?;
         let range = self.draw_ranges[slot as usize];
         let old_bounds = self.picks[slot as usize].bounds;
         collapse_vertices(&mut self.line_vertices, range.line_start, range.line_end);
@@ -259,7 +339,19 @@ impl DisplayList {
         self.picks[slot as usize] = EntityPick::new(entity_id);
         self.draw_ranges[slot as usize] = EntityDrawRange::default();
         self.pick_of.remove(&entity_id);
-        true
+        Some(TouchedVertices::rewritten(
+            VertexSpan::new(range.line_start, range.line_end),
+            VertexSpan::new(range.fill_start, range.fill_end),
+        ))
+    }
+
+    fn touched_tail(&self, range: AppendedGeometry) -> TouchedVertices {
+        TouchedVertices {
+            lines: VertexSpan::EMPTY,
+            fills: VertexSpan::EMPTY,
+            appended_lines: VertexSpan::new(range.line_start, self.line_vertices.len() as u32),
+            appended_fills: VertexSpan::new(range.fill_start, self.triangle_vertices.len() as u32),
+        }
     }
 
     // --------------------------------------------------------
@@ -445,6 +537,51 @@ impl VectorSink for TessSink<'_> {
         }
         emit_triangles(self.list, &triangulate_even_odd(contours), rgb);
     }
+
+    fn fill_gradient(&mut self, contours: &[Vec<Point2>], ramp: &GradientRamp) {
+        for contour in contours {
+            if let Some(pick) = self.pick.as_mut() {
+                pick.add_fill(contour);
+            }
+        }
+        let (min, max) = contour_bounds(contours);
+        let origin = self.list.origin;
+        for tri in triangulate_even_odd(contours) {
+            for point in tri {
+                let rgb = self.display_rgb(ramp.color_at(ramp.parameter(point, min, max)));
+                self.list
+                    .triangle_vertices
+                    .push(to_gpu(point, origin, rgb.to_array()));
+            }
+        }
+    }
+
+    fn pick_outline(&mut self, pts: &[Point2], closed: bool) {
+        if let Some(pick) = self.pick.as_mut() {
+            pick.add_stroke(pts, closed);
+        }
+    }
+}
+
+fn contour_bounds(contours: &[Vec<Point2>]) -> (Point2, Point2) {
+    let mut min = Point2::new(f64::INFINITY, f64::INFINITY);
+    let mut max = Point2::new(f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for contour in contours {
+        for point in contour {
+            if !point.is_finite() {
+                continue;
+            }
+            min.x = min.x.min(point.x);
+            min.y = min.y.min(point.y);
+            max.x = max.x.max(point.x);
+            max.y = max.y.max(point.y);
+        }
+    }
+    if !min.x.is_finite() {
+        (Point2::new(0.0, 0.0), Point2::new(0.0, 0.0))
+    } else {
+        (min, max)
+    }
 }
 
 pub fn tessellate_document(document: &Document) -> DisplayList {
@@ -468,12 +605,7 @@ pub fn tessellate_document(document: &Document) -> DisplayList {
     for (entity_index, entity) in document.model_space.iter().enumerate() {
         emit_top_level_entity(document, entity, entity_index, &mut list, &mut stack);
     }
-    list.spatial = SpatialIndex::build(
-        list.picks
-            .iter()
-            .enumerate()
-            .map(|(slot, pick)| (slot as u32, pick.bounds)),
-    );
+    list.finish_build();
     list
 }
 
@@ -522,12 +654,7 @@ pub fn tessellate_document_for_block_edit(
         &mut list,
         &mut stack,
     );
-    list.spatial = SpatialIndex::build(
-        list.picks
-            .iter()
-            .enumerate()
-            .map(|(slot, pick)| (slot as u32, pick.bounds)),
-    );
+    list.finish_build();
     list
 }
 

@@ -2,12 +2,13 @@
 //!
 //! Fallback policy (never silent):
 //! - Supported native types are written as the matching DXF entity.
-//! - Types MyCAD cannot represent fully are exploded to simpler primitives
+//! - Types EntoCAD cannot represent fully are exploded to simpler primitives
 //!   and recorded on `SaveReport.warnings` (MLINE segments, HATCH spline
 //!   edges, an attribute with no tag).
 //! - Missing blocks or empty exploded geometry still produce a warning.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write;
 use std::path::Path;
 
 use cad_core::{
@@ -36,6 +37,32 @@ pub fn write_dxf(
     path: &Path,
     options: &DxfExportOptions,
 ) -> Result<SaveReport, ExportError> {
+    let (report, text) = render_dxf(document, options)?;
+    crate::atomic::write_atomic(path, text.as_bytes())
+        .map_err(|source| ExportError::io(path, source))?;
+    Ok(report)
+}
+
+// ------------------------------------------------------------
+// Function: write_dxf_interchange
+// Purpose: Write a throwaway DXF for LibreDWG to read back. A crash
+//          here must not touch the destination DWG, so this skips the
+//          durable temp-file, flush, and replace used by write_dxf.
+// ------------------------------------------------------------
+pub fn write_dxf_interchange(
+    document: &Document,
+    path: &Path,
+    options: &DxfExportOptions,
+) -> Result<SaveReport, ExportError> {
+    let (report, text) = render_dxf(document, options)?;
+    std::fs::write(path, text.as_bytes()).map_err(|source| ExportError::io(path, source))?;
+    Ok(report)
+}
+
+fn render_dxf(
+    document: &Document,
+    options: &DxfExportOptions,
+) -> Result<(SaveReport, String), ExportError> {
     let mut writer = DxfWriter::new(document, options.version);
     writer.write_document();
     if writer.nonfinite {
@@ -43,9 +70,7 @@ pub fn write_dxf(
             "DXF cannot store non-finite coordinates or scales",
         ));
     }
-    crate::atomic::write_atomic(path, writer.out.as_bytes())
-        .map_err(|source| ExportError::io(path, source))?;
-    Ok(writer.report)
+    Ok((writer.report, writer.out))
 }
 
 #[derive(Clone)]
@@ -78,6 +103,8 @@ struct DxfWriter<'a> {
     export_styles: Vec<TextStyle>,
     export_shape_files: Vec<String>,
     style_handles: BTreeMap<String, String>,
+    plot_style: String,
+    paper_entity: bool,
     nonfinite: bool,
 }
 
@@ -101,13 +128,15 @@ impl<'a> DxfWriter<'a> {
             export_styles: Vec::new(),
             export_shape_files: Vec::new(),
             style_handles: BTreeMap::new(),
+            plot_style: String::new(),
+            paper_entity: false,
             nonfinite: false,
         }
     }
 
     fn pair(&mut self, code: i16, value: impl AsRef<str>) {
-        self.out
-            .push_str(&format!("{code:3}\n{}\n", value.as_ref()));
+        // Writing into a String does not fail.
+        let _ = write!(self.out, "{code:3}\n{}\n", value.as_ref());
     }
 
     fn pair_f(&mut self, code: i16, value: f64) {
@@ -119,7 +148,11 @@ impl<'a> DxfWriter<'a> {
     }
 
     fn pair_i(&mut self, code: i16, value: i32) {
-        self.pair(code, value.to_string());
+        let _ = write!(self.out, "{code:3}\n{value}\n");
+    }
+
+    fn pair_hex(&mut self, code: i16, value: u64) {
+        let _ = write!(self.out, "{code:3}\n{value:X}\n");
     }
 
     fn next_handle(&mut self) -> String {
@@ -140,6 +173,9 @@ impl<'a> DxfWriter<'a> {
         for (layout, handle) in self.export_layouts.iter_mut().zip(handles) {
             layout.handle = handle;
         }
+        // Layers reference the Normal plot style. Its handle has to exist
+        // before the LAYER table, which is written before OBJECTS.
+        self.plot_style = self.next_handle();
         self.write_classes();
         self.write_tables();
         self.write_blocks();
@@ -188,12 +224,16 @@ impl<'a> DxfWriter<'a> {
         self.pair_i(62, 256);
         self.pair(9, "$CLAYER");
         self.pair(8, sanitize_name(&self.document.current_layer));
+        self.pair(9, "$DIMSTYLE");
+        self.pair(2, "STANDARD");
+        self.write_dim_header();
         self.pair(9, "$LWDISPLAY");
         self.pair_i(290, 0);
         self.pair(9, "$LTSCALE");
         self.pair_f(40, self.document.ltscale.max(1e-12));
+        self.write_system_header();
         self.pair(9, "$HANDSEED");
-        self.pair(5, format!("{:X}", self.handle));
+        self.pair_hex(5, self.handle);
         // LibreDWG's R2000 decoder copies TDUCREATE into TDCREATE and always
         // calls strftime() with STRFTIME_DATE. A zero Julian day produces
         // tm_mday=0, which MSVC treats as an invalid parameter and aborts
@@ -263,6 +303,9 @@ impl<'a> DxfWriter<'a> {
         self.pair(5, &table_handle);
         self.pair(330, "0");
         self.pair(100, "AcDbSymbolTable");
+        if name == "DIMSTYLE" {
+            self.pair(100, "AcDbDimStyleTable");
+        }
         self.pair_i(70, count);
         table_handle
     }
@@ -310,12 +353,27 @@ impl<'a> DxfWriter<'a> {
         self.pair_i(76, 0);
         self.pair_i(77, 0);
         self.pair_i(78, 0);
+        // UCS axes must be unit length. A zero axis is an audit error.
+        self.pair_f(110, 0.0);
+        self.pair_f(120, 0.0);
+        self.pair_f(130, 0.0);
+        self.pair_f(111, 1.0);
+        self.pair_f(121, 0.0);
+        self.pair_f(131, 0.0);
+        self.pair_f(112, 0.0);
+        self.pair_f(122, 1.0);
+        self.pair_f(132, 0.0);
+        self.pair_i(79, 0);
         self.pair(0, "ENDTAB");
     }
 
     fn write_ltype_table(&mut self) {
-        let owner = self.write_table_header("LTYPE", self.export_linetypes.len() as i32);
-        for linetype in self.export_linetypes.clone() {
+        let mut linetypes: Vec<_> = self.export_linetypes.clone();
+        // BYBLOCK, BYLAYER, then CONTINUOUS. Any other record before
+        // CONTINUOUS makes AutoCAD report "Index 1  0" on CONTINUOUS.
+        linetypes.sort_by_key(|linetype| linetype_table_rank(linetype));
+        let owner = self.write_table_header("LTYPE", linetypes.len() as i32);
+        for linetype in linetypes {
             self.write_ltype(&linetype, &owner);
         }
         self.pair(0, "ENDTAB");
@@ -333,7 +391,10 @@ impl<'a> DxfWriter<'a> {
         self.pair(3, "");
         self.pair_i(72, 65);
         self.pair_i(73, linetype.dashes.len() as i32);
-        let pattern_len: f64 = linetype.dashes.iter().map(|d| d.abs()).sum();
+        let mut pattern_len: f64 = linetype.dashes.iter().map(|d| d.abs()).sum();
+        if pattern_len == 0.0 {
+            pattern_len = 0.0;
+        }
         self.pair_f(40, pattern_len);
         for (index, dash) in linetype.dashes.iter().enumerate() {
             self.pair_f(49, *dash);
@@ -365,8 +426,8 @@ impl<'a> DxfWriter<'a> {
                 ));
             }
         }
-        self.pair_f(44, shape.x_offset);
-        self.pair_f(45, shape.y_offset);
+        // AutoCAD reads a complex dash in this order and ends the element at
+        // the first unexpected group, so scale and rotation come before offsets.
         let scale = if shape.scale.is_finite() {
             shape.scale
         } else {
@@ -379,6 +440,8 @@ impl<'a> DxfWriter<'a> {
             0.0
         };
         self.pair_f(50, degrees);
+        self.pair_f(44, shape.x_offset);
+        self.pair_f(45, shape.y_offset);
         if !shape.text.is_empty() || shape.flag & 2 != 0 {
             self.pair(9, sanitize_text(&shape.text));
         }
@@ -459,6 +522,11 @@ impl<'a> DxfWriter<'a> {
         }
         self.pair(6, sanitize_name(&layer.linetype));
         self.pair_i(370, i32::from(layer.lineweight));
+        self.pair_i(290, if layer.plot { 1 } else { 0 });
+        let plot_style = self.plot_style.clone();
+        if !plot_style.is_empty() {
+            self.pair(390, plot_style);
+        }
     }
 
     fn write_style_table(&mut self) {
@@ -486,11 +554,6 @@ impl<'a> DxfWriter<'a> {
             self.pair(3, &style.font_file);
             self.pair(4, &style.bigfont_file);
         }
-        let mut used_names: BTreeSet<String> = self
-            .export_styles
-            .iter()
-            .map(|style| style.name.to_ascii_uppercase())
-            .collect();
         for file in self.export_shape_files.clone() {
             self.pair(0, "STYLE");
             let record = self
@@ -502,12 +565,9 @@ impl<'a> DxfWriter<'a> {
             self.pair(330, &owner);
             self.pair(100, "AcDbSymbolTableRecord");
             self.pair(100, "AcDbTextStyleTableRecord");
-            let mut record_name = shape_style_record_name(&file);
-            if used_names.contains(&record_name) {
-                record_name = format!("{record_name}_SHAPE");
-            }
-            used_names.insert(record_name.clone());
-            self.pair(2, &record_name);
+            // A shape-file STYLE (group 70 bit 1) must have an empty name.
+            // AutoCAD rejects a name such as LTYPESHP.
+            self.pair(2, "");
             self.pair_i(70, 1);
             self.pair_f(40, 0.0);
             self.pair_f(41, 1.0);
@@ -518,6 +578,64 @@ impl<'a> DxfWriter<'a> {
             self.pair(4, "");
         }
         self.pair(0, "ENDTAB");
+    }
+
+    fn write_dim_header(&mut self) {
+        for (name, value) in dim_defaults() {
+            self.pair(9, name);
+            self.pair_f(40, value);
+        }
+        self.pair(9, "$DIMALTU");
+        self.pair_i(70, 2);
+    }
+
+    fn write_system_header(&mut self) {
+        self.pair(9, "$CELTSCALE");
+        self.pair_f(40, 1.0);
+        for (name, value) in [
+            ("$LUNITS", 2),
+            ("$LUPREC", 4),
+            ("$AUNITS", 0),
+            ("$AUPREC", 0),
+            ("$MAXACTVP", 64),
+            ("$SPLINETYPE", 6),
+            ("$SPLINESEGS", 8),
+            ("$SURFTAB1", 6),
+            ("$SURFTAB2", 6),
+            ("$SURFTYPE", 6),
+            ("$SURFU", 6),
+            ("$SURFV", 6),
+            ("$USRTIMER", 1),
+        ] {
+            self.pair(9, name);
+            self.pair_i(70, value);
+        }
+        self.pair(9, "$TEXTSIZE");
+        self.pair_f(40, 2.5);
+        self.pair(9, "$FINGERPRINTGUID");
+        self.pair(2, "{A5B4C3D2-E1F0-4A5B-8C7D-6E5F4A3B2C1D}");
+        self.pair(9, "$VERSIONGUID");
+        self.pair(2, "{B6C5D4E3-F2A1-4B6C-9D8E-7F6A5B4C3D2E}");
+    }
+
+    fn write_dimstyle_defaults(&mut self) {
+        for (code, value) in [
+            (40, 1.0),
+            (41, 2.5),
+            (42, 0.625),
+            (44, 1.25),
+            (43, 3.75),
+            (140, 2.5),
+            (141, 2.5),
+            (143, 25.4),
+            (144, 1.0),
+            (147, 0.625),
+        ] {
+            self.pair_f(code, value);
+        }
+        self.pair_i(271, 4);
+        self.pair_i(272, 4);
+        self.pair_i(277, 2);
     }
 
     fn write_dimstyle_table(&mut self) {
@@ -542,6 +660,10 @@ impl<'a> DxfWriter<'a> {
             self.pair(100, "AcDbDimStyleTableRecord");
             self.pair(2, sanitize_name(&name));
             self.pair_i(70, 0);
+            self.write_dimstyle_defaults();
+            if let Some(handle) = self.style_handles.get("STANDARD").cloned() {
+                self.pair(340, handle);
+            }
         }
         self.pair(0, "ENDTAB");
     }
@@ -595,7 +717,10 @@ impl<'a> DxfWriter<'a> {
         self.pair(330, owner);
         self.pair(100, "AcDbSymbolTableRecord");
         self.pair(100, "AcDbBlockTableRecord");
-        self.pair(2, sanitize_name(name));
+        self.pair(2, &export_block_name(name));
+        if is_anonymous_block(name) {
+            self.pair_i(70, 1);
+        }
         if let Some(block) = self.document.blocks.get(name) {
             if !block.xref_path.trim().is_empty() {
                 let mut flags = 4 | 32;
@@ -619,8 +744,18 @@ impl<'a> DxfWriter<'a> {
     }
 
     fn write_owner(&mut self) {
+        let paper_owner = if self.paper_entity {
+            self.block_records
+                .iter()
+                .find(|(name, _)| is_primary_paper_space(name))
+                .map(|(_, handle)| handle.clone())
+        } else {
+            None
+        };
         let handle = if let Some(name) = self.block_stack.last() {
             self.block_records.get(name).cloned()
+        } else if let Some(handle) = paper_owner {
+            Some(handle)
         } else if !self.model_record.is_empty() {
             Some(self.model_record.clone())
         } else {
@@ -635,7 +770,9 @@ impl<'a> DxfWriter<'a> {
         self.pair(0, "SECTION");
         self.pair(2, "BLOCKS");
         for layout in self.export_layouts.clone() {
-            if layout.paper {
+            // *MODEL_SPACE and *PAPER_SPACE stay empty. AutoCAD rejects
+            // entities in those two block bodies and reads them from ENTITIES.
+            if layout.paper && !is_primary_paper_space(&layout.block_name) {
                 let block = self.paper_block(&layout.block_name);
                 self.write_block_definition(&layout.block_name, &block);
             } else {
@@ -688,9 +825,9 @@ impl<'a> DxfWriter<'a> {
         self.pair(100, "AcDbEntity");
         self.pair(8, "0");
         self.pair(100, "AcDbBlockBegin");
-        self.pair(2, sanitize_name(name));
+        self.pair(2, &export_block_name(name));
         let mut flags = 0_i32;
-        if name.starts_with('*') && !is_layout_block(name) {
+        if is_anonymous_block(name) {
             flags |= 1;
         }
         if block_has_attdef(block) {
@@ -707,7 +844,7 @@ impl<'a> DxfWriter<'a> {
         self.pair_f(10, block.base_pt.x);
         self.pair_f(20, block.base_pt.y);
         self.pair_f(30, block.base_pt.z);
-        self.pair(3, sanitize_name(name));
+        self.pair(3, &export_block_name(name));
         if !block.xref_path.trim().is_empty() {
             self.pair(1, &block.xref_path);
         }
@@ -730,6 +867,12 @@ impl<'a> DxfWriter<'a> {
         for entity in &self.document.model_space {
             self.write_entity(entity);
         }
+        let paper = self.paper_block("*PAPER_SPACE");
+        self.paper_entity = true;
+        for entity in &paper.entities {
+            self.write_entity(entity);
+        }
+        self.paper_entity = false;
         self.pair(0, "ENDSEC");
     }
 
@@ -764,12 +907,15 @@ impl<'a> DxfWriter<'a> {
                 end_angle,
                 extrusion,
             } => {
-                self.begin_entity("ARC", entity);
+                // ARC is a circle subclass. The circle marker has to come
+                // before the center and radius, and AcDbArc before the angles.
+                self.begin_entity_class("ARC", "AcDbCircle", entity);
                 self.point(10, *center);
                 self.pair_f(40, radius.abs());
+                self.extrusion(*extrusion);
+                self.pair(100, "AcDbArc");
                 self.pair_f(50, start_angle.to_degrees());
                 self.pair_f(51, end_angle.to_degrees());
-                self.extrusion(*extrusion);
                 self.report.entities_written += 1;
             }
             Geometry::Ellipse {
@@ -870,6 +1016,10 @@ impl<'a> DxfWriter<'a> {
                     if !fit_points.is_empty() {
                         self.pair_i(74, fit_points.len() as i32);
                     }
+                    // A stored tolerance of 0 is rejected when the spline is
+                    // written as DWG. AutoCAD's own default is 1e-7.
+                    self.pair_f(42, 1e-7);
+                    self.pair_f(43, 1e-7);
                     for knot in knots {
                         self.pair_f(40, *knot);
                     }
@@ -884,6 +1034,7 @@ impl<'a> DxfWriter<'a> {
                     for point in fit_points {
                         self.point(11, *point);
                     }
+                    self.point(210, WORLD);
                     self.report.entities_written += 1;
                 }
             }
@@ -906,7 +1057,7 @@ impl<'a> DxfWriter<'a> {
                     ));
                 }
                 let insert_handle = self.begin_entity("INSERT", entity);
-                self.pair(2, sanitize_name(block_name));
+                self.pair(2, &export_block_name(block_name));
                 self.point(10, *insertion);
                 self.pair_f(41, scale.x);
                 self.pair_f(42, scale.y);
@@ -973,7 +1124,9 @@ impl<'a> DxfWriter<'a> {
                     self.pair(3, "STANDARD");
                     self.pair_i(71, 1);
                     self.pair_i(72, 0);
-                    self.pair_i(73, 0);
+                    // 3 means the leader was created without an annotation.
+                    // 0 tells AutoCAD to look for an MTEXT that is not there.
+                    self.pair_i(73, 3);
                     self.pair_i(74, 0);
                     self.pair_i(75, 0);
                     self.pair_f(40, 0.0);
@@ -982,6 +1135,9 @@ impl<'a> DxfWriter<'a> {
                     for point in vertices {
                         self.point(10, *point);
                     }
+                    // A zero extrusion is not a unit normal. AutoCAD then
+                    // discards the leader when it is stored in a DWG.
+                    self.point(210, WORLD);
                     self.report.entities_written += 1;
                 }
             }
@@ -1003,7 +1159,7 @@ impl<'a> DxfWriter<'a> {
         closed: bool,
         linetype_generation_continuous: bool,
     ) {
-        self.begin_entity("POLYLINE", entity);
+        let polyline = self.begin_entity("POLYLINE", entity);
         let elevation = vertices.first().map(|vertex| vertex.point.z).unwrap_or(0.0);
         self.pair_f(10, 0.0);
         self.pair_f(20, 0.0);
@@ -1021,9 +1177,10 @@ impl<'a> DxfWriter<'a> {
             self.pair(0, "VERTEX");
             let handle = self.next_handle();
             self.pair(5, handle);
-            self.write_owner();
+            self.pair(330, &polyline);
             self.pair(100, "AcDbEntity");
             self.pair(8, sanitize_name(&entity.layer));
+            write_subentity_color(self, entity.color);
             self.pair(100, "AcDbVertex");
             self.pair(100, "AcDb2dVertex");
             self.point(10, vertex.point);
@@ -1034,9 +1191,10 @@ impl<'a> DxfWriter<'a> {
         self.pair(0, "SEQEND");
         let seq = self.next_handle();
         self.pair(5, seq);
-        self.write_owner();
+        self.pair(330, &polyline);
         self.pair(100, "AcDbEntity");
         self.pair(8, sanitize_name(&entity.layer));
+        write_subentity_color(self, entity.color);
         self.report.entities_written += 1;
     }
 
@@ -1044,7 +1202,7 @@ impl<'a> DxfWriter<'a> {
         if vertices.iter().any(|vertex| vertex.bulge.abs() > 1e-15) {
             self.warn("POLYLINE bulge was dropped because varying Z was exported as a 3D POLYLINE");
         }
-        self.begin_entity_class("POLYLINE", "AcDb3dPolyline", entity);
+        let polyline = self.begin_entity_class("POLYLINE", "AcDb3dPolyline", entity);
         let mut flags = 8_i32;
         if closed {
             flags |= 1;
@@ -1055,9 +1213,10 @@ impl<'a> DxfWriter<'a> {
             self.pair(0, "VERTEX");
             let handle = self.next_handle();
             self.pair(5, handle);
-            self.write_owner();
+            self.pair(330, &polyline);
             self.pair(100, "AcDbEntity");
             self.pair(8, sanitize_name(&entity.layer));
+            write_subentity_color(self, entity.color);
             self.pair(100, "AcDbVertex");
             self.pair(100, "AcDb3dPolylineVertex");
             self.point(10, vertex.point);
@@ -1066,9 +1225,10 @@ impl<'a> DxfWriter<'a> {
         self.pair(0, "SEQEND");
         let seq = self.next_handle();
         self.pair(5, seq);
-        self.write_owner();
+        self.pair(330, &polyline);
         self.pair(100, "AcDbEntity");
         self.pair(8, sanitize_name(&entity.layer));
+        write_subentity_color(self, entity.color);
         self.report.entities_written += 1;
     }
 
@@ -1127,22 +1287,29 @@ impl<'a> DxfWriter<'a> {
             DimensionKind::Ordinate => 6,
         };
         self.begin_entity_class("DIMENSION", "AcDbDimension", entity);
-        self.pair(2, sanitize_name(&data.block_name));
+        // Group order matches the R2000 dimension DXF: common groups, then
+        // the aligned points, then rotation, and only then the rotated
+        // subclass marker. A group after that marker is a premature end.
+        self.pair(2, &export_block_name(&data.block_name));
         self.point(10, data.definition);
         self.point(11, data.text_midpoint);
+        self.pair_i(70, flag | 32);
         if !data.text.is_empty() {
             self.pair(1, sanitize_text(&data.text));
         }
+        self.pair_i(71, 5);
+        self.pair_i(72, 1);
+        self.pair_f(41, 1.0);
+        self.point(210, WORLD);
         self.pair(3, sanitize_name(&data.dimstyle));
-        self.pair_i(70, flag);
         match data.kind {
             DimensionKind::Linear | DimensionKind::Aligned => {
                 self.pair(100, "AcDbAlignedDimension");
                 self.point(13, data.extension1);
                 self.point(14, data.extension2);
                 if data.kind == DimensionKind::Linear {
-                    self.pair(100, "AcDbRotatedDimension");
                     self.pair_f(50, data.rotation.to_degrees());
+                    self.pair(100, "AcDbRotatedDimension");
                 }
             }
             DimensionKind::Radius | DimensionKind::Diameter => {
@@ -1192,7 +1359,13 @@ impl<'a> DxfWriter<'a> {
         self.pair_f(10, 0.0);
         self.pair_f(20, 0.0);
         self.pair_f(30, hatch.elevation);
-        self.extrusion(hatch.extrusion);
+        // AutoCAD requires group 210 on a HATCH even when the normal is world.
+        let normal = if hatch.extrusion.length() < 1e-12 {
+            WORLD
+        } else {
+            hatch.extrusion
+        };
+        self.point(210, normal);
         let mut pattern_lines = hatch.pattern_lines.clone();
         if !hatch.solid_fill && pattern_lines.is_empty() {
             self.warn("HATCH has no pattern definition; one line family was generated");
@@ -1212,25 +1385,31 @@ impl<'a> DxfWriter<'a> {
         for path in &hatch.paths {
             self.write_hatch_path(path);
         }
-        self.pair_i(75, 1);
+        self.pair_i(75, i32::from(hatch.style));
         self.pair_i(76, i32::from(hatch.pattern_type));
-        self.pair_f(52, hatch.pattern_angle.to_degrees());
-        self.pair_f(41, hatch.pattern_scale);
-        self.pair_i(77, i32::from(hatch.double));
-        self.pair_i(78, pattern_lines.len() as i32);
-        for line in &pattern_lines {
-            self.pair_f(53, line.angle.to_degrees());
-            self.pair_f(43, line.base.x);
-            self.pair_f(44, line.base.y);
-            self.pair_f(45, line.offset.x);
-            self.pair_f(46, line.offset.y);
-            self.pair_i(79, line.dashes.len() as i32);
-            for dash in &line.dashes {
-                self.pair_f(49, *dash);
+        // A solid hatch has no pattern definition. AutoCAD expects group 98
+        // immediately after group 76.
+        if !hatch.solid_fill {
+            self.pair_f(52, hatch.pattern_angle.to_degrees());
+            self.pair_f(41, hatch.pattern_scale);
+            self.pair_i(77, i32::from(hatch.double));
+            self.pair_i(78, pattern_lines.len() as i32);
+            for line in &pattern_lines {
+                self.pair_f(53, line.angle.to_degrees());
+                self.pair_f(43, line.base.x);
+                self.pair_f(44, line.base.y);
+                self.pair_f(45, line.offset.x);
+                self.pair_f(46, line.offset.y);
+                self.pair_i(79, line.dashes.len() as i32);
+                for dash in &line.dashes {
+                    self.pair_f(49, *dash);
+                }
             }
         }
-        self.pair_f(47, 0.0);
-        self.pair_i(98, 0);
+        let seed = hatch_seed(hatch);
+        self.pair_i(98, 1);
+        self.pair_f(10, seed.x);
+        self.pair_f(20, seed.y);
         self.report.entities_written += 1;
     }
 
@@ -1249,24 +1428,9 @@ impl<'a> DxfWriter<'a> {
                 self.pair_i(97, 0);
             }
             HatchPath::Edges(edges) => {
-                let mut flat = Vec::new();
-                for edge in edges {
-                    match edge {
-                        HatchEdge::Spline { control_points } => {
-                            self.warn("HATCH spline edges exported as LINE segments");
-                            for pair in control_points.windows(2) {
-                                flat.push(HatchEdge::Line {
-                                    start: pair[0],
-                                    end: pair[1],
-                                });
-                            }
-                        }
-                        other => flat.push(other.clone()),
-                    }
-                }
                 self.pair_i(92, 1);
-                self.pair_i(93, flat.len() as i32);
-                for edge in &flat {
+                self.pair_i(93, edges.len() as i32);
+                for edge in edges {
                     self.write_hatch_edge(edge);
                 }
                 self.pair_i(97, 0);
@@ -1290,6 +1454,7 @@ impl<'a> DxfWriter<'a> {
                 end_angle,
                 is_ccw,
             } => {
+                let (start_angle, end_angle) = dxf_hatch_angles(*start_angle, *end_angle, *is_ccw);
                 self.pair_i(72, 2);
                 self.pair_f(10, center.x);
                 self.pair_f(20, center.y);
@@ -1306,6 +1471,7 @@ impl<'a> DxfWriter<'a> {
                 end_angle,
                 is_ccw,
             } => {
+                let (start_angle, end_angle) = dxf_hatch_angles(*start_angle, *end_angle, *is_ccw);
                 self.pair_i(72, 3);
                 self.pair_f(10, center.x);
                 self.pair_f(20, center.y);
@@ -1316,13 +1482,35 @@ impl<'a> DxfWriter<'a> {
                 self.pair_f(51, end_angle.to_degrees());
                 self.pair_i(73, i32::from(*is_ccw));
             }
-            HatchEdge::Spline { control_points } => {
-                self.warn("HATCH spline edges exported as LINE segments");
-                for pair in control_points.windows(2) {
-                    self.write_hatch_edge(&HatchEdge::Line {
-                        start: pair[0],
-                        end: pair[1],
-                    });
+            HatchEdge::Spline {
+                degree,
+                periodic,
+                knots,
+                weights,
+                control_points,
+                fit_points,
+            } => {
+                let degree = if *degree == 0 { 3 } else { *degree };
+                self.pair_i(72, 4);
+                self.pair_i(94, degree as i32);
+                self.pair_i(73, i32::from(!weights.is_empty()));
+                self.pair_i(74, i32::from(*periodic));
+                self.pair_i(95, knots.len() as i32);
+                self.pair_i(96, control_points.len() as i32);
+                for knot in knots {
+                    self.pair_f(40, *knot);
+                }
+                for point in control_points {
+                    self.pair_f(10, point.x);
+                    self.pair_f(20, point.y);
+                }
+                for weight in weights {
+                    self.pair_f(42, *weight);
+                }
+                self.pair_i(97, fit_points.len() as i32);
+                for point in fit_points {
+                    self.pair_f(11, point.x);
+                    self.pair_f(21, point.y);
                 }
             }
         }
@@ -1336,14 +1524,14 @@ impl<'a> DxfWriter<'a> {
         self.pair_f(50, data.rotation.to_degrees());
         self.pair_f(41, data.width_factor);
         self.pair_f(51, data.oblique.to_degrees());
+        self.pair(7, &style_name(&data.style));
+        self.extrusion(data.extrusion);
         if data.halign.uses_alignment_point() || data.valign.uses_alignment_point() {
             self.point(11, data.alignment);
         }
         self.pair_i(72, i32::from(data.halign.to_dxf()));
         self.pair(100, "AcDbText");
         self.pair_i(73, i32::from(data.valign.to_dxf()));
-        self.pair(7, &style_name(&data.style));
-        self.extrusion(data.extrusion);
     }
 
     fn write_attrib(&mut self, entity: &Entity, data: &TextData, owner: &str) {
@@ -1357,14 +1545,14 @@ impl<'a> DxfWriter<'a> {
         self.pair(330, owner);
         self.pair(100, "AcDbEntity");
         self.pair(8, sanitize_name(&entity.layer));
+        self.paperspace_flag();
         write_entity_color(self, entity.color);
         self.pair(100, "AcDbText");
         self.write_text_fields(data);
         self.pair(100, "AcDbAttribute");
-        self.pair(2, sanitize_name(tag));
-        self.pair_i(70, i32::from(flags));
+        self.pair(2, &export_attribute_tag(tag));
+        self.pair_i(70, i32::from(flags & 0x0F));
         self.pair_i(73, i32::from(data.valign.to_dxf()));
-        self.pair(1, sanitize_text(&data.value));
         self.report.entities_written += 1;
     }
 
@@ -1382,10 +1570,9 @@ impl<'a> DxfWriter<'a> {
         self.write_text_fields(data);
         self.pair(100, "AcDbAttributeDefinition");
         self.pair(3, sanitize_text(prompt));
-        self.pair(2, sanitize_name(tag));
-        self.pair_i(70, i32::from(flags));
+        self.pair(2, &export_attribute_tag(tag));
+        self.pair_i(70, i32::from(flags & 0x0F));
         self.pair_i(74, i32::from(data.valign.to_dxf()));
-        self.pair(1, sanitize_text(&data.value));
     }
 
     fn write_text_fields(&mut self, data: &TextData) {
@@ -1418,7 +1605,15 @@ impl<'a> DxfWriter<'a> {
         self.pair_f(40, data.height.abs().max(1e-9));
         self.pair_f(41, data.width.abs());
         self.pair_i(71, i32::from(data.attachment.clamp(1, 9)));
-        self.pair_f(44, data.line_spacing);
+        // 0 is not a drawing direction. AutoCAD leaves the MTEXT unrepaired.
+        self.pair_i(72, 1);
+        let spacing = if data.line_spacing.is_finite() && data.line_spacing > 1e-9 {
+            data.line_spacing
+        } else {
+            1.0
+        };
+        self.pair_f(44, spacing);
+        self.pair_i(73, 1);
         write_mtext_chunks(&data.value, |code, chunk| {
             self.pair(code, chunk);
         });
@@ -1426,6 +1621,12 @@ impl<'a> DxfWriter<'a> {
         let axis = Point3::from_xy(data.rotation.cos(), data.rotation.sin());
         self.point(11, axis);
         self.extrusion(data.extrusion);
+    }
+
+    fn paperspace_flag(&mut self) {
+        if self.paper_entity {
+            self.pair_i(67, 1);
+        }
     }
 
     fn begin_entity(&mut self, kind: &str, entity: &Entity) -> String {
@@ -1439,6 +1640,7 @@ impl<'a> DxfWriter<'a> {
         self.write_owner();
         self.pair(100, "AcDbEntity");
         self.pair(8, sanitize_name(&entity.layer));
+        self.paperspace_flag();
         write_entity_color(self, entity.color);
         if !cad_core::is_bylayer_name(&entity.linetype) {
             self.pair(6, sanitize_name(&entity.linetype));
@@ -1466,7 +1668,11 @@ impl<'a> DxfWriter<'a> {
         let mline_style = self.next_handle();
         let plot_dict = self.next_handle();
         let plotstyle = self.next_handle();
-        let placeholder = self.next_handle();
+        let placeholder = if self.plot_style.is_empty() {
+            self.next_handle()
+        } else {
+            self.plot_style.clone()
+        };
         let layouts_to_write = self.export_layouts.clone();
 
         self.begin_object("DICTIONARY", &root, "0");
@@ -1681,6 +1887,11 @@ impl<'a> DxfWriter<'a> {
     }
 
     fn extrusion(&mut self, extrusion: Point3) {
+        // A missing normal is stored as (0, 0, 0). Group 210 of (0, 0, 0) is read
+        // as (0, 0, -1), which mirrors the entity.
+        if extrusion.length() < 1e-12 {
+            return;
+        }
         if (extrusion.x - WORLD.x).abs() > 1e-12
             || (extrusion.y - WORLD.y).abs() > 1e-12
             || (extrusion.z - WORLD.z).abs() > 1e-12
@@ -1698,6 +1909,15 @@ impl<'a> DxfWriter<'a> {
         {
             self.report.warnings.push(message.to_string());
         }
+    }
+}
+
+fn write_subentity_color(writer: &mut DxfWriter<'_>, color: CadColor) {
+    // A omitted group 62 on VERTEX defaults to ByBlock, while the polyline
+    // defaults to ByLayer. AutoCAD audits that as a color mismatch.
+    match color {
+        CadColor::ByLayer => writer.pair_i(62, 256),
+        other => write_entity_color(writer, other),
     }
 }
 
@@ -1781,9 +2001,65 @@ fn write_mtext_chunks(value: &str, mut write: impl FnMut(i16, &str)) {
     }
 }
 
+fn dim_defaults() -> [(&'static str, f64); 11] {
+    [
+        ("$DIMSCALE", 1.0),
+        ("$DIMASZ", 2.5),
+        ("$DIMEXO", 0.625),
+        ("$DIMDLI", 3.75),
+        ("$DIMEXE", 1.25),
+        ("$DIMTXT", 2.5),
+        ("$DIMCEN", 2.5),
+        ("$DIMALTF", 25.4),
+        ("$DIMLFAC", 1.0),
+        ("$DIMGAP", 0.625),
+        ("$DIMTFAC", 1.0),
+    ]
+}
+
+fn is_primary_paper_space(name: &str) -> bool {
+    name.trim().eq_ignore_ascii_case("*PAPER_SPACE")
+}
+
 fn is_model_space_name(name: &str) -> bool {
     let upper = name.trim().to_ascii_uppercase();
     upper == "*MODEL_SPACE" || upper == "$MODEL_SPACE"
+}
+
+// Clockwise hatch arcs are stored mirrored in DXF. Internal angles are
+// the real geometry, so the writer negates them on the way out.
+fn dxf_hatch_angles(start: f64, end: f64, is_ccw: bool) -> (f64, f64) {
+    let (start, end) = if is_ccw { (start, end) } else { (-start, -end) };
+    let positive_zero = |angle: f64| if angle == 0.0 { 0.0 } else { angle };
+    (positive_zero(start), positive_zero(end))
+}
+
+fn hatch_seed(hatch: &HatchData) -> Point3 {
+    for path in &hatch.paths {
+        match path {
+            HatchPath::Polyline { vertices, .. } => {
+                if let Some(vertex) = vertices.first() {
+                    return vertex.point;
+                }
+            }
+            HatchPath::Edges(edges) => {
+                for edge in edges {
+                    match edge {
+                        HatchEdge::Line { start, .. } => return *start,
+                        HatchEdge::Arc { center, .. } | HatchEdge::Ellipse { center, .. } => {
+                            return *center;
+                        }
+                        HatchEdge::Spline { control_points, fit_points, .. } => {
+                            if let Some(point) = control_points.first().or(fit_points.first()) {
+                                return *point;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Point3::default()
 }
 
 fn generated_hatch_line(hatch: &HatchData) -> cad_core::HatchPatternLine {
@@ -1826,6 +2102,71 @@ fn style_name(style: &str) -> String {
 
 fn is_layout_block(name: &str) -> bool {
     is_model_space_name(name) || is_paper_layout_block(name)
+}
+
+fn is_anonymous_block(name: &str) -> bool {
+    let name = name.trim();
+    // *D, *U, and *X names are rejected by AutoCAD audit unless they
+    // were created as its own anonymous blocks. Written without the
+    // star, the same block is an ordinary named block.
+    if drops_anonymous_star(name) {
+        return false;
+    }
+    name.starts_with('*') && !is_layout_block(name)
+}
+
+fn linetype_table_rank(linetype: &LineType) -> u8 {
+    match linetype.name.to_ascii_uppercase().as_str() {
+        "BYBLOCK" => 0,
+        "BYLAYER" => 1,
+        "CONTINUOUS" => 2,
+        _ if linetype.dashes.is_empty() => 3,
+        _ => 4,
+    }
+}
+
+fn export_block_name(name: &str) -> String {
+    let sanitized = sanitize_name(name);
+    if drops_anonymous_star(&sanitized) {
+        sanitized[1..].to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn drops_anonymous_star(name: &str) -> bool {
+    is_star_numbered(name, b'D')
+        || is_star_numbered(name, b'U')
+        || is_star_numbered(name, b'X')
+}
+
+fn is_star_numbered(name: &str, kind: u8) -> bool {
+    let bytes = name.as_bytes();
+    bytes.len() > 2
+        && bytes[0] == b'*'
+        && bytes[1].eq_ignore_ascii_case(&kind)
+        && bytes[2..].iter().all(|byte| byte.is_ascii_digit())
+}
+
+fn export_attribute_tag(tag: &str) -> String {
+    // AutoCAD clears a tag that contains a period or '#', then reports
+    // the tag as empty. LibreDWG also drops a tag that contains a
+    // lowercase letter, which AutoCAD then reports the same way.
+    let cleaned: String = sanitize_name(tag)
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                ch.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if cleaned.is_empty() {
+        "TAG".to_string()
+    } else {
+        cleaned
+    }
 }
 
 fn written_entities(document: &Document) -> impl Iterator<Item = &Entity> {
@@ -1933,20 +2274,6 @@ fn shape_file_key(file: &str) -> String {
     format!("SHAPEFILE:{}", file.trim().to_ascii_uppercase())
 }
 
-fn shape_style_record_name(file: &str) -> String {
-    let trimmed = file.trim();
-    let stem = std::path::Path::new(trimmed)
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or(trimmed);
-    let name = sanitize_name(stem);
-    if name == "0" {
-        "SHAPE".to_string()
-    } else {
-        name.to_ascii_uppercase()
-    }
-}
-
 fn collect_shape_files(document: &Document) -> Vec<String> {
     let mut found: BTreeMap<String, String> = BTreeMap::new();
     for linetype in document.linetypes.values() {
@@ -2029,6 +2356,8 @@ fn export_linetypes(document: &Document) -> (Vec<LineType>, Vec<String>) {
         found.insert(linetype.name.to_ascii_uppercase(), linetype.clone());
     }
     let mut warnings = Vec::new();
+    // BYLAYER and BYBLOCK are not patterns, but AutoCAD's audit requires
+    // both names in the LTYPE table.
     let mut needed = vec![
         "BYLAYER".to_string(),
         "BYBLOCK".to_string(),
@@ -2174,7 +2503,7 @@ mod tests {
     use super::*;
     use cad_core::{
         BlockDefinition, CadColor, DrawingUnits, Entity, Geometry, HatchData, HatchEdge, HatchPath,
-        MTextData, Point2, Point3, PolyVertex, RasterFrame, TextData,
+        AttributeInfo, MTextData, Point2, Point3, PolyVertex, RasterFrame, TextData,
     };
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -2188,11 +2517,7 @@ mod tests {
     }
 
     fn write_to_string(document: &Document) -> (SaveReport, String) {
-        let path = temp_path("out.dxf");
-        let report = write_dxf(document, &path, &DxfExportOptions::default()).expect("write");
-        let text = fs::read_to_string(&path).expect("read");
-        let _ = fs::remove_file(&path);
-        (report, text)
+        render_dxf(document, &DxfExportOptions::default()).expect("write")
     }
 
     fn entities_section(text: &str) -> &str {
@@ -2216,6 +2541,9 @@ mod tests {
         assert!(text.contains("$TDUUPDATE"));
         assert!(text.contains("  2\nLTYPE"));
         assert!(text.contains("  2\nLAYER"));
+        assert!(text.contains("\n390\n"), "layers need a plot style handle");
+        assert!(text.contains("$DIMTXT"));
+        assert!(text.contains("$DIMALTF"));
         assert!(text.contains("  2\nBLOCKS"));
         assert!(text.contains("*MODEL_SPACE"));
         assert!(text.contains("  2\nENTITIES"));
@@ -2248,6 +2576,35 @@ mod tests {
         assert!(entities.contains(" 60\n1"));
         assert!(entities.contains(" 30\n3.0"));
         assert!(entities.contains(" 31\n6.0"));
+    }
+
+    #[test]
+    fn zero_extrusion_writes_no_normal() {
+        let mut document = Document::default();
+        document.add_entity(Entity::new(Geometry::LwPolyline {
+            vertices: vec![
+                PolyVertex {
+                    point: Point3::from_xy(1.0, 2.0),
+                    bulge: 0.0,
+                    vertex_id: Default::default(),
+                },
+                PolyVertex {
+                    point: Point3::from_xy(4.0, 2.0),
+                    bulge: 0.0,
+                    vertex_id: Default::default(),
+                },
+            ],
+            closed: false,
+            extrusion: Point3::default(),
+            linetype_generation_continuous: false,
+        }));
+        let (_, text) = write_to_string(&document);
+        let entities = entities_section(&text);
+        assert!(entities.contains("LWPOLYLINE"));
+        assert!(
+            !entities.contains("\n210\n"),
+            "a zero extrusion must not be written as group 210"
+        );
     }
 
     #[test]
@@ -2307,8 +2664,44 @@ mod tests {
         let entities = entities_section(&text);
         assert!(report.entities_written >= 1);
         assert!(entities.contains("DIMENSION"));
-        assert!(entities.contains("*D1"));
+        assert!(entities.contains("\nD1\n"));
         assert!(text.contains("AcDbRotatedDimension"));
+    }
+
+    #[test]
+    fn star_x_block_is_written_as_an_ordinary_name() {
+        let mut document = Document::default();
+        document.blocks.insert(
+            "*X12".into(),
+            BlockDefinition {
+                name: "*X12".into(),
+                base_pt: Point3::from_xy(0.0, 0.0),
+                entities: Vec::new(),
+                ..Default::default()
+            },
+        );
+        let (_, text) = write_to_string(&document);
+        assert!(text.contains("\nX12\n"));
+        assert!(!text.contains("*X12"));
+    }
+
+    #[test]
+    fn attribute_tag_is_written_in_uppercase() {
+        let mut document = Document::default();
+        document.add_entity(Entity::new(Geometry::Text(TextData {
+            value: "J06".into(),
+            is_attrib_def: true,
+            attribute: Some(AttributeInfo {
+                tag: "ILabel".into(),
+                prompt: String::new(),
+                flags: 8,
+            }),
+            ..TextData::default()
+        })));
+        let (_, text) = write_to_string(&document);
+        let entities = entities_section(&text);
+        assert!(entities.contains("\nILABEL\n"));
+        assert!(!entities.contains("ILabel"));
     }
 
     #[test]
@@ -2413,25 +2806,49 @@ mod tests {
     }
 
     #[test]
-    fn hatch_spline_edges_export_as_line_edges() {
+    fn hatch_spline_edges_export_their_degree_and_controls() {
         let mut document = Document::default();
         document.add_entity(Entity::new(Geometry::Hatch(HatchData {
             extrusion: Point3::new(0.0, 0.0, 1.0),
             elevation: 0.0,
             solid_fill: true,
-            paths: vec![HatchPath::Edges(vec![HatchEdge::Spline {
-                control_points: vec![Point3::from_xy(0.0, 0.0), Point3::from_xy(1.0, 1.0)],
-            }])],
+            paths: vec![HatchPath::Edges(vec![HatchEdge::spline(vec![
+                Point3::from_xy(0.0, 0.0),
+                Point3::from_xy(1.0, 1.0),
+            ])])],
             pattern_lines: Vec::new(),
             ..HatchData::default()
         })));
         let (report, text) = write_to_string(&document);
-        assert!(report
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("HATCH spline")));
-        assert!(entities_section(&text).contains("HATCH"));
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        let entities = entities_section(&text);
+        assert!(entities.contains("HATCH"));
+        assert!(entities.contains(" 94\n3\n"), "{entities}");
         assert_eq!(report.entities_written, 1);
+    }
+
+    #[test]
+    fn clockwise_hatch_arc_is_written_mirrored() {
+        let mut document = Document::default();
+        document.add_entity(Entity::new(Geometry::Hatch(HatchData {
+            extrusion: Point3::new(0.0, 0.0, 1.0),
+            elevation: 0.0,
+            solid_fill: true,
+            paths: vec![HatchPath::Edges(vec![HatchEdge::Arc {
+                center: Point3::from_xy(0.0, 0.0),
+                radius: 1.0,
+                start_angle: 0.0,
+                end_angle: std::f64::consts::FRAC_PI_2,
+                is_ccw: false,
+            }])],
+            pattern_lines: Vec::new(),
+            ..HatchData::default()
+        })));
+        let (_, text) = write_to_string(&document);
+        let entities = entities_section(&text);
+        assert!(entities.contains(" 50\n0.0\n"), "{entities}");
+        assert!(entities.contains(" 51\n-90.0\n"), "{entities}");
+        assert!(entities.contains(" 73\n0\n"), "{entities}");
     }
 
     #[test]
@@ -2451,9 +2868,10 @@ mod tests {
         assert_eq!(report.entities_written, 1);
         assert!(entities.contains("MTEXT"));
         assert!(entities.contains("Hello"));
-        // Group 72 is flow direction in DXF but LibreDWG also binds it to
-        // column counts; omit it rather than write a value that aborts read.
-        assert!(!entities.contains(" 72\n"));
+        // Group 72 is the flow direction. 0 leaves the MTEXT unrepaired in
+        // AutoCAD; 1 is left to right.
+        assert!(entities.contains(" 72\n1\n"));
+        assert!(entities.contains(" 73\n1\n"));
         assert!(entities.contains(" 11\n0.0\n 21\n1.0\n"));
         assert!(!entities.contains(" 50\n90"));
     }
@@ -2862,6 +3280,10 @@ mod tests {
         assert!(text.contains("  9\nZ\n"));
         assert!(text.contains(" 46\n1.0"));
         assert!(text.contains("\n340\n"));
+        let element = text.split("AMZIGZAG").nth(1).expect("linetype body");
+        let scale = element.find(" 46\n").expect("scale");
+        let offset = element.find(" 44\n").expect("x offset");
+        assert!(scale < offset, "group 46 must precede group 44");
     }
 
     #[test]

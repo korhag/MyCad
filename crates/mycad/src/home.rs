@@ -44,10 +44,31 @@ pub fn show(ui: &mut Ui, app: &mut MyCadApp) {
     let available = ui.available_size();
     let density = ribbon::density_for(ui, available.y);
     let metrics = ribbon::metrics_for(density, available.y);
-    let groups = home_groups(app);
-    let layer = layer_state(app);
-    if let Some(action) = ribbon::show(ui, &groups, Some(&layer), &metrics) {
-        dispatch(app, action);
+    ensure_home_groups(app);
+    let layer = cached_layer_state(app).clone();
+    let Some(action) = app
+        .home_ribbon
+        .as_ref()
+        .and_then(|(_, _, _, groups)| ribbon::show(ui, groups, Some(&layer), &metrics))
+    else {
+        return;
+    };
+    dispatch(app, action);
+}
+
+fn ensure_home_groups(app: &mut MyCadApp) {
+    let kind = app.command_kind();
+    let undo = app.can_undo();
+    let redo = app.can_redo();
+    let fresh =
+        app.home_ribbon
+            .as_ref()
+            .is_none_or(|(cached_kind, cached_undo, cached_redo, _)| {
+                *cached_kind != kind || *cached_undo != undo || *cached_redo != redo
+            });
+    if fresh {
+        let groups = home_groups(app);
+        app.home_ribbon = Some((kind, undo, redo, groups));
     }
 }
 
@@ -376,6 +397,35 @@ fn later_tooltip(release: &'static str) -> &'static str {
         "v0.6.0" => "Coming in v0.6.0",
         _ => "Coming in a later release",
     }
+}
+
+fn cached_layer_state(app: &mut MyCadApp) -> &LayerState {
+    let key = layer_chip_key(app);
+    let fresh = app
+        .layer_chips
+        .as_ref()
+        .map(|(cached, _)| *cached != key)
+        .unwrap_or(true);
+    if fresh {
+        let state = layer_state(app);
+        app.layer_chips = Some((key, state));
+    }
+    &app.layer_chips.as_ref().expect("layer chips").1
+}
+
+fn layer_chip_key(app: &MyCadApp) -> u64 {
+    let mut hash = app
+        .document
+        .as_ref()
+        .map(|document| document.content_generation())
+        .unwrap_or(0);
+    if let Some(document) = app.document.as_ref() {
+        for byte in document.current_layer.bytes() {
+            hash = hash.wrapping_mul(31).wrapping_add(u64::from(byte));
+        }
+    }
+    hash.wrapping_mul(31)
+        .wrapping_add(app.selection.generation())
 }
 
 fn layer_state(app: &MyCadApp) -> LayerState {

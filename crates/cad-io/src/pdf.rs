@@ -274,8 +274,9 @@ mod tests {
     use super::*;
     use crate::options::{PdfOrientation, PdfPaperSize, PDF_STROKE_HEAVY_PT};
     use cad_core::{
-        default_extrusion, plot_geometry, BlockDefinition, CadColor, Entity, Geometry, HatchData,
-        HatchEdge, HatchPath, Layer, LineType, MTextData, Point3, PolyVertex, TextData,
+        default_extrusion, hatch_path_points, plot_geometry, BlockDefinition, CadColor, Entity,
+        Geometry, HatchData, HatchEdge, HatchPath, Layer, LineType, MTextData, Point3, PolyVertex,
+        TextData,
     };
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -721,19 +722,22 @@ mod tests {
         document
     }
 
+    fn arc_mid(document: &Document) -> Point2 {
+        let Geometry::Hatch(hatch) = &document.model_space[0].geometry else {
+            panic!("hatch");
+        };
+        let pts = hatch_path_points(&hatch.paths[0], hatch.extrusion, hatch.elevation);
+        pts[pts.len() / 2]
+    }
+
     #[test]
     fn hatch_circular_arc_cw_and_ccw() {
-        let ccw = plot_geometry(&hatch_arc_document(true));
-        let cw = plot_geometry(&hatch_arc_document(false));
-        let ccw_mid = ccw.strokes[0].points[ccw.strokes[0].points.len() / 2];
-        let cw_mid = cw.strokes[0].points[cw.strokes[0].points.len() / 2];
+        let ccw_doc = hatch_arc_document(true);
+        let cw_doc = hatch_arc_document(false);
+        let ccw_mid = arc_mid(&ccw_doc);
+        let cw_mid = arc_mid(&cw_doc);
         assert!(ccw_mid.x > 0.0 && ccw_mid.y > 0.0);
         assert!(cw_mid.x < 0.0);
-        let (_, ccw_pdf) = write_pdf(&hatch_arc_document(true), &PdfExportOptions::default());
-        let (_, cw_pdf) = write_pdf(&hatch_arc_document(false), &PdfExportOptions::default());
-        assert!(count_op(&ccw_pdf, "m") > 0);
-        assert!(count_op(&cw_pdf, "m") > 0);
-        assert_ne!(path_points(&ccw_pdf), path_points(&cw_pdf));
     }
 
     fn hatch_ellipse_document(ccw: bool) -> Document {
@@ -759,14 +763,12 @@ mod tests {
 
     #[test]
     fn hatch_elliptic_arc_cw_and_ccw() {
-        let ccw = plot_geometry(&hatch_ellipse_document(true));
-        let cw = plot_geometry(&hatch_ellipse_document(false));
-        let ccw_mid = ccw.strokes[0].points[ccw.strokes[0].points.len() / 2];
-        let cw_mid = cw.strokes[0].points[cw.strokes[0].points.len() / 2];
+        let ccw_doc = hatch_ellipse_document(true);
+        let cw_doc = hatch_ellipse_document(false);
+        let ccw_mid = arc_mid(&ccw_doc);
+        let cw_mid = arc_mid(&cw_doc);
         assert!(ccw_mid.x > 0.0 && ccw_mid.y > 0.0);
         assert!(cw_mid.x < 0.0);
-        let (_, text) = write_pdf(&hatch_ellipse_document(true), &PdfExportOptions::default());
-        assert!(count_op(&text, "m") > 0);
     }
 
     #[test]

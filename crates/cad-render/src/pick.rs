@@ -460,6 +460,7 @@ fn on_segment(a: Point2, b: Point2, p: Point2) -> bool {
 // ------------------------------------------------------------
 pub fn hit_test(
     picks: &[EntityPick],
+    spatial: Option<&SpatialIndex>,
     camera: &Camera2,
     screen: Point2,
     viewport_origin: Point2,
@@ -469,52 +470,105 @@ pub fn hit_test(
     let tolerance_px = tolerance_px.max(0.5);
     let mut best_stroke: Option<Hit> = None;
     let mut best_fill: Option<Hit> = None;
-
-    for (draw_order, pick) in picks.iter().enumerate() {
-        if pick.is_empty() {
-            continue;
+    let mut slots = Vec::new();
+    if let Some(index) = spatial.filter(|index| !index.is_empty()) {
+        let world = camera.screen_to_world(screen, viewport_origin, viewport_size);
+        let scale = camera.pixels_per_world(viewport_size.y).max(1e-15);
+        let pad = tolerance_px / scale + 1e-6;
+        index.gather(
+            Extents2::from_corners(
+                Point2::new(world.x - pad, world.y - pad),
+                Point2::new(world.x + pad, world.y + pad),
+            ),
+            &mut slots,
+        );
+        for slot in slots {
+            let Some(pick) = picks.get(slot as usize) else {
+                continue;
+            };
+            consider_pick(
+                pick,
+                slot as usize,
+                camera,
+                screen,
+                viewport_origin,
+                viewport_size,
+                tolerance_px,
+                &mut best_stroke,
+                &mut best_fill,
+            );
         }
-        if !screen_bounds_hit(
-            pick,
-            camera,
-            screen,
-            viewport_origin,
-            viewport_size,
-            tolerance_px,
-        ) {
-            continue;
-        }
-        for primitive in &pick.primitives {
-            match primitive.kind {
-                PickKind::Stroke { .. } => {
-                    if let Some(dist) = stroke_screen_distance(
-                        primitive,
-                        camera,
-                        screen,
-                        viewport_origin,
-                        viewport_size,
-                    ) {
-                        if dist <= tolerance_px {
-                            consider_hit(&mut best_stroke, pick.entity_id, draw_order, dist);
-                        }
-                    }
-                }
-                PickKind::Fill => {
-                    if fill_contains_screen(
-                        primitive,
-                        camera,
-                        screen,
-                        viewport_origin,
-                        viewport_size,
-                    ) {
-                        consider_hit(&mut best_fill, pick.entity_id, draw_order, 0.0);
-                    }
-                }
-            }
+    } else {
+        for (draw_order, pick) in picks.iter().enumerate() {
+            consider_pick(
+                pick,
+                draw_order,
+                camera,
+                screen,
+                viewport_origin,
+                viewport_size,
+                tolerance_px,
+                &mut best_stroke,
+                &mut best_fill,
+            );
         }
     }
 
     best_stroke.or(best_fill).map(|hit| hit.entity_id)
+}
+
+fn consider_pick(
+    pick: &EntityPick,
+    draw_order: usize,
+    camera: &Camera2,
+    screen: Point2,
+    viewport_origin: Point2,
+    viewport_size: Point2,
+    tolerance_px: f64,
+    best_stroke: &mut Option<Hit>,
+    best_fill: &mut Option<Hit>,
+) {
+    if pick.is_empty() {
+        return;
+    }
+    if !screen_bounds_hit(
+        pick,
+        camera,
+        screen,
+        viewport_origin,
+        viewport_size,
+        tolerance_px,
+    ) {
+        return;
+    }
+    for primitive in &pick.primitives {
+        match primitive.kind {
+            PickKind::Stroke { .. } => {
+                if let Some(dist) = stroke_screen_distance(
+                    primitive,
+                    camera,
+                    screen,
+                    viewport_origin,
+                    viewport_size,
+                ) {
+                    if dist <= tolerance_px {
+                        consider_hit(best_stroke, pick.entity_id, draw_order, dist);
+                    }
+                }
+            }
+            PickKind::Fill => {
+                if fill_contains_screen(
+                    primitive,
+                    camera,
+                    screen,
+                    viewport_origin,
+                    viewport_size,
+                ) {
+                    consider_hit(best_fill, pick.entity_id, draw_order, 0.0);
+                }
+            }
+        }
+    }
 }
 
 struct Hit {

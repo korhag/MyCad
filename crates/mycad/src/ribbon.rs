@@ -275,22 +275,31 @@ pub fn packed_group_width(group: &MeasuredGroup, packed: &PackedGroup, button_ga
     group_width(group, &hidden, button_gap)
 }
 
-pub fn show(
-    ui: &mut Ui,
+#[derive(Clone)]
+struct RibbonLayoutCache {
+    key: u64,
+    packed: Vec<PackedGroup>,
+    used_rows: usize,
+    emergency: bool,
+    content_h: f32,
+}
+
+fn cached_ribbon_layout(
+    ui: &Ui,
     groups: &[RibbonGroup],
-    layer: Option<&LayerState>,
     metrics: &RibbonMetrics,
-) -> Option<RibbonAction> {
-    let available = ui.available_size();
-    let layer_width = layer
-        .map(|state| estimate_layer_width(ui, state, metrics, available.x))
-        .unwrap_or(0.0);
-    let separator = if layer.is_some() {
-        metrics.group_gap
-    } else {
-        0.0
-    };
-    let command_width = (available.x - layer_width - separator).max(32.0);
+    command_width: f32,
+    available_y: f32,
+) -> RibbonLayoutCache {
+    let key = ribbon_layout_key(ui, groups, metrics, command_width, available_y);
+    let id = ui.id().with("ribbon-layout");
+    if let Some(cached) = ui
+        .ctx()
+        .data(|data| data.get_temp::<RibbonLayoutCache>(id))
+        .filter(|cached| cached.key == key)
+    {
+        return cached;
+    }
     let measured: Vec<MeasuredGroup> = groups
         .iter()
         .map(|group| measure_group(ui, group, metrics))
@@ -309,7 +318,7 @@ pub fn show(
         .collect();
     let one_row_fits = groups_fit(&one_row_widths, command_width, 1, metrics.group_gap);
     let use_second_row =
-        should_use_second_row(one_row_fits, available.y, metrics.height_for_rows(2));
+        should_use_second_row(one_row_fits, available_y, metrics.height_for_rows(2));
     let packed = if use_second_row {
         pack_ribbon(
             &measured,
@@ -327,10 +336,70 @@ pub fn show(
         .zip(packed.iter())
         .map(|(group, plan)| packed_group_width(group, plan, metrics.button_gap))
         .collect();
-    let emergency = !groups_fit(&packed_widths, command_width, used_rows, metrics.group_gap);
-    let content_h = metrics
-        .height_for_rows(used_rows)
-        .min(available.y.max(metrics.row_height));
+    let layout = RibbonLayoutCache {
+        key,
+        packed,
+        used_rows,
+        emergency: !groups_fit(&packed_widths, command_width, used_rows, metrics.group_gap),
+        content_h: metrics
+            .height_for_rows(used_rows)
+            .min(available_y.max(metrics.row_height)),
+    };
+    ui.ctx()
+        .data_mut(|data| data.insert_temp(id, layout.clone()));
+    layout
+}
+
+fn ribbon_layout_key(
+    ui: &Ui,
+    groups: &[RibbonGroup],
+    metrics: &RibbonMetrics,
+    command_width: f32,
+    available_y: f32,
+) -> u64 {
+    let mut hash = mix_ribbon(0xcbf2_9ce4_8422_2325, (command_width / 4.0) as u64);
+    hash = mix_ribbon(hash, (available_y / 2.0) as u64);
+    hash = mix_ribbon(hash, metrics.font_size.to_bits() as u64);
+    hash = mix_ribbon(hash, metrics.icon_size.to_bits() as u64);
+    hash = mix_ribbon(hash, u64::from(metrics.show_icons));
+    hash = mix_ribbon(hash, ui.pixels_per_point().to_bits() as u64);
+    for group in groups {
+        for command in &group.commands {
+            hash = mix_ribbon(hash, command.id.as_ptr() as u64);
+            hash = mix_ribbon(hash, u64::from(command.enabled));
+            hash = mix_ribbon(hash, u64::from(command.active));
+            hash = mix_ribbon(hash, u64::from(command.priority));
+        }
+    }
+    hash
+}
+
+fn mix_ribbon(hash: u64, value: u64) -> u64 {
+    hash.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(value)
+}
+
+pub fn show(
+    ui: &mut Ui,
+    groups: &[RibbonGroup],
+    layer: Option<&LayerState>,
+    metrics: &RibbonMetrics,
+) -> Option<RibbonAction> {
+    let available = ui.available_size();
+    let layer_width = layer
+        .map(|state| estimate_layer_width(ui, state, metrics, available.x))
+        .unwrap_or(0.0);
+    let separator = if layer.is_some() {
+        metrics.group_gap
+    } else {
+        0.0
+    };
+    let command_width = (available.x - layer_width - separator).max(32.0);
+    let layout = cached_ribbon_layout(ui, groups, metrics, command_width, available.y);
+    let packed = layout.packed;
+    let used_rows = layout.used_rows;
+    let use_second_row = used_rows == 2;
+    let emergency = layout.emergency;
+    let content_h = layout.content_h;
 
     let mut action = None;
     ui.spacing_mut().item_spacing = Vec2::new(metrics.button_gap, 1.0);

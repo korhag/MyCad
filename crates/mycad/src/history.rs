@@ -167,15 +167,17 @@ pub struct Transaction {
 }
 
 // ------------------------------------------------------------
-// Enum: SpaceChange
-// Purpose: Classify a transaction that only mutates one entity
-//          space, so derived caches can update incrementally.
+// Type: SpaceChange
+// Purpose: The entity edits of a transaction that only mutates one
+//          entity space, so derived caches can update incrementally.
+//          Each entity id lands in at most one group, so applying
+//          removed, then replaced, then inserted gives the same result.
 // ------------------------------------------------------------
-#[derive(Debug, Clone)]
-pub enum SpaceChange {
-    Inserted(Vec<Entity>),
-    Removed(Vec<Entity>),
-    Replaced(Vec<(Entity, Entity)>),
+#[derive(Debug, Clone, Default)]
+pub struct SpaceChange {
+    pub removed: Vec<Entity>,
+    pub replaced: Vec<(Entity, Entity)>,
+    pub inserted: Vec<Entity>,
 }
 
 impl Transaction {
@@ -201,14 +203,14 @@ impl Transaction {
         self.space_change(&EntitySpace::ModelSpace)
     }
 
-    /// Edits that all land in `space` and are all inserts, all removals, or all replacements.
+    /// Entity edits that all land in `space`, with no id in two groups.
     pub fn space_change(&self, space: &EntitySpace) -> Option<SpaceChange> {
         if self.edits.is_empty() {
             return None;
         }
-        let mut inserted = Vec::new();
-        let mut removed = Vec::new();
-        let mut replaced = Vec::new();
+        let mut inserted: Vec<Entity> = Vec::new();
+        let mut removed: Vec<Entity> = Vec::new();
+        let mut replaced: Vec<(Entity, Entity)> = Vec::new();
         for edit in &self.edits {
             match edit {
                 Edit::InsertEntity {
@@ -236,12 +238,27 @@ impl Transaction {
                 _ => return None,
             }
         }
-        match (inserted.is_empty(), removed.is_empty(), replaced.is_empty()) {
-            (false, true, true) => Some(SpaceChange::Inserted(inserted)),
-            (true, false, true) => Some(SpaceChange::Removed(removed)),
-            (true, true, false) => Some(SpaceChange::Replaced(replaced)),
-            _ => None,
+        let groups = usize::from(!inserted.is_empty())
+            + usize::from(!removed.is_empty())
+            + usize::from(!replaced.is_empty());
+        if groups > 1 {
+            let mut seen = std::collections::HashMap::new();
+            let ids = inserted
+                .iter()
+                .map(|entity| (entity.id, 0u8))
+                .chain(removed.iter().map(|entity| (entity.id, 1u8)))
+                .chain(replaced.iter().map(|(_, after)| (after.id, 2u8)));
+            for (id, group) in ids {
+                if *seen.entry(id).or_insert(group) != group {
+                    return None;
+                }
+            }
         }
+        Some(SpaceChange {
+            removed,
+            replaced,
+            inserted,
+        })
     }
 
     pub fn apply(&self, document: &mut Document) {
@@ -468,7 +485,10 @@ mod tests {
             }],
         };
         match inserted.space_change(&block) {
-            Some(SpaceChange::Inserted(entities)) => assert_eq!(entities.len(), 1),
+            Some(change) => {
+                assert_eq!(change.inserted.len(), 1);
+                assert!(change.removed.is_empty() && change.replaced.is_empty());
+            }
             other => panic!("expected insert, got {other:?}"),
         }
         assert!(inserted.model_space_change().is_none());
@@ -487,6 +507,53 @@ mod tests {
             ],
         };
         assert!(mixed.space_change(&EntitySpace::ModelSpace).is_none());
+    }
+
+    #[test]
+    fn space_change_keeps_a_split_and_rejects_one_id_in_two_groups() {
+        let mut before = line(0.0, 0.0, 10.0, 0.0);
+        before.id = cad_core::EntityId(1);
+        let mut after = line(0.0, 0.0, 4.0, 0.0);
+        after.id = before.id;
+        let mut piece = line(6.0, 0.0, 10.0, 0.0);
+        piece.id = cad_core::EntityId(2);
+        let split = Transaction {
+            edits: vec![
+                Edit::ReplaceEntity {
+                    space: EntitySpace::ModelSpace,
+                    index: 0,
+                    before: before.clone(),
+                    after: after.clone(),
+                },
+                Edit::InsertEntity {
+                    space: EntitySpace::ModelSpace,
+                    index: 1,
+                    entity: piece.clone(),
+                },
+            ],
+        };
+        let change = split.model_space_change().expect("split patches");
+        assert_eq!(change.replaced.len(), 1);
+        assert_eq!(change.inserted.len(), 1);
+        let undo = split.invert().model_space_change().expect("undo patches");
+        assert_eq!(undo.removed.len(), 1);
+        assert_eq!(undo.replaced.len(), 1);
+
+        let conflict = Transaction {
+            edits: vec![
+                Edit::InsertEntity {
+                    space: EntitySpace::ModelSpace,
+                    index: 1,
+                    entity: piece.clone(),
+                },
+                Edit::RemoveEntity {
+                    space: EntitySpace::ModelSpace,
+                    index: 1,
+                    entity: piece,
+                },
+            ],
+        };
+        assert!(conflict.model_space_change().is_none());
     }
 
     fn circle(x: f64, y: f64, radius: f64) -> Entity {

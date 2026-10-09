@@ -493,6 +493,8 @@ fn transform_hatch(hatch: &HatchData, matrix: Transform2) -> Result<HatchData, T
         pattern_angle: hatch.pattern_angle,
         pattern_type: hatch.pattern_type,
         double: hatch.double,
+        style: hatch.style,
+        gradient: hatch.gradient.clone(),
         paths,
         pattern_lines,
     })
@@ -556,8 +558,20 @@ fn transform_hatch_edge(edge: &HatchEdge, matrix: Transform2) -> Result<HatchEdg
                 *is_ccw
             },
         },
-        HatchEdge::Spline { control_points } => HatchEdge::Spline {
+        HatchEdge::Spline {
+            degree,
+            periodic,
+            knots,
+            weights,
+            control_points,
+            fit_points,
+        } => HatchEdge::Spline {
+            degree: *degree,
+            periodic: *periodic,
+            knots: knots.clone(),
+            weights: weights.clone(),
             control_points: control_points.iter().map(|p| matrix.apply3(*p)).collect(),
+            fit_points: fit_points.iter().map(|p| matrix.apply3(*p)).collect(),
         },
     })
 }

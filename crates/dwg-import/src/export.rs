@@ -10,7 +10,8 @@ use std::path::{Path, PathBuf};
 
 use cad_core::Document;
 use cad_io::{
-    replace_atomic, sibling_temp_with_extension, write_dxf, DxfExportOptions, SaveReport,
+    replace_atomic, sibling_temp_with_extension, write_dxf_interchange, DxfExportOptions,
+    SaveReport,
 };
 use thiserror::Error;
 
@@ -76,7 +77,10 @@ pub fn convert_dxf_to_dwg(
         Box::new(unsafe { MaybeUninit::zeroed().assume_init() });
     set_header_version(dwg.as_mut(), version.libredwg());
 
-    let read_error = unsafe { libredwg_sys::dxf_read_file(c_dxf.as_ptr(), dwg.as_mut()) };
+    let read_error = {
+        let _span = cad_core::perf::span("dxf_read_file");
+        unsafe { libredwg_sys::dxf_read_file(c_dxf.as_ptr(), dwg.as_mut()) }
+    };
     #[allow(clippy::unnecessary_cast)]
     if read_error >= libredwg_sys::DWG_ERROR_DWG_ERR_CLASSESNOTFOUND as i32 {
         unsafe { libredwg_sys::dwg_free(dwg.as_mut()) };
@@ -88,11 +92,14 @@ pub fn convert_dxf_to_dwg(
 
     crate::ltype::restore_linetype_strings_area(dwg.as_mut());
     set_header_version(dwg.as_mut(), version.libredwg());
-    let write_error = unsafe {
-        libredwg_sys::dwg_write_file(
-            c_dwg.as_ptr(),
-            dwg.as_mut() as *const libredwg_sys::Dwg_Data,
-        )
+    let write_error = {
+        let _span = cad_core::perf::span("dwg_write_file");
+        unsafe {
+            libredwg_sys::dwg_write_file(
+                c_dwg.as_ptr(),
+                dwg.as_mut() as *const libredwg_sys::Dwg_Data,
+            )
+        }
     };
     unsafe { libredwg_sys::dwg_free(dwg.as_mut()) };
     #[allow(clippy::unnecessary_cast)]
@@ -143,28 +150,34 @@ pub fn write_dwg_as(
         let _ = fs::remove_file(&dwg_tmp);
     };
 
-    let report = match write_dxf(document, &dxf_tmp, &DxfExportOptions::default()) {
-        Ok(report) => report,
-        Err(err) => {
-            cleanup();
-            return Err(DwgWriteError::Dxf(err));
+    let report = {
+        let _span = cad_core::perf::span("write_dxf_interchange");
+        match write_dxf_interchange(document, &dxf_tmp, &DxfExportOptions::default()) {
+            Ok(report) => report,
+            Err(err) => {
+                cleanup();
+                return Err(DwgWriteError::Dxf(err));
+            }
         }
     };
     if let Err(err) = convert_dxf_to_dwg(&dxf_tmp, &dwg_tmp, version) {
         cleanup();
         return Err(DwgWriteError::Convert(err));
     }
-    if let Err(err) = OpenOptions::new()
-        .write(true)
-        .open(&dwg_tmp)
-        .and_then(|file| file.sync_all())
     {
-        cleanup();
-        return Err(err.into());
-    }
-    if let Err(err) = replace_atomic(&dwg_tmp, path) {
-        cleanup();
-        return Err(err.into());
+        let _span = cad_core::perf::span("dwg_sync_replace");
+        if let Err(err) = OpenOptions::new()
+            .write(true)
+            .open(&dwg_tmp)
+            .and_then(|file| file.sync_all())
+        {
+            cleanup();
+            return Err(err.into());
+        }
+        if let Err(err) = replace_atomic(&dwg_tmp, path) {
+            cleanup();
+            return Err(err.into());
+        }
     }
     let _ = fs::remove_file(&dxf_tmp);
     Ok(report)
@@ -343,6 +356,68 @@ mod tests {
             }
             Err(other) => panic!("unexpected write_dwg error: {other}"),
         }
+    }
+
+    #[test]
+    fn write_dwg_keeps_every_attdef_in_a_block() {
+        let mut entities = Vec::new();
+        for index in 0..5 {
+            entities.push(cad_core::Entity::new(cad_core::Geometry::Text(
+                cad_core::TextData {
+                    insertion: cad_core::Point3::from_xy(0.0, f64::from(index) * 5.0),
+                    height: 2.5,
+                    value: format!("V{index}"),
+                    is_attrib_def: true,
+                    attribute: Some(cad_core::AttributeInfo {
+                        tag: format!("T{index}"),
+                        prompt: format!("P{index}"),
+                        flags: 0,
+                    }),
+                    ..cad_core::TextData::default()
+                },
+            )));
+        }
+        for index in 0..3 {
+            entities.push(cad_core::Entity::new(cad_core::Geometry::Line {
+                start: cad_core::Point3::from_xy(0.0, f64::from(index)),
+                end: cad_core::Point3::from_xy(10.0, f64::from(index)),
+            }));
+        }
+        let mut document = Document::default();
+        document.blocks.insert(
+            "LABELS".into(),
+            cad_core::BlockDefinition {
+                name: "LABELS".into(),
+                base_pt: cad_core::Point3::default(),
+                entities,
+                ..Default::default()
+            },
+        );
+        let dest = std::env::temp_dir().join(format!("mycad-attdef-{}.dwg", stamp()));
+        write_dwg(&document, &dest).expect("write");
+        let imported = crate::import_dwg(&dest).expect("read");
+        let _ = fs::remove_file(&dest);
+        let block = imported
+            .blocks
+            .get("LABELS")
+            .expect("LABELS block missing after a DWG round trip");
+        let attdefs = block
+            .entities
+            .iter()
+            .filter(|entity| {
+                matches!(
+                    entity.geometry,
+                    cad_core::Geometry::Text(ref text) if text.is_attrib_def
+                )
+            })
+            .count();
+        let lines = block
+            .entities
+            .iter()
+            .filter(|entity| matches!(entity.geometry, cad_core::Geometry::Line { .. }))
+            .count();
+        assert_eq!(attdefs, 5, "ATTDEF count after DWG save");
+        assert_eq!(lines, 3, "line count after DWG save");
     }
 
     #[test]

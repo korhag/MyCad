@@ -306,6 +306,9 @@ impl MeasureIndex {
             let bounds = index.primitives[slot].bounds;
             index.insert_slot(slot as u32, bounds);
         }
+        crate::perf::reserve_vec_headroom(&mut index.primitives);
+        crate::perf::reserve_vec_headroom(&mut index.alive);
+        crate::perf::reserve_map_headroom(&mut index.owner_slots);
         index
     }
 
@@ -346,14 +349,37 @@ impl MeasureIndex {
     }
 
     pub fn query(&self, region: Extents2, out: &mut Vec<MeasurePrimitive>) {
+        let mut slots = Vec::new();
+        self.query_slots(region, &mut slots);
         out.clear();
-        let center = region.center();
-        let mut best: Vec<(u64, usize)> = Vec::new();
-        self.for_region(region, |slot| {
-            if !self.alive.get(slot).copied().unwrap_or(false) {
-                return;
+        for slot in slots {
+            if let Some(primitive) = self.primitive(slot) {
+                out.push(primitive.clone());
             }
-            let Some(primitive) = self.primitives.get(slot) else {
+        }
+    }
+
+    /// Nearest living primitives in `region`, as slots into this index.
+    /// The caller reads them with [`Self::primitive`] instead of cloning.
+    pub fn query_slots(&self, region: Extents2, out: &mut Vec<usize>) {
+        let mut best = Vec::new();
+        self.rank_slots(region, &mut best);
+        out.clear();
+        out.extend(best.into_iter().map(|(_, slot)| slot));
+    }
+
+    pub fn primitive(&self, slot: usize) -> Option<&MeasurePrimitive> {
+        if !self.alive.get(slot).copied().unwrap_or(false) {
+            return None;
+        }
+        self.primitives.get(slot)
+    }
+
+    fn rank_slots(&self, region: Extents2, best: &mut Vec<(u64, usize)>) {
+        best.clear();
+        let center = region.center();
+        self.for_region(region, |slot| {
+            let Some(primitive) = self.primitive(slot) else {
                 return;
             };
             if matches!(primitive.geom, MeasureGeom::ClosedLoop { .. }) {
@@ -384,11 +410,6 @@ impl MeasureIndex {
             }
         });
         best.sort_by_key(|(distance, _)| *distance);
-        for (_, slot) in best {
-            if let Some(primitive) = self.primitives.get(slot) {
-                out.push(primitive.clone());
-            }
-        }
     }
 
     pub fn primitives_for_owner(&self, owner: EntityId) -> impl Iterator<Item = &MeasurePrimitive> {

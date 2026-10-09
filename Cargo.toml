@@ -10,10 +10,10 @@ members = [
 ]
 
 [workspace.package]
-version = "0.40.1"
+version = "0.44.2"
 edition = "2021"
 license = "GPL-3.0-or-later"
-authors = ["MyCad"]
+authors = ["Entomak"]
 rust-version = "1.80"
 
 [workspace.dependencies]
@@ -42,6 +42,15 @@ egui_dock = { version = "0.17", features = ["serde"] }
 egui-phosphor = "0.10"
 thiserror = "2"
 earcutr = "0.4"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+# Dependencies stay optimized in dev so snap and tessellation match a real session.
+[profile.dev.package."*"]
+opt-level = 2
+
+# MSVC 14.41 ICEs on vendored LibreDWG decode.c at /O2 (C1001, 0xC0000005).
+[profile.dev.package."libredwg-sys"]
+opt-level = 1
 
 # MSVC 14.41 ICEs on vendored LibreDWG decode.c at /O2 (C1001, 0xC0000005).
 [profile.release.package."libredwg-sys"]
@@ -51,3 +60,8 @@ opt-level = 1
 # at the default 16 release codegen-units. One unit keeps cargo run --release stable.
 [profile.release.package.mycad]
 codegen-units = 1
+
+# Local LibreDWG. The registry crate is unmodified 0.13.3, whose R2000
+# writer drops entity links and leaves header unit ratios at 0.
+[patch.crates-io]
+libredwg-sys = { path = "vendor/libredwg-sys" }

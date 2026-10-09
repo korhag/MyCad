@@ -4,6 +4,7 @@
 //! uses the same solvers with the edited curve left unbounded, and keeps
 //! the boundary curve finite.
 
+use crate::extents::Extents2;
 use crate::geom::{Point2, GEOM_TOLERANCE};
 use crate::measure::{
     angle_on_arc, bulge_circle, infinite_line_intersection, point_on_circle, point_segment_distance,
@@ -201,11 +202,19 @@ impl Curve {
         }
     }
 
-    pub(crate) fn intersections(&self, other: &Self) -> Vec<Point2> {
-        self.hits(other, false)
-            .into_iter()
-            .map(|hit| hit.point)
-            .collect()
+    pub(crate) fn bounds(&self) -> Extents2 {
+        match self {
+            Self::Segment { start, end } => Extents2::from_corners(*start, *end),
+            Self::Arc(arc) => Extents2::from_corners(
+                Point2::new(arc.center.x - arc.radius, arc.center.y - arc.radius),
+                Point2::new(arc.center.x + arc.radius, arc.center.y + arc.radius),
+            ),
+        }
+    }
+
+    pub(crate) fn collect_hits(&self, other: &Self, extend_self: bool, out: &mut Vec<CurveHit>) {
+        out.clear();
+        out.extend(self.hits(other, extend_self));
     }
 
     /// Intersections with `other`. When `extend_self` is set, this curve

@@ -1,10 +1,11 @@
-//! MyCad — Linux-first 2D CAD application (Milestone 1: DWG viewer).
+//! EntoCAD — Linux-first 2D CAD application (Milestone 1: DWG viewer).
 
 mod app;
 mod audit;
 mod block_edit;
 mod block_prefetch;
 mod blocks;
+mod brand;
 mod command_line;
 mod commands;
 mod config_form;
@@ -26,6 +27,8 @@ mod selection;
 mod settings;
 mod settings_ui;
 mod theme;
+mod view_motion;
+mod wheel_zoom;
 mod workspace;
 
 use std::env;
@@ -36,6 +39,10 @@ use std::process::ExitCode;
 // on any machine, including a VM or a Remote Desktop session.
 const GRAPHICS_STARTUP_HINT: &str = "\
 If the window did not open, update the GPU driver or set WGPU_BACKEND to dx12, vulkan, or gl.";
+
+// Frames the GPU may queue ahead. One keeps the cursor and the drawing in
+// step with the pointer instead of a frame or two behind.
+const MAX_FRAME_LATENCY: u32 = 1;
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -56,18 +63,27 @@ fn main() -> ExitCode {
     }
 
     install_panic_hook();
+    brand::migrate_legacy_storage();
 
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1440.0, 900.0])
+        .with_min_inner_size([800.0, 560.0])
+        .with_title(brand::APP_NAME);
+    if let Some(icon) = brand::window_icon() {
+        viewport = viewport.with_icon(icon);
+    }
     let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1440.0, 900.0])
-            .with_min_inner_size([800.0, 560.0])
-            .with_title("MyCad"),
-        multisampling: cad_render::VIEWPORT_MSAA_SAMPLES as u16,
+        viewport,
+        multisampling: 1,
+        wgpu_options: egui_wgpu::WgpuConfiguration {
+            desired_maximum_frame_latency: Some(MAX_FRAME_LATENCY),
+            ..Default::default()
+        },
         ..Default::default()
     };
 
     let result = eframe::run_native(
-        "MyCad",
+        brand::APP_NAME,
         native_options,
         Box::new(move |cc| Ok(Box::new(app::MyCadApp::new(cc, path)))),
     );
@@ -75,7 +91,7 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("MyCad failed to start: {err}");
+            eprintln!("{} failed to start: {err}", brand::APP_NAME);
             eprintln!("{GRAPHICS_STARTUP_HINT}");
             ExitCode::FAILURE
         }
@@ -92,17 +108,19 @@ fn install_panic_hook() {
             .unwrap_or_else(|| "unknown location".into());
         let backtrace = std::backtrace::Backtrace::force_capture();
         let body = format!(
-            "MyCad {}\n{message}\n{location}\n\n{backtrace}\n",
+            "{} {}\n{message}\n{location}\n\n{backtrace}\n",
+            brand::APP_NAME,
             env!("CARGO_PKG_VERSION")
         );
         let path = crash_log_path();
         let _ = std::fs::create_dir_all(path.parent().unwrap_or(std::path::Path::new(".")));
         let _ = std::fs::write(&path, body);
         let _ = rfd::MessageDialog::new()
-            .set_title("MyCad stopped unexpectedly")
+            .set_title(format!("{} stopped unexpectedly", brand::APP_NAME))
             .set_level(rfd::MessageLevel::Error)
             .set_description(format!(
-                "MyCad hit an unexpected error.\n\nA report was saved to:\n{}",
+                "{} hit an unexpected error.\n\nA report was saved to:\n{}",
+                brand::APP_NAME,
                 path.display()
             ))
             .show();
@@ -121,7 +139,7 @@ fn panic_message(info: &std::panic::PanicHookInfo<'_>) -> String {
 }
 
 fn crash_log_path() -> PathBuf {
-    eframe::storage_dir("MyCad")
+    eframe::storage_dir(brand::APP_NAME)
         .unwrap_or_else(std::env::temp_dir)
         .join("crash.log")
 }
@@ -167,7 +185,7 @@ fn run_import_only(path: Option<PathBuf>) -> ExitCode {
             audit::print_geometry_audit(&doc);
             audit::print_linetype_audit(&doc);
             if let Some(extents) = doc.diagnostics.extents {
-                let preview_path = std::path::Path::new("test-data").join("MyCad-preview.ppm");
+                let preview_path = std::path::Path::new("test-data").join("EntoCAD-preview.ppm");
                 if let Err(err) =
                     preview::write_preview_ppm(&preview_path, &display, extents, 1600, 1000)
                 {

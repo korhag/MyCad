@@ -26,12 +26,25 @@ pub enum SelectionOp {
 pub struct Selection {
     ids: Vec<EntityId>,
     members: HashSet<EntityId>,
+    generation: u64,
 }
 
 impl Selection {
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn touch(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+    }
+
     pub fn clear(&mut self) {
+        if self.ids.is_empty() {
+            return;
+        }
         self.ids.clear();
         self.members.clear();
+        self.touch();
     }
 
     pub fn is_empty(&self) -> bool {
@@ -53,20 +66,26 @@ impl Selection {
     pub fn add(&mut self, id: EntityId) {
         if self.members.insert(id) {
             self.ids.push(id);
+            self.touch();
         }
     }
 
     pub fn remove(&mut self, id: EntityId) {
         if self.members.remove(&id) {
             self.ids.retain(|existing| *existing != id);
+            self.touch();
         }
     }
 
     pub fn replace(&mut self, id: EntityId) {
+        if self.ids.len() == 1 && self.ids[0] == id {
+            return;
+        }
         self.ids.clear();
         self.members.clear();
         self.ids.push(id);
         self.members.insert(id);
+        self.touch();
     }
 
     pub fn add_all(&mut self, ids: impl IntoIterator<Item = EntityId>) {
@@ -77,17 +96,23 @@ impl Selection {
 
     pub fn remove_all(&mut self, ids: impl IntoIterator<Item = EntityId>) {
         let drop: HashSet<EntityId> = ids.into_iter().collect();
-        if drop.is_empty() {
+        if drop.is_empty() || !self.ids.iter().any(|id| drop.contains(id)) {
             return;
         }
         self.ids.retain(|id| !drop.contains(id));
         self.members.retain(|id| !drop.contains(id));
+        self.touch();
     }
 
     pub fn replace_all(&mut self, ids: impl IntoIterator<Item = EntityId>) {
+        let had = !self.ids.is_empty();
         self.ids.clear();
         self.members.clear();
+        let before = self.generation;
         self.add_all(ids);
+        if had && self.generation == before {
+            self.touch();
+        }
     }
 
     pub fn apply_click(&mut self, hit: Option<EntityId>, op: SelectionOp) {
@@ -110,9 +135,13 @@ impl Selection {
     }
 
     pub fn retain_valid(&mut self, document: &Document) {
+        let before = self.ids.len();
         self.ids.retain(|id| document.entity_by_id(*id).is_some());
         self.members
             .retain(|id| document.entity_by_id(*id).is_some());
+        if self.ids.len() != before {
+            self.touch();
+        }
     }
 
     pub fn shared_layer(&self, document: &Document) -> Option<String> {
@@ -143,6 +172,7 @@ pub fn pick_entity(
     let _span = cad_core::perf::span("click_picking");
     hit_test(
         &display.picks,
+        Some(display.spatial()),
         camera,
         screen,
         viewport_origin,
@@ -224,6 +254,22 @@ mod tests {
         assert_eq!(selection.ids(), &[id(2)]);
         selection.apply_click(None, SelectionOp::Replace);
         assert!(selection.is_empty());
+    }
+
+    #[test]
+    fn generation_changes_only_when_membership_changes() {
+        let mut selection = Selection::default();
+        assert_eq!(selection.generation(), 0);
+        selection.add(id(1));
+        let added = selection.generation();
+        assert_ne!(added, 0);
+        selection.add(id(1));
+        assert_eq!(selection.generation(), added);
+        selection.clear();
+        let cleared = selection.generation();
+        assert_ne!(cleared, added);
+        selection.clear();
+        assert_eq!(selection.generation(), cleared);
     }
 
     #[test]

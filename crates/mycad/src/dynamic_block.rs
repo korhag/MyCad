@@ -4771,10 +4771,6 @@ pub fn paint_authoring_overlays(painter: &egui::Painter, app: &MyCadApp, rect: e
     }
 }
 
-pub fn show_instance_parameters(ui: &mut Ui, app: &mut MyCadApp, _entity: &Entity) {
-    show_selected_instance_parameters(ui, app);
-}
-
 pub fn show_selected_instance_parameters(ui: &mut Ui, app: &mut MyCadApp) {
     let Some((dynamic, ids, current, mixed)) = selected_same_definition_config(app) else {
         return;

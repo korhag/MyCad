@@ -30,6 +30,32 @@ pub fn threshold_label(elapsed: Duration) -> Option<&'static str> {
     }
 }
 
+/// Fewest spare slots a freshly built collection keeps for edits.
+pub const MIN_EDIT_HEADROOM: usize = 4096;
+
+// ------------------------------------------------------------
+// Function: edit_headroom
+// Purpose: Spare capacity a freshly built index reserves on its
+//          worker, so the first edit after opening a large drawing
+//          does not reallocate or rehash the whole collection on
+//          the UI thread.
+// ------------------------------------------------------------
+pub fn edit_headroom(len: usize) -> usize {
+    (len / 16).max(MIN_EDIT_HEADROOM)
+}
+
+pub fn reserve_vec_headroom<T>(items: &mut Vec<T>) {
+    items.reserve_exact(edit_headroom(items.len()));
+}
+
+pub fn reserve_map_headroom<K, V, S>(map: &mut std::collections::HashMap<K, V, S>)
+where
+    K: Eq + std::hash::Hash,
+    S: std::hash::BuildHasher,
+{
+    map.reserve(edit_headroom(map.len()));
+}
+
 // ------------------------------------------------------------
 // Function: enabled
 // Purpose: Decide whether spans should record Instant samples.
@@ -126,6 +152,19 @@ mod tests {
         assert_eq!(threshold_label(Duration::from_micros(16001)), Some(">16ms"));
         assert_eq!(threshold_label(Duration::from_micros(50001)), Some(">50ms"));
         assert_eq!(threshold_label(Duration::from_millis(101)), Some(">100ms"));
+    }
+
+    #[test]
+    fn built_collections_keep_room_for_edits() {
+        assert_eq!(edit_headroom(0), MIN_EDIT_HEADROOM);
+        assert_eq!(edit_headroom(1_600_000), 100_000);
+        let mut items: Vec<u32> = (0..10).collect();
+        items.shrink_to_fit();
+        reserve_vec_headroom(&mut items);
+        assert!(items.capacity() >= 10 + MIN_EDIT_HEADROOM);
+        let mut map: std::collections::HashMap<u32, u32> = (0..10).map(|i| (i, i)).collect();
+        reserve_map_headroom(&mut map);
+        assert!(map.capacity() >= 10 + MIN_EDIT_HEADROOM);
     }
 
     #[test]

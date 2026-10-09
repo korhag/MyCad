@@ -1,7 +1,7 @@
 //! Convert a live LibreDWG `Dwg_Data` into a cad-core `Document`.
 //! LibreDWG types never leave this module.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::{c_void, CStr};
 use std::os::raw::c_char;
 use std::path::Path;
@@ -24,8 +24,8 @@ use crate::ltype::{
     linetype_from_flags, parse_ltype_dashes_r11, parse_ltype_records, DashRecord, LtypeDash,
 };
 
-const LWPOLYLINE_CLOSED_BIT1: u16 = 1;
-const LWPOLYLINE_CLOSED_BIT512: u16 = 512;
+// DWG LWPOLYLINE flag: bit 512 is closed. Bit 1 means the extrusion was stored.
+const LWPOLYLINE_CLOSED_BIT: u16 = 512;
 const HATCH_PATH_POLYLINE: u32 = 0x02;
 
 pub unsafe fn convert_document(
@@ -648,11 +648,25 @@ pub(crate) fn resolve_block_name(
     block_record_name(object_ptr)
 }
 
+// LibreDWG `Dwg_Version_Type` enumerator. Same value as `DwgOutputVersion::R2000`.
+const LIBREDWG_R_2000: i32 = 25;
+
 unsafe fn owned_entities(
     dwg: *mut libredwg_sys::Dwg_Data,
     block_obj: *mut libredwg_sys::Dwg_Object,
     diagnostics: &mut ImportDiagnostics,
 ) -> Vec<Entity> {
+    // R2000 `get_next_owned_entity` skips ATTDEF. After a DXF read the owned
+    // vector still lists every definition, and it contains the iterator's
+    // entities. A DWG read is the other way around, so the vector is used only
+    // when it covers that iterator.
+    let version = get_header_field::<i32>(dwg, "version").unwrap_or(0);
+    if version <= LIBREDWG_R_2000 {
+        let from_iterator = iterator_entity_objects(block_obj);
+        let from_vector = block_header_entities(dwg, block_obj).unwrap_or_default();
+        let objects = r2000_owned_objects(from_iterator, from_vector);
+        return convert_owned_objects(dwg, &objects, diagnostics);
+    }
     let mut entities = Vec::new();
     let mut owned = unsafe { libredwg_sys::get_first_owned_entity(block_obj) };
     while !owned.is_null() {
@@ -660,6 +674,111 @@ unsafe fn owned_entities(
             entities.push(entity);
         }
         owned = unsafe { libredwg_sys::get_next_owned_entity(block_obj, owned) };
+    }
+    entities
+}
+
+fn block_header_entities(
+    dwg: *mut libredwg_sys::Dwg_Data,
+    block_obj: *mut libredwg_sys::Dwg_Object,
+) -> Option<Vec<*mut libredwg_sys::Dwg_Object>> {
+    let header = unsafe { libredwg_sys::uncad_object_object_ptr(block_obj) };
+    if header.is_null() {
+        return None;
+    }
+    let count = get_field::<u32>(header, "BLOCK_HEADER", "num_owned")?;
+    if count == 0 {
+        return None;
+    }
+    let limit = unsafe { libredwg_sys::dwg_get_num_objects(dwg) } as u32;
+    if count > limit {
+        return None;
+    }
+    let handles =
+        get_field::<*const *mut libredwg_sys::Dwg_Object_Ref>(header, "BLOCK_HEADER", "entities")?;
+    if handles.is_null() {
+        return None;
+    }
+    let handles = unsafe { std::slice::from_raw_parts(handles, count as usize) };
+    let mut objects = Vec::with_capacity(handles.len());
+    for handle in handles {
+        if handle.is_null() {
+            continue;
+        }
+        let mut object = unsafe { (**handle).obj.cast::<libredwg_sys::Dwg_Object>() };
+        if object.is_null() {
+            object = unsafe { libredwg_sys::dwg_ref_object(dwg, *handle) };
+        }
+        if object.is_null() || is_linked_subentity(object_fixedtype(object)) {
+            continue;
+        }
+        objects.push(object);
+    }
+    Some(objects)
+}
+
+fn is_linked_subentity(fixedtype: libredwg_sys::DWG_OBJECT_TYPE) -> bool {
+    matches!(
+        fixedtype,
+        libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_ATTRIB
+            | libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_VERTEX_2D
+            | libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_VERTEX_3D
+            | libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_VERTEX_MESH
+            | libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_VERTEX_PFACE
+            | libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_VERTEX_PFACE_FACE
+    )
+}
+
+fn iterator_entity_objects(
+    block_obj: *mut libredwg_sys::Dwg_Object,
+) -> Vec<*mut libredwg_sys::Dwg_Object> {
+    let mut objects = Vec::new();
+    let mut seen = HashSet::new();
+    let mut owned = unsafe { libredwg_sys::get_first_owned_entity(block_obj) };
+    while !owned.is_null() && seen.insert(owned as usize) {
+        objects.push(owned);
+        owned = unsafe { libredwg_sys::get_next_owned_entity(block_obj, owned) };
+    }
+    objects
+}
+
+fn r2000_owned_objects(
+    from_iterator: Vec<*mut libredwg_sys::Dwg_Object>,
+    from_vector: Vec<*mut libredwg_sys::Dwg_Object>,
+) -> Vec<*mut libredwg_sys::Dwg_Object> {
+    let mut iterator_ids: HashSet<usize> = from_iterator
+        .iter()
+        .map(|object| *object as usize)
+        .collect();
+    let vector_ids: HashSet<usize> = from_vector.iter().map(|object| *object as usize).collect();
+    let vector_covers_iterator = from_iterator
+        .iter()
+        .all(|object| vector_ids.contains(&(*object as usize)));
+    if !from_vector.is_empty() && vector_covers_iterator && from_vector.len() >= from_iterator.len()
+    {
+        return from_vector;
+    }
+    let mut objects = from_iterator;
+    for object in from_vector {
+        if object_fixedtype(object) == libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_ATTDEF
+            && iterator_ids.insert(object as usize)
+        {
+            objects.push(object);
+        }
+    }
+    objects
+}
+
+fn convert_owned_objects(
+    dwg: *mut libredwg_sys::Dwg_Data,
+    objects: &[*mut libredwg_sys::Dwg_Object],
+    diagnostics: &mut ImportDiagnostics,
+) -> Vec<Entity> {
+    let mut entities = Vec::new();
+    for object in objects {
+        if let Some(entity) = unsafe { convert_one(dwg, *object, diagnostics) } {
+            entities.push(entity);
+        }
     }
     entities
 }
@@ -788,7 +907,7 @@ unsafe fn convert_geometry(
             let bulges: Vec<f64> =
                 get_array_field::<u32, f64>(entity_ptr, "LWPOLYLINE", "num_bulges", "bulges");
             let flag = get_field::<u16>(entity_ptr, "LWPOLYLINE", "flag").unwrap_or(0);
-            let closed = flag & LWPOLYLINE_CLOSED_BIT1 != 0 || flag & LWPOLYLINE_CLOSED_BIT512 != 0;
+            let closed = lwpolyline_is_closed(flag);
             Geometry::LwPolyline {
                 vertices: points
                     .iter()
@@ -1248,9 +1367,43 @@ fn convert_hatch(entity_ptr: *mut c_void) -> Option<Geometry> {
         pattern_type: get_field::<i16>(entity_ptr, "HATCH", "pattern_type")
             .unwrap_or(if solid_fill { 1 } else { 0 }),
         double: get_field::<u8>(entity_ptr, "HATCH", "double_flag").unwrap_or(0) != 0,
+        style: get_field::<u16>(entity_ptr, "HATCH", "style")
+            .map(|style| i16::try_from(style).unwrap_or(0))
+            .unwrap_or(0),
+        gradient: convert_hatch_gradient(entity_ptr),
         paths: paths.iter().map(convert_hatch_path).collect(),
         pattern_lines: deflines.iter().map(convert_hatch_defline).collect(),
     }))
+}
+
+fn convert_hatch_gradient(entity_ptr: *mut c_void) -> Option<cad_core::HatchGradient> {
+    let filled = get_field::<u32>(entity_ptr, "HATCH", "is_gradient_fill").unwrap_or(0) != 0;
+    if !filled {
+        return None;
+    }
+    let colors: Vec<libredwg_sys::Dwg_HATCH_Color> =
+        get_array_field::<u32, _>(entity_ptr, "HATCH", "num_colors", "colors");
+    let stops = colors
+        .iter()
+        .map(|stop| cad_core::GradientStop {
+            shift: stop.shift_value,
+            color: dwg_color_rgb(stop.color),
+        })
+        .filter(|stop| stop.shift.is_finite())
+        .collect();
+    Some(cad_core::HatchGradient {
+        name: get_utf8_field(entity_ptr, "HATCH", "gradient_name").unwrap_or_default(),
+        angle: get_field::<f64>(entity_ptr, "HATCH", "gradient_angle").unwrap_or(0.0),
+        shift: get_field::<f64>(entity_ptr, "HATCH", "gradient_shift").unwrap_or(0.0),
+        single_color: get_field::<u32>(entity_ptr, "HATCH", "single_color_gradient").unwrap_or(0)
+            != 0,
+        tint: get_field::<f64>(entity_ptr, "HATCH", "gradient_tint").unwrap_or(1.0),
+        stops,
+    })
+}
+
+fn dwg_color_rgb(color: libredwg_sys::Dwg_Color) -> cad_core::Rgb {
+    resolve_layer_color(color).resolve(cad_core::CadColor::Aci(7), cad_core::CadColor::Aci(7))
 }
 
 fn convert_hatch_path(path: &libredwg_sys::Dwg_HATCH_Path) -> HatchPath {
@@ -1274,6 +1427,17 @@ fn convert_hatch_path(path: &libredwg_sys::Dwg_HATCH_Path) -> HatchPath {
     }
 }
 
+// AutoCAD stores a clockwise hatch arc with both angles mirrored.
+// Negating them recovers the real start and end. Counter-clockwise
+// edges are already stored as real angles.
+fn real_hatch_angles(start: f64, end: f64, is_ccw: bool) -> (f64, f64) {
+    if is_ccw {
+        (start, end)
+    } else {
+        (-start, -end)
+    }
+}
+
 fn convert_hatch_edge(seg: &libredwg_sys::Dwg_HATCH_PathSeg) -> Option<HatchEdge> {
     let p2 = |p: libredwg_sys::BITCODE_2RD| Point3::from_xy(p.x, p.y);
     Some(match seg.curve_type {
@@ -1281,28 +1445,54 @@ fn convert_hatch_edge(seg: &libredwg_sys::Dwg_HATCH_PathSeg) -> Option<HatchEdge
             start: p2(seg.first_endpoint),
             end: p2(seg.second_endpoint),
         },
-        2 => HatchEdge::Arc {
-            center: p2(seg.center),
-            radius: seg.radius,
-            start_angle: seg.start_angle,
-            end_angle: seg.end_angle,
-            is_ccw: seg.is_ccw != 0,
-        },
-        3 => HatchEdge::Ellipse {
-            center: p2(seg.center),
-            major_endpoint: p2(seg.endpoint),
-            axis_ratio: seg.minor_major_ratio,
-            start_angle: seg.start_angle,
-            end_angle: seg.end_angle,
-            is_ccw: seg.is_ccw != 0,
-        },
+        2 => {
+            let is_ccw = seg.is_ccw != 0;
+            let (start_angle, end_angle) =
+                real_hatch_angles(seg.start_angle, seg.end_angle, is_ccw);
+            HatchEdge::Arc {
+                center: p2(seg.center),
+                radius: seg.radius,
+                start_angle,
+                end_angle,
+                is_ccw,
+            }
+        }
+        3 => {
+            let is_ccw = seg.is_ccw != 0;
+            let (start_angle, end_angle) =
+                real_hatch_angles(seg.start_angle, seg.end_angle, is_ccw);
+            HatchEdge::Ellipse {
+                center: p2(seg.center),
+                major_endpoint: p2(seg.endpoint),
+                axis_ratio: seg.minor_major_ratio,
+                start_angle,
+                end_angle,
+                is_ccw,
+            }
+        }
         4 => {
-            let control_points =
-                unsafe { read_raw_array(seg.control_points, seg.num_control_points) }
-                    .into_iter()
+            let controls = unsafe { read_raw_array(seg.control_points, seg.num_control_points) };
+            let knots = unsafe { read_raw_array(seg.knots, seg.num_knots) };
+            let fitpts = unsafe { read_raw_array(seg.fitpts, seg.num_fitpts) };
+            let degree = if seg.degree == 0 { 3 } else { seg.degree };
+            HatchEdge::Spline {
+                degree,
+                periodic: seg.is_periodic != 0,
+                knots,
+                weights: if seg.is_rational != 0 {
+                    controls.iter().map(|cp| cp.weight).collect()
+                } else {
+                    Vec::new()
+                },
+                control_points: controls
+                    .iter()
                     .map(|cp| Point3::from_xy(cp.point.x, cp.point.y))
-                    .collect();
-            HatchEdge::Spline { control_points }
+                    .collect(),
+                fit_points: fitpts
+                    .iter()
+                    .map(|point| Point3::from_xy(point.x, point.y))
+                    .collect(),
+            }
         }
         _ => return None,
     })
@@ -1392,7 +1582,22 @@ pub(crate) fn solid_polygon_corners(c1: Point3, c2: Point3, c3: Point3, c4: Poin
 fn extrusion_of(entity_ptr: *mut c_void, dxfname: &str) -> Point3 {
     get_field::<Point3D>(entity_ptr, dxfname, "extrusion")
         .map(pt3)
+        .map(extrusion_or_world)
         .unwrap_or_else(default_extrusion)
+}
+
+pub(crate) fn lwpolyline_is_closed(flag: u16) -> bool {
+    flag & LWPOLYLINE_CLOSED_BIT != 0
+}
+
+// LibreDWG leaves the extrusion at (0, 0, 0) when the entity did not store one.
+// A zero normal is the world Z axis. Writing it out makes DXF readers flip the entity.
+pub(crate) fn extrusion_or_world(extrusion: Point3) -> Point3 {
+    if extrusion.length() < 1e-12 {
+        default_extrusion()
+    } else {
+        extrusion
+    }
 }
 
 fn pt_field(entity_ptr: *mut c_void, dxfname: &str, field: &str) -> Option<Point3> {
@@ -1522,6 +1727,24 @@ mod tests {
         assert_eq!(document.current_layer, "0");
         document.apply_current_layer(None);
         assert_eq!(document.current_layer, "0");
+    }
+
+    #[test]
+    fn lwpolyline_closed_bit_is_512_not_the_extrusion_bit() {
+        assert!(!lwpolyline_is_closed(1));
+        assert!(lwpolyline_is_closed(512));
+        assert!(lwpolyline_is_closed(513));
+        assert!(!lwpolyline_is_closed(256));
+    }
+
+    #[test]
+    fn zero_extrusion_is_the_world_normal() {
+        assert_eq!(extrusion_or_world(Point3::default()), default_extrusion());
+        assert_eq!(
+            extrusion_or_world(Point3::new(0.0, 0.0, -1.0)),
+            Point3::new(0.0, 0.0, -1.0)
+        );
+        assert_eq!(extrusion_or_world(default_extrusion()), default_extrusion());
     }
 
     #[test]

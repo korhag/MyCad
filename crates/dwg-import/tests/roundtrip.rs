@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use cad_core::{
     autocad_features_document, compare_documents, primitives_document, AttributeInfo,
     BlockDefinition, CompareTol, Document, DrawingUnits, Entity, Geometry, PaperLayout, Point2,
-    Point3, TextData, TextStyle, ViewportData, ATTRIB_INVISIBLE,
+    Point3, TextData, TextStyle, ViewportData, ATTRIB_INVISIBLE, ATTRIB_PRESET,
 };
 use cad_io::{write_dxf, DxfExportOptions};
 use dwg_import::{convert_dxf_to_dwg, import_dwg, import_dxf, write_dwg, DwgOutputVersion};
@@ -53,6 +53,33 @@ fn assert_geometry(expected: &Document, actual: &Document, label: &str) {
 fn cleanup(paths: &[&Path]) {
     for path in paths {
         let _ = fs::remove_file(path);
+    }
+}
+
+fn rename_block(document: &mut Document, from: &str, to: &str) {
+    if let Some(mut block) = document.blocks.remove(from) {
+        block.name = to.to_string();
+        document.blocks.insert(to.to_string(), block);
+    }
+    for entity in &mut document.model_space {
+        rewrite_block_ref(&mut entity.geometry, from, to);
+    }
+    for block in document.blocks.values_mut() {
+        for entity in &mut block.entities {
+            rewrite_block_ref(&mut entity.geometry, from, to);
+        }
+    }
+}
+
+fn rewrite_block_ref(geometry: &mut Geometry, from: &str, to: &str) {
+    match geometry {
+        Geometry::Dimension(data) if data.block_name == from => {
+            data.block_name = to.to_string();
+        }
+        Geometry::Insert { block_name, .. } if block_name == from => {
+            *block_name = to.to_string();
+        }
+        _ => {}
     }
 }
 
@@ -551,8 +578,119 @@ fn attributes_survive_dxf_roundtrip() {
 }
 
 #[test]
+fn several_attdefs_in_one_block_survive_dxf_roundtrip() {
+    let mut document = Document::default();
+    document.units = DrawingUnits::Millimeters;
+    let specs = [
+        ("A", 0_i16),
+        ("B", ATTRIB_INVISIBLE),
+        ("C", ATTRIB_PRESET),
+        ("D", 0),
+        ("E", ATTRIB_PRESET),
+    ];
+    let entities = specs
+        .iter()
+        .enumerate()
+        .map(|(index, (tag, flags))| {
+            Entity::new(Geometry::Text(TextData {
+                insertion: Point3::from_xy(index as f64, 0.0),
+                height: 2.5,
+                value: (*tag).into(),
+                is_attrib_def: true,
+                attribute: Some(AttributeInfo {
+                    tag: (*tag).into(),
+                    prompt: "Prompt".into(),
+                    flags: *flags,
+                }),
+                ..TextData::default()
+            }))
+        })
+        .collect();
+    document.blocks.insert(
+        "TAGGED".into(),
+        BlockDefinition {
+            name: "TAGGED".into(),
+            entities,
+            ..BlockDefinition::default()
+        },
+    );
+    let dxf = temp_path("dxf");
+    write_dxf(&document, &dxf, &DxfExportOptions::default()).expect("write DXF");
+    let actual = match import_dxf(&dxf) {
+        Ok(document) => document,
+        Err(err) => {
+            cleanup(&[&dxf]);
+            panic!("import_dxf failed: {err}");
+        }
+    };
+    let block = actual
+        .block_by_name("TAGGED")
+        .unwrap_or_else(|| panic!("blocks: {:?}", actual.blocks.keys().collect::<Vec<_>>()));
+    let found: Vec<(String, i16)> = block
+        .entities
+        .iter()
+        .filter_map(|entity| match &entity.geometry {
+            Geometry::Text(data) if data.is_attrib_def => {
+                let tag = data
+                    .attribute
+                    .as_ref()
+                    .map(|info| info.tag.clone())
+                    .unwrap_or_default();
+                let flags = data.attribute.as_ref().map(|info| info.flags).unwrap_or(0);
+                Some((tag, flags))
+            }
+            _ => None,
+        })
+        .collect();
+    let dwg = temp_path("dwg");
+    let from_dwg = write_dwg(&document, &dwg)
+        .map_err(|err| err.to_string())
+        .and_then(|_| import_dwg(&dwg).map_err(|err| err.to_string()));
+    cleanup(&[&dxf, &dwg]);
+    assert_eq!(
+        found,
+        vec![
+            ("A".into(), 0),
+            ("B".into(), ATTRIB_INVISIBLE),
+            ("C".into(), ATTRIB_PRESET),
+            ("D".into(), 0),
+            ("E".into(), ATTRIB_PRESET),
+        ],
+        "counts {:?}",
+        actual.diagnostics.entity_counts
+    );
+    let from_dwg = from_dwg.unwrap_or_else(|err| panic!("DWG round-trip failed: {err}"));
+    let dwg_tags = attdef_tags(from_dwg.block_by_name("TAGGED"));
+    assert_eq!(
+        dwg_tags,
+        vec!["A", "B", "C", "D", "E"],
+        "DWG counts {:?}",
+        from_dwg.diagnostics.entity_counts
+    );
+}
+
+fn attdef_tags(block: Option<&BlockDefinition>) -> Vec<String> {
+    block
+        .into_iter()
+        .flat_map(|block| block.entities.iter())
+        .filter_map(|entity| match &entity.geometry {
+            Geometry::Text(data) if data.is_attrib_def => Some(
+                data.attribute
+                    .as_ref()
+                    .map(|info| info.tag.clone())
+                    .unwrap_or_default(),
+            ),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
 fn autocad_features_survive_dxf_roundtrip() {
-    let expected = autocad_features_document();
+    let mut expected = autocad_features_document();
+    // *D names are saved without the star. AutoCAD rejects them as anonymous
+    // blocks, and the reimport comes back under the ordinary name.
+    rename_block(&mut expected, "*D1", "D1");
     let dxf = temp_path("dxf");
     write_dxf(&expected, &dxf, &DxfExportOptions::default()).expect("write DXF");
     let actual = match import_dxf(&dxf) {

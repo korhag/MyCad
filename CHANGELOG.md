@@ -1,13 +1,88 @@
 # Changelog
 
-All notable changes to MyCad are documented in this file.
+All notable changes to EntoCAD are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project versions with [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Workspace version is `0.40.1` (`Cargo.toml`).
+Workspace version is `0.44.2` (`Cargo.toml`).
 
 ## [Unreleased]
+
+## [0.44.2] - 2026-10-09
+
+### Fixed
+
+- A saved DWG opens in AutoCAD with no recovery errors and no erased objects. Fit-point splines stay in the drawing, and the file's tables stay readable.
+- Every attribute definition in a block survives a DWG save. A save used to keep only the first and the last.
+- Attribute tags that contain punctuation or lowercase letters, and blocks named like `*D`, `*U`, or `*X`, are written so AutoCAD keeps the tag and the block.
+
+## [0.44.1] - 2026-10-06
+
+### Fixed
+
+- Saving a large drawing no longer copies the whole document when the save finishes, so the window does not stall at the end of the save.
+- Saving as DWG no longer flushes the temporary DXF that is only read back once. Writing a DXF also no longer allocates a separate string for every group code.
+- A missing extrusion no longer mirrors the drawing after a DXF or DWG save. The file stored a zero normal, and the reader turned that into (0, 0, -1), which flipped every LWPOLYLINE in X.
+- An LWPOLYLINE is no longer imported as closed just because the file records an extrusion. Closed follows the closed bit.
+- Attribute definitions in a block are kept on import and through a DXF save. A DWG save still drops the definitions between the first and the last in a block; that step is inside LibreDWG.
+
+## [0.44.0] - 2026-10-05
+
+### Added
+
+- The window, taskbar, and Windows executable use the EntoCAD symbol. A startup card shows the logo and fades out, and the same symbol sits on the empty viewport above the open hint.
+
+### Changed
+
+- The application name is EntoCAD. Drawing formats are unchanged (`.mycad`, `.mycadblock`, and `Plant.dwg.mycad`), and settings saved under the previous name are carried over. New DWG copies are named `*-EntoCAD.dwg`. An existing `*-MyCad.dwg` still saves in place.
+
+## [0.43.0] - 2026-10-05
+
+### Added
+
+- Settings > Viewport has an Antialiasing choice (Off, 2×, or 4×). It applies while the dialog is open, so a large drawing can stay smooth to look at and fast to sketch.
+- The cursor is a crosshair while a command is waiting for a point, so the pick point is obvious without waiting for a frame.
+- Settings > Viewport has Smooth zoom (on by default). Each wheel click eases to the new view, anchored on the cursor, and can be turned off for an instant jump.
+- Pan and zoom draw at one sample while the view is moving, then settle to the chosen antialiasing once the camera stops.
+
+### Changed
+
+- Drawing or editing one entity no longer copies the whole picture. The new line shows up in the same frame, and a TRIM that splits an entity patches the two pieces instead of rebuilding the drawing. Undoing that split patches the picture too.
+- The viewport picture stays sharp. It uses the same pixel edges as the window, nearest-pixel sampling, and reuses its texture while a dock split is dragged.
+- A settled frame skips an empty selection overlay, and the status readout, Home ribbon, and multi-selection summary refresh only when their inputs change.
+- Erase, move, and replace upload only the vertices they changed.
+- Moving the mouse while a command is active redraws the snap and preview marks, not the whole drawing. Panning and zooming still redraw the scene.
+- Snaps and hover picks look at nearby geometry instead of every entity, so the cursor stays responsive in a dense area.
+- Debug builds optimize dependencies, so `cargo run` is closer to a release session.
+
+## [0.42.0] - 2026-10-05
+
+### Added
+
+- HATCH gradient fills draw in the viewport. Linear gradients follow the two colors; the curved kinds are sampled at each triangle corner. PDF and plot use the midpoint color.
+- HATCH style is kept. Normal fills every loop, Outer fills the boundary and its holes, and Ignore fills only the outermost loop.
+
+### Fixed
+
+- TEXT and MTEXT use Hershey Simplex shapes, so `a` and `f` no longer read as other letters. Latin-1 and Turkish accented letters (`ğ`, `ç`, `ş`, `ı`, `İ`, `ö`, `ü`) are composed from a base letter and a mark.
+- MTEXT paragraph codes such as `\pxqj;` no longer print. Underline, overline, and strikethrough toggles are consumed, stacked fractions become `a/b`, and `\U+` codes become the character. TEXT `%%u`, `%%o`, and `%%nnn` are handled the same way.
+- HATCH spline edges keep their degree, knots, weights, and fit points, so curved logo outlines follow the spline instead of the control polygon.
+- Clockwise HATCH arcs and ellipses are stored mirrored in the file. Import turns them into real angles, which closes those loops, and DXF export writes the mirrored form back.
+- HATCH boundaries are no longer stroked. The outline stays pickable, and the viewport, PDF, and plot match AutoCAD.
+- Pattern lines keep even-odd parity at a vertex and where two loops touch, so a line on a corner no longer leaks across the gap.
+
+## [0.41.0] - 2026-10-05
+
+### Added
+
+- Add wheel zoom acceleration: consecutive wheel clicks in the same direction zoom progressively further, so large zoom changes no longer need frantic scrolling while a single click stays precise. Toggle and strength are in Settings > Viewport.
+
+## [0.40.2] - 2026-10-04
+
+### Fixed
+
+- HATCH pattern lines are clipped to the boundary, so pattern fills such as tree symbols stay inside their outline instead of drawing long rays. Dashes follow the pattern definition, and the lines are placed in the hatch plane and in an INSERT.
 
 ## [0.40.1] - 2026-10-04
 

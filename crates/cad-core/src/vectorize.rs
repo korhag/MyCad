@@ -17,7 +17,9 @@ use crate::document::Document;
 use crate::entity::{Entity, Geometry, TextData, TextHAlign, TextVAlign};
 use crate::extents::Extents2;
 use crate::geom::{ocs_to_wcs, Point2, Point3};
-use crate::hatch::hatch_path_points_with_tolerance;
+use crate::hatch::{
+    hatch_fill_contours, hatch_path_points_with_tolerance, hatch_pattern_segments, GradientRamp,
+};
 use crate::linetype::LineType;
 use crate::stroke_font::{measure_styled_width, strip_mtext, stroke_text_styled};
 use crate::transform::Transform2;
@@ -65,6 +67,14 @@ pub trait VectorSink {
             self.fill(contour, rgb);
         }
     }
+
+    /// A gradient fill. Plot and PDF use the color at the middle of the ramp.
+    fn fill_gradient(&mut self, contours: &[Vec<Point2>], ramp: &GradientRamp) {
+        self.fill_even_odd(contours, ramp.midpoint_color());
+    }
+
+    /// Hatch boundaries are pickable but not drawn. AutoCAD does not stroke them.
+    fn pick_outline(&mut self, _pts: &[Point2], _closed: bool) {}
 
     fn stroke_mm(&mut self, _mm: f64) {}
 }
@@ -297,105 +307,6 @@ fn mtext_first_baseline(attachment: i16, line_count: usize, cap: f64, step: f64)
         1 => -cap + block * 0.5,
         _ => (lines - 1.0) * step,
     }
-}
-
-fn emit_hatch_pattern_lines(
-    sink: &mut impl VectorSink,
-    hatch: &crate::entity::HatchData,
-    contours: &[Vec<Point2>],
-    rgb: Rgb,
-) {
-    let mut lines = hatch.pattern_lines.clone();
-    if lines.is_empty() {
-        let angle = hatch.pattern_angle;
-        let scale = if hatch.pattern_scale.is_finite() && hatch.pattern_scale > 1e-6 {
-            hatch.pattern_scale
-        } else {
-            1.0
-        };
-        lines.push(crate::entity::HatchPatternLine {
-            angle,
-            base: Point3::default(),
-            offset: Point3::from_xy(-angle.sin() * scale, angle.cos() * scale),
-            dashes: Vec::new(),
-        });
-    }
-    let mut emitted = 0_usize;
-    for line in &lines {
-        if emitted >= crate::MAX_HATCH_PATTERN_SEGMENTS {
-            break;
-        }
-        let mut hull = Vec::new();
-        for contour in contours {
-            hull.extend(contour.iter().copied());
-        }
-        if hull.len() < 2 {
-            continue;
-        }
-        let mut min = hull[0];
-        let mut max = hull[0];
-        for point in &hull {
-            min.x = min.x.min(point.x);
-            min.y = min.y.min(point.y);
-            max.x = max.x.max(point.x);
-            max.y = max.y.max(point.y);
-        }
-        let dir = Point2::new(line.angle.cos(), line.angle.sin());
-        let offset = line.offset.xy();
-        let step = offset.x.hypot(offset.y).max(1e-3);
-        let span = (max.x - min.x).hypot(max.y - min.y).max(step) * 2.0;
-        let count = ((span / step).ceil() as i32).clamp(1, 64);
-        let base = line.base.xy();
-        let perp = Point2::new(-dir.y, dir.x);
-        for index in -count..=count {
-            if emitted >= crate::MAX_HATCH_PATTERN_SEGMENTS {
-                break;
-            }
-            let origin = Point2::new(
-                base.x + perp.x * step * f64::from(index),
-                base.y + perp.y * step * f64::from(index),
-            );
-            let a = Point2::new(origin.x - dir.x * span, origin.y - dir.y * span);
-            let b = Point2::new(origin.x + dir.x * span, origin.y + dir.y * span);
-            let mid = Point2::new((a.x + b.x) * 0.5, (a.y + b.y) * 0.5);
-            if contours
-                .iter()
-                .any(|contour| point_in_polygon(mid, contour))
-            {
-                sink.path(
-                    &[a, b],
-                    false,
-                    &line_chain(&[a, b], false),
-                    true,
-                    rgb,
-                    &continuous(),
-                    1.0,
-                );
-                emitted += 1;
-            }
-        }
-    }
-}
-
-fn point_in_polygon(point: Point2, poly: &[Point2]) -> bool {
-    if poly.len() < 3 {
-        return false;
-    }
-    let mut inside = false;
-    let mut previous = poly.len() - 1;
-    for index in 0..poly.len() {
-        let current = poly[index];
-        let prior = poly[previous];
-        if ((current.y > point.y) != (prior.y > point.y))
-            && (point.x
-                < (prior.x - current.x) * (point.y - current.y) / (prior.y - current.y + 1e-30)
-                    + current.x)
-        {
-            inside = !inside;
-        }
-        previous = index;
-    }
-    inside
 }
 
 fn emit_attrib(sink: &mut impl VectorSink, transform: Transform2, rgb: Rgb, attrib: &TextData) {
@@ -751,21 +662,26 @@ pub fn vectorize_entity(
                 .into_iter()
                 .map(|p| transform.apply(p))
                 .collect();
-                sink.path(
-                    &world,
-                    true,
-                    &line_chain(&world, true),
-                    true,
-                    rgb,
-                    &continuous(),
-                    1.0,
-                );
+                sink.pick_outline(&world, true);
                 contours.push(world);
             }
-            if hatch.solid_fill {
-                sink.fill_even_odd(&contours, rgb);
+            let filled = hatch_fill_contours(hatch.style, &contours);
+            if let Some(gradient) = &hatch.gradient {
+                sink.fill_gradient(&filled, &GradientRamp::from_gradient(gradient));
+            } else if hatch.solid_fill {
+                sink.fill_even_odd(&filled, rgb);
             } else {
-                emit_hatch_pattern_lines(sink, hatch, &contours, rgb);
+                for (a, b) in hatch_pattern_segments(hatch, &filled, transform) {
+                    sink.path(
+                        &[a, b],
+                        false,
+                        &line_chain(&[a, b], false),
+                        true,
+                        rgb,
+                        &continuous(),
+                        1.0,
+                    );
+                }
             }
         }
         Geometry::Solid { corners, extrusion } => {
@@ -1026,7 +942,10 @@ pub fn plot_geometry(document: &Document) -> PlotGeometry {
 mod tests {
     use super::*;
     use crate::document::{BlockDefinition, Layer};
-    use crate::entity::{default_extrusion, HatchData, HatchPath, MTextData, PolyVertex, TextData};
+    use crate::entity::{
+        default_extrusion, HatchData, HatchPath, HatchPatternLine, MTextData, PolyVertex, TextData,
+        MAX_HATCH_PATTERN_SEGMENTS,
+    };
     use crate::stroke_font::stroke_text;
 
     fn layer0(document: &mut Document) {
@@ -1252,6 +1171,10 @@ mod tests {
         assert_eq!(plot.fills.len(), 1);
         assert!(plot.fills[0].even_odd);
         assert_eq!(plot.fills[0].contours.len(), 2);
+        assert!(
+            plot.strokes.is_empty(),
+            "hatch boundaries are pick-only, not stroked"
+        );
     }
 
     #[test]
@@ -1306,6 +1229,302 @@ mod tests {
         let expected = stroke_text(Point2::new(50.0 - width, 80.0 - 4.0), 4.0, 0.0, "HI");
         let plot = plot_geometry(&document);
         assert!(plot_has_stroke(&plot, expected[0][0]));
+    }
+
+    fn square_hatch_path(min_x: f64, min_y: f64, max_x: f64, max_y: f64) -> HatchPath {
+        let corners = [
+            (min_x, min_y),
+            (max_x, min_y),
+            (max_x, max_y),
+            (min_x, max_y),
+        ];
+        HatchPath::Polyline {
+            vertices: corners
+                .into_iter()
+                .map(|(x, y)| PolyVertex {
+                    point: Point3::from_xy(x, y),
+                    bulge: 0.0,
+                    vertex_id: Default::default(),
+                })
+                .collect(),
+            closed: true,
+        }
+    }
+
+    fn horizontal_pattern(base: Point2, spacing: f64, dashes: Vec<f64>) -> HatchPatternLine {
+        HatchPatternLine {
+            angle: 0.0,
+            base: Point3::from_xy(base.x, base.y),
+            offset: Point3::from_xy(0.0, spacing),
+            dashes,
+        }
+    }
+
+    fn pattern_hatch(paths: Vec<HatchPath>, lines: Vec<HatchPatternLine>) -> Entity {
+        Entity::new(Geometry::Hatch(HatchData {
+            solid_fill: false,
+            pattern_name: "ANSI31".into(),
+            pattern_scale: 1.0,
+            pattern_angle: 0.0,
+            pattern_type: 1,
+            paths,
+            pattern_lines: lines,
+            ..HatchData::default()
+        }))
+    }
+
+    fn pattern_segments(plot: &PlotGeometry) -> Vec<(Point2, Point2)> {
+        plot.strokes
+            .iter()
+            .filter_map(|stroke| {
+                if stroke.points.len() == 2 {
+                    Some((stroke.points[0], stroke.points[1]))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn near_segment(got: (Point2, Point2), a: Point2, b: Point2) -> bool {
+        const EPS: f64 = 1e-4;
+        (got.0.distance(a) < EPS && got.1.distance(b) < EPS)
+            || (got.0.distance(b) < EPS && got.1.distance(a) < EPS)
+    }
+
+    #[test]
+    fn pattern_hatch_segments_stay_inside_the_boundary() {
+        let mut document = Document::default();
+        layer0(&mut document);
+        document.add_entity(pattern_hatch(
+            vec![square_hatch_path(0.0, 0.0, 10.0, 10.0)],
+            vec![horizontal_pattern(Point2::new(0.0, 0.0), 2.0, Vec::new())],
+        ));
+        let segments = pattern_segments(&plot_geometry(&document));
+        assert!(!segments.is_empty());
+        for (a, b) in &segments {
+            for point in [*a, *b] {
+                assert!(
+                    (0.0..=10.0).contains(&point.x) && (0.0..=10.0).contains(&point.y),
+                    "pattern segment {:?} extends outside the hatch",
+                    (a, b)
+                );
+            }
+        }
+        assert!(
+            segments.iter().any(|segment| near_segment(
+                *segment,
+                Point2::new(0.0, 4.0),
+                Point2::new(10.0, 4.0)
+            )),
+            "expected a clipped line across y=4, got {segments:?}"
+        );
+    }
+
+    #[test]
+    fn pattern_hatch_skips_the_hole() {
+        let mut document = Document::default();
+        layer0(&mut document);
+        document.add_entity(pattern_hatch(
+            vec![
+                square_hatch_path(0.0, 0.0, 10.0, 10.0),
+                square_hatch_path(3.0, 3.0, 7.0, 7.0),
+            ],
+            vec![horizontal_pattern(Point2::new(0.0, 0.0), 2.0, Vec::new())],
+        ));
+        let segments = pattern_segments(&plot_geometry(&document));
+        assert!(segments.iter().any(|segment| {
+            near_segment(*segment, Point2::new(0.0, 4.0), Point2::new(3.0, 4.0))
+        }));
+        assert!(segments.iter().any(|segment| {
+            near_segment(*segment, Point2::new(7.0, 4.0), Point2::new(10.0, 4.0))
+        }));
+        for (a, b) in &segments {
+            let mid = Point2::new((a.x + b.x) * 0.5, (a.y + b.y) * 0.5);
+            let inside_hole = mid.x > 3.0 + 1e-6
+                && mid.x < 7.0 - 1e-6
+                && mid.y > 3.0 + 1e-6
+                && mid.y < 7.0 - 1e-6;
+            assert!(!inside_hole, "segment midpoint {mid:?} falls in the hole");
+        }
+    }
+
+    #[test]
+    fn pattern_hatch_base_far_from_boundary_still_fills() {
+        let mut document = Document::default();
+        layer0(&mut document);
+        document.add_entity(pattern_hatch(
+            vec![square_hatch_path(0.0, 0.0, 10.0, 10.0)],
+            vec![horizontal_pattern(
+                Point2::new(-1000.0, -1000.0),
+                2.0,
+                Vec::new(),
+            )],
+        ));
+        let segments = pattern_segments(&plot_geometry(&document));
+        assert!(
+            segments.iter().any(|segment| near_segment(
+                *segment,
+                Point2::new(0.0, 4.0),
+                Point2::new(10.0, 4.0)
+            )),
+            "a base far outside the boundary must still seed lines across it, got {segments:?}"
+        );
+        for (a, b) in &segments {
+            for point in [*a, *b] {
+                assert!((0.0..=10.0).contains(&point.x) && (0.0..=10.0).contains(&point.y));
+            }
+        }
+    }
+
+    #[test]
+    fn pattern_hatch_dashes_are_clipped_to_the_dash_length() {
+        let mut document = Document::default();
+        layer0(&mut document);
+        document.add_entity(pattern_hatch(
+            vec![square_hatch_path(0.0, 0.0, 10.0, 10.0)],
+            vec![horizontal_pattern(
+                Point2::new(0.0, 5.0),
+                20.0,
+                vec![1.0, -1.0],
+            )],
+        ));
+        let segments = pattern_segments(&plot_geometry(&document));
+        assert!(
+            segments.len() > 1,
+            "a dashed line must break into more than one segment, got {segments:?}"
+        );
+        for (a, b) in &segments {
+            let length = a.distance(*b);
+            assert!(
+                length <= 1.0 + 1e-4,
+                "dash length {length} exceeds the pattern dash"
+            );
+            assert!((0.0..=10.0).contains(&a.x) && (0.0..=10.0).contains(&b.x));
+            assert!((a.y - 5.0).abs() < 1e-4 && (b.y - 5.0).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn pattern_hatch_dash_phase_follows_the_row_offset() {
+        let mut document = Document::default();
+        layer0(&mut document);
+        document.add_entity(pattern_hatch(
+            vec![square_hatch_path(0.0, 0.0, 10.0, 10.0)],
+            vec![HatchPatternLine {
+                angle: 0.0,
+                base: Point3::from_xy(0.0, 0.0),
+                offset: Point3::from_xy(0.5, 2.0),
+                dashes: vec![1.0, -1.0],
+            }],
+        ));
+        let segments = pattern_segments(&plot_geometry(&document));
+        let row: Vec<_> = segments
+            .iter()
+            .copied()
+            .filter(|(a, b)| (a.y - 4.0).abs() < 1e-4 && (b.y - 4.0).abs() < 1e-4)
+            .collect();
+        assert!(
+            row.iter().any(|segment| near_segment(
+                *segment,
+                Point2::new(1.0, 4.0),
+                Point2::new(2.0, 4.0)
+            )),
+            "row offset must shift the dash phase, got {row:?}"
+        );
+        assert!(
+            row.iter().all(|(a, b)| {
+                let mid_x = (a.x + b.x) * 0.5;
+                !(mid_x > 0.0 && mid_x < 1.0)
+            }),
+            "x 0..1 on y=4 is a gap for this row offset, got {row:?}"
+        );
+    }
+
+    #[test]
+    fn pattern_hatch_follows_insert_transform() {
+        let mut document = Document::default();
+        layer0(&mut document);
+        document.blocks.insert(
+            "TREE".into(),
+            BlockDefinition {
+                name: "TREE".into(),
+                base_pt: Point3::from_xy(0.0, 0.0),
+                entities: vec![pattern_hatch(
+                    vec![square_hatch_path(0.0, 0.0, 10.0, 10.0)],
+                    vec![horizontal_pattern(Point2::new(0.0, 0.0), 2.0, Vec::new())],
+                )],
+                ..Default::default()
+            },
+        );
+        document.add_entity(Entity::new(Geometry::Insert {
+            block_name: "TREE".into(),
+            insertion: Point3::from_xy(100.0, 200.0),
+            scale: Point3::new(2.0, 2.0, 1.0),
+            rotation: std::f64::consts::FRAC_PI_2,
+            extrusion: default_extrusion(),
+            attribs: Vec::new(),
+            column_count: 1,
+            row_count: 1,
+            column_spacing: 0.0,
+            row_spacing: 0.0,
+            configuration: None,
+        }));
+        let transform = Transform2::block_insert(
+            Point3::from_xy(100.0, 200.0),
+            Point3::new(2.0, 2.0, 1.0),
+            std::f64::consts::FRAC_PI_2,
+            default_extrusion(),
+            Point3::from_xy(0.0, 0.0),
+        );
+        let corners = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)];
+        let world: Vec<Point2> = corners
+            .into_iter()
+            .map(|(x, y)| transform.apply(Point2::new(x, y)))
+            .collect();
+        let min_x = world.iter().map(|p| p.x).fold(f64::INFINITY, f64::min);
+        let max_x = world.iter().map(|p| p.x).fold(f64::NEG_INFINITY, f64::max);
+        let min_y = world.iter().map(|p| p.y).fold(f64::INFINITY, f64::min);
+        let max_y = world.iter().map(|p| p.y).fold(f64::NEG_INFINITY, f64::max);
+        let segments = pattern_segments(&plot_geometry(&document));
+        assert!(!segments.is_empty());
+        for (a, b) in &segments {
+            for point in [*a, *b] {
+                assert!(
+                    point.x >= min_x - 1e-4
+                        && point.x <= max_x + 1e-4
+                        && point.y >= min_y - 1e-4
+                        && point.y <= max_y + 1e-4,
+                    "segment {:?} is outside the inserted boundary",
+                    (a, b)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dense_pattern_stays_within_the_segment_cap_and_covers_the_boundary() {
+        let mut document = Document::default();
+        layer0(&mut document);
+        document.add_entity(pattern_hatch(
+            vec![square_hatch_path(0.0, 0.0, 10.0, 10.0)],
+            vec![horizontal_pattern(Point2::new(0.0, 0.0), 0.001, Vec::new())],
+        ));
+        let segments = pattern_segments(&plot_geometry(&document));
+        assert!(segments.len() <= MAX_HATCH_PATTERN_SEGMENTS);
+        assert!(segments.len() > 1);
+        let min_y = segments
+            .iter()
+            .map(|(a, b)| (a.y + b.y) * 0.5)
+            .fold(f64::INFINITY, f64::min);
+        let max_y = segments
+            .iter()
+            .map(|(a, b)| (a.y + b.y) * 0.5)
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert!(
+            min_y < 1.0 && max_y > 9.0,
+            "thinned pattern must still cover the boundary, y span {min_y}..{max_y}"
+        );
     }
 
     fn plot_has_stroke(plot: &PlotGeometry, point: Point2) -> bool {
