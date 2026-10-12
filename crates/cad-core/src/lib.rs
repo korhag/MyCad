@@ -32,18 +32,19 @@ pub mod snap_edges;
 pub mod stroke_font;
 pub mod thumbnail;
 pub mod transform;
+pub mod ttf_font;
 pub mod vectorize;
 
 pub use block::{
     block_depends_on, clamped_array_counts, count_block_references, create_block_from_entities,
     duplicate_block_definition, identity_insert, insert_instance_ids, insert_instance_ids_in_space,
-    insert_transform, is_paper_layout_block, is_system_block_name, is_user_editable_block_name,
-    make_unique_block, membership_matrix, nesting_too_deep, next_user_block_name,
-    paper_layout_block_order, purge_unused_user_blocks, rename_block, resolve_block_name,
-    sorted_paper_layout_blocks, transfer_entity, user_block_list, validate_block_rename,
-    validate_user_block_name, would_create_block_cycle, BlockError, BlockListEntry, BlockTreeChild,
-    BlockTreeIndex, CreateBlockResult, MakeUniqueResult, TransferResult, MAX_BLOCK_DEPTH,
-    MAX_INSERT_ARRAY_CELLS, NON_UNIFORM_MEMBERSHIP_MESSAGE,
+    insert_transform, is_in_place_editable_block_name, is_paper_layout_block, is_system_block_name,
+    is_user_editable_block_name, make_unique_block, membership_matrix, nesting_too_deep,
+    next_user_block_name, paper_layout_block_order, purge_unused_user_blocks, rename_block,
+    resolve_block_name, sorted_paper_layout_blocks, transfer_entity, user_block_list,
+    validate_block_rename, validate_user_block_name, would_create_block_cycle, BlockError,
+    BlockListEntry, BlockTreeChild, BlockTreeIndex, CreateBlockResult, MakeUniqueResult,
+    TransferResult, MAX_BLOCK_DEPTH, MAX_INSERT_ARRAY_CELLS, NON_UNIFORM_MEMBERSHIP_MESSAGE,
 };
 pub use color::{aci_rgb, nearest_aci, CadColor, Rgb};
 pub use compare::{compare_documents, CompareTol, Mismatch};
@@ -52,10 +53,10 @@ pub use curve_edit::{
     TrimResult, MAX_EXTEND_EDGES, MAX_STRETCH_PREVIEW, MAX_TRIM_EDGES,
 };
 pub use curves::{
-    arc_points, bspline_points, bulge_arc, catmull_rom_fit_points, circle_points,
-    ellipse_arc_points, ellipse_points, polyline_points, polyline_points_with_tolerance,
-    segments_for_arc, segments_per_turn, spline_sample_count, CIRCLE_SEGMENTS,
-    POLYLINE_BULGE_SEGMENTS,
+    arc_extent_points, arc_points, bspline_points, bulge_arc, catmull_rom_fit_points,
+    circle_points, ellipse_arc_points, ellipse_extent_points, ellipse_points, polyline_points,
+    polyline_points_with_tolerance, segments_for_arc, segments_per_turn, spline_sample_count,
+    EllipsePlacement, CIRCLE_SEGMENTS, POLYLINE_BULGE_SEGMENTS,
 };
 pub use document::{
     BlockDefinition, Document, DrawingUnits, EntityLocation, EntitySpace, ImportDiagnostics, Layer,
@@ -87,8 +88,8 @@ pub use entity::{
     default_extrusion, AttributeInfo, DimensionData, DimensionKind, Entity, EntityId, Geometry,
     GradientStop, HatchData, HatchEdge, HatchGradient, HatchPath, HatchPatternLine, MTextData,
     PolyVertex, RasterFrame, TextData, TextHAlign, TextVAlign, ViewportData, ATTRIB_CONSTANT,
-    ATTRIB_INVISIBLE, ATTRIB_PRESET, ATTRIB_VERIFY, LINEWEIGHT_BYBLOCK, LINEWEIGHT_BYLAYER,
-    LINEWEIGHT_DEFAULT, MAX_HATCH_DASHES_PER_SPAN, MAX_HATCH_PATTERN_LINES,
+    ATTRIB_INVISIBLE, ATTRIB_PRESET, ATTRIB_VERIFY, HATCH_MAX_LINES, LINEWEIGHT_BYBLOCK,
+    LINEWEIGHT_BYLAYER, LINEWEIGHT_DEFAULT, MAX_HATCH_DASHES_PER_SPAN, MAX_HATCH_PATTERN_LINES,
     MAX_HATCH_PATTERN_SEGMENTS,
 };
 pub use entity_transform::{
@@ -109,7 +110,7 @@ pub use geom::{
 };
 pub use hatch::{
     hatch_fill_contours, hatch_path_points, hatch_path_points_with_tolerance,
-    hatch_pattern_segments, GradientRamp,
+    hatch_pattern_segments, pattern_line_estimate, GradientRamp,
 };
 pub use ids::{ActionId, AnchorId, BlockDefinitionId, OptionId, ParameterId, PresetId, VertexId};
 pub use linetype::{
@@ -126,7 +127,7 @@ pub use measure_index::{
     area_from_primitive, radius_from_primitive, straight_of, MeasureGeom, MeasureIndex,
     MeasurePrimitive, MeasureRole, MEASURE_APERTURE_PX,
 };
-pub use polygon::{contour_contains, contour_depths, point_in_polygon};
+pub use polygon::{contour_contains, contour_depths, point_in_polygon, signed_area};
 pub use snap::{SnapFeature, SnapIndex, SnapKind, MAX_SNAP_CANDIDATES};
 pub use snap_edges::edge_snaps;
 pub use stroke_font::{
@@ -139,6 +140,7 @@ pub use thumbnail::{
     THUMBNAIL_FOLDER_NAME,
 };
 pub use transform::Transform2;
+pub use ttf_font::{describe_text_style_font, warm_document_fonts, FontAvailability};
 pub use vectorize::{
     plot_geometry, vectorize_entity, PlotFill, PlotGeometry, PlotStroke, VectorSink,
     VectorVisibility,

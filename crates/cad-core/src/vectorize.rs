@@ -21,8 +21,9 @@ use crate::hatch::{
     hatch_fill_contours, hatch_path_points_with_tolerance, hatch_pattern_segments, GradientRamp,
 };
 use crate::linetype::LineType;
-use crate::stroke_font::{measure_styled_width, strip_mtext, stroke_text_styled};
+use crate::stroke_font::{mtext_paragraphs, MTextAlign, MTextRun};
 use crate::transform::Transform2;
+use crate::ttf_font::TextFont;
 
 // ------------------------------------------------------------
 // Enum: VectorVisibility
@@ -77,16 +78,34 @@ pub trait VectorSink {
     fn pick_outline(&mut self, _pts: &[Point2], _closed: bool) {}
 
     fn stroke_mm(&mut self, _mm: f64) {}
+
+    /// Audits set this so each drawn path can be tied to its entity.
+    /// The viewport leaves it off and pays nothing per entity.
+    fn wants_spans(&self) -> bool {
+        false
+    }
+
+    fn push_span(&mut self, _label: &str) {}
+
+    fn pop_span(&mut self) {}
 }
 
 fn continuous() -> LineType {
     LineType::continuous("CONTINUOUS")
 }
 
-fn resolved_stroke_mm(document: &Document, entity: &Entity) -> f64 {
+fn inherited_layer<'a>(entity_layer: &'a str, block_layer: &'a str) -> &'a str {
+    if entity_layer.eq_ignore_ascii_case("0") && !block_layer.is_empty() {
+        block_layer
+    } else {
+        entity_layer
+    }
+}
+
+fn resolved_stroke_mm(document: &Document, entity: &Entity, layer_name: &str) -> f64 {
     let raw = match entity.lineweight {
         crate::LINEWEIGHT_BYLAYER => document
-            .layer(&entity.layer)
+            .layer(layer_name)
             .map(|layer| layer.lineweight)
             .unwrap_or(crate::LINEWEIGHT_DEFAULT),
         crate::LINEWEIGHT_BYBLOCK | crate::LINEWEIGHT_DEFAULT => crate::LINEWEIGHT_DEFAULT,
@@ -108,17 +127,27 @@ fn local_chord_tolerance(document: &Document, transform: Transform2) -> f64 {
     document.display_chord_tolerance() / scale
 }
 
-fn emit_text_data(sink: &mut impl VectorSink, transform: Transform2, rgb: Rgb, text: &TextData) {
-    let placed = place_text(text, transform);
-    emit_styled_line(
+fn emit_text_data(
+    sink: &mut impl VectorSink,
+    document: &Document,
+    transform: Transform2,
+    rgb: Rgb,
+    text: &TextData,
+) {
+    let style = resolve_text_style(document, &text.style);
+    let placed = place_text(text, transform, &style);
+    draw_text(
         sink,
         rgb,
+        &style.font,
         placed.origin,
         placed.height,
         placed.rotation,
         placed.width_factor,
         placed.oblique,
         &placed.value,
+        true,
+        0.0,
     );
 }
 
@@ -131,7 +160,7 @@ struct PlacedText {
     value: String,
 }
 
-fn place_text(text: &TextData, transform: Transform2) -> PlacedText {
+fn place_text(text: &TextData, transform: Transform2, style: &ResolvedTextStyle) -> PlacedText {
     let scale = transform
         .scale_x()
         .abs()
@@ -145,7 +174,7 @@ fn place_text(text: &TextData, transform: Transform2) -> PlacedText {
             let delta = Point2::new(alignment.x - insertion.x, alignment.y - insertion.y);
             let distance = delta.distance(Point2::new(0.0, 0.0)).max(1e-9);
             let rotation = delta.y.atan2(delta.x);
-            let natural = measure_styled_width(&text.value, height, 1.0).max(1e-9);
+            let natural = style.font.measure(&text.value, height, 1.0, true).max(1e-9);
             if matches!(text.halign, TextHAlign::Aligned) {
                 let fitted_height = height * (distance / natural);
                 return PlacedText {
@@ -161,7 +190,7 @@ fn place_text(text: &TextData, transform: Transform2) -> PlacedText {
         } else {
             (
                 text.rotation + transform.rotation_component(),
-                text.width_factor.max(1e-6),
+                (text.width_factor * style.width_factor).max(1e-6),
                 if text.halign.uses_alignment_point() || text.valign.uses_alignment_point() {
                     alignment
                 } else {
@@ -169,7 +198,7 @@ fn place_text(text: &TextData, transform: Transform2) -> PlacedText {
                 },
             )
         };
-    let width = measure_styled_width(&text.value, height, width_factor);
+    let width = style.font.measure(&text.value, height, width_factor, true);
     let (dx, dy) = text_anchor_offset(text.halign, text.valign, width, height);
     let (sin, cos) = rotation.sin_cos();
     PlacedText {
@@ -207,17 +236,55 @@ fn text_anchor_offset(
     (dx, dy)
 }
 
-fn emit_styled_line(
+fn draw_text(
     sink: &mut impl VectorSink,
     rgb: Rgb,
+    font: &TextFont,
     origin: Point2,
     height: f64,
     rotation: f64,
     width_factor: f64,
     oblique: f64,
     value: &str,
+    expand_codes: bool,
+    extra_space: f64,
 ) {
-    for [a, b] in stroke_text_styled(origin, height, rotation, width_factor, oblique, value) {
+    if extra_space > 1e-9 {
+        let (sin, cos) = rotation.sin_cos();
+        let mut cursor = 0.0_f64;
+        for ch in value.chars() {
+            let piece = ch.to_string();
+            let piece_origin = Point2::new(origin.x + cursor * cos, origin.y + cursor * sin);
+            draw_text(
+                sink,
+                rgb,
+                font,
+                piece_origin,
+                height,
+                rotation,
+                width_factor,
+                oblique,
+                &piece,
+                expand_codes,
+                0.0,
+            );
+            cursor += font.measure(&piece, height, width_factor, expand_codes);
+            if ch == ' ' {
+                cursor += extra_space;
+            }
+        }
+        return;
+    }
+    let drawn = font.draw(
+        origin,
+        height,
+        rotation,
+        width_factor,
+        oblique,
+        value,
+        expand_codes,
+    );
+    for [a, b] in drawn.strokes {
         sink.path(
             &[a, b],
             false,
@@ -228,6 +295,23 @@ fn emit_styled_line(
             1.0,
         );
     }
+    for glyph in drawn.glyphs {
+        sink.fill_even_odd(&glyph, rgb);
+    }
+}
+
+struct ResolvedTextStyle {
+    font: TextFont,
+    width_factor: f64,
+}
+
+struct LaidLine {
+    runs: Vec<MTextRun>,
+    align: Option<MTextAlign>,
+    left: f64,
+    right: f64,
+    first: f64,
+    last_of_paragraph: bool,
 }
 
 fn emit_mtext(
@@ -235,68 +319,294 @@ fn emit_mtext(
     transform: Transform2,
     rgb: Rgb,
     text: &crate::entity::MTextData,
+    style: &ResolvedTextStyle,
 ) {
-    let cleaned = strip_mtext(&text.value);
     let scale = transform
         .scale_x()
         .abs()
         .max(transform.scale_y().abs())
         .max(1e-12);
+    let style_width = if style.width_factor.is_finite() && style.width_factor > 1e-9 {
+        style.width_factor
+    } else {
+        1.0
+    };
     let height = (text.height * scale).max(1e-6);
     let rotation = text.rotation + transform.rotation_component();
-    let width_limit = text.width.abs() * scale;
-    let lines = wrap_mtext(&cleaned, height, width_limit);
+    let box_width = text.width.abs() * scale;
+    let mut lines = Vec::new();
+    for paragraph in mtext_paragraphs(&text.value, text.height) {
+        let left = paragraph.left_indent * height;
+        let right = paragraph.right_indent * height;
+        let first = paragraph.first_indent * height;
+        let wrapped = wrap_mtext_runs(
+            &paragraph.runs,
+            scale,
+            style_width,
+            &style.font,
+            wrap_width(box_width, left, right),
+        );
+        let count = wrapped.len();
+        for (index, runs) in wrapped.into_iter().enumerate() {
+            lines.push(LaidLine {
+                runs,
+                align: paragraph.align,
+                left,
+                right,
+                first: if index == 0 { first } else { 0.0 },
+                last_of_paragraph: index + 1 == count,
+            });
+        }
+    }
+    if lines.is_empty() {
+        lines.push(LaidLine {
+            runs: Vec::new(),
+            align: None,
+            left: 0.0,
+            right: 0.0,
+            first: 0.0,
+            last_of_paragraph: true,
+        });
+    }
     let step = height * text.line_spacing.max(0.25) * (5.0 / 3.0);
     let anchor = transform.apply(text.insertion.xy());
     let (sin, cos) = rotation.sin_cos();
     let baseline = mtext_first_baseline(text.attachment, lines.len(), height, step);
     for (index, line) in lines.iter().enumerate() {
-        let line_width = measure_styled_width(line, height, 1.0);
-        let dx = mtext_line_dx(text.attachment, line_width);
-        let dy = baseline - index as f64 * step;
-        let origin = Point2::new(
-            anchor.x + dx * cos - dy * sin,
-            anchor.y + dx * sin + dy * cos,
+        let line_width = mtext_line_width(&line.runs, scale, style_width, &style.font);
+        let dx = mtext_line_dx(
+            text.attachment,
+            line.align,
+            box_width,
+            line_width,
+            line.left,
+            line.right,
+            line.first,
         );
-        emit_styled_line(sink, rgb, origin, height, rotation, 1.0, 0.0, line);
+        let dy = baseline - index as f64 * step;
+        let inner = (box_width - line.left - line.right).max(0.0);
+        let spaces = space_count(&line.runs);
+        let justify = matches!(
+            line.align,
+            Some(MTextAlign::Justify | MTextAlign::Distribute)
+        ) && !line.last_of_paragraph
+            && spaces > 0
+            && inner > line_width;
+        let extra_space = if justify {
+            (inner - line_width) / spaces as f64
+        } else {
+            0.0
+        };
+        let mut cursor = 0.0;
+        for run in &line.runs {
+            let font = run_font(&style.font, run);
+            let run_height = (run.height * scale).max(1e-6);
+            let width_factor = (run.width_factor * style_width).max(1e-6);
+            let origin = Point2::new(
+                anchor.x + (dx + cursor) * cos - dy * sin,
+                anchor.y + (dx + cursor) * sin + dy * cos,
+            );
+            draw_text(
+                sink,
+                rgb,
+                &font,
+                origin,
+                run_height,
+                rotation,
+                width_factor,
+                0.0,
+                &run.text,
+                false,
+                extra_space,
+            );
+            cursor += font.measure(&run.text, run_height, width_factor, false);
+            if extra_space > 1e-9 {
+                cursor += extra_space * run.text.chars().filter(|ch| *ch == ' ').count() as f64;
+            }
+        }
     }
 }
 
-fn wrap_mtext(text: &str, height: f64, width_limit: f64) -> Vec<String> {
+fn wrap_width(box_width: f64, left: f64, right: f64) -> Option<f64> {
+    if box_width <= 1e-9 {
+        None
+    } else {
+        Some((box_width - left - right).max(1e-6))
+    }
+}
+
+fn wrap_mtext_runs(
+    paragraph: &[MTextRun],
+    scale: f64,
+    style_width: f64,
+    style_font: &TextFont,
+    width_limit: Option<f64>,
+) -> Vec<Vec<MTextRun>> {
+    let Some(width_limit) = width_limit else {
+        return vec![paragraph.to_vec()];
+    };
+    let words = mtext_words(paragraph);
+    if words.is_empty() {
+        return vec![Vec::new()];
+    }
     let mut lines = Vec::new();
-    for paragraph in text.split('\n') {
-        if width_limit <= 1e-9 {
-            lines.push(paragraph.to_string());
-            continue;
-        }
-        let mut current = String::new();
-        for word in paragraph.split_whitespace() {
-            let trial = if current.is_empty() {
-                word.to_string()
-            } else {
-                format!("{current} {word}")
-            };
-            if current.is_empty() || measure_styled_width(&trial, height, 1.0) <= width_limit {
-                current = trial;
-            } else {
-                lines.push(std::mem::take(&mut current));
-                current = word.to_string();
+    let mut current: Vec<MTextRun> = Vec::new();
+    for word in words {
+        let space = if current.is_empty() {
+            0.0
+        } else {
+            run_width(style_font, &space_run(&word), scale, style_width)
+        };
+        let trial = mtext_line_width(&current, scale, style_width, style_font)
+            + space
+            + run_width(style_font, &word, scale, style_width);
+        if current.is_empty() || trial <= width_limit {
+            if !current.is_empty() {
+                push_mtext_piece(&mut current, " ", &word);
             }
+            push_mtext_piece(&mut current, &word.text, &word);
+        } else {
+            lines.push(std::mem::take(&mut current));
+            current.push(word);
         }
+    }
+    if !current.is_empty() {
         lines.push(current);
     }
     if lines.is_empty() {
-        lines.push(String::new());
+        lines.push(Vec::new());
     }
     lines
 }
 
-fn mtext_line_dx(attachment: i16, line_width: f64) -> f64 {
-    match (attachment.clamp(1, 9) - 1) % 3 {
-        1 => -line_width * 0.5,
-        2 => -line_width,
-        _ => 0.0,
+fn space_run(word: &MTextRun) -> MTextRun {
+    let mut space = word.clone();
+    space.text = " ".to_string();
+    space
+}
+
+fn mtext_words(paragraph: &[MTextRun]) -> Vec<MTextRun> {
+    let mut words = Vec::new();
+    for run in paragraph {
+        for word in run.text.split_whitespace() {
+            if !word.is_empty() {
+                let mut piece = run.clone();
+                piece.text = word.to_string();
+                words.push(piece);
+            }
+        }
     }
+    words
+}
+
+fn push_mtext_piece(line: &mut Vec<MTextRun>, text: &str, template: &MTextRun) {
+    if let Some(last) = line.last_mut() {
+        if same_run_piece(last, template) {
+            last.text.push_str(text);
+            return;
+        }
+    }
+    let mut piece = template.clone();
+    piece.text = text.to_string();
+    line.push(piece);
+}
+
+fn same_run_piece(run: &MTextRun, template: &MTextRun) -> bool {
+    (run.height - template.height).abs() <= 1e-9
+        && (run.width_factor - template.width_factor).abs() <= 1e-9
+        && run.bold == template.bold
+        && run.italic == template.italic
+        && run.font == template.font
+}
+
+fn mtext_line_width(line: &[MTextRun], scale: f64, style_width: f64, style_font: &TextFont) -> f64 {
+    line.iter()
+        .map(|run| run_width(style_font, run, scale, style_width))
+        .sum()
+}
+
+fn run_width(style_font: &TextFont, run: &MTextRun, scale: f64, style_width: f64) -> f64 {
+    let font = run_font(style_font, run);
+    font.measure(
+        &run.text,
+        (run.height * scale).max(1e-6),
+        (run.width_factor * style_width).max(1e-6),
+        false,
+    )
+}
+
+fn run_font(style_font: &TextFont, run: &MTextRun) -> TextFont {
+    if run.font.trim().is_empty() {
+        style_font.clone()
+    } else {
+        TextFont::cached_family(&run.font, run.bold, run.italic)
+    }
+}
+
+fn space_count(line: &[MTextRun]) -> usize {
+    line.iter()
+        .map(|run| run.text.chars().filter(|ch| *ch == ' ').count())
+        .sum()
+}
+
+fn resolve_text_style(document: &Document, name: &str) -> ResolvedTextStyle {
+    let key = if name.trim().is_empty() {
+        "STANDARD"
+    } else {
+        name
+    };
+    let style = document.text_styles.get(key).or_else(|| {
+        document
+            .text_styles
+            .iter()
+            .find(|(stored, _)| stored.eq_ignore_ascii_case(key))
+            .map(|(_, style)| style)
+    });
+    let width_factor = style
+        .map(|style| style.width_factor)
+        .filter(|width| width.is_finite() && *width > 1e-9)
+        .unwrap_or(1.0);
+    let font = style
+        .map(|style| TextFont::cached_file(&style.font_file))
+        .unwrap_or(TextFont::Stroke);
+    ResolvedTextStyle { font, width_factor }
+}
+
+fn mtext_line_dx(
+    attachment: i16,
+    align: Option<MTextAlign>,
+    box_width: f64,
+    line_width: f64,
+    left: f64,
+    right: f64,
+    first: f64,
+) -> f64 {
+    let column = (attachment.clamp(1, 9) - 1) % 3;
+    let align = align.unwrap_or(match column {
+        1 => MTextAlign::Center,
+        2 => MTextAlign::Right,
+        _ => MTextAlign::Left,
+    });
+    if box_width <= 1e-9 {
+        let base = match align {
+            MTextAlign::Center => -line_width * 0.5,
+            MTextAlign::Right => -line_width,
+            MTextAlign::Left | MTextAlign::Justify | MTextAlign::Distribute => 0.0,
+        };
+        return base + left + first;
+    }
+    let box_left = match column {
+        1 => -box_width * 0.5,
+        2 => -box_width,
+        _ => 0.0,
+    };
+    let inner = (box_width - left - right).max(0.0);
+    let start = match align {
+        MTextAlign::Center => box_left + left + (inner - line_width) * 0.5,
+        MTextAlign::Right => box_left + left + inner - line_width,
+        MTextAlign::Left | MTextAlign::Justify | MTextAlign::Distribute => box_left + left,
+    };
+    start + first
 }
 
 fn mtext_first_baseline(attachment: i16, line_count: usize, cap: f64, step: f64) -> f64 {
@@ -309,7 +619,13 @@ fn mtext_first_baseline(attachment: i16, line_count: usize, cap: f64, step: f64)
     }
 }
 
-fn emit_attrib(sink: &mut impl VectorSink, transform: Transform2, rgb: Rgb, attrib: &TextData) {
+fn emit_attrib(
+    sink: &mut impl VectorSink,
+    document: &Document,
+    transform: Transform2,
+    rgb: Rgb,
+    attrib: &TextData,
+) {
     if attrib
         .attribute
         .as_ref()
@@ -317,7 +633,7 @@ fn emit_attrib(sink: &mut impl VectorSink, transform: Transform2, rgb: Rgb, attr
     {
         return;
     }
-    emit_text_data(sink, transform, rgb, attrib);
+    emit_text_data(sink, document, transform, rgb, attrib);
 }
 
 // ------------------------------------------------------------
@@ -331,26 +647,31 @@ pub fn vectorize_entity(
     transform: Transform2,
     block_color: CadColor,
     block_linetype: &str,
+    block_layer: &str,
     stack: &mut Vec<String>,
     visibility: VectorVisibility,
     sink: &mut impl VectorSink,
 ) {
-    if !entity.visible || !visibility.layer_allowed(document, &entity.layer) {
+    let layer_name = inherited_layer(&entity.layer, block_layer);
+    if !entity.visible || !visibility.layer_allowed(document, layer_name) {
         return;
     }
     let layer_color = document
-        .layer(&entity.layer)
+        .layer(layer_name)
         .map(|l| l.color)
         .unwrap_or(CadColor::Aci(7));
     let rgb = entity.color.resolve(layer_color, block_color);
-    sink.stroke_mm(resolved_stroke_mm(document, entity));
-    let linetype_name = document.resolved_linetype_name(entity, block_linetype);
+    sink.stroke_mm(resolved_stroke_mm(document, entity, layer_name));
+    let linetype_name = document.linetype_resolved(&entity.linetype, layer_name, block_linetype);
     let linetype = document
         .linetype(&linetype_name)
         .cloned()
         .unwrap_or_else(|| LineType::continuous(&linetype_name));
     let scale = document.effective_linetype_scale(entity);
     let chord_tol = local_chord_tolerance(document, transform);
+    if sink.wants_spans() {
+        sink.push_span(&entity_span(entity, layer_name, stack));
+    }
 
     match &entity.geometry {
         Geometry::Insert {
@@ -369,17 +690,25 @@ pub fn vectorize_entity(
             if crate::nesting_too_deep(stack)
                 || stack.iter().any(|n| n.eq_ignore_ascii_case(block_name))
             {
+                if sink.wants_spans() {
+                    sink.pop_span();
+                }
                 return;
             }
             let Some(block) = document.blocks.get(block_name) else {
+                if sink.wants_spans() {
+                    sink.pop_span();
+                }
                 return;
             };
             stack.push(block_name.clone());
             let inherit = match entity.color {
-                CadColor::ByLayer | CadColor::ByBlock => block_color,
+                CadColor::ByBlock => block_color,
+                CadColor::ByLayer => layer_color,
                 other => other,
             };
-            let inherit_lt = document.resolved_linetype_name(entity, block_linetype);
+            let inherit_lt =
+                document.linetype_resolved(&entity.linetype, layer_name, block_linetype);
             let (cols, rows) = crate::clamped_array_counts(*column_count, *row_count);
             for col in 0..cols {
                 for row in 0..rows {
@@ -404,6 +733,7 @@ pub fn vectorize_entity(
                             nested,
                             inherit,
                             inherit_lt.as_str(),
+                            layer_name,
                             stack,
                             visibility,
                             sink,
@@ -412,7 +742,7 @@ pub fn vectorize_entity(
                 }
             }
             for attrib in attribs {
-                emit_attrib(sink, transform, rgb, attrib);
+                emit_attrib(sink, document, transform, rgb, attrib);
             }
             stack.pop();
         }
@@ -421,6 +751,9 @@ pub fn vectorize_entity(
             if crate::nesting_too_deep(stack)
                 || stack.iter().any(|n| n.eq_ignore_ascii_case(block_name))
             {
+                if sink.wants_spans() {
+                    sink.pop_span();
+                }
                 return;
             }
             if let Some(block) = document.blocks.get(block_name) {
@@ -432,6 +765,7 @@ pub fn vectorize_entity(
                         transform,
                         block_color,
                         block_linetype,
+                        layer_name,
                         stack,
                         visibility,
                         sink,
@@ -640,15 +974,22 @@ pub fn vectorize_entity(
         }
         Geometry::Text(text) => {
             if text.is_attrib_def && !stack.is_empty() {
+                if sink.wants_spans() {
+                    sink.pop_span();
+                }
                 return;
             }
             if text.attribute.as_ref().is_some_and(|info| info.invisible()) {
+                if sink.wants_spans() {
+                    sink.pop_span();
+                }
                 return;
             }
-            emit_text_data(sink, transform, rgb, text);
+            emit_text_data(sink, document, transform, rgb, text);
         }
         Geometry::MText(text) => {
-            emit_mtext(sink, transform, rgb, text);
+            let style = resolve_text_style(document, &text.style);
+            emit_mtext(sink, transform, rgb, text, &style);
         }
         Geometry::Hatch(hatch) => {
             let mut contours = Vec::new();
@@ -665,13 +1006,13 @@ pub fn vectorize_entity(
                 sink.pick_outline(&world, true);
                 contours.push(world);
             }
-            let filled = hatch_fill_contours(hatch.style, &contours);
+            let (filled, depths) = hatch_fill_contours(hatch.style, &contours);
             if let Some(gradient) = &hatch.gradient {
                 sink.fill_gradient(&filled, &GradientRamp::from_gradient(gradient));
             } else if hatch.solid_fill {
                 sink.fill_even_odd(&filled, rgb);
             } else {
-                for (a, b) in hatch_pattern_segments(hatch, &filled, transform) {
+                for (a, b) in hatch_pattern_segments(hatch, &filled, &depths, transform) {
                     sink.path(
                         &[a, b],
                         false,
@@ -745,6 +1086,47 @@ pub fn vectorize_entity(
             );
         }
     }
+    if sink.wants_spans() {
+        sink.pop_span();
+    }
+}
+
+fn entity_span(entity: &Entity, layer: &str, stack: &[String]) -> String {
+    let kind = match &entity.geometry {
+        Geometry::Text(text) if text.is_attrib_def => "ATTDEF",
+        Geometry::Text(text) if text.attribute.is_some() => "ATTRIB",
+        other => other.type_name(),
+    };
+    let extrusion = match &entity.geometry {
+        Geometry::Text(text) => Some(text.extrusion),
+        Geometry::MText(text) => Some(text.extrusion),
+        _ => None,
+    };
+    let mut flags = Vec::new();
+    if extrusion.is_some_and(|direction| !crate::geom::is_world_extrusion(direction)) {
+        flags.push("extrusion");
+    }
+    if let Geometry::Text(text) = &entity.geometry {
+        if text.attribute.as_ref().is_some_and(|info| info.invisible()) {
+            flags.push("attrib-invisible");
+        }
+    }
+    if !entity.visible {
+        flags.push("hidden");
+    }
+    format!(
+        "{kind} layer={layer} stack={} flags={}",
+        if stack.is_empty() {
+            "*MODEL".to_string()
+        } else {
+            stack.join(">")
+        },
+        if flags.is_empty() {
+            "-".to_string()
+        } else {
+            flags.join(",")
+        }
+    )
 }
 
 // ------------------------------------------------------------
@@ -926,6 +1308,7 @@ pub fn plot_geometry(document: &Document) -> PlotGeometry {
             Transform2::identity(),
             CadColor::Aci(7),
             "CONTINUOUS",
+            "",
             &mut stack,
             VectorVisibility::Plot,
             &mut sink,
@@ -941,12 +1324,12 @@ pub fn plot_geometry(document: &Document) -> PlotGeometry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::document::{BlockDefinition, Layer};
+    use crate::document::{BlockDefinition, Layer, TextStyle};
     use crate::entity::{
         default_extrusion, HatchData, HatchPath, HatchPatternLine, MTextData, PolyVertex, TextData,
         MAX_HATCH_PATTERN_SEGMENTS,
     };
-    use crate::stroke_font::stroke_text;
+    use crate::stroke_font::{measure_styled_width, stroke_text, stroke_text_styled};
 
     fn layer0(document: &mut Document) {
         document.layers.insert(
@@ -1229,6 +1612,91 @@ mod tests {
         let expected = stroke_text(Point2::new(50.0 - width, 80.0 - 4.0), 4.0, 0.0, "HI");
         let plot = plot_geometry(&document);
         assert!(plot_has_stroke(&plot, expected[0][0]));
+    }
+
+    #[test]
+    fn mtext_inline_height_and_style_width_scale_the_strokes() {
+        let mut document = Document::default();
+        layer0(&mut document);
+        document.text_styles.insert(
+            "TITLE".into(),
+            TextStyle {
+                name: "TITLE".into(),
+                width_factor: 2.0,
+                ..TextStyle::standard()
+            },
+        );
+        document.add_entity(Entity::new(Geometry::MText(MTextData {
+            insertion: Point3::from_xy(0.0, 0.0),
+            height: 10.0,
+            value: r"\H0.5x;A".into(),
+            style: "TITLE".into(),
+            ..MTextData::default()
+        })));
+        let expected = stroke_text_styled(Point2::new(0.0, -10.0), 5.0, 0.0, 2.0, 0.0, "A");
+        let plain = stroke_text(Point2::new(0.0, -10.0), 5.0, 0.0, "A");
+        let plot = plot_geometry(&document);
+        assert!(!expected.is_empty());
+        assert!(plot_has_stroke(&plot, expected[0][0]));
+        let max_x = |segments: &[[Point2; 2]]| {
+            segments
+                .iter()
+                .flat_map(|segment| segment.iter())
+                .map(|point| point.x)
+                .fold(0.0_f64, f64::max)
+        };
+        let drawn = plot
+            .strokes
+            .iter()
+            .flat_map(|stroke| stroke.points.iter())
+            .map(|point| point.x)
+            .fold(0.0_f64, f64::max);
+        let top = plot
+            .strokes
+            .iter()
+            .flat_map(|stroke| stroke.points.iter())
+            .map(|point| point.y)
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert!((drawn - max_x(&expected)).abs() < 0.05);
+        assert!(max_x(&expected) > max_x(&plain) * 1.5);
+        assert!(top < -3.0 && top > -7.0, "half height top {top}");
+    }
+
+    #[test]
+    fn mtext_paragraph_right_aligns_inside_the_width() {
+        let mut document = Document::default();
+        layer0(&mut document);
+        document.add_entity(Entity::new(Geometry::MText(MTextData {
+            insertion: Point3::from_xy(0.0, 0.0),
+            height: 4.0,
+            width: 40.0,
+            value: r"\pxqr;HI".into(),
+            attachment: 1,
+            ..MTextData::default()
+        })));
+        let width = measure_styled_width("HI", 4.0, 1.0);
+        let expected = stroke_text(Point2::new(40.0 - width, -4.0), 4.0, 0.0, "HI");
+        let plot = plot_geometry(&document);
+        assert!(plot_has_stroke(&plot, expected[0][0]));
+    }
+
+    #[test]
+    fn mtext_first_indent_shifts_only_the_first_line() {
+        let mut document = Document::default();
+        layer0(&mut document);
+        document.add_entity(Entity::new(Geometry::MText(MTextData {
+            insertion: Point3::from_xy(0.0, 0.0),
+            height: 2.0,
+            width: 80.0,
+            value: r"\pi1,l0;ONE\PTWO".into(),
+            ..MTextData::default()
+        })));
+        let plot = plot_geometry(&document);
+        let step = 2.0 * (5.0 / 3.0);
+        let first = stroke_text(Point2::new(2.0, -2.0), 2.0, 0.0, "ONE");
+        let second = stroke_text(Point2::new(0.0, -2.0 - step), 2.0, 0.0, "TWO");
+        assert!(plot_has_stroke(&plot, first[0][0]));
+        assert!(plot_has_stroke(&plot, second[0][0]));
     }
 
     fn square_hatch_path(min_x: f64, min_y: f64, max_x: f64, max_y: f64) -> HatchPath {
@@ -1525,6 +1993,113 @@ mod tests {
             min_y < 1.0 && max_y > 9.0,
             "thinned pattern must still cover the boundary, y span {min_y}..{max_y}"
         );
+    }
+
+    fn colored_layer(name: &str, color: CadColor, visible: bool) -> Layer {
+        Layer {
+            name: name.to_string(),
+            visible,
+            frozen: false,
+            color,
+            linetype: "CONTINUOUS".into(),
+            ..Layer::default()
+        }
+    }
+
+    fn insert_of(block_name: &str, layer: &str, color: CadColor) -> Entity {
+        let mut insert = Entity::new(Geometry::Insert {
+            block_name: block_name.to_string(),
+            insertion: Point3::from_xy(0.0, 0.0),
+            scale: Point3::new(1.0, 1.0, 1.0),
+            rotation: 0.0,
+            extrusion: default_extrusion(),
+            attribs: Vec::new(),
+            column_count: 1,
+            row_count: 1,
+            column_spacing: 0.0,
+            row_spacing: 0.0,
+            configuration: None,
+        });
+        insert.layer = layer.to_string();
+        insert.color = color;
+        insert
+    }
+
+    #[test]
+    fn layer_zero_bylayer_uses_the_insert_layer_color() {
+        let mut document = Document::default();
+        layer0(&mut document);
+        document
+            .layers
+            .insert("RED".into(), colored_layer("RED", CadColor::Aci(1), true));
+        let mut line = Entity::new(Geometry::Line {
+            start: Point3::from_xy(0.0, 0.0),
+            end: Point3::from_xy(10.0, 0.0),
+        });
+        line.layer = "0".into();
+        line.color = CadColor::ByLayer;
+        document.blocks.insert(
+            "SYM".into(),
+            BlockDefinition {
+                name: "SYM".into(),
+                base_pt: Point3::default(),
+                entities: vec![line],
+                ..Default::default()
+            },
+        );
+        document.add_entity(insert_of("SYM", "RED", CadColor::ByLayer));
+        let plot = plot_geometry(&document);
+        assert_eq!(plot.strokes[0].rgb, crate::color::aci_rgb(1));
+    }
+
+    #[test]
+    fn byblock_child_uses_the_insert_layer_color_when_the_insert_is_bylayer() {
+        let mut document = Document::default();
+        layer0(&mut document);
+        document
+            .layers
+            .insert("RED".into(), colored_layer("RED", CadColor::Aci(1), true));
+        let mut line = Entity::new(Geometry::Line {
+            start: Point3::from_xy(0.0, 0.0),
+            end: Point3::from_xy(10.0, 0.0),
+        });
+        line.color = CadColor::ByBlock;
+        document.blocks.insert(
+            "SYM".into(),
+            BlockDefinition {
+                name: "SYM".into(),
+                base_pt: Point3::default(),
+                entities: vec![line],
+                ..Default::default()
+            },
+        );
+        document.add_entity(insert_of("SYM", "RED", CadColor::ByLayer));
+        let plot = plot_geometry(&document);
+        assert_eq!(plot.strokes[0].rgb, crate::color::aci_rgb(1));
+    }
+
+    #[test]
+    fn an_off_insert_layer_hides_layer_zero_geometry() {
+        let mut document = Document::default();
+        layer0(&mut document);
+        document
+            .layers
+            .insert("RED".into(), colored_layer("RED", CadColor::Aci(1), false));
+        let line = Entity::new(Geometry::Line {
+            start: Point3::from_xy(0.0, 0.0),
+            end: Point3::from_xy(10.0, 0.0),
+        });
+        document.blocks.insert(
+            "SYM".into(),
+            BlockDefinition {
+                name: "SYM".into(),
+                base_pt: Point3::default(),
+                entities: vec![line],
+                ..Default::default()
+            },
+        );
+        document.add_entity(insert_of("SYM", "RED", CadColor::ByLayer));
+        assert!(plot_geometry(&document).strokes.is_empty());
     }
 
     fn plot_has_stroke(plot: &PlotGeometry, point: Point2) -> bool {

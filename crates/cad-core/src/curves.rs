@@ -1,8 +1,9 @@
 //! Curve sampling shared by viewport tessellation and vector PDF export.
 
 use crate::entity::PolyVertex;
-use crate::geom::{ocs_to_wcs, Point2, Point3};
+use crate::geom::{ocs_axes, ocs_to_wcs, Point2, Point3};
 use crate::measure::bulge_circle;
+use crate::transform::Transform2;
 
 pub const CIRCLE_SEGMENTS: usize = 32;
 const MAX_SEGMENTS_PER_TURN: usize = 512;
@@ -181,6 +182,184 @@ pub fn ellipse_arc_points(
         pts.push(p.xy());
     }
     pts
+}
+
+// ------------------------------------------------------------
+// Enum: EllipsePlacement
+// Purpose: ELLIPSE entities are already in WCS. Hatch ellipse
+//          edges are parameterized in OCS and then mapped.
+// ------------------------------------------------------------
+#[derive(Debug, Clone, Copy)]
+pub enum EllipsePlacement {
+    World,
+    Ocs { extrusion: Point3, elevation: f64 },
+}
+
+// ------------------------------------------------------------
+// Function: arc_extent_points
+// Purpose: Endpoints and world-axis extrema of a circular arc.
+//          The sweep is the same CCW/CW rule as `arc_points`, and
+//          each sample is OCS-mapped before `transform`, so an
+//          INSERT scale changes the radius.
+// ------------------------------------------------------------
+pub fn arc_extent_points(
+    center: Point3,
+    radius: f64,
+    start: f64,
+    end: f64,
+    ccw: bool,
+    extrusion: Point3,
+    transform: Transform2,
+) -> Vec<Point2> {
+    if !center.is_finite() || !radius.is_finite() {
+        return Vec::new();
+    }
+    let point_at = |angle: f64| {
+        let local = Point3::new(
+            center.x + radius * angle.cos(),
+            center.y + radius * angle.sin(),
+            center.z,
+        );
+        transform.apply(ocs_to_wcs(local, extrusion).xy())
+    };
+    if radius.abs() < 1e-15 {
+        return vec![point_at(start)];
+    }
+    let (ex, ey) = ocs_basis_xy(extrusion, transform);
+    let mut angles = vec![start, sweep_end(start, end, ccw)];
+    push_axis_angles(&mut angles, radius * ex.x, radius * ey.x);
+    push_axis_angles(&mut angles, radius * ex.y, radius * ey.y);
+    points_on_sweep(&angles, start, end, ccw, point_at)
+}
+
+// ------------------------------------------------------------
+// Function: ellipse_extent_points
+// Purpose: Endpoints and world-axis extrema of an elliptic arc.
+//          Parameterization matches `ellipse_arc_points`.
+// ------------------------------------------------------------
+pub fn ellipse_extent_points(
+    center: Point3,
+    major_axis: Point3,
+    axis_ratio: f64,
+    start_param: f64,
+    end_param: f64,
+    ccw: bool,
+    minor_normal: Point3,
+    placement: EllipsePlacement,
+    transform: Transform2,
+) -> Vec<Point2> {
+    if !center.is_finite() || !major_axis.is_finite() || !axis_ratio.is_finite() {
+        return Vec::new();
+    }
+    let map_point = |point: Point3| match placement {
+        EllipsePlacement::World => transform.apply(point.xy()),
+        EllipsePlacement::Ocs {
+            extrusion,
+            elevation,
+        } => transform.apply(ocs_to_wcs(Point3::new(point.x, point.y, elevation), extrusion).xy()),
+    };
+    let map_vector = |vector: Point3| match placement {
+        EllipsePlacement::World => transform.apply_vector(vector.xy()),
+        EllipsePlacement::Ocs { extrusion, .. } => {
+            let origin = ocs_to_wcs(Point3::default(), extrusion);
+            transform.apply_vector((ocs_to_wcs(vector, extrusion) - origin).xy())
+        }
+    };
+    let major_len = major_axis.length();
+    if major_len < 1e-15 {
+        return vec![map_point(center)];
+    }
+    let minor_normal = if minor_normal.length() < 1e-15 {
+        Point3::new(0.0, 0.0, 1.0)
+    } else {
+        minor_normal.normalized()
+    };
+    let minor_dir = minor_normal.cross(major_axis.normalized());
+    if minor_dir.length() < 1e-15 {
+        return vec![map_point(center)];
+    }
+    let along_major = major_axis.normalized() * major_len;
+    let along_minor = minor_dir.normalized() * (major_len * axis_ratio.abs());
+    let point_at =
+        |param: f64| map_point(center + along_major * param.cos() + along_minor * param.sin());
+    let major_world = map_vector(along_major);
+    let minor_world = map_vector(along_minor);
+    let mut params = vec![start_param, sweep_end(start_param, end_param, ccw)];
+    push_axis_angles(&mut params, major_world.x, minor_world.x);
+    push_axis_angles(&mut params, major_world.y, minor_world.y);
+    points_on_sweep(&params, start_param, end_param, ccw, point_at)
+}
+
+fn ocs_basis_xy(extrusion: Point3, transform: Transform2) -> (Point2, Point2) {
+    let (ax, ay) = ocs_axes(extrusion);
+    (
+        transform.apply_vector(ax.xy()),
+        transform.apply_vector(ay.xy()),
+    )
+}
+
+fn push_axis_angles(angles: &mut Vec<f64>, cos_coeff: f64, sin_coeff: f64) {
+    if cos_coeff.abs() < 1e-15 && sin_coeff.abs() < 1e-15 {
+        return;
+    }
+    let theta = sin_coeff.atan2(cos_coeff);
+    angles.push(theta);
+    angles.push(theta + std::f64::consts::PI);
+}
+
+fn sweep_end(start: f64, end: f64, ccw: bool) -> f64 {
+    let sweep = normalized_sweep(start, end, ccw);
+    if ccw {
+        start + sweep
+    } else {
+        start - sweep
+    }
+}
+
+fn normalized_sweep(start: f64, end: f64, ccw: bool) -> f64 {
+    let mut sweep = if ccw { end - start } else { start - end };
+    if !sweep.is_finite() {
+        return 0.0;
+    }
+    if sweep.abs() < 1e-15 {
+        return std::f64::consts::TAU;
+    }
+    while sweep <= 0.0 {
+        sweep += std::f64::consts::TAU;
+    }
+    while sweep > std::f64::consts::TAU + 1e-12 {
+        sweep -= std::f64::consts::TAU;
+    }
+    sweep
+}
+
+fn points_on_sweep(
+    angles: &[f64],
+    start: f64,
+    end: f64,
+    ccw: bool,
+    mut point_at: impl FnMut(f64) -> Point2,
+) -> Vec<Point2> {
+    let sweep = normalized_sweep(start, end, ccw);
+    let mut points = Vec::new();
+    for angle in angles {
+        if !angle.is_finite() || !angle_on_sweep(*angle, start, sweep, ccw) {
+            continue;
+        }
+        let point = point_at(*angle);
+        if point.is_finite() {
+            points.push(point);
+        }
+    }
+    points
+}
+
+fn angle_on_sweep(angle: f64, start: f64, sweep: f64, ccw: bool) -> bool {
+    if sweep >= std::f64::consts::TAU - 1e-8 {
+        return true;
+    }
+    let delta = if ccw { angle - start } else { start - angle };
+    delta.rem_euclid(std::f64::consts::TAU) <= sweep + 1e-8
 }
 
 pub const POLYLINE_BULGE_SEGMENTS: usize = 16;
@@ -826,5 +1005,83 @@ mod tests {
         }
         let mid = pts[pts.len() / 2];
         assert!(mid.y > 0.5, "curve should bow upward, mid y={}", mid.y);
+    }
+
+    fn bounds_of(points: &[Point2]) -> crate::extents::Extents2 {
+        crate::extents::Extents2::from_points(points.iter().copied()).expect("points")
+    }
+
+    #[test]
+    fn quarter_circle_bounds_exclude_the_far_side() {
+        let points = arc_extent_points(
+            Point3::from_xy(0.0, 0.0),
+            10.0,
+            0.0,
+            std::f64::consts::FRAC_PI_2,
+            true,
+            Point3::new(0.0, 0.0, 1.0),
+            Transform2::identity(),
+        );
+        let bounds = bounds_of(&points);
+        assert_near(bounds.min.x, 0.0, "min x");
+        assert_near(bounds.min.y, 0.0, "min y");
+        assert_near(bounds.max.x, 10.0, "max x");
+        assert_near(bounds.max.y, 10.0, "max y");
+    }
+
+    #[test]
+    fn negative_extrusion_mirrors_the_arc_in_x() {
+        let points = arc_extent_points(
+            Point3::from_xy(0.0, 0.0),
+            10.0,
+            0.0,
+            std::f64::consts::FRAC_PI_2,
+            true,
+            Point3::new(0.0, 0.0, -1.0),
+            Transform2::identity(),
+        );
+        let bounds = bounds_of(&points);
+        assert_near(bounds.min.x, -10.0, "min x");
+        assert_near(bounds.max.x, 0.0, "max x");
+        assert_near(bounds.min.y, 0.0, "min y");
+        assert_near(bounds.max.y, 10.0, "max y");
+    }
+
+    #[test]
+    fn insert_scale_changes_the_arc_radius() {
+        let points = arc_extent_points(
+            Point3::from_xy(0.0, 0.0),
+            10.0,
+            0.0,
+            std::f64::consts::TAU,
+            true,
+            Point3::new(0.0, 0.0, 1.0),
+            Transform2::scale(2.0, 3.0),
+        );
+        let bounds = bounds_of(&points);
+        assert_near(bounds.min.x, -20.0, "min x");
+        assert_near(bounds.max.x, 20.0, "max x");
+        assert_near(bounds.min.y, -30.0, "min y");
+        assert_near(bounds.max.y, 30.0, "max y");
+    }
+
+    #[test]
+    fn ellipse_quadrant_uses_the_minor_axis() {
+        let points = ellipse_extent_points(
+            Point3::from_xy(0.0, 0.0),
+            Point3::from_xy(10.0, 0.0),
+            0.5,
+            0.0,
+            std::f64::consts::FRAC_PI_2,
+            true,
+            Point3::new(0.0, 0.0, 1.0),
+            EllipsePlacement::World,
+            Transform2::identity(),
+        );
+        let bounds = bounds_of(&points);
+        assert_near(bounds.min.x, 0.0, "min x");
+        assert_near(bounds.max.x, 10.0, "max x");
+        assert_near(bounds.min.y, 0.0, "min y");
+        assert_near(bounds.max.y, 5.0, "max y");
     }
 }

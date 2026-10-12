@@ -557,13 +557,7 @@ fn consider_pick(
                 }
             }
             PickKind::Fill => {
-                if fill_contains_screen(
-                    primitive,
-                    camera,
-                    screen,
-                    viewport_origin,
-                    viewport_size,
-                ) {
+                if fill_contains_screen(primitive, camera, screen, viewport_origin, viewport_size) {
                     consider_hit(best_fill, pick.entity_id, draw_order, 0.0);
                 }
             }

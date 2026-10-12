@@ -186,6 +186,9 @@ pub struct ImportDiagnostics {
     pub layer_count: usize,
     pub block_count: usize,
     pub extents: Option<Extents2>,
+    /// `$EXTMIN` / `$EXTMAX` from the file. Separate from `extents`, which
+    /// is recomputed from the imported geometry.
+    pub header_extents: Option<Extents2>,
     pub import_time: Duration,
     pub render_prepare_time: Duration,
     pub warnings: Vec<String>,
@@ -1094,7 +1097,7 @@ impl Document {
         let mut extents = Extents2::empty();
         let mut any = false;
         let mut stack = Vec::new();
-        collect_entity_points(self, entity, transform, &mut stack, &mut |p| {
+        collect_entity_points(self, entity, transform, "", &mut stack, &mut |p| {
             if p.is_finite() {
                 extents.include(p);
                 any = true;
@@ -1185,10 +1188,19 @@ impl Document {
     }
 
     pub fn resolved_linetype_name(&self, entity: &Entity, block_linetype: &str) -> String {
-        let name = normalize_linetype_name(&entity.linetype);
+        self.linetype_resolved(&entity.linetype, &entity.layer, block_linetype)
+    }
+
+    pub fn linetype_resolved(
+        &self,
+        linetype: &str,
+        layer_name: &str,
+        block_linetype: &str,
+    ) -> String {
+        let name = normalize_linetype_name(linetype);
         if is_bylayer_name(&name) {
             let layer_lt = self
-                .layer(&entity.layer)
+                .layer(layer_name)
                 .map(|l| normalize_linetype_name(&l.linetype))
                 .unwrap_or_else(|| "CONTINUOUS".into());
             if is_bylayer_name(&layer_lt) {
@@ -1214,12 +1226,19 @@ impl Document {
             let mut extents = Extents2::empty();
             let mut any = false;
             let mut stack = Vec::new();
-            collect_entity_points(self, entity, Transform2::identity(), &mut stack, &mut |p| {
-                if p.is_finite() {
-                    extents.include(p);
-                    any = true;
-                }
-            });
+            collect_entity_points(
+                self,
+                entity,
+                Transform2::identity(),
+                "",
+                &mut stack,
+                &mut |p| {
+                    if p.is_finite() {
+                        extents.include(p);
+                        any = true;
+                    }
+                },
+            );
             any.then_some(extents)
         };
         let Some(extra) = extra else {
@@ -1282,16 +1301,26 @@ impl Document {
     //          full-view circle stays smooth without a huge mesh.
     // --------------------------------------------------------
     pub fn display_chord_tolerance(&self) -> f64 {
-        let extents = if self.extents_stale || self.diagnostics.extents.is_none() {
-            self.compute_extents()
-        } else {
-            self.diagnostics.extents
-        };
+        let extents = self.current_extents();
         let diagonal = extents
             .map(|e| e.width().hypot(e.height()))
             .filter(|d| d.is_finite() && *d > 1e-9)
             .unwrap_or(1.0);
         (diagonal * 2.0e-6).max(1e-9)
+    }
+
+    // --------------------------------------------------------
+    // Method: current_extents
+    // Purpose: Cached world bounds when they are still valid.
+    //          A stale cache is recomputed without storing it,
+    //          so a shared document can be read during a save.
+    // --------------------------------------------------------
+    pub fn current_extents(&self) -> Option<Extents2> {
+        if self.extents_stale || self.diagnostics.extents.is_none() {
+            self.compute_extents()
+        } else {
+            self.diagnostics.extents
+        }
     }
 
     pub fn compute_extents(&self) -> Option<Extents2> {
@@ -1300,12 +1329,19 @@ impl Document {
         let mut any = false;
         let mut stack = Vec::new();
         for entity in &self.model_space {
-            collect_entity_points(self, entity, Transform2::identity(), &mut stack, &mut |p| {
-                if p.is_finite() {
-                    extents.include(p);
-                    any = true;
-                }
-            });
+            collect_entity_points(
+                self,
+                entity,
+                Transform2::identity(),
+                "",
+                &mut stack,
+                &mut |p| {
+                    if p.is_finite() {
+                        extents.include(p);
+                        any = true;
+                    }
+                },
+            );
         }
         any.then_some(extents)
     }
@@ -1320,14 +1356,28 @@ fn resolved_byblock(block_linetype: &str) -> String {
     }
 }
 
+fn is_layer_zero(name: &str) -> bool {
+    name.eq_ignore_ascii_case("0")
+}
+
+fn effective_layer<'a>(entity_layer: &'a str, inherited_layer: &'a str) -> &'a str {
+    if is_layer_zero(entity_layer) && !inherited_layer.is_empty() {
+        inherited_layer
+    } else {
+        entity_layer
+    }
+}
+
 fn collect_entity_points(
     document: &Document,
     entity: &Entity,
     transform: Transform2,
+    inherited_layer: &str,
     block_stack: &mut Vec<String>,
     visit: &mut impl FnMut(Point2),
 ) {
-    if !entity.visible || !document.layer_is_visible(&entity.layer) {
+    let layer = effective_layer(&entity.layer, inherited_layer);
+    if !entity.visible || !document.layer_is_visible(layer) {
         return;
     }
     match &entity.geometry {
@@ -1372,7 +1422,7 @@ fn collect_entity_points(
                     .then(extra);
                     let nested = transform.then(local);
                     for child in &block.entities {
-                        collect_entity_points(document, child, nested, block_stack, visit);
+                        collect_entity_points(document, child, nested, layer, block_stack, visit);
                     }
                 }
             }
@@ -1393,7 +1443,7 @@ fn collect_entity_points(
                 }
                 block_stack.push(block_name.clone());
                 for child in &block.entities {
-                    collect_entity_points(document, child, transform, block_stack, visit);
+                    collect_entity_points(document, child, transform, layer, block_stack, visit);
                 }
                 block_stack.pop();
             }
@@ -1403,24 +1453,63 @@ fn collect_entity_points(
             visit(transform.apply(end.xy()));
         }
         crate::entity::Geometry::Point { position } => visit(transform.apply(position.xy())),
-        crate::entity::Geometry::Circle { center, radius, .. } => {
-            let c = transform.apply(center.xy());
-            let r = *radius * transform.scale_x().abs().max(transform.scale_y().abs());
-            visit(Point2::new(c.x - r, c.y - r));
-            visit(Point2::new(c.x + r, c.y + r));
+        crate::entity::Geometry::Circle {
+            center,
+            radius,
+            extrusion,
+        } => {
+            for point in crate::curves::arc_extent_points(
+                *center,
+                *radius,
+                0.0,
+                std::f64::consts::TAU,
+                true,
+                *extrusion,
+                transform,
+            ) {
+                visit(point);
+            }
         }
-        crate::entity::Geometry::Arc { center, radius, .. } => {
-            let c = transform.apply(center.xy());
-            let r = *radius * transform.scale_x().abs().max(transform.scale_y().abs());
-            visit(Point2::new(c.x - r, c.y - r));
-            visit(Point2::new(c.x + r, c.y + r));
+        crate::entity::Geometry::Arc {
+            center,
+            radius,
+            start_angle,
+            end_angle,
+            extrusion,
+        } => {
+            for point in crate::curves::arc_extent_points(
+                *center,
+                *radius,
+                *start_angle,
+                *end_angle,
+                true,
+                *extrusion,
+                transform,
+            ) {
+                visit(point);
+            }
         }
         crate::entity::Geometry::Ellipse {
-            center, major_axis, ..
+            center,
+            major_axis,
+            axis_ratio,
+            start_param,
+            end_param,
+            extrusion,
         } => {
-            visit(transform.apply(center.xy()));
-            visit(transform.apply((*center + *major_axis).xy()));
-            visit(transform.apply((*center - *major_axis).xy()));
+            for point in crate::curves::ellipse_extent_points(
+                *center,
+                *major_axis,
+                *axis_ratio,
+                *start_param,
+                *end_param,
+                true,
+                *extrusion,
+                crate::curves::EllipsePlacement::World,
+                transform,
+            ) {
+                visit(point);
+            }
         }
         crate::entity::Geometry::LwPolyline { vertices, .. }
         | crate::entity::Geometry::Polyline { vertices, .. } => {
@@ -1474,19 +1563,49 @@ fn collect_entity_points(
                                     visit(transform.apply(start.xy()));
                                     visit(transform.apply(end.xy()));
                                 }
-                                crate::entity::HatchEdge::Arc { center, radius, .. } => {
-                                    let c = transform.apply(center.xy());
-                                    let r = *radius;
-                                    visit(Point2::new(c.x - r, c.y - r));
-                                    visit(Point2::new(c.x + r, c.y + r));
+                                crate::entity::HatchEdge::Arc {
+                                    center,
+                                    radius,
+                                    start_angle,
+                                    end_angle,
+                                    is_ccw,
+                                } => {
+                                    for point in crate::curves::arc_extent_points(
+                                        Point3::new(center.x, center.y, hatch.elevation),
+                                        *radius,
+                                        *start_angle,
+                                        *end_angle,
+                                        *is_ccw,
+                                        hatch.extrusion,
+                                        transform,
+                                    ) {
+                                        visit(point);
+                                    }
                                 }
                                 crate::entity::HatchEdge::Ellipse {
                                     center,
                                     major_endpoint,
-                                    ..
+                                    axis_ratio,
+                                    start_angle,
+                                    end_angle,
+                                    is_ccw,
                                 } => {
-                                    visit(transform.apply(center.xy()));
-                                    visit(transform.apply(major_endpoint.xy()));
+                                    for point in crate::curves::ellipse_extent_points(
+                                        Point3::from_xy(center.x, center.y),
+                                        Point3::from_xy(major_endpoint.x, major_endpoint.y),
+                                        *axis_ratio,
+                                        *start_angle,
+                                        *end_angle,
+                                        *is_ccw,
+                                        crate::entity::default_extrusion(),
+                                        crate::curves::EllipsePlacement::Ocs {
+                                            extrusion: hatch.extrusion,
+                                            elevation: hatch.elevation,
+                                        },
+                                        transform,
+                                    ) {
+                                        visit(point);
+                                    }
                                 }
                                 crate::entity::HatchEdge::Spline {
                                     control_points,
@@ -1613,6 +1732,23 @@ mod tests {
         assert!((e.min.x - 100.0).abs() < 1e-9);
         assert!((e.max.x - 120.0).abs() < 1e-9);
         assert!((e.min.y - 50.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn arc_extents_follow_the_sweep_and_not_the_full_circle() {
+        let mut document = Document::default();
+        document.add_entity(Entity::new(Geometry::Arc {
+            center: Point3::from_xy(0.0, 0.0),
+            radius: 1_000_000.0,
+            start_angle: 0.0,
+            end_angle: std::f64::consts::FRAC_PI_2,
+            extrusion: Point3::new(0.0, 0.0, 1.0),
+        }));
+        let extents = document.compute_extents().unwrap();
+        assert!(extents.min.x > -1.0, "min x {}", extents.min.x);
+        assert!(extents.min.y > -1.0, "min y {}", extents.min.y);
+        assert!((extents.max.x - 1_000_000.0).abs() < 1e-6);
+        assert!((extents.max.y - 1_000_000.0).abs() < 1e-6);
     }
 
     #[test]

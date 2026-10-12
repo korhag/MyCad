@@ -5,9 +5,32 @@ All notable changes to EntoCAD are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project versions with [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Workspace version is `0.44.2` (`Cargo.toml`).
+Workspace version is `0.45.0` (`Cargo.toml`).
 
 ## [Unreleased]
+
+## [0.45.0] - 2026-10-10
+
+### Added
+- Double-click opens anonymous `*U` block references, such as dynamic blocks from a DWG, in Block Edit in place.
+- TEXT and MTEXT draw TrueType faces from the installed Windows fonts, so title-block text keeps the width AutoCAD uses. SHX styles and missing fonts still use the stroke font.
+- `--import-only` lists each text style, its font file, and whether that font was found.
+
+### Fixed
+- Double-clicking an object no longer zooms out to the whole drawing. Only an empty-space double-click zooms extents, and a block that cannot be edited shows a status message.
+- MTEXT paragraph codes set alignment and indents, and `\f` switches the font inside a paragraph, so centered and right-aligned title-block lines stay in their cells.
+
+## [0.44.3] - 2026-10-09
+
+### Fixed
+
+- A DWG saved by EntoCAD opens in AutoCAD without the "Non-unitary UCS" prompt, and the opening view is centered on the drawing instead of an empty spot at the origin.
+- Arc and ellipse extents follow the sweep and the extrusion, so a large arc no longer inflates the drawing bounds to the full circle.
+- In an R2004 or newer DWG, layer color method 0xC3 stays an ACI index and 0xC2 stays RGB. Cyan geometry no longer draws as white.
+- Geometry on layer 0 inside a block uses the insert's layer for color, linetype, lineweight, and visibility. A ByLayer insert passes that layer color to ByBlock children.
+- MTEXT honors inline `\H` and `\W`, and the text style width factor, so title-block text keeps its height and width.
+- `--import-only` reports drawn geometry that falls outside the file's stored extents.
+- Skip a HATCH pattern that AutoCAD would not draw because it exceeds HPMAXLINES (100,000 by default in AutoCAD 2025), so dense wall hatches no longer show as white bars.
 
 ## [0.44.2] - 2026-10-09
 

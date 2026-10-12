@@ -172,6 +172,16 @@ pub fn is_user_editable_block_name(name: &str) -> bool {
     !is_system_block_name(name)
 }
 
+/// User blocks and anonymous `*U` definitions can be edited in place.
+/// Dimension (`*D`), hatch (`*X`), and layout blocks stay locked.
+/// Rename, duplicate, and the Blocks tree still use [`is_user_editable_block_name`].
+pub fn is_in_place_editable_block_name(name: &str) -> bool {
+    if is_user_editable_block_name(name) {
+        return true;
+    }
+    name.trim().to_ascii_uppercase().starts_with("*U")
+}
+
 pub fn validate_user_block_name(document: &Document, name: &str) -> Result<String, BlockError> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
@@ -1527,5 +1537,21 @@ mod tests {
         let index = BlockTreeIndex::build(&document);
         assert_eq!(index.children_of("Machine")[0].name, "Drive");
         assert_eq!(index.children_of("Machine")[0].count, 2);
+    }
+
+    #[test]
+    fn anonymous_u_blocks_are_editable_in_place_but_not_renamable() {
+        assert!(is_in_place_editable_block_name("*U12"));
+        assert!(is_in_place_editable_block_name("*u3"));
+        assert!(is_in_place_editable_block_name("Motor"));
+        assert!(!is_in_place_editable_block_name("*D12"));
+        assert!(!is_in_place_editable_block_name("*X1"));
+        assert!(!is_in_place_editable_block_name("*Model_Space"));
+        assert!(!is_user_editable_block_name("*U12"));
+        let document = Document::default();
+        assert!(matches!(
+            validate_block_rename(&document, "*U12", "Motor"),
+            Err(BlockError::ReservedName(_))
+        ));
     }
 }

@@ -175,6 +175,9 @@ fn run_import_only(path: Option<PathBuf>) -> ExitCode {
             for warning in &d.warnings {
                 println!("warning: {warning}");
             }
+            for style in doc.text_styles.values() {
+                println!("{}", cad_core::describe_text_style_font(style));
+            }
             let prepare = std::time::Instant::now();
             let display = cad_render::tessellate_document(&doc);
             println!("render_prepare_s: {:.3}", prepare.elapsed().as_secs_f64());
@@ -182,6 +185,8 @@ fn run_import_only(path: Option<PathBuf>) -> ExitCode {
             println!("triangle_vertices: {}", display.triangle_vertices.len());
             println!("triangles: {}", display.triangle_vertices.len() / 3);
             audit::print_display_list_audit(&display);
+            audit::print_outside_header(&doc);
+            audit::print_hatch_line_limit(&doc);
             audit::print_geometry_audit(&doc);
             audit::print_linetype_audit(&doc);
             if let Some(extents) = doc.diagnostics.extents {

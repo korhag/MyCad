@@ -12,3 +12,4 @@ perf = []
 
 [dependencies]
 thiserror.workspace = true
+ttf-parser.workspace = true

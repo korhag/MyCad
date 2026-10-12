@@ -359,6 +359,39 @@ mod tests {
     }
 
     #[test]
+    fn write_dwg_stores_unit_ucs_axes() {
+        let dest = std::env::temp_dir().join(format!("mycad-ucs-{}.dwg", stamp()));
+        write_dwg(&line_document(), &dest).expect("write");
+        let x_axis = header_point(&dest, "UCSXDIR");
+        let y_axis = header_point(&dest, "UCSYDIR");
+        let _ = fs::remove_file(&dest);
+        assert!((x_axis.x - 1.0).abs() < 1e-9 && x_axis.y.abs() < 1e-9 && x_axis.z.abs() < 1e-9);
+        assert!(y_axis.x.abs() < 1e-9 && (y_axis.y - 1.0).abs() < 1e-9 && y_axis.z.abs() < 1e-9);
+    }
+
+    fn header_point(path: &Path, field: &str) -> crate::dynapi::Point3D {
+        use std::ffi::CString;
+        use std::mem::MaybeUninit;
+        let c_path = CString::new(path.to_str().expect("utf8 path")).expect("path");
+        let _guard = crate::LIBREDWG_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut dwg: Box<libredwg_sys::Dwg_Data> =
+            Box::new(unsafe { MaybeUninit::zeroed().assume_init() });
+        let error = unsafe { libredwg_sys::dwg_read_file(c_path.as_ptr(), dwg.as_mut()) };
+        let point = crate::dynapi::get_header_field(dwg.as_mut(), field);
+        unsafe { libredwg_sys::dwg_free(dwg.as_mut()) };
+        #[allow(clippy::unnecessary_cast)]
+        {
+            assert!(
+                error < libredwg_sys::DWG_ERROR_DWG_ERR_CLASSESNOTFOUND as i32,
+                "read {error}"
+            );
+        }
+        point.expect(field)
+    }
+
+    #[test]
     fn write_dwg_keeps_every_attdef_in_a_block() {
         let mut entities = Vec::new();
         for index in 0..5 {

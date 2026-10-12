@@ -13,11 +13,11 @@ use cad_core::{
     insert_instance_ids_in_space, make_unique_block, materialize_evaluated,
     materialize_evaluated_with, membership_matrix, purge_unused_user_blocks, reference_radius,
     transfer_entity, transform_entity_matrix, transform_geometry, validate_block_rename,
-    validate_entities, would_create_block_cycle, BlockTreeIndex, Document, DrawingUnits, Entity,
-    EntityId, EntitySpace, EntityTransform, EvaluationCache, EvaluationRequest, Extents2, Geometry,
-    InstanceConfiguration, MaterializedExport, MeasureIndex, MeasureRole, MeasurementResult,
-    ParameterId, Point2, Point3, SnapFeature, SnapIndex, Transform2, TransformError,
-    GEOM_TOLERANCE,
+    validate_entities, warm_document_fonts, would_create_block_cycle, BlockTreeIndex, Document,
+    DrawingUnits, Entity, EntityId, EntitySpace, EntityTransform, EvaluationCache,
+    EvaluationRequest, Extents2, Geometry, InstanceConfiguration, MaterializedExport, MeasureIndex,
+    MeasureRole, MeasurementResult, ParameterId, Point2, Point3, SnapFeature, SnapIndex,
+    Transform2, TransformError, GEOM_TOLERANCE,
 };
 use cad_io::{
     apply_companion, companion_path, drawing_for_companion, export_pdf, read_companion_optional,
@@ -723,6 +723,7 @@ impl MyCadApp {
                     };
                     match loaded {
                         Ok(mut document) => {
+                            warm_document_fonts(&mut document);
                             let companion_note = apply_open_companion(&path, &mut document);
                             let prepare = Instant::now();
                             let _prepare_span = cad_core::perf::span("import_prepare");
@@ -730,8 +731,9 @@ impl MyCadApp {
                                 generation: document.content_generation(),
                             };
                             let mut cache = EvaluationCache::default();
-                            let view = materialize_evaluated(&document, &mut cache, request)
+                            let mut view = materialize_evaluated(&document, &mut cache, request)
                                 .unwrap_or_else(|_| document.clone());
+                            warm_document_fonts(&mut view);
                             let display = tessellate_document(&view);
                             let snaps = SnapIndex::build(&view);
                             let measures = MeasureIndex::build(&view);
@@ -4097,18 +4099,19 @@ impl MyCadApp {
         }
     }
 
-    fn try_enter_block_from_hit(&mut self, hit: Option<EntityId>) -> bool {
-        let Some(id) = hit else {
-            return false;
-        };
+    fn try_enter_block(&mut self, id: EntityId) {
         let Some(document) = self.document.as_ref() else {
-            return false;
+            return;
         };
         let Some(entity) = document.entity_by_id(id) else {
-            return false;
+            return;
+        };
+        let Geometry::Insert { block_name, .. } = &entity.geometry else {
+            return;
         };
         if !insert_is_editable(entity) {
-            return false;
+            self.status = format!("Cannot edit system block {block_name}");
+            return;
         }
         if self.block_edit.current_is_dirty() {
             self.block_edit.ui = BlockUi::LeaveDirty {
@@ -4119,10 +4122,9 @@ impl MyCadApp {
                     .unwrap_or_default(),
                 intent: LeaveIntent::EnterNested { instance_id: id },
             };
-            return true;
+            return;
         }
         self.enter_block_edit(id);
-        true
     }
 
     pub(crate) fn save_active_block(&mut self) {
@@ -4511,7 +4513,7 @@ impl MyCadApp {
             return;
         };
         self.blocks_panel.error = None;
-        self.try_enter_block_from_hit(Some(id));
+        self.try_enter_block(id);
     }
 
     pub(crate) fn edit_named_block_from_tree(&mut self, name: &str) {
@@ -4528,7 +4530,7 @@ impl MyCadApp {
             }
             [id] => {
                 self.blocks_panel.error = None;
-                self.try_enter_block_from_hit(Some(*id));
+                self.try_enter_block(*id);
             }
             ids => {
                 let message = format!("{} references; double-click an instance", ids.len());
@@ -6700,7 +6702,10 @@ fn handle_viewport_input(app: &mut MyCadApp, ui: &Ui, response: &egui::Response,
                         size,
                     )
                 });
-                if !app.command.is_active() && app.try_enter_block_from_hit(hit) {
+                if let Some(id) = hit {
+                    if !app.command.is_active() {
+                        app.try_enter_block(id);
+                    }
                     continue;
                 }
                 app.zoom_extents(size.x, size.y);

@@ -4,7 +4,7 @@
 //! Even depth is a filled outer ring; odd depth is a hole of the
 //! smallest outer ring that contains it.
 
-use cad_core::{contour_contains, Point2};
+use cad_core::{contour_contains, signed_area, Point2};
 
 // ------------------------------------------------------------
 // Function: triangulate_polygon
@@ -75,16 +75,6 @@ fn ring_area(pts: &[Point2]) -> f64 {
     signed_area(pts)
 }
 
-fn signed_area(pts: &[Point2]) -> f64 {
-    let mut area = 0.0;
-    for i in 0..pts.len() {
-        let a = pts[i];
-        let b = pts[(i + 1) % pts.len()];
-        area += a.x * b.y - b.x * a.y;
-    }
-    area * 0.5
-}
-
 fn with_winding(pts: &[Point2], ccw: bool) -> Vec<Point2> {
     let positive = signed_area(pts) >= 0.0;
     if positive == ccw {
@@ -133,6 +123,7 @@ fn earcut_group(outer: &[Point2], holes: &[Vec<Point2>]) -> Vec<[Point2; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cad_core::signed_area;
 
     fn mesh_area(tris: &[[Point2; 3]]) -> f64 {
         tris.iter().map(|tri| signed_area(tri).abs()).sum()

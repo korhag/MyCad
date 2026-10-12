@@ -64,6 +64,21 @@ fn point_near_segment(p: Point2, a: Point2, b: Point2) -> bool {
 }
 
 // ------------------------------------------------------------
+// Function: signed_area
+// Purpose: Shoelace area of a ring. Positive is counter-clockwise.
+//          The first point is joined back to the last.
+// ------------------------------------------------------------
+pub fn signed_area(pts: &[Point2]) -> f64 {
+    let mut area = 0.0;
+    for i in 0..pts.len() {
+        let a = pts[i];
+        let b = pts[(i + 1) % pts.len()];
+        area += a.x * b.y - b.x * a.y;
+    }
+    area * 0.5
+}
+
+// ------------------------------------------------------------
 // Function: contour_depths
 // Purpose: How many other contours contain each contour. Even depth
 //          is an outer ring; odd depth is a hole.

@@ -9,7 +9,7 @@ use std::path::Path;
 use cad_core::{
     default_extrusion, is_paper_layout_block, normalize_linetype_name, sorted_paper_layout_blocks,
     AttributeInfo, BlockDefinition, CadColor, DimensionData, DimensionKind, Document, DrawingUnits,
-    Entity, EntityId, Geometry, HatchData, HatchEdge, HatchPath, HatchPatternLine,
+    Entity, EntityId, Extents2, Geometry, HatchData, HatchEdge, HatchPath, HatchPatternLine,
     ImportDiagnostics, Layer, LineType, LineTypeShape, MTextData, PaperLayout, Point2, Point3,
     PolyVertex, RasterFrame, TextData, TextHAlign, TextStyle, TextVAlign, ViewportData,
     MAX_INSERT_ARRAY_CELLS,
@@ -28,18 +28,30 @@ use crate::ltype::{
 const LWPOLYLINE_CLOSED_BIT: u16 = 512;
 const HATCH_PATH_POLYLINE: u32 = 0x02;
 
+// File magic AC1018 is R2004, when AutoCAD CmColor methods start.
+fn dwg_magic_is_r2004(label: &str) -> bool {
+    let magic = label.split_whitespace().next().unwrap_or(label);
+    magic
+        .strip_prefix("AC")
+        .and_then(|revision| revision.parse::<u32>().ok())
+        .is_some_and(|revision| revision >= 1018)
+}
+
+// AutoCAD CmColor methods. LibreDWG's enum swaps 0xC2 and 0xC3.
+const ACAD_COLOR_BYLAYER: u32 = 0xc0;
+const ACAD_COLOR_BYBLOCK: u32 = 0xc1;
+const ACAD_COLOR_TRUE: u32 = 0xc2;
+const ACAD_COLOR_ACI: u32 = 0xc3;
+
 pub unsafe fn convert_document(
     dwg: *mut libredwg_sys::Dwg_Data,
     path: &Path,
     mut diagnostics: ImportDiagnostics,
+    from_dwg: bool,
 ) -> Document {
     diagnostics.object_count = unsafe { libredwg_sys::dwg_get_num_objects(dwg) } as u64;
     crate::classes::record_unhandled_classes(dwg, &mut diagnostics);
-    if let Some(version) = get_header_field::<i32>(dwg, "version") {
-        if diagnostics.dwg_version.is_empty() || diagnostics.dwg_version == "unknown" {
-            diagnostics.dwg_version = crate::version_label(version);
-        }
-    }
+    let r2004_colors = from_dwg && dwg_magic_is_r2004(&diagnostics.dwg_version);
 
     let mut layers = BTreeMap::new();
     let mut linetypes = BTreeMap::new();
@@ -56,7 +68,7 @@ pub unsafe fn convert_document(
         let fixedtype = object_fixedtype(obj);
         if fixedtype == libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_LAYER {
             let ptr = unsafe { libredwg_sys::uncad_object_object_ptr(obj) };
-            if let Some(layer) = convert_layer(dwg, ptr) {
+            if let Some(layer) = convert_layer(dwg, ptr, r2004_colors) {
                 layers.insert(layer.name.clone(), layer);
             }
         } else if fixedtype == libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_STYLE {
@@ -87,7 +99,7 @@ pub unsafe fn convert_document(
         let Some(name) = block_record_name(object_ptr) else {
             continue;
         };
-        let entities = unsafe { owned_entities(dwg, obj, &mut diagnostics) };
+        let entities = unsafe { owned_entities(dwg, obj, &mut diagnostics, r2004_colors) };
         let base_pt = pt_field(object_ptr, "BLOCK_HEADER", "base_pt").unwrap_or(Point3::default());
         if is_model_space(&name) {
             model_space.extend(entities.clone());
@@ -109,20 +121,30 @@ pub unsafe fn convert_document(
     }
 
     unsafe {
-        fill_named_blocks_from_sequences(dwg, &mut blocks, &mut diagnostics);
+        fill_named_blocks_from_sequences(dwg, &mut blocks, &mut diagnostics, r2004_colors);
     }
 
     diagnostics.layer_count = layers.len();
     diagnostics.block_count = blocks.len();
-    if let Some(p) = get_header_field::<Point3D>(dwg, "EXTMIN") {
+    let header_min = get_header_field::<Point3D>(dwg, "EXTMIN");
+    let header_max = get_header_field::<Point3D>(dwg, "EXTMAX");
+    if let Some(p) = header_min {
         diagnostics
             .warnings
             .push(format!("HEADER EXTMIN {:.6},{:.6},{:.6}", p.x, p.y, p.z));
     }
-    if let Some(p) = get_header_field::<Point3D>(dwg, "EXTMAX") {
+    if let Some(p) = header_max {
         diagnostics
             .warnings
             .push(format!("HEADER EXTMAX {:.6},{:.6},{:.6}", p.x, p.y, p.z));
+    }
+    if let (Some(min), Some(max)) = (header_min, header_max) {
+        if min.x.is_finite() && min.y.is_finite() && max.x.is_finite() && max.y.is_finite() {
+            diagnostics.header_extents = Some(Extents2 {
+                min: Point2::new(min.x.min(max.x), min.y.min(max.y)),
+                max: Point2::new(min.x.max(max.x), min.y.max(max.y)),
+            });
+        }
     }
 
     let ltscale = get_header_field::<f64>(dwg, "LTSCALE")
@@ -323,6 +345,7 @@ unsafe fn fill_named_blocks_from_sequences(
     dwg: *mut libredwg_sys::Dwg_Data,
     blocks: &mut BTreeMap<String, BlockDefinition>,
     diagnostics: &mut ImportDiagnostics,
+    r2004_colors: bool,
 ) {
     let num_objects = unsafe { libredwg_sys::dwg_get_num_objects(dwg) };
     let mut current_name: Option<String> = None;
@@ -383,7 +406,7 @@ unsafe fn fill_named_blocks_from_sequences(
                 .map(|block| block.entities.is_empty())
                 .unwrap_or(true);
             if needs_fill {
-                if let Some(entity) = unsafe { convert_one(dwg, obj, diagnostics) } {
+                if let Some(entity) = unsafe { convert_one(dwg, obj, diagnostics, r2004_colors) } {
                     collected.push(entity);
                 }
             }
@@ -398,10 +421,16 @@ fn find_block_key(blocks: &BTreeMap<String, BlockDefinition>, name: &str) -> Opt
         .cloned()
 }
 
-fn convert_layer(dwg: *mut libredwg_sys::Dwg_Data, object_ptr: *mut c_void) -> Option<Layer> {
+fn convert_layer(
+    dwg: *mut libredwg_sys::Dwg_Data,
+    object_ptr: *mut c_void,
+    r2004_colors: bool,
+) -> Option<Layer> {
     let name = get_utf8_field(object_ptr, "LAYER", "name")?;
     let color = get_field::<libredwg_sys::Dwg_Color>(object_ptr, "LAYER", "color");
-    let color = color.map(resolve_layer_color).unwrap_or(CadColor::Aci(7));
+    let color = color
+        .map(|color| resolve_layer_color(color, r2004_colors))
+        .unwrap_or(CadColor::Aci(7));
     let off = get_field::<u8>(object_ptr, "LAYER", "off").unwrap_or(0) != 0;
     let frozen = get_field::<u8>(object_ptr, "LAYER", "frozen").unwrap_or(0) != 0
         || get_field::<u8>(object_ptr, "LAYER", "flag")
@@ -453,24 +482,50 @@ fn lineweight_from_index(raw: i16) -> i16 {
         .unwrap_or(raw)
 }
 
-fn resolve_layer_color(color: libredwg_sys::Dwg_Color) -> CadColor {
+fn resolve_layer_color(color: libredwg_sys::Dwg_Color, r2004_dwg: bool) -> CadColor {
+    if r2004_dwg {
+        return resolve_r2004_cmc(color);
+    }
     let rgb = color.rgb & 0x00ff_ffff;
-    // Group 420 is stored as method ACI (0xC2) with the true color in the
-    // low 24 bits. A layer that only has group 62 leaves those bits at 0.
+    // A DXF read stores group 420 with LibreDWG's method byte. Those names
+    // are swapped relative to AutoCAD, so both values are accepted here.
     let true_color = rgb != 0
         && (color.method == libredwg_sys::DWG_COLOR_METHOD_DWG_COLOR_METHOD_TRUECOLOR
             || color.method == libredwg_sys::DWG_COLOR_METHOD_DWG_COLOR_METHOD_ACI);
     if true_color {
-        return CadColor::Rgb {
-            r: ((rgb >> 16) & 0xff) as u8,
-            g: ((rgb >> 8) & 0xff) as u8,
-            b: (rgb & 0xff) as u8,
-        };
+        return rgb_color(rgb);
     }
     if color.index == 0 {
         CadColor::Aci(7)
     } else {
         CadColor::from_aci_index(color.index)
+    }
+}
+
+fn resolve_r2004_cmc(color: libredwg_sys::Dwg_Color) -> CadColor {
+    let rgb = color.rgb & 0x00ff_ffff;
+    match color.method as u32 {
+        ACAD_COLOR_BYLAYER => CadColor::ByLayer,
+        ACAD_COLOR_BYBLOCK => CadColor::ByBlock,
+        ACAD_COLOR_TRUE => rgb_color(rgb),
+        ACAD_COLOR_ACI => aci_color((rgb & 0xff) as i16, color.index),
+        _ => aci_color(color.index, color.index),
+    }
+}
+
+fn rgb_color(rgb: u32) -> CadColor {
+    CadColor::Rgb {
+        r: ((rgb >> 16) & 0xff) as u8,
+        g: ((rgb >> 8) & 0xff) as u8,
+        b: (rgb & 0xff) as u8,
+    }
+}
+
+fn aci_color(preferred: i16, fallback: i16) -> CadColor {
+    if (1..=255).contains(&preferred) {
+        CadColor::from_aci_index(preferred)
+    } else {
+        CadColor::from_aci_index(fallback)
     }
 }
 
@@ -655,6 +710,7 @@ unsafe fn owned_entities(
     dwg: *mut libredwg_sys::Dwg_Data,
     block_obj: *mut libredwg_sys::Dwg_Object,
     diagnostics: &mut ImportDiagnostics,
+    r2004_colors: bool,
 ) -> Vec<Entity> {
     // R2000 `get_next_owned_entity` skips ATTDEF. After a DXF read the owned
     // vector still lists every definition, and it contains the iterator's
@@ -665,12 +721,12 @@ unsafe fn owned_entities(
         let from_iterator = iterator_entity_objects(block_obj);
         let from_vector = block_header_entities(dwg, block_obj).unwrap_or_default();
         let objects = r2000_owned_objects(from_iterator, from_vector);
-        return convert_owned_objects(dwg, &objects, diagnostics);
+        return convert_owned_objects(dwg, &objects, diagnostics, r2004_colors);
     }
     let mut entities = Vec::new();
     let mut owned = unsafe { libredwg_sys::get_first_owned_entity(block_obj) };
     while !owned.is_null() {
-        if let Some(entity) = unsafe { convert_one(dwg, owned, diagnostics) } {
+        if let Some(entity) = unsafe { convert_one(dwg, owned, diagnostics, r2004_colors) } {
             entities.push(entity);
         }
         owned = unsafe { libredwg_sys::get_next_owned_entity(block_obj, owned) };
@@ -773,10 +829,11 @@ fn convert_owned_objects(
     dwg: *mut libredwg_sys::Dwg_Data,
     objects: &[*mut libredwg_sys::Dwg_Object],
     diagnostics: &mut ImportDiagnostics,
+    r2004_colors: bool,
 ) -> Vec<Entity> {
     let mut entities = Vec::new();
     for object in objects {
-        if let Some(entity) = unsafe { convert_one(dwg, *object, diagnostics) } {
+        if let Some(entity) = unsafe { convert_one(dwg, *object, diagnostics, r2004_colors) } {
             entities.push(entity);
         }
     }
@@ -787,6 +844,7 @@ unsafe fn convert_one(
     dwg: *mut libredwg_sys::Dwg_Data,
     obj: *mut libredwg_sys::Dwg_Object,
     diagnostics: &mut ImportDiagnostics,
+    r2004_colors: bool,
 ) -> Option<Entity> {
     let fixedtype = object_fixedtype(obj);
     let entity_ptr = unsafe { libredwg_sys::uncad_object_entity_ptr(obj) };
@@ -811,7 +869,7 @@ unsafe fn convert_one(
     let layer = get_common_field::<*mut libredwg_sys::Dwg_Object_Ref>(entity_ptr, "layer")
         .and_then(|h| resolve_handle_name(dwg, h))
         .unwrap_or_else(|| "0".to_string());
-    let color = entity_color(entity_ptr);
+    let color = entity_color(entity_ptr, r2004_colors);
     let linetype = linetype_from_flags(
         get_common_field::<u8>(entity_ptr, "ltype_flags"),
         get_common_field::<*mut libredwg_sys::Dwg_Object_Ref>(entity_ptr, "ltype")
@@ -820,13 +878,14 @@ unsafe fn convert_one(
     let linetype_scale = get_common_field::<f64>(entity_ptr, "ltype_scale").unwrap_or(1.0);
     let invisible = get_common_field::<u16>(entity_ptr, "invisible").unwrap_or(0) != 0;
 
-    let geometry = match convert_geometry(dwg, obj, entity_ptr, fixedtype, diagnostics) {
-        Some(g) => g,
-        None => {
-            diagnostics.bump_unsupported(&type_name);
-            return None;
-        }
-    };
+    let geometry =
+        match convert_geometry(dwg, obj, entity_ptr, fixedtype, diagnostics, r2004_colors) {
+            Some(g) => g,
+            None => {
+                diagnostics.bump_unsupported(&type_name);
+                return None;
+            }
+        };
 
     Some(Entity {
         id: EntityId::UNASSIGNED,
@@ -840,20 +899,29 @@ unsafe fn convert_one(
     })
 }
 
-fn entity_color(entity_ptr: *mut c_void) -> CadColor {
+fn entity_color(entity_ptr: *mut c_void, r2004_dwg: bool) -> CadColor {
     let Some(color) = get_common_field::<libredwg_sys::Dwg_Color>(entity_ptr, "color") else {
         return CadColor::ByLayer;
     };
+    decode_entity_color(color, r2004_dwg)
+}
+
+fn decode_entity_color(color: libredwg_sys::Dwg_Color, r2004_dwg: bool) -> CadColor {
+    if r2004_dwg && (color.flag as u32) & 0x80 != 0 {
+        let method = color.rgb >> 24;
+        let rgb = color.rgb & 0x00ff_ffff;
+        if method == ACAD_COLOR_TRUE {
+            return rgb_color(rgb);
+        }
+        if method == ACAD_COLOR_ACI {
+            return aci_color((rgb & 0xff) as i16, color.index);
+        }
+    }
     if (1..=255).contains(&color.index) {
         return CadColor::from_aci_index(color.index);
     }
     if color.method == libredwg_sys::DWG_COLOR_METHOD_DWG_COLOR_METHOD_TRUECOLOR {
-        let rgb = color.rgb & 0x00ff_ffff;
-        return CadColor::Rgb {
-            r: ((rgb >> 16) & 0xff) as u8,
-            g: ((rgb >> 8) & 0xff) as u8,
-            b: (rgb & 0xff) as u8,
-        };
+        return rgb_color(color.rgb & 0x00ff_ffff);
     }
     CadColor::from_aci_index(color.index)
 }
@@ -864,6 +932,7 @@ unsafe fn convert_geometry(
     entity_ptr: *mut c_void,
     fixedtype: libredwg_sys::DWG_OBJECT_TYPE,
     diagnostics: &mut ImportDiagnostics,
+    r2004_colors: bool,
 ) -> Option<Geometry> {
     Some(match fixedtype {
         libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_LINE => {
@@ -1097,7 +1166,7 @@ unsafe fn convert_geometry(
                 ..Default::default()
             })
         }
-        libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_HATCH => convert_hatch(entity_ptr)?,
+        libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_HATCH => convert_hatch(entity_ptr, r2004_colors)?,
         libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_SOLID
         | libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_TRACE => {
             let dxf = if fixedtype == libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_TRACE {
@@ -1340,7 +1409,7 @@ fn text_layout(entity_ptr: *mut c_void, dxf: &str) -> (TextHAlign, TextVAlign, P
     )
 }
 
-fn convert_hatch(entity_ptr: *mut c_void) -> Option<Geometry> {
+fn convert_hatch(entity_ptr: *mut c_void, r2004_colors: bool) -> Option<Geometry> {
     let solid_fill = get_field::<u8>(entity_ptr, "HATCH", "is_solid_fill").unwrap_or(0) != 0;
     let paths: Vec<libredwg_sys::Dwg_HATCH_Path> =
         get_array_field::<u32, _>(entity_ptr, "HATCH", "num_paths", "paths");
@@ -1370,13 +1439,16 @@ fn convert_hatch(entity_ptr: *mut c_void) -> Option<Geometry> {
         style: get_field::<u16>(entity_ptr, "HATCH", "style")
             .map(|style| i16::try_from(style).unwrap_or(0))
             .unwrap_or(0),
-        gradient: convert_hatch_gradient(entity_ptr),
+        gradient: convert_hatch_gradient(entity_ptr, r2004_colors),
         paths: paths.iter().map(convert_hatch_path).collect(),
         pattern_lines: deflines.iter().map(convert_hatch_defline).collect(),
     }))
 }
 
-fn convert_hatch_gradient(entity_ptr: *mut c_void) -> Option<cad_core::HatchGradient> {
+fn convert_hatch_gradient(
+    entity_ptr: *mut c_void,
+    r2004_colors: bool,
+) -> Option<cad_core::HatchGradient> {
     let filled = get_field::<u32>(entity_ptr, "HATCH", "is_gradient_fill").unwrap_or(0) != 0;
     if !filled {
         return None;
@@ -1387,7 +1459,7 @@ fn convert_hatch_gradient(entity_ptr: *mut c_void) -> Option<cad_core::HatchGrad
         .iter()
         .map(|stop| cad_core::GradientStop {
             shift: stop.shift_value,
-            color: dwg_color_rgb(stop.color),
+            color: dwg_color_rgb(stop.color, r2004_colors),
         })
         .filter(|stop| stop.shift.is_finite())
         .collect();
@@ -1402,8 +1474,9 @@ fn convert_hatch_gradient(entity_ptr: *mut c_void) -> Option<cad_core::HatchGrad
     })
 }
 
-fn dwg_color_rgb(color: libredwg_sys::Dwg_Color) -> cad_core::Rgb {
-    resolve_layer_color(color).resolve(cad_core::CadColor::Aci(7), cad_core::CadColor::Aci(7))
+fn dwg_color_rgb(color: libredwg_sys::Dwg_Color, r2004_colors: bool) -> cad_core::Rgb {
+    resolve_layer_color(color, r2004_colors)
+        .resolve(cad_core::CadColor::Aci(7), cad_core::CadColor::Aci(7))
 }
 
 fn convert_hatch_path(path: &libredwg_sys::Dwg_HATCH_Path) -> HatchPath {
@@ -1759,5 +1832,52 @@ mod tests {
         assert_eq!(corners[1], Point3::from_xy(10.0, 0.0));
         assert_eq!(corners[2], Point3::from_xy(10.0, 4.0));
         assert_eq!(corners[3], Point3::from_xy(0.0, 4.0));
+    }
+
+    fn cmc(method: u32, rgb: u32, index: i16, flag: u16) -> libredwg_sys::Dwg_Color {
+        let mut color: libredwg_sys::Dwg_Color = unsafe { std::mem::zeroed() };
+        color.method = method as _;
+        color.rgb = rgb;
+        color.index = index;
+        color.flag = flag as _;
+        color
+    }
+
+    #[test]
+    fn ac1032_label_selects_r2004_color_methods() {
+        assert!(dwg_magic_is_r2004("AC1032 (R2018)"));
+        assert!(dwg_magic_is_r2004("AC1018"));
+        assert!(!dwg_magic_is_r2004("AC1015 (R2000)"));
+        assert!(!dwg_magic_is_r2004("DXF"));
+    }
+
+    #[test]
+    fn r2004_layer_method_0xc3_is_an_aci_index() {
+        let cyan = cmc(ACAD_COLOR_ACI, 4, 256, 0);
+        assert_eq!(resolve_layer_color(cyan, true), CadColor::Aci(4));
+        let legacy = cmc(
+            libredwg_sys::DWG_COLOR_METHOD_DWG_COLOR_METHOD_TRUECOLOR as u32,
+            4,
+            256,
+            0,
+        );
+        assert!(matches!(
+            resolve_layer_color(legacy, false),
+            CadColor::Rgb { r: 0, g: 0, b: 4 }
+        ));
+    }
+
+    #[test]
+    fn r2004_entity_true_color_uses_the_rgb_flag() {
+        let color = cmc(0, 0xc211_2233, 256, 0x80);
+        assert_eq!(
+            decode_entity_color(color, true),
+            CadColor::Rgb {
+                r: 0x11,
+                g: 0x22,
+                b: 0x33
+            }
+        );
+        assert_eq!(decode_entity_color(color, false), CadColor::ByLayer);
     }
 }

@@ -306,7 +306,10 @@ pub enum GpuUpload {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GpuUploadPlan {
     Skip,
-    Append { line_start: u32, fill_start: u32 },
+    Append {
+        line_start: u32,
+        fill_start: u32,
+    },
     Patch {
         lines: [UploadRange; MAX_PATCH_RANGES],
         line_count: u8,
@@ -674,8 +677,20 @@ impl CadGpu {
             samples,
             [0.0, 0.0, 0.0, 0.0],
             |gpu, pipelines, pass| {
-                draw_overlay(gpu, pipelines, pass, &gpu.selection.bind_group, &frame.selection);
-                draw_overlay(gpu, pipelines, pass, &gpu.preview.bind_group, &frame.preview);
+                draw_overlay(
+                    gpu,
+                    pipelines,
+                    pass,
+                    &gpu.selection.bind_group,
+                    &frame.selection,
+                );
+                draw_overlay(
+                    gpu,
+                    pipelines,
+                    pass,
+                    &gpu.preview.bind_group,
+                    &frame.preview,
+                );
             },
         );
         self.overlay_key = Some(overlay_key);
@@ -728,7 +743,11 @@ impl CadGpu {
                 self.target_format,
                 texture_px,
                 msaa_samples,
-                if scene { "mycad.scene" } else { "mycad.overlay" },
+                if scene {
+                    "mycad.scene"
+                } else {
+                    "mycad.overlay"
+                },
             )
         });
         let created = fresh.is_some();
@@ -1513,10 +1532,7 @@ mod tests {
 
     #[test]
     fn viewport_pixels_match_egui_edge_rounding() {
-        assert_eq!(
-            viewport_pixel_size([0.5, 0.0], [13.0, 10.0], 1.0),
-            [12, 10]
-        );
+        assert_eq!(viewport_pixel_size([0.5, 0.0], [13.0, 10.0], 1.0), [12, 10]);
         assert_eq!(
             viewport_pixel_size([100.3, 40.0], [900.3, 640.0], 1.25),
             [1000, 750]
@@ -1539,7 +1555,10 @@ mod tests {
             picture_texture_size(Some([1024, 768]), [1030, 700], max),
             Some([1280, 768])
         );
-        assert_eq!(picture_texture_size(None, [9000, 100], max), Some([8192, 256]));
+        assert_eq!(
+            picture_texture_size(None, [9000, 100], max),
+            Some([8192, 256])
+        );
         assert_eq!(
             picture_texture_size(Some([4096, 4096]), [300, 300], max),
             Some([512, 512])
@@ -1645,10 +1664,7 @@ mod tests {
     fn a_patch_writes_only_the_rewritten_spans() {
         let mut lines = [UploadRange { start: 0, end: 0 }; MAX_PATCH_RANGES];
         lines[0] = UploadRange { start: 4, end: 8 };
-        lines[1] = UploadRange {
-            start: 40,
-            end: 44,
-        };
+        lines[1] = UploadRange { start: 40, end: 44 };
         assert_eq!(
             plan_gpu_upload(
                 1,

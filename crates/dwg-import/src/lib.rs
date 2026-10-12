@@ -94,9 +94,17 @@ fn import_cad_file(path: &Path, kind: CadReadKind) -> Result<Document, ImportErr
         diagnostics.warnings.push(format_libredwg_status(error));
     }
 
-    let mut document = unsafe { convert::convert_document(dwg.as_mut(), path, diagnostics) };
+    let mut document = unsafe {
+        convert::convert_document(
+            dwg.as_mut(),
+            path,
+            diagnostics,
+            matches!(kind, CadReadKind::Dwg),
+        )
+    };
     unsafe { libredwg_sys::dwg_free(dwg.as_mut()) };
     document.diagnostics.import_time = started.elapsed();
+    cad_core::warm_document_fonts(&mut document);
     Ok(document)
 }
 
@@ -119,10 +127,6 @@ fn ac_magic_label(magic: &str) -> &'static str {
         "AC1036" => "R2024",
         _ => "unknown revision",
     }
-}
-
-pub(crate) fn version_label(version: i32) -> String {
-    format!("LibreDWG version enum {version}")
 }
 
 /// Named LibreDWG error bits below `DWG_ERR_CLASSESNOTFOUND`.

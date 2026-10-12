@@ -619,12 +619,7 @@ fn autocad_audits_export() {
         if let Some(path) = almarai_dwg() {
             failures.extend(audit_copy(&console, &root, "almarai-original", &path));
         }
-        failures.extend(audit_copy(
-            &console,
-            &root,
-            "kd-original",
-            &reference_dwg(),
-        ));
+        failures.extend(audit_copy(&console, &root, "kd-original", &reference_dwg()));
     }
 
     if audit_wanted("primitives") {
@@ -696,9 +691,20 @@ fn parses_autocad_audit_summary() {
 
 #[test]
 fn parses_a_discarded_dxf_as_a_hard_failure() {
-    let report = parse_audit("DXF read error on line 34.\nInvalid or incomplete DXF input -- drawing discarded.\n");
+    let report = parse_audit(
+        "DXF read error on line 34.\nInvalid or incomplete DXF input -- drawing discarded.\n",
+    );
     assert!(report.hard.iter().any(|item| item.contains("discarded")));
     assert_eq!(report.errors_found, 0);
+}
+
+#[test]
+fn an_opening_ucs_prompt_is_a_hard_failure() {
+    let report = parse_audit(
+        "MessageBox: Non-unitary UCS Y axis; normalizing\nTotal errors found 0 fixed 0\n",
+    );
+    assert!(report.hard.iter().any(|item| item == "MessageBox"));
+    assert!(report.hard.iter().any(|item| item == "Non-unitary"));
 }
 
 fn audit_wanted(name: &str) -> bool {
@@ -721,13 +727,96 @@ fn almarai_dwg() -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
+#[test]
+fn almarai_title_block_fonts_resolve() {
+    let Some(path) = almarai_dwg() else {
+        return;
+    };
+    let document = dwg_import::import_dwg(&path).expect("AlMarai DWG imports");
+    let mut truetype = 0;
+    for style in document.text_styles.values() {
+        let line = cad_core::describe_text_style_font(style);
+        let lower = style.font_file.to_ascii_lowercase();
+        if lower.ends_with(".ttf") || lower.ends_with(".otf") {
+            assert!(
+                line.ends_with("truetype") || line.ends_with("missing"),
+                "{line}"
+            );
+            if line.ends_with("truetype") {
+                truetype += 1;
+            }
+        }
+    }
+    assert!(
+        truetype > 0,
+        "expected at least one installed TrueType style"
+    );
+    let mut seen = BTreeMap::<String, u32>::new();
+    let mut visit = |value: &str, height: f64| {
+        for paragraph in cad_core::stroke_font::mtext_paragraphs(value, height) {
+            if paragraph.align.is_none()
+                && paragraph.first_indent == 0.0
+                && paragraph.left_indent == 0.0
+                && paragraph.right_indent == 0.0
+                && paragraph.runs.iter().all(|run| run.font.is_empty())
+            {
+                continue;
+            }
+            let fonts: Vec<_> = paragraph
+                .runs
+                .iter()
+                .filter(|run| !run.font.is_empty())
+                .map(|run| {
+                    format!(
+                        "{} b{} i{}",
+                        run.font,
+                        u8::from(run.bold),
+                        u8::from(run.italic)
+                    )
+                })
+                .collect();
+            let key = format!(
+                "align={:?} i={} l={} r={} fonts={}",
+                paragraph.align,
+                paragraph.first_indent,
+                paragraph.left_indent,
+                paragraph.right_indent,
+                fonts.join(",")
+            );
+            *seen.entry(key).or_insert(0) += 1;
+        }
+    };
+    for entity in &document.model_space {
+        if let cad_core::Geometry::MText(text) = &entity.geometry {
+            visit(&text.value, text.height);
+        }
+    }
+    for block in document.blocks.values() {
+        for entity in &block.entities {
+            if let cad_core::Geometry::MText(text) = &entity.geometry {
+                visit(&text.value, text.height);
+            }
+        }
+    }
+    assert!(
+        !seen.is_empty(),
+        "title block MTEXT should carry fonts or paragraph codes"
+    );
+}
+
 fn audit_copy(console: &Path, root: &Path, name: &str, source: &Path) -> Vec<String> {
     let dest = root.join(format!(
         "{name}.{}",
-        source.extension().and_then(|ext| ext.to_str()).unwrap_or("dwg")
+        source
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("dwg")
     ));
     if let Err(err) = fs::copy(source, &dest) {
-        return vec![format!("{name}: failed to copy {}: {err}", source.display())];
+        return vec![format!(
+            "{name}: failed to copy {}: {err}",
+            source.display()
+        )];
     }
     expect_clean(console, &dest, name)
 }
@@ -904,6 +993,8 @@ fn parse_audit(text: &str) -> AuditReport {
         "DXF read error",
         "FATAL ERROR",
         "Invalid or incomplete",
+        "MessageBox",
+        "Non-unitary",
     ] {
         if text.contains(needle) {
             report.hard.push(needle.to_string());
@@ -992,17 +1083,18 @@ fn bisect_almarai(console: &Path, root: &Path, document: &cad_core::Document) {
     let tables = strip_entities(document);
     let _ = export_and_audit(console, root, "almarai-tables", &tables);
     let mut inserts = document.clone();
-    inserts.model_space.retain(|entity| {
-        matches!(entity.geometry, cad_core::Geometry::Insert { .. })
-    });
+    inserts
+        .model_space
+        .retain(|entity| matches!(entity.geometry, cad_core::Geometry::Insert { .. }));
     let _ = export_and_audit(console, root, "almarai-inserts", &inserts);
 
     let mut buckets: BTreeMap<&str, u64> = BTreeMap::new();
-    for entity in document
-        .model_space
-        .iter()
-        .chain(document.blocks.values().flat_map(|block| block.entities.iter()))
-    {
+    for entity in document.model_space.iter().chain(
+        document
+            .blocks
+            .values()
+            .flat_map(|block| block.entities.iter()),
+    ) {
         *buckets.entry(entity_bucket(entity)).or_insert(0) += 1;
     }
     for (bucket, count) in buckets {

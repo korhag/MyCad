@@ -9,6 +9,10 @@ pub const MAX_HATCH_PATTERN_SEGMENTS: usize = 4000;
 /// Parallel lines drawn for one pattern family. A denser family is
 /// thinned so the hatch still covers the whole boundary.
 pub const MAX_HATCH_PATTERN_LINES: usize = 256;
+/// AutoCAD 2025's default HPMAXLINES. A pattern that would need more
+/// lines than this is not drawn. The limit lives in AutoCAD's settings,
+/// not in the DWG, and can be raised as high as 10_000_000.
+pub const HATCH_MAX_LINES: u64 = 100_000;
 /// A clipped span that would need more dashes than this is drawn solid.
 pub const MAX_HATCH_DASHES_PER_SPAN: usize = 64;
 

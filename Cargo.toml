@@ -10,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.44.2"
+version = "0.45.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
 authors = ["Entomak"]
@@ -42,6 +42,7 @@ egui_dock = { version = "0.17", features = ["serde"] }
 egui-phosphor = "0.10"
 thiserror = "2"
 earcutr = "0.4"
+ttf-parser = "0.25"
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 # Dependencies stay optimized in dev so snap and tessellation match a real session.

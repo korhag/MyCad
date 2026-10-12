@@ -13,9 +13,9 @@ use std::path::Path;
 
 use cad_core::{
     is_paper_layout_block, nearest_aci, sorted_paper_layout_blocks, BlockDefinition, CadColor,
-    DimensionData, DimensionKind, Document, DrawingUnits, Entity, Geometry, HatchData, HatchEdge,
-    HatchPath, Layer, LineType, LineTypeShape, MTextData, Point3, PolyVertex, RasterFrame,
-    TextData, TextStyle, ViewportData,
+    DimensionData, DimensionKind, Document, DrawingUnits, Entity, Extents2, Geometry, HatchData,
+    HatchEdge, HatchPath, Layer, LineType, LineTypeShape, MTextData, Point3, PolyVertex,
+    RasterFrame, TextData, TextStyle, ViewportData,
 };
 
 use crate::error::ExportError;
@@ -27,6 +27,9 @@ const WORLD: Point3 = Point3 {
     y: 0.0,
     z: 1.0,
 };
+
+/// Extra view around the drawing so the opening view is not flush with the edges.
+const VIEW_PAD: f64 = 0.05;
 
 // ------------------------------------------------------------
 // Function: write_dxf
@@ -106,6 +109,7 @@ struct DxfWriter<'a> {
     plot_style: String,
     paper_entity: bool,
     nonfinite: bool,
+    export_extents: Option<Extents2>,
 }
 
 impl<'a> DxfWriter<'a> {
@@ -131,6 +135,7 @@ impl<'a> DxfWriter<'a> {
             plot_style: String::new(),
             paper_entity: false,
             nonfinite: false,
+            export_extents: None,
         }
     }
 
@@ -162,6 +167,7 @@ impl<'a> DxfWriter<'a> {
     }
 
     fn write_document(&mut self) {
+        self.export_extents = self.document.current_extents();
         self.prepare_export_tables();
         // Layout object handles are referenced by BLOCK_RECORD group 340,
         // so they are reserved before the tables are written.
@@ -243,22 +249,58 @@ impl<'a> DxfWriter<'a> {
             self.pair(9, name);
             self.pair_f(40, created);
         }
-        if let Some(extents) = self
-            .document
-            .diagnostics
-            .extents
-            .or_else(|| self.document.compute_extents())
-        {
-            self.pair(9, "$EXTMIN");
-            self.pair_f(10, extents.min.x);
-            self.pair_f(20, extents.min.y);
-            self.pair_f(30, 0.0);
-            self.pair(9, "$EXTMAX");
-            self.pair_f(10, extents.max.x);
-            self.pair_f(20, extents.max.y);
-            self.pair_f(30, 0.0);
+        if let Some(extents) = self.export_extents {
+            self.header_point("$EXTMIN", extents.min.x, extents.min.y, 0.0);
+            self.header_point("$EXTMAX", extents.max.x, extents.max.y, 0.0);
         }
+        self.write_ucs_header();
+        let (min_x, min_y, max_x, max_y) = self.limit_box();
+        self.header_point2("$LIMMIN", min_x, min_y);
+        self.header_point2("$LIMMAX", max_x, max_y);
+        self.header_point2("$PLIMMIN", min_x, min_y);
+        self.header_point2("$PLIMMAX", max_x, max_y);
         self.pair(0, "ENDSEC");
+    }
+
+    fn header_point(&mut self, name: &str, x: f64, y: f64, z: f64) {
+        self.pair(9, name);
+        self.pair_f(10, x);
+        self.pair_f(20, y);
+        self.pair_f(30, z);
+    }
+
+    fn header_point2(&mut self, name: &str, x: f64, y: f64) {
+        self.pair(9, name);
+        self.pair_f(10, x);
+        self.pair_f(20, y);
+    }
+
+    fn write_ucs_header(&mut self) {
+        for (origin, x_axis, y_axis) in [
+            ("$UCSORG", "$UCSXDIR", "$UCSYDIR"),
+            ("$PUCSORG", "$PUCSXDIR", "$PUCSYDIR"),
+        ] {
+            self.header_point(origin, 0.0, 0.0, 0.0);
+            self.header_point(x_axis, 1.0, 0.0, 0.0);
+            self.header_point(y_axis, 0.0, 1.0, 0.0);
+        }
+    }
+
+    fn limit_box(&self) -> (f64, f64, f64, f64) {
+        self.export_extents
+            .map(|extents| (extents.min.x, extents.min.y, extents.max.x, extents.max.y))
+            .unwrap_or((0.0, 0.0, 12.0, 9.0))
+    }
+
+    fn active_view(&self) -> (f64, f64, f64, f64) {
+        let Some(extents) = self.export_extents else {
+            return (0.0, 0.0, 100.0, 1.0);
+        };
+        let frame = extents.expanded_to_square_if_degenerate().padded(VIEW_PAD);
+        let height = frame.height().max(1e-6);
+        let aspect = (frame.width() / height).max(1e-6);
+        let center = frame.center();
+        (center.x, center.y, height, aspect)
     }
 
     fn write_classes(&mut self) {
@@ -311,6 +353,7 @@ impl<'a> DxfWriter<'a> {
     }
 
     fn write_vport_table(&mut self) {
+        let (center_x, center_y, view_height, aspect) = self.active_view();
         let owner = self.write_table_header("VPORT", 1);
         self.pair(0, "VPORT");
         let handle = self.next_handle();
@@ -324,8 +367,8 @@ impl<'a> DxfWriter<'a> {
         self.pair_f(20, 0.0);
         self.pair_f(11, 1.0);
         self.pair_f(21, 1.0);
-        self.pair_f(12, 0.0);
-        self.pair_f(22, 0.0);
+        self.pair_f(12, center_x);
+        self.pair_f(22, center_y);
         self.pair_f(13, 0.0);
         self.pair_f(23, 0.0);
         self.pair_f(14, 1.0);
@@ -338,8 +381,8 @@ impl<'a> DxfWriter<'a> {
         self.pair_f(17, 0.0);
         self.pair_f(27, 0.0);
         self.pair_f(37, 0.0);
-        self.pair_f(40, 100.0);
-        self.pair_f(41, 1.0);
+        self.pair_f(40, view_height);
+        self.pair_f(41, aspect);
         self.pair_f(42, 50.0);
         self.pair_f(43, 0.0);
         self.pair_f(44, 0.0);
@@ -1843,15 +1886,7 @@ impl<'a> DxfWriter<'a> {
     }
 
     fn layout_limits(&self) -> (f64, f64, f64, f64) {
-        if let Some(extents) = self
-            .document
-            .diagnostics
-            .extents
-            .or_else(|| self.document.compute_extents())
-        {
-            return (extents.min.x, extents.min.y, extents.max.x, extents.max.y);
-        }
-        (0.0, 0.0, 12.0, 9.0)
+        self.limit_box()
     }
 
     fn write_standard_mlinestyle(&mut self, handle: &str, owner: &str) {
@@ -2049,7 +2084,11 @@ fn hatch_seed(hatch: &HatchData) -> Point3 {
                         HatchEdge::Arc { center, .. } | HatchEdge::Ellipse { center, .. } => {
                             return *center;
                         }
-                        HatchEdge::Spline { control_points, fit_points, .. } => {
+                        HatchEdge::Spline {
+                            control_points,
+                            fit_points,
+                            ..
+                        } => {
                             if let Some(point) = control_points.first().or(fit_points.first()) {
                                 return *point;
                             }
@@ -2135,9 +2174,7 @@ fn export_block_name(name: &str) -> String {
 }
 
 fn drops_anonymous_star(name: &str) -> bool {
-    is_star_numbered(name, b'D')
-        || is_star_numbered(name, b'U')
-        || is_star_numbered(name, b'X')
+    is_star_numbered(name, b'D') || is_star_numbered(name, b'U') || is_star_numbered(name, b'X')
 }
 
 fn is_star_numbered(name: &str, kind: u8) -> bool {
@@ -2502,8 +2539,8 @@ fn format_dxf_r2000_f64(value: f64) -> String {
 mod tests {
     use super::*;
     use cad_core::{
-        BlockDefinition, CadColor, DrawingUnits, Entity, Geometry, HatchData, HatchEdge, HatchPath,
-        AttributeInfo, MTextData, Point2, Point3, PolyVertex, RasterFrame, TextData,
+        AttributeInfo, BlockDefinition, CadColor, DrawingUnits, Entity, Geometry, HatchData,
+        HatchEdge, HatchPath, MTextData, Point2, Point3, PolyVertex, RasterFrame, TextData,
     };
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -2549,6 +2586,30 @@ mod tests {
         assert!(text.contains("  2\nENTITIES"));
         assert!(text.contains("LINE"));
         assert!(!text.contains("libredwg"));
+    }
+
+    #[test]
+    fn header_ucs_is_unit_length_and_the_view_centers_on_the_drawing() {
+        let mut document = Document::default();
+        document.add_entity(Entity::new(Geometry::Line {
+            start: Point3::from_xy(1000.0, 2000.0),
+            end: Point3::from_xy(3000.0, 4000.0),
+        }));
+        let (_, text) = write_to_string(&document);
+        assert!(text.contains("$UCSXDIR\n 10\n1.0\n 20\n0.0\n 30\n0.0\n"));
+        assert!(text.contains("$UCSYDIR\n 10\n0.0\n 20\n1.0\n 30\n0.0\n"));
+        assert!(text.contains("$PUCSXDIR\n 10\n1.0\n 20\n0.0\n 30\n0.0\n"));
+        assert!(text.contains("$PUCSYDIR\n 10\n0.0\n 20\n1.0\n 30\n0.0\n"));
+        assert!(text.contains("$LIMMIN\n 10\n1000.0\n 20\n2000.0\n"));
+        assert!(text.contains("$LIMMAX\n 10\n3000.0\n 20\n4000.0\n"));
+        let vport = text
+            .split("  0\nVPORT\n")
+            .nth(1)
+            .and_then(|rest| rest.split("  0\nENDTAB\n").next())
+            .expect("vport");
+        assert!(vport.contains(" 12\n2000.0\n"), "{vport}");
+        assert!(vport.contains(" 22\n3000.0\n"), "{vport}");
+        assert!(vport.contains(" 40\n2200.0\n"), "{vport}");
     }
 
     #[test]

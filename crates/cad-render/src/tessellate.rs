@@ -74,7 +74,11 @@ impl TouchedVertices {
         }
     }
 
-    pub fn push_ranges(self, lines: &mut Vec<std::ops::Range<u32>>, fills: &mut Vec<std::ops::Range<u32>>) {
+    pub fn push_ranges(
+        self,
+        lines: &mut Vec<std::ops::Range<u32>>,
+        fills: &mut Vec<std::ops::Range<u32>>,
+    ) {
         push_span(lines, self.lines);
         push_span(lines, self.appended_lines);
         push_span(fills, self.fills);
@@ -801,6 +805,7 @@ fn emit_pickable_entity(
             transform,
             CadColor::Aci(7),
             "CONTINUOUS",
+            "",
             stack,
             VectorVisibility::Viewport,
             &mut sink,
@@ -848,6 +853,7 @@ fn emit_top_level_entity(
             Transform2::identity(),
             CadColor::Aci(7),
             "CONTINUOUS",
+            "",
             stack,
             VectorVisibility::Viewport,
             &mut sink,

@@ -4,7 +4,10 @@
 
 use std::collections::BTreeMap;
 
-use cad_core::{Document, Entity, Geometry, Point2, Point3, Transform2};
+use cad_core::{
+    hatch_fill_contours, hatch_path_points, pattern_line_estimate, Document, Entity, Geometry,
+    Point2, Point3, Transform2, HATCH_MAX_LINES,
+};
 use cad_render::{
     curves::{bspline_points, circle_points, ellipse_points, polyline_points, CIRCLE_SEGMENTS},
     DisplayList,
@@ -500,6 +503,368 @@ impl<'a> AuditCtx<'a> {
                 }
             }
         }
+    }
+}
+
+struct OutsideGroup {
+    paths: u64,
+    min_x: f64,
+    min_y: f64,
+    max_x: f64,
+    max_y: f64,
+    rgb: cad_core::Rgb,
+}
+
+impl OutsideGroup {
+    fn new(rgb: cad_core::Rgb) -> Self {
+        Self {
+            paths: 0,
+            min_x: f64::INFINITY,
+            min_y: f64::INFINITY,
+            max_x: f64::NEG_INFINITY,
+            max_y: f64::NEG_INFINITY,
+            rgb,
+        }
+    }
+
+    fn include(&mut self, point: Point2) {
+        self.min_x = self.min_x.min(point.x);
+        self.min_y = self.min_y.min(point.y);
+        self.max_x = self.max_x.max(point.x);
+        self.max_y = self.max_y.max(point.y);
+    }
+
+    fn span(&self) -> f64 {
+        (self.max_x - self.min_x).hypot(self.max_y - self.min_y)
+    }
+}
+
+struct OutsideSink {
+    limit: cad_core::Extents2,
+    spans: Vec<String>,
+    groups: BTreeMap<String, OutsideGroup>,
+}
+
+impl OutsideSink {
+    fn note(&mut self, pts: &[Point2], rgb: cad_core::Rgb) {
+        if !pts.iter().any(|point| !self.limit.contains(*point)) {
+            return;
+        }
+        let label = self
+            .spans
+            .last()
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string());
+        Self::accumulate(&mut self.groups, &label, pts, rgb);
+    }
+
+    fn accumulate(
+        groups: &mut BTreeMap<String, OutsideGroup>,
+        label: &str,
+        pts: &[Point2],
+        rgb: cad_core::Rgb,
+    ) {
+        let group = groups
+            .entry(label.to_string())
+            .or_insert_with(|| OutsideGroup::new(rgb));
+        group.paths += 1;
+        for point in pts {
+            if point.is_finite() {
+                group.include(*point);
+            }
+        }
+    }
+}
+
+impl cad_core::VectorSink for OutsideSink {
+    fn path(
+        &mut self,
+        pts: &[Point2],
+        _closed: bool,
+        _segs: &[cad_core::dash::PathSeg],
+        _plinegen: bool,
+        rgb: cad_core::Rgb,
+        _linetype: &cad_core::LineType,
+        _scale: f64,
+    ) {
+        self.note(pts, rgb);
+    }
+
+    fn fill(&mut self, pts: &[Point2], rgb: cad_core::Rgb) {
+        self.note(pts, rgb);
+    }
+
+    fn wants_spans(&self) -> bool {
+        true
+    }
+
+    fn push_span(&mut self, label: &str) {
+        self.spans.push(label.to_string());
+    }
+
+    fn pop_span(&mut self) {
+        self.spans.pop();
+    }
+}
+
+fn outside_header_groups(document: &Document) -> Vec<(String, OutsideGroup)> {
+    let Some(header) = document.diagnostics.header_extents else {
+        return Vec::new();
+    };
+    let pad = header.width().hypot(header.height()) * 0.002;
+    let mut sink = OutsideSink {
+        limit: header.inflated(pad.max(1.0)),
+        spans: Vec::new(),
+        groups: BTreeMap::new(),
+    };
+    let mut stack = Vec::new();
+    for entity in &document.model_space {
+        cad_core::vectorize_entity(
+            document,
+            entity,
+            Transform2::identity(),
+            cad_core::CadColor::Aci(7),
+            "CONTINUOUS",
+            "",
+            &mut stack,
+            cad_core::VectorVisibility::Viewport,
+            &mut sink,
+        );
+    }
+    let mut groups: Vec<_> = sink.groups.into_iter().collect();
+    groups.sort_by(|left, right| {
+        right
+            .1
+            .span()
+            .partial_cmp(&left.1.span())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    groups
+}
+
+fn print_groups(title: &str, groups: &[(String, OutsideGroup)]) {
+    println!("{title} {}", groups.len());
+    for (label, group) in groups.iter().take(40) {
+        println!(
+            "  n={} box=({:.3},{:.3})-({:.3},{:.3}) rgb={},{},{} {label}",
+            group.paths,
+            group.min_x,
+            group.min_y,
+            group.max_x,
+            group.max_y,
+            group.rgb.r,
+            group.rgb.g,
+            group.rgb.b
+        );
+    }
+}
+
+pub fn print_outside_header(document: &Document) {
+    if document.diagnostics.header_extents.is_none() {
+        println!("audit_outside_header none");
+        return;
+    }
+    let groups = outside_header_groups(document);
+    print_groups("audit_outside_header", &groups);
+}
+
+// ------------------------------------------------------------
+// Function: print_hatch_line_limit
+// Purpose: Count pattern hatches AutoCAD would leave blank because
+//          they exceed HPMAXLINES. The same estimate decides what
+//          the viewport draws.
+// ------------------------------------------------------------
+pub fn print_hatch_line_limit(document: &Document) {
+    let mut tally = HatchLimitTally::default();
+    let mut stack = Vec::new();
+    for entity in &document.model_space {
+        tally.visit(document, entity, Transform2::identity(), "", &mut stack);
+    }
+    println!("hatch_over_max_lines {}", tally.over);
+    let mut groups: Vec<_> = tally.groups.into_iter().collect();
+    groups.retain(|(_, group)| group.count > 0);
+    groups.sort_by(|left, right| {
+        right
+            .1
+            .count
+            .cmp(&left.1.count)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    for (layer, group) in groups.iter().take(20) {
+        println!(
+            "  hatch_over {layer} n={} est={:.0}..{:.0} under_max={:.0} box=({:.3},{:.3})-({:.3},{:.3})",
+            group.count,
+            group.min_est,
+            group.max_est,
+            group.under_max,
+            group.min_x,
+            group.min_y,
+            group.max_x,
+            group.max_y
+        );
+    }
+}
+
+#[derive(Default)]
+struct HatchLimitTally {
+    over: u64,
+    groups: BTreeMap<String, HatchLimitGroup>,
+}
+
+struct HatchLimitGroup {
+    count: u64,
+    min_est: f64,
+    max_est: f64,
+    under_max: f64,
+    min_x: f64,
+    min_y: f64,
+    max_x: f64,
+    max_y: f64,
+}
+
+impl HatchLimitGroup {
+    fn new() -> Self {
+        Self {
+            count: 0,
+            min_est: f64::INFINITY,
+            max_est: 0.0,
+            under_max: 0.0,
+            min_x: f64::INFINITY,
+            min_y: f64::INFINITY,
+            max_x: f64::NEG_INFINITY,
+            max_y: f64::NEG_INFINITY,
+        }
+    }
+}
+
+impl HatchLimitTally {
+    fn visit(
+        &mut self,
+        document: &Document,
+        entity: &Entity,
+        transform: Transform2,
+        block_layer: &str,
+        stack: &mut Vec<String>,
+    ) {
+        let layer_name = inherited_hatch_layer(&entity.layer, block_layer);
+        if !entity.visible || !document.layer_is_visible(layer_name) {
+            return;
+        }
+        match &entity.geometry {
+            Geometry::Insert {
+                block_name,
+                insertion,
+                scale,
+                rotation,
+                extrusion,
+                column_count,
+                row_count,
+                column_spacing,
+                row_spacing,
+                ..
+            } => {
+                if cad_core::nesting_too_deep(stack)
+                    || stack
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case(block_name))
+                {
+                    return;
+                }
+                let Some(block) = document.blocks.get(block_name) else {
+                    return;
+                };
+                stack.push(block_name.clone());
+                let (cols, rows) = cad_core::clamped_array_counts(*column_count, *row_count);
+                for col in 0..cols {
+                    for row in 0..rows {
+                        let extra = Transform2::translate(
+                            col as f64 * *column_spacing,
+                            row as f64 * *row_spacing,
+                        );
+                        let nested = transform.then(
+                            Transform2::block_insert(
+                                *insertion,
+                                *scale,
+                                *rotation,
+                                *extrusion,
+                                block.base_pt,
+                            )
+                            .then(extra),
+                        );
+                        for child in &block.entities {
+                            self.visit(document, child, nested, layer_name, stack);
+                        }
+                    }
+                }
+                stack.pop();
+            }
+            Geometry::Dimension(data) => {
+                let block_name = &data.block_name;
+                if cad_core::nesting_too_deep(stack)
+                    || stack
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case(block_name))
+                {
+                    return;
+                }
+                if let Some(block) = document.blocks.get(block_name) {
+                    stack.push(block_name.clone());
+                    for child in &block.entities {
+                        self.visit(document, child, transform, layer_name, stack);
+                    }
+                    stack.pop();
+                }
+            }
+            Geometry::Hatch(hatch) => {
+                if hatch.solid_fill || hatch.gradient.is_some() {
+                    return;
+                }
+                let mut contours = Vec::new();
+                for path in &hatch.paths {
+                    let world: Vec<Point2> =
+                        hatch_path_points(path, hatch.extrusion, hatch.elevation)
+                            .into_iter()
+                            .map(|point| transform.apply(point))
+                            .collect();
+                    contours.push(world);
+                }
+                let (filled, depths) = hatch_fill_contours(hatch.style, &contours);
+                let estimate = pattern_line_estimate(hatch, &filled, &depths, transform);
+                let hidden = !(estimate <= HATCH_MAX_LINES as f64);
+                let group = self
+                    .groups
+                    .entry(layer_name.to_string())
+                    .or_insert_with(HatchLimitGroup::new);
+                if hidden {
+                    self.over += 1;
+                    group.count += 1;
+                    group.min_est = group.min_est.min(estimate);
+                    group.max_est = group.max_est.max(estimate);
+                    for contour in &filled {
+                        for point in contour {
+                            if !point.is_finite() {
+                                continue;
+                            }
+                            group.min_x = group.min_x.min(point.x);
+                            group.min_y = group.min_y.min(point.y);
+                            group.max_x = group.max_x.max(point.x);
+                            group.max_y = group.max_y.max(point.y);
+                        }
+                    }
+                } else if estimate.is_finite() {
+                    group.under_max = group.under_max.max(estimate);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn inherited_hatch_layer<'a>(entity_layer: &'a str, block_layer: &'a str) -> &'a str {
+    if entity_layer.eq_ignore_ascii_case("0") && !block_layer.is_empty() {
+        block_layer
+    } else {
+        entity_layer
     }
 }
 
@@ -1131,4 +1496,36 @@ fn polar(center: Point2, radius: f64, angle: f64) -> Point2 {
         center.x + radius * angle.cos(),
         center.y + radius * angle.sin(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cad_core::{Entity, Extents2, Geometry, Point2, Point3};
+
+    #[test]
+    fn outside_header_groups_a_line_past_the_file_extents() {
+        let mut document = Document::default();
+        document.diagnostics.header_extents = Some(Extents2::from_corners(
+            Point2::new(0.0, 0.0),
+            Point2::new(10.0, 10.0),
+        ));
+        document.add_entity(Entity::new(Geometry::Line {
+            start: Point3::from_xy(0.0, 0.0),
+            end: Point3::from_xy(1.0, 0.0),
+        }));
+        document.add_entity(Entity::new(Geometry::Line {
+            start: Point3::from_xy(5_000.0, 5_000.0),
+            end: Point3::from_xy(8_000.0, 5_000.0),
+        }));
+        let groups = outside_header_groups(&document);
+        assert_eq!(
+            groups.len(),
+            1,
+            "{:?}",
+            groups.iter().map(|(label, _)| label).collect::<Vec<_>>()
+        );
+        assert!(groups[0].0.contains("Line"));
+        assert!(groups[0].1.min_x > 1000.0);
+    }
 }

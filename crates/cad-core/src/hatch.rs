@@ -11,9 +11,11 @@ use crate::curves::{
 use crate::dash::{generate_path_dashes, pattern_period, scaled_pattern, PathSeg};
 use crate::entity::{
     default_extrusion, HatchData, HatchEdge, HatchPath, HatchPatternLine, PolyVertex,
-    MAX_HATCH_DASHES_PER_SPAN, MAX_HATCH_PATTERN_LINES, MAX_HATCH_PATTERN_SEGMENTS,
+    HATCH_MAX_LINES, MAX_HATCH_DASHES_PER_SPAN, MAX_HATCH_PATTERN_LINES,
+    MAX_HATCH_PATTERN_SEGMENTS,
 };
 use crate::geom::{ocs_to_wcs, Point2, Point3};
+use crate::polygon::signed_area;
 use crate::transform::Transform2;
 
 fn map_ocs(point: Point2, elevation: f64, extrusion: Point3) -> Point2 {
@@ -185,23 +187,28 @@ const PATTERN_EPS: f64 = 1e-9;
 
 // ------------------------------------------------------------
 // Function: hatch_fill_contours
-// Purpose: Keep the loops a hatch style actually fills.
-//          Normal keeps every loop, Outer keeps the boundary and
-//          its holes, Ignore keeps only the outermost loops.
+// Purpose: Keep the loops a hatch style actually fills, with the
+//          nesting depth of each kept loop. Normal keeps every
+//          loop, Outer keeps the boundary and its holes, Ignore
+//          keeps only the outermost loops. Depth 0 is an outer
+//          ring; an odd depth is a hole.
 // ------------------------------------------------------------
-pub fn hatch_fill_contours(style: i16, contours: &[Vec<Point2>]) -> Vec<Vec<Point2>> {
+pub fn hatch_fill_contours(style: i16, contours: &[Vec<Point2>]) -> (Vec<Vec<Point2>>, Vec<usize>) {
     let depths = crate::polygon::contour_depths(contours);
     let keep = |depth: usize| match style {
         2 => depth == 0,
         1 => depth <= 1,
         _ => true,
     };
-    contours
-        .iter()
-        .zip(depths)
-        .filter(|(_, depth)| keep(*depth))
-        .map(|(contour, _)| contour.clone())
-        .collect()
+    let mut kept = Vec::new();
+    let mut kept_depths = Vec::new();
+    for (contour, depth) in contours.iter().zip(depths) {
+        if keep(depth) {
+            kept.push(contour.clone());
+            kept_depths.push(depth);
+        }
+    }
+    (kept, kept_depths)
 }
 
 // ------------------------------------------------------------
@@ -427,17 +434,163 @@ fn lerp_rgb(a: crate::color::Rgb, b: crate::color::Rgb, t: f64) -> crate::color:
 }
 
 // ------------------------------------------------------------
+// Function: pattern_line_estimate
+// Purpose: How many lines AutoCAD would generate for this pattern.
+//          A family contributes its clipped spans plus its dash
+//          pieces. `contours` and `depths` are the filled loops
+//          from `hatch_fill_contours`, already in the same space
+//          as `transform`.
+// ------------------------------------------------------------
+pub fn pattern_line_estimate(
+    hatch: &HatchData,
+    contours: &[Vec<Point2>],
+    depths: &[usize],
+    transform: Transform2,
+) -> f64 {
+    if contours.is_empty() || !transform_is_finite(transform) {
+        return 0.0;
+    }
+    let (spans, dashes) = pattern_line_parts(hatch, contours, depths, transform);
+    spans + dashes
+}
+
+// ------------------------------------------------------------
+// Function: pattern_line_parts
+// Purpose: Split the line estimate into clipped spans and dash
+//          pieces, so a dense pattern can be compared with
+//          AutoCAD's HPMAXLINES count.
+// ------------------------------------------------------------
+fn pattern_line_parts(
+    hatch: &HatchData,
+    contours: &[Vec<Point2>],
+    depths: &[usize],
+    transform: Transform2,
+) -> (f64, f64) {
+    if contours.is_empty() || !transform_is_finite(transform) {
+        return (0.0, 0.0);
+    }
+    let area = even_odd_area(contours, depths);
+    let mut spans = 0.0;
+    let mut dashes = 0.0;
+    let add = |spans: &mut f64, dashes: &mut f64, line: &HatchPatternLine| {
+        let (family_spans, family_dashes) =
+            family_line_parts(hatch, line, contours, area, transform);
+        *spans += family_spans;
+        *dashes += family_dashes;
+    };
+    if hatch.pattern_lines.is_empty() {
+        add(&mut spans, &mut dashes, &fallback_pattern_line(hatch));
+    } else {
+        for line in &hatch.pattern_lines {
+            add(&mut spans, &mut dashes, line);
+        }
+    }
+    (spans, dashes)
+}
+
+fn family_line_parts(
+    hatch: &HatchData,
+    line: &HatchPatternLine,
+    contours: &[Vec<Point2>],
+    area: f64,
+    transform: Transform2,
+) -> (f64, f64) {
+    let Some(frame) = pattern_frame(hatch, line, transform) else {
+        return (0.0, 0.0);
+    };
+    let normal = Point2::new(-frame.dir.y, frame.dir.x);
+    let spacing = dot(frame.offset, normal).abs();
+    let offset_len = hypot(frame.offset);
+    if offset_len < PATTERN_EPS || spacing < offset_len * 1e-9 {
+        return (0.0, 0.0);
+    }
+    let spans = projected_boundary(contours, normal) / spacing / 2.0;
+    let dashes = dash_line_count(area / spacing, &frame.dashes);
+    (
+        if spans.is_finite() {
+            spans
+        } else {
+            f64::INFINITY
+        },
+        if dashes.is_finite() {
+            dashes
+        } else {
+            f64::INFINITY
+        },
+    )
+}
+
+// Even-odd fill: an outer ring adds its area, a hole subtracts,
+// and an island inside a hole adds its area back.
+fn even_odd_area(contours: &[Vec<Point2>], depths: &[usize]) -> f64 {
+    let mut area = 0.0;
+    for (index, contour) in contours.iter().enumerate() {
+        let depth = depths.get(index).copied().unwrap_or(0);
+        let sign = if depth % 2 == 0 { 1.0 } else { -1.0 };
+        area += sign * signed_area(contour).abs();
+    }
+    if area.is_finite() {
+        area.max(0.0)
+    } else {
+        0.0
+    }
+}
+
+fn projected_boundary(contours: &[Vec<Point2>], normal: Point2) -> f64 {
+    let mut sum = 0.0;
+    for contour in contours {
+        let n = contour.len();
+        if n < 2 {
+            continue;
+        }
+        let tol = contour_tolerance(std::slice::from_ref(contour));
+        let closed = contour[0].distance(contour[n - 1]) <= tol;
+        let edges = if closed { n - 1 } else { n };
+        for index in 0..edges {
+            let a = contour[index];
+            let b = contour[(index + 1) % n];
+            if !a.is_finite() || !b.is_finite() {
+                continue;
+            }
+            sum += dot(b - a, normal).abs();
+        }
+    }
+    sum
+}
+
+fn dash_line_count(length: f64, dashes: &[f64]) -> f64 {
+    if !length.is_finite() || length <= PATTERN_EPS || pattern_is_solid(dashes) {
+        return 0.0;
+    }
+    let period = pattern_period(dashes);
+    if period <= PATTERN_EPS {
+        return 0.0;
+    }
+    let pens = dashes.iter().filter(|dash| **dash >= 0.0).count() as f64;
+    if pens == 0.0 {
+        return 0.0;
+    }
+    length / period * pens
+}
+
+// ------------------------------------------------------------
 // Function: hatch_pattern_segments
 // Purpose: Clip each HATCH pattern family to the boundary and
 //          return world-space dash segments. `contours` are the
 //          boundary samples already mapped into the same space
-//          as `transform` (WCS, then INSERT).
+//          as `transform` (WCS, then INSERT). A pattern AutoCAD
+//          would refuse because it exceeds HPMAXLINES is left blank.
 // ------------------------------------------------------------
 pub fn hatch_pattern_segments(
     hatch: &HatchData,
     contours: &[Vec<Point2>],
+    depths: &[usize],
     transform: Transform2,
 ) -> Vec<(Point2, Point2)> {
+    let estimate = pattern_line_estimate(hatch, contours, depths, transform);
+    if !(estimate <= HATCH_MAX_LINES as f64) {
+        return Vec::new();
+    }
     let mut out = Vec::new();
     if !transform_is_finite(transform) || contours.is_empty() {
         return out;
@@ -1072,9 +1225,118 @@ mod tests {
         let hole = square(2.0, 2.0, 8.0, 8.0);
         let island = square(4.0, 4.0, 6.0, 6.0);
         let contours = [outer, hole, island];
-        assert_eq!(hatch_fill_contours(0, &contours).len(), 3);
-        assert_eq!(hatch_fill_contours(1, &contours).len(), 2);
-        assert_eq!(hatch_fill_contours(2, &contours).len(), 1);
+        let (normal, depths) = hatch_fill_contours(0, &contours);
+        assert_eq!(normal.len(), 3);
+        assert_eq!(depths, vec![0, 1, 2]);
+        assert_eq!(hatch_fill_contours(1, &contours).0.len(), 2);
+        assert_eq!(hatch_fill_contours(2, &contours).0.len(), 1);
+    }
+
+    fn horizontal_hatch(spacing: f64, dashes: Vec<f64>) -> HatchData {
+        HatchData {
+            solid_fill: false,
+            pattern_name: "ANSI31".into(),
+            pattern_lines: vec![HatchPatternLine {
+                angle: 0.0,
+                base: Point3::default(),
+                offset: Point3::from_xy(0.0, spacing),
+                dashes,
+            }],
+            ..HatchData::default()
+        }
+    }
+
+    #[test]
+    fn span_estimate_on_a_strip_is_height_over_spacing() {
+        // Two vertical edges of length 2, spacing 1: crossings = 4,
+        // spans = 4 / 1 / 2 = 2. A continuous pattern adds no dashes.
+        let strip = square(0.0, 0.0, 20.0, 2.0);
+        let hatch = horizontal_hatch(1.0, Vec::new());
+        let estimate = pattern_line_estimate(&hatch, &[strip], &[0], Transform2::identity());
+        assert!((estimate - 2.0).abs() < 1e-6, "strip spans, got {estimate}");
+    }
+
+    #[test]
+    fn normal_hatch_still_draws_its_pattern() {
+        let square = square(0.0, 0.0, 4.0, 4.0);
+        let hatch = horizontal_hatch(2.0, Vec::new());
+        let segments =
+            hatch_pattern_segments(&hatch, &[square.clone()], &[0], Transform2::identity());
+        assert_eq!(segments.len(), 2, "the interior line and the top edge");
+        for (start, end) in segments {
+            assert!((start.y - end.y).abs() < 1e-6);
+            assert!((start.y - 2.0).abs() < 1e-6 || (start.y - 4.0).abs() < 1e-6);
+            assert!((start.x - end.x).abs() > 3.0);
+        }
+        let estimate = pattern_line_estimate(&hatch, &[square], &[0], Transform2::identity());
+        assert!(estimate <= HATCH_MAX_LINES as f64);
+    }
+
+    #[test]
+    fn dense_hatch_over_the_line_limit_draws_nothing() {
+        // Height 2000 / spacing 0.001 = 2_000_000 spans, between
+        // HPMAXLINES and the 10_000_000 setting that revealed them.
+        let square = square(0.0, 0.0, 2000.0, 2000.0);
+        let hatch = horizontal_hatch(0.001, Vec::new());
+        let estimate =
+            pattern_line_estimate(&hatch, &[square.clone()], &[0], Transform2::identity());
+        assert!(
+            estimate > HATCH_MAX_LINES as f64 && estimate < 10_000_000.0,
+            "{estimate}"
+        );
+        let segments = hatch_pattern_segments(&hatch, &[square], &[0], Transform2::identity());
+        assert!(segments.is_empty());
+    }
+
+    #[test]
+    fn long_wall_over_the_autocad_2025_limit_draws_nothing() {
+        // Spacing 1 on a strip 120_000 tall is 120_000 spans: over
+        // AutoCAD 2025's default of 100_000, under the 10_000_000
+        // setting that draws it. A 40_000 strip stays visible.
+        let hatch = horizontal_hatch(1.0, Vec::new());
+        let tall = square(0.0, 0.0, 2.0, 120_000.0);
+        let tall_estimate =
+            pattern_line_estimate(&hatch, &[tall.clone()], &[0], Transform2::identity());
+        assert!(
+            tall_estimate > 100_000.0 && tall_estimate < 1_000_000.0,
+            "{tall_estimate}"
+        );
+        assert!(tall_estimate > HATCH_MAX_LINES as f64);
+        assert!(hatch_pattern_segments(&hatch, &[tall], &[0], Transform2::identity()).is_empty());
+
+        let short = square(0.0, 0.0, 2.0, 40_000.0);
+        let short_estimate =
+            pattern_line_estimate(&hatch, &[short.clone()], &[0], Transform2::identity());
+        assert!(short_estimate < HATCH_MAX_LINES as f64, "{short_estimate}");
+        assert!(!hatch_pattern_segments(&hatch, &[short], &[0], Transform2::identity()).is_empty());
+    }
+
+    #[test]
+    fn odd_depth_island_subtracts_its_area() {
+        // Dashes [1, -1] have period 2 and one pen-down element.
+        // Spacing is 1, so dashes = even-odd area / 2.
+        // A hole of area 36 removes 18 dashes and adds 6 spans
+        // (its height). Net drop is 12.
+        let outer = square(0.0, 0.0, 10.0, 10.0);
+        let hole = square(2.0, 2.0, 8.0, 8.0);
+        let island = square(4.0, 4.0, 6.0, 6.0);
+        let hatch = horizontal_hatch(1.0, vec![1.0, -1.0]);
+        let at = |contours: &[Vec<Point2>], depths: &[usize]| {
+            pattern_line_estimate(&hatch, contours, depths, Transform2::identity())
+        };
+        let outer_only = at(&[outer.clone()], &[0]);
+        let with_hole = at(&[outer.clone(), hole.clone()], &[0, 1]);
+        let with_island = at(&[outer, hole, island], &[0, 1, 2]);
+        assert!((outer_only - 60.0).abs() < 1e-6, "outer {outer_only}");
+        assert!((with_hole - 48.0).abs() < 1e-6, "hole {with_hole}");
+        assert!(
+            (outer_only - with_hole - 12.0).abs() < 1e-6,
+            "hole area 36 subtracts 18 dashes and adds 6 spans"
+        );
+        assert!(
+            (with_island - with_hole - 4.0).abs() < 1e-6,
+            "the island adds its area back, got {with_island}"
+        );
     }
 
     #[test]

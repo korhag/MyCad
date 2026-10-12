@@ -1,7 +1,7 @@
 //! In-place block edit session: nested stack, save/discard, transforms.
 
 use cad_core::{
-    count_block_references, insert_transform, is_user_editable_block_name, BlockDefinition,
+    count_block_references, insert_transform, is_in_place_editable_block_name, BlockDefinition,
     Document, Entity, EntityId, EntitySpace, Geometry, Transform2,
 };
 use cad_render::{BlockEditView, BlockEditViewFrame};
@@ -188,7 +188,7 @@ impl BlockEditSession {
         let Geometry::Insert { block_name, .. } = &entity.geometry else {
             return Err("Select a block reference".into());
         };
-        if !is_user_editable_block_name(block_name) {
+        if !is_in_place_editable_block_name(block_name) {
             return Err("Cannot edit a system block".into());
         }
         if !self.stack.is_empty() {
@@ -322,7 +322,7 @@ impl BlockEditSession {
 
 pub fn insert_is_editable(entity: &Entity) -> bool {
     match &entity.geometry {
-        Geometry::Insert { block_name, .. } => is_user_editable_block_name(block_name),
+        Geometry::Insert { block_name, .. } => is_in_place_editable_block_name(block_name),
         _ => false,
     }
 }
@@ -646,6 +646,37 @@ mod tests {
             configuration: None,
         });
         assert!(!insert_is_editable(&entity));
+    }
+
+    #[test]
+    fn anonymous_u_insert_is_editable() {
+        let entity = Entity::new(cad_core::identity_insert(
+            "*U12".into(),
+            Point3::from_xy(0.0, 0.0),
+        ));
+        assert!(insert_is_editable(&entity));
+    }
+
+    #[test]
+    fn enter_anonymous_u_maps_local_through_insert() {
+        let mut document = Document::default();
+        document.replace_block_definition(BlockDefinition {
+            name: "*U12".into(),
+            base_pt: Point3::from_xy(0.0, 0.0),
+            entities: vec![line(0.0, 0.0, 1.0, 0.0)],
+            ..Default::default()
+        });
+        let insert = document.add_entity(Entity::new(cad_core::identity_insert(
+            "*U12".into(),
+            Point3::from_xy(10.0, 5.0),
+        )));
+        let mut session = BlockEditSession::default();
+        let history = History::default();
+        session.enter(&document, &history, insert.id).unwrap();
+        assert_eq!(session.breadcrumb(), ["Model", "*U12"]);
+        let world = session.world_from_local().apply(Point2::new(1.0, 0.0));
+        assert!((world.x - 11.0).abs() < 1e-9);
+        assert!((world.y - 5.0).abs() < 1e-9);
     }
 
     #[test]
