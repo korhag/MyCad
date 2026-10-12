@@ -23,6 +23,11 @@ fn stamp() -> u128 {
         .as_nanos()
 }
 
+fn convert_dxf_file(dxf: &Path, dwg: &Path) -> Result<(), dwg_import::ExportError> {
+    let bytes = fs::read(dxf).expect("read dxf");
+    convert_dxf_to_dwg(&bytes, dwg, DwgOutputVersion::R2000)
+}
+
 fn temp_path(ext: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
         "mycad-roundtrip-{}-{}.{}",
@@ -105,7 +110,7 @@ fn document_dxf_dwg_import_preserves_geometry() {
     let dxf = temp_path("dxf");
     let dwg = temp_path("dwg");
     write_dxf(&expected, &dxf, &DxfExportOptions::default()).expect("write DXF");
-    if let Err(err) = convert_dxf_to_dwg(&dxf, &dwg, DwgOutputVersion::R2000) {
+    if let Err(err) = convert_dxf_file(&dxf, &dwg) {
         cleanup(&[&dxf, &dwg]);
         panic!("Document → DXF → DWG failed: {err}");
     }
@@ -186,7 +191,7 @@ fn document_dxf_dwg_import_preserves_inches() {
     let dxf = temp_path("dxf");
     let dwg = temp_path("dwg");
     write_dxf(&expected, &dxf, &DxfExportOptions::default()).expect("write DXF");
-    if let Err(err) = convert_dxf_to_dwg(&dxf, &dwg, DwgOutputVersion::R2000) {
+    if let Err(err) = convert_dxf_file(&dxf, &dwg) {
         cleanup(&[&dxf, &dwg]);
         panic!("Document → DXF → DWG failed: {err}");
     }
@@ -332,7 +337,7 @@ fn created_block_survives_dxf_dwg_roundtrip() {
     let dxf = temp_path("dxf");
     let dwg = temp_path("dwg");
     write_dxf(&expected, &dxf, &DxfExportOptions::default()).expect("write DXF");
-    if let Err(err) = convert_dxf_to_dwg(&dxf, &dwg, DwgOutputVersion::R2000) {
+    if let Err(err) = convert_dxf_file(&dxf, &dwg) {
         cleanup(&[&dxf, &dwg]);
         panic!("Document → DXF → DWG failed: {err}");
     }
@@ -398,7 +403,7 @@ fn renamed_block_survives_dxf_and_dwg_roundtrip() {
     }
 
     let dwg = temp_path("dwg");
-    if let Err(err) = convert_dxf_to_dwg(&dxf, &dwg, DwgOutputVersion::R2000) {
+    if let Err(err) = convert_dxf_file(&dxf, &dwg) {
         cleanup(&[&dxf, &dwg]);
         panic!("Document → DXF → DWG failed: {err}");
     }

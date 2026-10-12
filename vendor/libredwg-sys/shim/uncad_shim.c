@@ -8,6 +8,8 @@
 #include "out_dxf.h"
 #include "uncad_shim.h"
 
+extern int dwg_read_dxf (Bit_Chain *dat, Dwg_Data *dwg);
+
 int
 uncad_write_dxf_file (const char *dwg_path, const char *dxf_path)
 {
@@ -56,6 +58,62 @@ uncad_write_dxf (Dwg_Data *dwg, const char *dxf_path)
   int error = dwg_write_dxf (&dat, dwg);
   fclose (dat.fh);
   return error;
+}
+
+int
+uncad_read_dxf_buffer (const char *buf, size_t len, Dwg_Data *dwg)
+{
+  Bit_Chain dat;
+  Dwg_Version_Type version;
+  unsigned int loglevel;
+  size_t size;
+  int add_nl;
+  int error;
+
+  if (!buf || !dwg)
+    return DWG_ERR_INVALIDDWG;
+
+  loglevel = dwg->opts & DWG_OPTS_LOGLEVEL;
+  version = dwg->header.version;
+  memset (dwg, 0, sizeof (Dwg_Data));
+  dwg->opts = loglevel | DWG_OPTS_INDXF;
+  dwg->header.version = version;
+
+  memset (&dat, 0, sizeof (Bit_Chain));
+  add_nl = (len == 0 || (unsigned char)buf[len - 1] != '\n');
+  size = len + (add_nl ? 1 : 0);
+  dat.chain = (unsigned char *)calloc (1, size + 1);
+  if (!dat.chain)
+    return DWG_ERR_OUTOFMEM;
+  if (len)
+    memcpy (dat.chain, buf, len);
+  if (add_nl)
+    dat.chain[len] = '\n';
+  dat.chain[size] = '\0';
+  dat.size = size;
+  dat.byte = 0;
+  dat.bit = 0;
+  dat.from_version = dwg->header.from_version;
+  dat.version = dwg->header.version;
+  dat.opts = dwg->opts;
+
+  if (size < 31)
+    {
+      free (dat.chain);
+      return DWG_ERR_IOERROR;
+    }
+  if (!memcmp (dat.chain, "AC10", 4) || !memcmp (dat.chain, "AC1.", 4)
+      || !memcmp (dat.chain, "AC2.10", 4) || !memcmp (dat.chain, "MC0.0", 4))
+    {
+      free (dat.chain);
+      return DWG_ERR_INVALIDDWG;
+    }
+
+  error = dwg_read_dxf (&dat, dwg);
+  free (dat.chain);
+  if (error >= DWG_ERR_CRITICAL)
+    return error;
+  return 0;
 }
 
 void *

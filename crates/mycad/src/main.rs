@@ -1,5 +1,9 @@
 //! EntoCAD — Linux-first 2D CAD application (Milestone 1: DWG viewer).
 
+// A release build on Windows is a GUI program: Start menu and taskbar
+// launches open the window with no console. Debug builds keep the console.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod app;
 mod audit;
 mod block_edit;
@@ -45,6 +49,7 @@ If the window did not open, update the GPU driver or set WGPU_BACKEND to dx12, v
 const MAX_FRAME_LATENCY: u32 = 1;
 
 fn main() -> ExitCode {
+    attach_parent_console();
     let args: Vec<String> = env::args().skip(1).collect();
     let import_only = args.iter().any(|a| a == "--import-only");
     let perf_baseline = args.iter().any(|a| a == "--perf-baseline");
@@ -68,7 +73,8 @@ fn main() -> ExitCode {
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1440.0, 900.0])
         .with_min_inner_size([800.0, 560.0])
-        .with_title(brand::APP_NAME);
+        .with_title(brand::APP_NAME)
+        .with_app_id(brand::APP_ID);
     if let Some(icon) = brand::window_icon() {
         viewport = viewport.with_icon(icon);
     }
@@ -93,10 +99,85 @@ fn main() -> ExitCode {
         Err(err) => {
             eprintln!("{} failed to start: {err}", brand::APP_NAME);
             eprintln!("{GRAPHICS_STARTUP_HINT}");
+            let _ = rfd::MessageDialog::new()
+                .set_title(format!("{} failed to start", brand::APP_NAME))
+                .set_level(rfd::MessageLevel::Error)
+                .set_description(format!("{err}\n\n{GRAPHICS_STARTUP_HINT}"))
+                .show();
             ExitCode::FAILURE
         }
     }
 }
+
+/// A Windows release build has no console of its own. When it is started
+/// from a terminal, attach to that terminal so `--import-only` can print.
+/// A Start menu launch has no parent console, so this does nothing and no
+/// console window appears.
+///
+/// Attaching is not enough: the process starts with no standard handles,
+/// and Rust reads them on the first print. `CONOUT$` is opened only when
+/// stdout was missing, so a redirected launch keeps its pipe.
+#[cfg(all(windows, not(debug_assertions)))]
+fn attach_parent_console() {
+    use std::ffi::c_void;
+
+    const ATTACH_PARENT_PROCESS: u32 = 0xFFFF_FFFF;
+    const STD_OUTPUT_HANDLE: u32 = 0xFFFF_FFF5;
+    const STD_ERROR_HANDLE: u32 = 0xFFFF_FFF4;
+    const INVALID_HANDLE_VALUE: isize = -1;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const OPEN_EXISTING: u32 = 3;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn AttachConsole(process_id: u32) -> i32;
+        fn GetStdHandle(std_handle: u32) -> *mut c_void;
+        fn SetStdHandle(std_handle: u32, handle: *mut c_void) -> i32;
+        fn CreateFileW(
+            file_name: *const u16,
+            access: u32,
+            share: u32,
+            security: *mut c_void,
+            disposition: u32,
+            flags: u32,
+            template: *mut c_void,
+        ) -> *mut c_void;
+    }
+
+    unsafe fn open_console_output() -> *mut c_void {
+        let name: Vec<u16> = "CONOUT$\0".encode_utf16().collect();
+        CreateFileW(
+            name.as_ptr(),
+            GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null_mut(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        )
+    }
+
+    unsafe {
+        let existing = GetStdHandle(STD_OUTPUT_HANDLE);
+        let has_stdout = !existing.is_null() && existing as isize != INVALID_HANDLE_VALUE;
+        if has_stdout || AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
+            return;
+        }
+        let output = open_console_output();
+        let error = open_console_output();
+        if !output.is_null() && output as isize != INVALID_HANDLE_VALUE {
+            let _ = SetStdHandle(STD_OUTPUT_HANDLE, output);
+        }
+        if !error.is_null() && error as isize != INVALID_HANDLE_VALUE {
+            let _ = SetStdHandle(STD_ERROR_HANDLE, error);
+        }
+    }
+}
+
+#[cfg(not(all(windows, not(debug_assertions))))]
+fn attach_parent_console() {}
 
 fn install_panic_hook() {
     let previous = std::panic::take_hook();
@@ -139,7 +220,7 @@ fn panic_message(info: &std::panic::PanicHookInfo<'_>) -> String {
 }
 
 fn crash_log_path() -> PathBuf {
-    eframe::storage_dir(brand::APP_NAME)
+    eframe::storage_dir(brand::APP_ID)
         .unwrap_or_else(std::env::temp_dir)
         .join("crash.log")
 }

@@ -452,7 +452,7 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "cad-core"
-version = "0.45.0"
+version = "0.46.1"
 dependencies = [
  "thiserror 2.0.20",
  "ttf-parser",
@@ -460,7 +460,7 @@ dependencies = [
 
 [[package]]
 name = "cad-io"
-version = "0.45.0"
+version = "0.46.1"
 dependencies = [
  "cad-core",
  "serde",
@@ -470,7 +470,7 @@ dependencies = [
 
 [[package]]
 name = "cad-render"
-version = "0.45.0"
+version = "0.46.1"
 dependencies = [
  "bytemuck",
  "cad-core",
@@ -482,7 +482,7 @@ dependencies = [
 
 [[package]]
 name = "cad-viewport"
-version = "0.45.0"
+version = "0.46.1"
 dependencies = [
  "cad-core",
 ]
@@ -769,7 +769,7 @@ dependencies = [
 
 [[package]]
 name = "dwg-import"
-version = "0.45.0"
+version = "0.46.1"
 dependencies = [
  "cad-core",
  "cad-io",
@@ -1859,7 +1859,7 @@ dependencies = [
 
 [[package]]
 name = "mycad"
-version = "0.45.0"
+version = "0.46.1"
 dependencies = [
  "cad-core",
  "cad-io",
@@ -1876,6 +1876,7 @@ dependencies = [
  "ron",
  "serde",
  "serde_json",
+ "ttf-parser",
  "winresource",
 ]
 

@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=EntoCAD
+GenericName=2D CAD
+Comment=Open and edit DWG and DXF drawings
+Exec="@BIN@" %f
+Icon=entocad
+StartupWMClass=entocad
+Categories=Graphics;Engineering;
+MimeType=image/vnd.dwg;image/vnd.dxf;
+Terminal=false
+StartupNotify=true

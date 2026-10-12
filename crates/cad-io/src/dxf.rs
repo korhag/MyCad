@@ -47,19 +47,15 @@ pub fn write_dxf(
 }
 
 // ------------------------------------------------------------
-// Function: write_dxf_interchange
-// Purpose: Write a throwaway DXF for LibreDWG to read back. A crash
-//          here must not touch the destination DWG, so this skips the
-//          durable temp-file, flush, and replace used by write_dxf.
+// Function: render_dxf_interchange
+// Purpose: DXF text for LibreDWG to read from memory. A crash here must
+//          not touch the destination DWG, so this does not write a file.
 // ------------------------------------------------------------
-pub fn write_dxf_interchange(
+pub fn render_dxf_interchange(
     document: &Document,
-    path: &Path,
     options: &DxfExportOptions,
-) -> Result<SaveReport, ExportError> {
-    let (report, text) = render_dxf(document, options)?;
-    std::fs::write(path, text.as_bytes()).map_err(|source| ExportError::io(path, source))?;
-    Ok(report)
+) -> Result<(SaveReport, String), ExportError> {
+    render_dxf(document, options)
 }
 
 fn render_dxf(
@@ -149,7 +145,9 @@ impl<'a> DxfWriter<'a> {
             self.nonfinite = true;
             self.warn("non-finite coordinate or scale was not written as a number");
         }
-        self.pair(code, format_dxf_r2000_f64(value));
+        let _ = write!(self.out, "{code:3}\n");
+        append_dxf_f64(&mut self.out, value);
+        self.out.push('\n');
     }
 
     fn pair_i(&mut self, code: i16, value: i32) {
@@ -812,14 +810,20 @@ impl<'a> DxfWriter<'a> {
     fn write_blocks(&mut self) {
         self.pair(0, "SECTION");
         self.pair(2, "BLOCKS");
-        for layout in self.export_layouts.clone() {
+        let layout_count = self.export_layouts.len();
+        for index in 0..layout_count {
             // *MODEL_SPACE and *PAPER_SPACE stay empty. AutoCAD rejects
             // entities in those two block bodies and reads them from ENTITIES.
-            if layout.paper && !is_primary_paper_space(&layout.block_name) {
-                let block = self.paper_block(&layout.block_name);
-                self.write_block_definition(&layout.block_name, &block);
+            let paper = self.export_layouts[index].paper;
+            let block_name = self.export_layouts[index].block_name.clone();
+            if paper && !is_primary_paper_space(&block_name) {
+                if let Some(block) = self.paper_block(&block_name) {
+                    self.write_block_definition(&block_name, block);
+                } else {
+                    self.write_space_block(&block_name);
+                }
             } else {
-                self.write_space_block(&layout.block_name);
+                self.write_space_block(&block_name);
             }
         }
         let names: Vec<String> = self.document.blocks.keys().cloned().collect();
@@ -827,24 +831,30 @@ impl<'a> DxfWriter<'a> {
             if is_layout_block(&name) {
                 continue;
             }
-            let Some(block) = self.document.blocks.get(&name).cloned() else {
+            let Some(block) = self.stored_block(&name) else {
                 continue;
             };
-            self.write_block_definition(&name, &block);
+            self.write_block_definition(&name, block);
         }
         self.pair(0, "ENDSEC");
     }
 
-    fn paper_block(&self, name: &str) -> BlockDefinition {
-        self.document
+    // The document is only read during a write. The raw pointer keeps the
+    // block borrow from being tied to `&mut self`, so the entities are
+    // written in place instead of cloned.
+    fn stored_block<'b>(&self, name: &str) -> Option<&'b BlockDefinition> {
+        let block = self.document.blocks.get(name)? as *const BlockDefinition;
+        Some(unsafe { &*block })
+    }
+
+    fn paper_block<'b>(&self, name: &str) -> Option<&'b BlockDefinition> {
+        let block = self
+            .document
             .blocks
             .iter()
             .find(|(key, _)| key.eq_ignore_ascii_case(name))
-            .map(|(_, block)| block.clone())
-            .unwrap_or_else(|| BlockDefinition {
-                name: name.to_string(),
-                ..BlockDefinition::default()
-            })
+            .map(|(_, block)| block as *const BlockDefinition)?;
+        Some(unsafe { &*block })
     }
 
     fn write_space_block(&mut self, name: &str) {
@@ -907,13 +917,18 @@ impl<'a> DxfWriter<'a> {
     fn write_entities(&mut self) {
         self.pair(0, "SECTION");
         self.pair(2, "ENTITIES");
-        for entity in &self.document.model_space {
-            self.write_entity(entity);
+        let count = self.document.model_space.len();
+        for index in 0..count {
+            let entity = &self.document.model_space[index] as *const Entity;
+            self.write_entity(unsafe { &*entity });
         }
-        let paper = self.paper_block("*PAPER_SPACE");
         self.paper_entity = true;
-        for entity in &paper.entities {
-            self.write_entity(entity);
+        if let Some(paper) = self.paper_block("*PAPER_SPACE") {
+            let count = paper.entities.len();
+            for index in 0..count {
+                let entity = &paper.entities[index] as *const Entity;
+                self.write_entity(unsafe { &*entity });
+            }
         }
         self.paper_entity = false;
         self.pair(0, "ENDSEC");
@@ -1716,8 +1731,6 @@ impl<'a> DxfWriter<'a> {
         } else {
             self.plot_style.clone()
         };
-        let layouts_to_write = self.export_layouts.clone();
-
         self.begin_object("DICTIONARY", &root, "0");
         self.pair(100, "AcDbDictionary");
         self.pair_i(281, 1);
@@ -1734,17 +1747,21 @@ impl<'a> DxfWriter<'a> {
         self.begin_object("DICTIONARY", &layouts, &root);
         self.pair(100, "AcDbDictionary");
         self.pair_i(281, 1);
-        for layout in &layouts_to_write {
-            self.dict_entry(&layout.name, &layout.handle);
+        let layout_count = self.export_layouts.len();
+        for index in 0..layout_count {
+            let name = self.export_layouts[index].name.clone();
+            let handle = self.export_layouts[index].handle.clone();
+            self.dict_entry(&name, &handle);
         }
-        for layout in &layouts_to_write {
+        for index in 0..layout_count {
+            let layout = self.export_layouts[index].clone();
             let record = self
                 .block_records
                 .iter()
                 .find(|(name, _)| name.eq_ignore_ascii_case(&layout.block_name))
                 .map(|(_, handle)| handle.clone())
                 .unwrap_or_default();
-            self.write_layout_object(layout, &layouts, &record);
+            self.write_layout_object(&layout, &layouts, &record);
         }
 
         self.begin_object("DICTIONARY", &mline_dict, &root);
@@ -2525,13 +2542,83 @@ fn autocad_julian_date() -> f64 {
     2_451_545.0
 }
 
+#[cfg(test)]
 fn format_dxf_r2000_f64(value: f64) -> String {
+    let mut out = String::new();
+    append_dxf_f64(&mut out, value);
+    out
+}
+
+// ------------------------------------------------------------
+// Function: append_dxf_f64
+// Purpose: Write a group value straight into the DXF buffer.
+//          Whole numbers stay `10.0`. Everything else is the shortest
+//          plain decimal that parses back to the same f64. No `1e-20`.
+// ------------------------------------------------------------
+fn append_dxf_f64(out: &mut String, value: f64) {
     if !value.is_finite() {
-        "0.0".into()
-    } else if value.fract().abs() < 1e-12 {
-        format!("{:.1}", value.round())
-    } else {
-        format!("{value:.16}")
+        out.push_str("0.0");
+        return;
+    }
+    // Snap only when the value is already an integer, or it is within
+    // 1e-12 of an integer whose magnitude is at least 1. A tiny value
+    // such as 1e-20 is not written as 0.0.
+    let rounded = value.round();
+    let delta = (value - rounded).abs();
+    if delta == 0.0 || (delta < 1e-12 && rounded.abs() >= 1.0) {
+        let _ = write!(out, "{:.1}", rounded);
+        return;
+    }
+    let start = out.len();
+    let _ = write!(out, "{value}");
+    if out.as_bytes()[start..]
+        .iter()
+        .any(|byte| *byte == b'e' || *byte == b'E')
+    {
+        out.truncate(start);
+        append_plain_decimal(out, value);
+    }
+}
+
+fn append_plain_decimal(out: &mut String, value: f64) {
+    let mut buf = StackWriter {
+        data: [0; 800],
+        len: 0,
+    };
+    if write!(buf, "{value:.340}").is_err() {
+        let _ = write!(out, "{value}");
+        return;
+    }
+    while buf.len > 0 && buf.data[buf.len - 1] == b'0' {
+        buf.len -= 1;
+    }
+    if buf.len > 0 && buf.data[buf.len - 1] == b'.' {
+        buf.data[buf.len] = b'0';
+        buf.len += 1;
+    }
+    out.push_str(buf.as_str());
+}
+
+struct StackWriter {
+    data: [u8; 800],
+    len: usize,
+}
+
+impl std::fmt::Write for StackWriter {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        let bytes = text.as_bytes();
+        if self.len + bytes.len() > self.data.len() {
+            return Err(std::fmt::Error);
+        }
+        self.data[self.len..self.len + bytes.len()].copy_from_slice(bytes);
+        self.len += bytes.len();
+        Ok(())
+    }
+}
+
+impl StackWriter {
+    fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.data[..self.len]).unwrap_or("0.0")
     }
 }
 
@@ -2555,6 +2642,34 @@ mod tests {
 
     fn write_to_string(document: &Document) -> (SaveReport, String) {
         render_dxf(document, &DxfExportOptions::default()).expect("write")
+    }
+
+    #[test]
+    fn dxf_numbers_round_trip_without_padding() {
+        let samples = [0.1_f64, 1e-20, 123456.789, -2.5];
+        let mut document = Document::default();
+        for value in samples {
+            document.add_entity(Entity::new(Geometry::Line {
+                start: Point3::new(value, 0.0, 0.0),
+                end: Point3::new(0.0, value, 0.0),
+            }));
+        }
+        let (_report, text) = write_to_string(&document);
+        for value in samples {
+            let token = format_dxf_r2000_f64(value);
+            assert!(
+                !token.contains(['e', 'E']),
+                "exponent in DXF number {token}"
+            );
+            let parsed: f64 = token.parse().expect("parse");
+            assert_eq!(parsed, value, "{token}");
+            assert!(
+                text.contains(&format!("\n{token}\n")),
+                "{token} missing from written DXF"
+            );
+        }
+        assert_eq!(format_dxf_r2000_f64(10.0), "10.0");
+        assert_eq!(format_dxf_r2000_f64(0.1), "0.1");
     }
 
     fn entities_section(text: &str) -> &str {
@@ -2933,7 +3048,14 @@ mod tests {
         // AutoCAD; 1 is left to right.
         assert!(entities.contains(" 72\n1\n"));
         assert!(entities.contains(" 73\n1\n"));
-        assert!(entities.contains(" 11\n0.0\n 21\n1.0\n"));
+        // Group 11/21 is the text direction, not a column count. cos(π/2)
+        // is a tiny non-zero value and must stay that way.
+        let x = format_dxf_r2000_f64(std::f64::consts::FRAC_PI_2.cos());
+        let y = format_dxf_r2000_f64(std::f64::consts::FRAC_PI_2.sin());
+        assert!(
+            entities.contains(&format!(" 11\n{x}\n 21\n{y}\n")),
+            "{entities}"
+        );
         assert!(!entities.contains(" 50\n90"));
     }
 

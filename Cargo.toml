@@ -10,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.45.0"
+version = "0.46.1"
 edition = "2021"
 license = "GPL-3.0-or-later"
 authors = ["Entomak"]
@@ -50,10 +50,14 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 opt-level = 2
 
 # MSVC 14.41 ICEs on vendored LibreDWG decode.c at /O2 (C1001, 0xC0000005).
+# build.rs compiles that one file at opt-level 1 and the rest at opt-level 2.
+# This default stays at 1 so a file without an explicit level stays safe.
 [profile.dev.package."libredwg-sys"]
 opt-level = 1
 
 # MSVC 14.41 ICEs on vendored LibreDWG decode.c at /O2 (C1001, 0xC0000005).
+# build.rs compiles that one file at opt-level 1 and the rest at opt-level 2.
+# This default stays at 1 so a file without an explicit level stays safe.
 [profile.release.package."libredwg-sys"]
 opt-level = 1
 

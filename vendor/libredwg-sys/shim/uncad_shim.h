@@ -32,6 +32,14 @@ int uncad_write_dxf_file(const char *dwg_path, const char *dxf_path);
  */
 int uncad_write_dxf(Dwg_Data *dwg, const char *dxf_path);
 
+/* Reads ASCII DXF bytes already in memory. Same setup as dxf_read_file
+ * (reset dwg, require a trailing newline, reject a DWG magic) without a
+ * temporary file. Returns 0 on success, or a LibreDWG error >= DWG_ERR_CRITICAL.
+ * `dwg` must be zeroed or a previous result freed by the caller. On failure
+ * the caller frees `dwg`.
+ */
+int uncad_read_dxf_buffer(const char *buf, size_t len, Dwg_Data *dwg);
+
 /* Returns the type-specific entity struct pointer (e.g. Dwg_Entity_LINE*,
  * as a void*) for `obj`, or NULL if `obj` isn't an entity or has no data.
  *

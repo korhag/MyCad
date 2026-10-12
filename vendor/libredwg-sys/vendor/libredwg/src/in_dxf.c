@@ -85,6 +85,245 @@ static array_hdls *header_hdls = NULL;
 static array_hdls *eed_hdls = NULL;
 static array_hdls *obj_hdls = NULL;
 
+/* Name → handle cache for one DXF read.
+   dwg_find_tablehandle walks every table entry and calls dynapi per entry.
+   On a large drawing that is entities × table size. These tables are the
+   ones resolved for nearly every entity (layer, linetype, style, block,
+   dimstyle). The cache is rebuilt when the control object's entry count
+   changes, and a miss falls back to the full search. Not reentrant, same
+   as the postponed-handle lists above. */
+typedef struct _dxf_table_cache_entry
+{
+  char *name;
+  BITCODE_H hdl;
+  BITCODE_BL order;
+} dxf_table_cache_entry;
+
+typedef struct _dxf_table_cache
+{
+  const char *table;
+  BITCODE_BL num_entries;
+  BITCODE_BL nitems;
+  dxf_table_cache_entry *items;
+  int ready;
+} dxf_table_cache;
+
+static dxf_table_cache table_name_cache[] = {
+  { "LAYER", 0, 0, NULL, 0 },
+  { "LTYPE", 0, 0, NULL, 0 },
+  { "STYLE", 0, 0, NULL, 0 },
+  { "BLOCK", 0, 0, NULL, 0 },
+  { "DIMSTYLE", 0, 0, NULL, 0 },
+};
+
+static int
+dxf_cache_sort_cmp (const void *a, const void *b)
+{
+  const dxf_table_cache_entry *ea = (const dxf_table_cache_entry *)a;
+  const dxf_table_cache_entry *eb = (const dxf_table_cache_entry *)b;
+  int cmp = strcasecmp (ea->name, eb->name);
+  if (cmp)
+    return cmp;
+  if (ea->order < eb->order)
+    return -1;
+  if (ea->order > eb->order)
+    return 1;
+  return 0;
+}
+
+static int
+dxf_cache_name_cmp (const void *key, const void *elem)
+{
+  const dxf_table_cache_entry *entry = (const dxf_table_cache_entry *)elem;
+  return strcasecmp ((const char *)key, entry->name);
+}
+
+static void
+dxf_table_cache_reset (dxf_table_cache *cache)
+{
+  BITCODE_BL i;
+  if (cache->items)
+    {
+      for (i = 0; i < cache->nitems; i++)
+        free (cache->items[i].name);
+      free (cache->items);
+    }
+  cache->items = NULL;
+  cache->nitems = 0;
+  cache->num_entries = 0;
+  cache->ready = 0;
+}
+
+static void
+dxf_table_cache_free (void)
+{
+  size_t i;
+  for (i = 0; i < ARRAY_SIZE (table_name_cache); i++)
+    dxf_table_cache_reset (&table_name_cache[i]);
+}
+
+static dxf_table_cache *
+dxf_cache_slot (const char *table)
+{
+  size_t i;
+  for (i = 0; i < ARRAY_SIZE (table_name_cache); i++)
+    if (strEQ (table_name_cache[i].table, table))
+      return &table_name_cache[i];
+  return NULL;
+}
+
+/* Same LTYPE header shortcuts as dwg_find_tablehandle. */
+static BITCODE_H
+dxf_ltype_preset (Dwg_Data *restrict dwg, const char *restrict name)
+{
+  Dwg_Header_Variables *vars = &dwg->header_vars;
+  if (strEQc (name, "BYLAYER") || strEQc (name, "ByLayer"))
+    return vars->LTYPE_BYLAYER;
+  if (strEQc (name, "BYBLOCK") || strEQc (name, "ByBlock"))
+    return vars->LTYPE_BYBLOCK;
+  if (strEQc (name, "CONTINUOUS") || strEQc (name, "Continuous"))
+    return vars->LTYPE_CONTINUOUS;
+  return NULL;
+}
+
+static void
+dxf_ltype_note (Dwg_Data *restrict dwg, const char *restrict name,
+                BITCODE_H hdl)
+{
+  Dwg_Header_Variables *vars = &dwg->header_vars;
+  if ((strEQc (name, "BYLAYER") || strEQc (name, "ByLayer"))
+      && !vars->LTYPE_BYLAYER)
+    vars->LTYPE_BYLAYER = hdl;
+  else if ((strEQc (name, "BYBLOCK") || strEQc (name, "ByBlock"))
+           && !vars->LTYPE_BYBLOCK)
+    vars->LTYPE_BYBLOCK = hdl;
+  else if ((strEQc (name, "CONTINUOUS") || strEQc (name, "Continuous"))
+           && !vars->LTYPE_CONTINUOUS)
+    vars->LTYPE_CONTINUOUS = hdl;
+}
+
+static int
+dxf_cache_rebuild (Dwg_Data *restrict dwg, dxf_table_cache *cache,
+                   BITCODE_BL num_entries, BITCODE_H *hdlv)
+{
+  dxf_table_cache_entry *items;
+  BITCODE_BL i, n = 0, w;
+  dxf_table_cache_reset (cache);
+  items = (dxf_table_cache_entry *)calloc (num_entries, sizeof (*items));
+  if (!items)
+    return 0;
+  for (i = 0; i < num_entries; i++)
+    {
+      char *hdlname = NULL;
+      Dwg_Object *hobj;
+      Dwg_Object_APPID *_o;
+      int isnew = 0;
+      bool ok;
+
+      if (!hdlv[i])
+        continue;
+      hobj = dwg_resolve_handle (dwg, hdlv[i]->absolute_ref);
+      if (!hobj || !hobj->tio.object || !hobj->tio.object->tio.APPID)
+        continue;
+      _o = hobj->tio.object->tio.APPID;
+      ok = dwg_dynapi_entity_utf8text (_o, hobj->name, "name", &hdlname,
+                                       &isnew, NULL);
+      if (!ok || !hdlname)
+        {
+          if (isnew)
+            free (hdlname);
+          continue;
+        }
+      items[n].name = strdup (hdlname);
+      if (isnew)
+        free (hdlname);
+      if (!items[n].name)
+        {
+          BITCODE_BL j;
+          for (j = 0; j < n; j++)
+            free (items[j].name);
+          free (items);
+          return 0;
+        }
+      items[n].hdl = hdlv[i];
+      items[n].order = i;
+      n++;
+    }
+  if (n > 1)
+    qsort (items, (size_t)n, sizeof (*items), dxf_cache_sort_cmp);
+  w = 0;
+  for (i = 0; i < n; i++)
+    {
+      /* Keep the earliest table entry. That is the one the linear search
+         returned. */
+      if (w > 0 && !strcasecmp (items[w - 1].name, items[i].name))
+        {
+          free (items[i].name);
+          continue;
+        }
+      items[w++] = items[i];
+    }
+  cache->items = items;
+  cache->nitems = w;
+  cache->num_entries = num_entries;
+  cache->ready = 1;
+  return 1;
+}
+
+static BITCODE_H
+cached_find_tablehandle (Dwg_Data *restrict dwg, const char *restrict name,
+                         const char *restrict table)
+{
+  dxf_table_cache *cache;
+  BITCODE_H ctrl, *hdlv = NULL;
+  BITCODE_BL num_entries = 0;
+  Dwg_Object *obj;
+  Dwg_Object_APPID_CONTROL *_obj;
+  dxf_table_cache_entry *found;
+
+  if (!dwg || !name || !table)
+    return NULL;
+  cache = dxf_cache_slot (table);
+  if (!cache)
+    return dwg_find_tablehandle_silent (dwg, name, table);
+  if (strEQc (table, "LTYPE"))
+    {
+      BITCODE_H preset = dxf_ltype_preset (dwg, name);
+      if (preset)
+        return preset;
+    }
+  ctrl = dwg_ctrl_table (dwg, table);
+  if (!ctrl)
+    return dwg_find_tablehandle_silent (dwg, name, table);
+  obj = dwg_resolve_handle (dwg, ctrl->absolute_ref);
+  if (!obj || !obj->tio.object || obj->fixedtype == DWG_TYPE_DICTIONARY
+      || !dwg_obj_is_control (obj))
+    return dwg_find_tablehandle_silent (dwg, name, table);
+  _obj = obj->tio.object->tio.APPID_CONTROL;
+  dwg_dynapi_entity_value (_obj, obj->name, "num_entries", &num_entries, NULL);
+  dwg_dynapi_entity_value (_obj, obj->name, "entries", &hdlv, NULL);
+  if (!num_entries || !hdlv)
+    return dwg_find_tablehandle_silent (dwg, name, table);
+  if (!cache->ready || cache->num_entries != num_entries)
+    {
+      if (!dxf_cache_rebuild (dwg, cache, num_entries, hdlv))
+        return dwg_find_tablehandle_silent (dwg, name, table);
+    }
+  found = NULL;
+  if (cache->nitems)
+    found = (dxf_table_cache_entry *)bsearch (
+        name, cache->items, (size_t)cache->nitems, sizeof (*cache->items),
+        dxf_cache_name_cmp);
+  if (!found)
+    return dwg_find_tablehandle_silent (dwg, name, table);
+  if (strEQc (table, "LTYPE"))
+    dxf_ltype_note (dwg, name, found->hdl);
+  return found->hdl;
+}
+
+#define dwg_find_tablehandle_silent(dwg, name, table)                         \
+  cached_find_tablehandle (dwg, name, table)
+
 // static long num_dxf_objs;  // how many elements are added
 // static long size_dxf_objs; // how many elements are allocated
 // static Dxf_Objs *dxf_objs;
@@ -7530,25 +7769,12 @@ find_tablehandle (Dwg_Data *restrict dwg, Dxf_Pair *restrict pair)
       newref->r11_idx = ref->r11_idx; // preserve table index for pre-R13
       return newref;
     }
-  /* I think all these >300 are given by hex value, not by name */
+  /* Codes above 300 are hex handles, not names. Both branches used to
+     call dwg_add_handleref with the same arguments, so the object_ref
+     scan did not change the result. dwg_add_handleref already returns
+     an existing ref for this absolute value. */
   if (!ref && pair->code > 300)
-    {
-      for (BITCODE_BL i = 0; i < dwg->num_object_refs; i++)
-        {
-          Dwg_Object_Ref *refi = dwg->object_ref[i];
-          if (refi->absolute_ref == (BITCODE_BL)pair->value.u)
-            {
-              // no relative offset
-              ref = dwg_add_handleref (dwg, 5, pair->value.u, NULL);
-              break;
-            }
-        }
-      if (!ref)
-        {
-          // no relative offset
-          ref = dwg_add_handleref (dwg, 5, pair->value.u, NULL);
-        }
-    }
+    ref = dwg_add_handleref (dwg, 5, pair->value.u, NULL);
 #  if 0
   else if (pair->code == 331)
     ref = dwg_find_tablehandle_silent (dwg, pair->value.s.ptr, "VPORT");
@@ -14990,6 +15216,7 @@ dwg_read_dxf (Bit_Chain *restrict dat, Dwg_Data *restrict dwg)
   header_hdls = new_array_hdls (16);
   eed_hdls = new_array_hdls (16);
   obj_hdls = new_array_hdls (16);
+  dxf_table_cache_free ();
 
   // start with the BLOCK_HEADER at objid 0
   if (!dwg->num_objects)
@@ -15211,6 +15438,7 @@ dwg_read_dxf (Bit_Chain *restrict dat, Dwg_Data *restrict dwg)
   free_array_hdls (header_hdls);
   free_array_hdls (eed_hdls);
   free_array_hdls (obj_hdls);
+  dxf_table_cache_free ();
   if (dwg->header.version <= R_2000
       && (dwg->header.from_version > R_2000 || (dwg->opts & DWG_OPTS_INDXF)))
     dwg_fixup_BLOCKS_entities (dwg);
@@ -15225,6 +15453,7 @@ error:
   free_array_hdls (header_hdls);
   free_array_hdls (eed_hdls);
   free_array_hdls (obj_hdls);
+  dxf_table_cache_free ();
   return error;
 }
 

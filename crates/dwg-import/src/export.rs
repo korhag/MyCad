@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use cad_core::Document;
 use cad_io::{
-    replace_atomic, sibling_temp_with_extension, write_dxf_interchange, DxfExportOptions,
+    render_dxf_interchange, replace_atomic, sibling_temp_with_extension, DxfExportOptions,
     SaveReport,
 };
 use thiserror::Error;
@@ -57,16 +57,14 @@ pub enum ExportError {
 
 // ------------------------------------------------------------
 // Function: convert_dxf_to_dwg
-// Purpose: Read a DXF with LibreDWG and write DWG, holding LIBREDWG_LOCK.
+// Purpose: Read DXF bytes with LibreDWG and write DWG, holding LIBREDWG_LOCK.
 // ------------------------------------------------------------
 pub fn convert_dxf_to_dwg(
-    dxf_path: &Path,
+    dxf: &[u8],
     dwg_path: &Path,
     version: DwgOutputVersion,
 ) -> Result<(), ExportError> {
-    let dxf_str = dxf_path.to_str().ok_or(ExportError::InvalidPath)?;
     let dwg_str = dwg_path.to_str().ok_or(ExportError::InvalidPath)?;
-    let c_dxf = CString::new(dxf_str).map_err(|_| ExportError::InvalidPath)?;
     let c_dwg = CString::new(dwg_str).map_err(|_| ExportError::InvalidPath)?;
 
     let _guard = LIBREDWG_LOCK
@@ -79,13 +77,15 @@ pub fn convert_dxf_to_dwg(
 
     let read_error = {
         let _span = cad_core::perf::span("dxf_read_file");
-        unsafe { libredwg_sys::dxf_read_file(c_dxf.as_ptr(), dwg.as_mut()) }
+        unsafe {
+            libredwg_sys::uncad_read_dxf_buffer(dxf.as_ptr().cast(), dxf.len(), dwg.as_mut())
+        }
     };
     #[allow(clippy::unnecessary_cast)]
     if read_error >= libredwg_sys::DWG_ERROR_DWG_ERR_CLASSESNOTFOUND as i32 {
         unsafe { libredwg_sys::dwg_free(dwg.as_mut()) };
         return Err(ExportError::Critical {
-            path: dxf_path.to_path_buf(),
+            path: dwg_path.to_path_buf(),
             code: read_error,
         });
     }
@@ -143,24 +143,22 @@ pub fn write_dwg_as(
     path: &Path,
     version: DwgOutputVersion,
 ) -> Result<SaveReport, DwgWriteError> {
-    let dxf_tmp = sibling_temp_with_extension(path, "dxf")?;
     let dwg_tmp = sibling_temp_with_extension(path, "dwg")?;
     let cleanup = || {
-        let _ = fs::remove_file(&dxf_tmp);
         let _ = fs::remove_file(&dwg_tmp);
     };
 
-    let report = {
+    let (report, dxf) = {
         let _span = cad_core::perf::span("write_dxf_interchange");
-        match write_dxf_interchange(document, &dxf_tmp, &DxfExportOptions::default()) {
-            Ok(report) => report,
+        match render_dxf_interchange(document, &DxfExportOptions::default()) {
+            Ok(rendered) => rendered,
             Err(err) => {
                 cleanup();
                 return Err(DwgWriteError::Dxf(err));
             }
         }
     };
-    if let Err(err) = convert_dxf_to_dwg(&dxf_tmp, &dwg_tmp, version) {
+    if let Err(err) = convert_dxf_to_dwg(dxf.as_bytes(), &dwg_tmp, version) {
         cleanup();
         return Err(DwgWriteError::Convert(err));
     }
@@ -179,7 +177,6 @@ pub fn write_dwg_as(
             return Err(err.into());
         }
     }
-    let _ = fs::remove_file(&dxf_tmp);
     Ok(report)
 }
 
@@ -217,37 +214,30 @@ mod tests {
             use std::ffi::OsString;
             use std::os::windows::ffi::OsStringExt;
             let path = std::path::PathBuf::from(OsString::from_wide(&[0xD800]));
-            let err = convert_dxf_to_dwg(&path, Path::new("out.dwg"), DwgOutputVersion::R2000);
+            let err = convert_dxf_to_dwg(b"", &path, DwgOutputVersion::R2000);
             assert!(matches!(err, Err(ExportError::InvalidPath)));
         }
         #[cfg(not(windows))]
         {
             use std::os::unix::ffi::OsStringExt;
             let path = std::path::PathBuf::from(std::ffi::OsString::from_vec(vec![0xff]));
-            let err = convert_dxf_to_dwg(&path, Path::new("out.dwg"), DwgOutputVersion::R2000);
+            let err = convert_dxf_to_dwg(b"", &path, DwgOutputVersion::R2000);
             assert!(matches!(err, Err(ExportError::InvalidPath)));
         }
     }
 
     #[test]
     fn converts_a_minimal_r2000_dxf() {
-        let dir = std::env::temp_dir();
-        let dxf_path = dir.join(format!("mycad-convert-{}.dxf", stamp()));
-        let dwg_path = dir.join(format!("mycad-convert-{}.dwg", stamp()));
-        fs::write(
-            &dxf_path,
-            concat!(
-                "  0\nSECTION\n  2\nHEADER\n  9\n$ACADVER\n  1\nAC1015\n",
-                "  0\nENDSEC\n  0\nSECTION\n  2\nTABLES\n  0\nTABLE\n  2\nLAYER\n",
-                "  0\nLAYER\n  2\n0\n 70\n0\n 62\n7\n  6\nCONTINUOUS\n  0\nENDTAB\n",
-                "  0\nENDSEC\n  0\nSECTION\n  2\nENTITIES\n  0\nLINE\n  8\n0\n",
-                " 10\n0.0\n 20\n0.0\n 30\n0.0\n 11\n1.0\n 21\n0.0\n 31\n0.0\n",
-                "  0\nENDSEC\n  0\nEOF\n"
-            ),
-        )
-        .expect("dxf");
-        let result = convert_dxf_to_dwg(&dxf_path, &dwg_path, DwgOutputVersion::R2000);
-        let _ = fs::remove_file(&dxf_path);
+        let dwg_path = std::env::temp_dir().join(format!("mycad-convert-{}.dwg", stamp()));
+        let dxf = concat!(
+            "  0\nSECTION\n  2\nHEADER\n  9\n$ACADVER\n  1\nAC1015\n",
+            "  0\nENDSEC\n  0\nSECTION\n  2\nTABLES\n  0\nTABLE\n  2\nLAYER\n",
+            "  0\nLAYER\n  2\n0\n 70\n0\n 62\n7\n  6\nCONTINUOUS\n  0\nENDTAB\n",
+            "  0\nENDSEC\n  0\nSECTION\n  2\nENTITIES\n  0\nLINE\n  8\n0\n",
+            " 10\n0.0\n 20\n0.0\n 30\n0.0\n 11\n1.0\n 21\n0.0\n 31\n0.0\n",
+            "  0\nENDSEC\n  0\nEOF\n"
+        );
+        let result = convert_dxf_to_dwg(dxf.as_bytes(), &dwg_path, DwgOutputVersion::R2000);
         match result {
             Ok(()) => {
                 let bytes = fs::read(&dwg_path).expect("dwg");

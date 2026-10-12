@@ -1732,7 +1732,10 @@ impl MyCadApp {
                 // thread can mark the drawing saved without copying it.
                 let finished = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
                     let dest = path;
-                    let prepared = export_snapshot(&snapshot);
+                    let prepared = {
+                        let _span = cad_core::perf::span("export_snapshot");
+                        export_snapshot(&snapshot)
+                    };
                     let document = prepared
                         .as_ref()
                         .map(|exported| &exported.document)
@@ -1742,6 +1745,7 @@ impl MyCadApp {
                             let _span = cad_core::perf::span("write_dxf");
                             write_dxf(document, &dest, &DxfExportOptions::default())
                                 .map(|report| {
+                                    let _span = cad_core::perf::span("sync_companion");
                                     sync_companion(&snapshot, prepared.as_ref(), &dest, report)
                                 })
                                 .map_err(|err| format_save_failed(&err))
@@ -1750,6 +1754,7 @@ impl MyCadApp {
                             let _span = cad_core::perf::span("write_dwg");
                             write_dwg(document, &dest)
                                 .map(|report| {
+                                    let _span = cad_core::perf::span("sync_companion");
                                     sync_companion(&snapshot, prepared.as_ref(), &dest, report)
                                 })
                                 .map_err(|err| format_save_failed(format_dwg_write_error(&err)))
@@ -5060,7 +5065,7 @@ impl MyCadApp {
             painter.text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
-                "File → Open   or   pass a DWG on the command line",
+                crate::brand::EMPTY_HINT,
                 egui::FontId::proportional(16.0),
                 egui::Color32::from_rgb(140, 160, 140),
             );

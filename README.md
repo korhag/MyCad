@@ -79,6 +79,63 @@ Install the Vulkan driver that matches the GPU (`vulkan-intel`, `vulkan-radeon`,
 or the NVIDIA package). `mesa-vulkan-drivers` is the Debian and Fedora name for
 the same drivers.
 
+## Install as a desktop app
+
+These scripts build a release binary and register EntoCAD for the current
+user. They do not need an administrator or sudo. Run the same command again
+after a git pull to update. Headless `--import-only` stays a terminal command
+(`cargo run -p mycad -- --import-only <file>`), because a Start menu launch
+has no console.
+
+### Windows
+
+Double-click `packaging\windows\Install EntoCAD.cmd`. The first build can
+take several minutes. When it finishes, EntoCAD opens. Double-click
+`packaging\windows\Uninstall EntoCAD.cmd` to remove it. Drawings and
+preferences are kept.
+
+Typing `.\install.ps1` directly fails on this machine because Windows is set
+to AllSigned, which blocks unsigned scripts. The `.cmd` files pass
+`-ExecutionPolicy Bypass` for that one run and do not change the setting.
+The same command from a terminal is:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File packaging\windows\install.ps1
+```
+
+EntoCAD appears in the Start menu. Right-click it to pin it to Start or the
+taskbar. It opens with no console window. DWG and DXF show EntoCAD under
+**Open with**; choose **Always** once if you want it as the default. The
+installed copy is `%LOCALAPPDATA%\Programs\EntoCAD\EntoCAD.exe`, so a later
+`cargo clean` does not remove it. Settings → Apps lists EntoCAD.
+
+Close EntoCAD before updating. If the compiler crashes, the script stops;
+retry the build with `cargo build --release -p mycad -j 1`, then run the
+installer again.
+
+Uninstall from a terminal (drawings and preferences are kept):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File packaging\windows\install.ps1 -Uninstall
+```
+
+### Linux
+
+```bash
+./packaging/linux/install.sh
+```
+
+If the script is not executable, run `bash packaging/linux/install.sh`.
+EntoCAD appears in the application menu. Pin it to the dock or taskbar; the
+window stays grouped with that launcher. The file manager can open DWG and
+DXF with EntoCAD. The binary is `~/.local/bin/entocad`.
+
+Uninstall (drawings and preferences are kept):
+
+```bash
+./packaging/linux/install.sh --uninstall
+```
+
 ### Troubleshooting
 
 **Compiler crashes.** If `rustc` or MSVC dies with `STATUS_ACCESS_VIOLATION`

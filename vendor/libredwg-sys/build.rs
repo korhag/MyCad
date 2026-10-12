@@ -32,6 +32,28 @@ const LIBREDWG_SOURCES: &[&str] = &[
     "reedsolomon.c",
 ];
 
+fn libredwg_cc(
+    vendor_config: &std::path::Path,
+    libredwg_src: &std::path::Path,
+    libredwg_include: &std::path::Path,
+) -> cc::Build {
+    let mut build = cc::Build::new();
+    build
+        .include(vendor_config)
+        .include(libredwg_src)
+        .include(libredwg_include)
+        .warnings(false); // upstream C source, not ours to keep warning-clean
+
+    if build.get_compiler().is_like_msvc() {
+        // Vendored LibreDWG source has a UTF-8 comment (decode.c) that MSVC's
+        // default code-page-based source interpretation misreads badly enough
+        // to swallow the following source line into the comment. /utf-8 fixes
+        // it and matches how every other toolchain already reads the file.
+        build.flag("/utf-8").flag("/std:c11");
+    }
+    build
+}
+
 fn main() {
     // The crate already watches shim/ and vendor-config/. Those directives
     // turn off Cargo's default "any file in the package" rerun, so C patches
@@ -121,27 +143,25 @@ fn main() {
         }
     }
 
-    let mut build = cc::Build::new();
-    build
-        .include(&vendor_config)
-        .include(&libredwg_src)
-        .include(&libredwg_include)
-        .warnings(false); // upstream C source, not ours to keep warning-clean
-
-    if build.get_compiler().is_like_msvc() {
-        // Vendored LibreDWG source has a UTF-8 comment (decode.c) that MSVC's
-        // default code-page-based source interpretation misreads badly enough
-        // to swallow the following source line into the comment. /utf-8 fixes
-        // it and matches how every other toolchain already reads the file.
-        build.flag("/utf-8").flag("/std:c11");
-    }
-
+    // decode.c is the only file that hits the MSVC internal compiler error
+    // at /O2. Everything else, including the DXF reader and the DWG writer,
+    // is built at /O2. The package profile stays at opt-level 1 so a file
+    // without an explicit level does not get the failing flag.
+    let mut build = libredwg_cc(&vendor_config, &libredwg_src, &libredwg_include);
+    build.opt_level(2);
     for src in LIBREDWG_SOURCES {
+        if *src == "decode.c" {
+            continue;
+        }
         build.file(libredwg_src.join(src));
     }
     build.file(shim_dir.join("uncad_shim.c"));
-
     build.compile("libredwg");
+
+    let mut decode = libredwg_cc(&vendor_config, &libredwg_src, &libredwg_include);
+    decode.opt_level(1);
+    decode.file(libredwg_src.join("decode.c"));
+    decode.compile("libredwg_decode");
 
     // --- bindgen -----------------------------------------------------------
     // Explicit --target so libclang follows the same ABI cl.exe used to
@@ -204,6 +224,7 @@ fn main() {
         .allowlist_function("dwg_resolve_handleref")
         .allowlist_function("uncad_write_dxf_file")
         .allowlist_function("uncad_write_dxf")
+        .allowlist_function("uncad_read_dxf_buffer")
         .allowlist_type("Dwg_Data")
         .allowlist_type("Dwg_Object")
         .allowlist_type("Dwg_Object_Type")

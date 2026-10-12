@@ -5,9 +5,29 @@ All notable changes to EntoCAD are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project versions with [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Workspace version is `0.45.0` (`Cargo.toml`).
+Workspace version is `0.46.1` (`Cargo.toml`).
 
 ## [Unreleased]
+
+## [0.46.1] - 2026-10-12
+
+### Fixed
+- Saving a large drawing finishes faster. On a 768,000-entity file, a DXF save dropped from 3.0 s to 1.4 s, and a DWG save from 180 s to 170 s.
+
+## [0.46.0] - 2026-10-12
+
+### Added
+- Per-user install scripts add EntoCAD to the Windows Start menu and the Linux application menu, so it can be pinned to the taskbar instead of being started from a terminal.
+- Double-click `Install EntoCAD.cmd` or `Uninstall EntoCAD.cmd` on Windows. They run when PowerShell is set to AllSigned, which blocks `.\install.ps1`.
+- DWG and DXF files can be opened with EntoCAD from the file manager. On Windows 10 and 11 you choose Always once; the installer does not take over the default app.
+
+### Changed
+- A Windows release build opens with no console window. Starting it from a terminal still prints `--import-only` and `--perf-baseline` output.
+- If the window cannot open, the graphics hint is shown in a dialog as well as on the console.
+- The Linux window uses the `entocad` application id so a pinned launcher stays grouped with the window. Existing layout and preferences are copied into that settings folder.
+
+### Fixed
+- Arrows and the dropdown triangle in menus, the ribbon, and the empty-drawing hint draw as glyphs instead of empty squares on Windows and Linux.
 
 ## [0.45.0] - 2026-10-10
 

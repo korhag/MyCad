@@ -1,0 +1,3 @@
+packaging/linux/install.sh text eol=lf
+packaging/linux/entocad.desktop text eol=lf
+*.cmd text eol=crlf

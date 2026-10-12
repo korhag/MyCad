@@ -8,6 +8,11 @@ use egui::{Color32, TextureHandle};
 /// Name shown in the window, menus, dialogs, and crash report.
 pub const APP_NAME: &str = "EntoCAD";
 
+/// Wayland application id and X11 window class. Must match
+/// `packaging/linux/entocad.desktop` so a dock or taskbar can group the
+/// window with its launcher. eframe also stores settings under this id.
+pub const APP_ID: &str = "entocad";
+
 /// App id eframe used before the rename. Settings live under this folder.
 const LEGACY_APP_NAME: &str = "MyCad";
 
@@ -34,7 +39,7 @@ const EMPTY_LOGO_SIZE: f32 = 96.0;
 const EMPTY_LOGO_ALPHA: u8 = 210;
 pub const MENU_ICON_SIZE: f32 = 22.0;
 
-const EMPTY_HINT: &str = "File → Open   or   pass a DWG on the command line";
+pub(crate) const EMPTY_HINT: &str = "File → Open   or   pass a DWG on the command line";
 
 // ------------------------------------------------------------
 // Type: SplashState
@@ -140,30 +145,47 @@ pub fn window_icon() -> Option<Arc<egui::IconData>> {
     }
 }
 
-/// Copy `MyCad/data/app.ron` to `EntoCAD` when the new file is not there yet,
-/// so a renamed build keeps the saved layout and preferences.
+/// Copy saved layout and preferences into the folder eframe uses for [`APP_ID`].
+///
+/// The previous EntoCAD id was the window title. On Windows that folder is
+/// `EntoCAD`; on Linux eframe lowercases it, so it is already `entocad`.
+/// Builds from before the rename stored settings under MyCad. A file that
+/// is already in the new folder is left alone.
 pub fn migrate_legacy_storage() {
-    let Some(new_dir) = eframe::storage_dir(APP_NAME) else {
+    let Some(new_dir) = eframe::storage_dir(APP_ID) else {
         return;
     };
     let new_file = new_dir.join(STORAGE_FILE);
     if new_file.exists() {
         return;
     }
-    let Some(old_file) = eframe::storage_dir(LEGACY_APP_NAME).map(|dir| dir.join(STORAGE_FILE))
-    else {
+    if copy_settings_file(APP_NAME, &new_dir, &new_file) {
         return;
+    }
+    copy_settings_file(LEGACY_APP_NAME, &new_dir, &new_file);
+}
+
+fn copy_settings_file(
+    from_app_id: &str,
+    new_dir: &std::path::Path,
+    new_file: &std::path::Path,
+) -> bool {
+    let Some(old_dir) = eframe::storage_dir(from_app_id) else {
+        return false;
     };
-    if !old_file.is_file() {
-        return;
+    let old_file = old_dir.join(STORAGE_FILE);
+    if !old_file.is_file() || old_file == new_file {
+        return false;
     }
-    if let Err(err) = std::fs::create_dir_all(&new_dir) {
+    if let Err(err) = std::fs::create_dir_all(new_dir) {
         eprintln!("{APP_NAME} could not create its settings folder: {err}");
-        return;
+        return false;
     }
-    if let Err(err) = std::fs::copy(&old_file, &new_file) {
-        eprintln!("{APP_NAME} could not copy settings from {LEGACY_APP_NAME}: {err}");
+    if let Err(err) = std::fs::copy(&old_file, new_file) {
+        eprintln!("{APP_NAME} could not copy settings from {from_app_id}: {err}");
+        return false;
     }
+    true
 }
 
 pub fn has_saved_copy_suffix(stem: &str) -> bool {
