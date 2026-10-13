@@ -21,7 +21,10 @@ pub use companion::{
     read_companion_optional, write_companion, Companion, CompanionReport, COMPANION_FORMAT,
     COMPANION_SCHEMA,
 };
-pub use dxf::{render_dxf_interchange, write_dxf};
+pub use dxf::{
+    read_dxf_lineweight_header, read_dxf_lineweight_header_file, render_dxf_interchange, write_dxf,
+    DxfLineweightHeader,
+};
 pub use error::ExportError;
 pub use native::{
     import_block_asset, parse_mycad_bytes, read_mycad, read_mycadblock, write_mycad,

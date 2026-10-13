@@ -64,13 +64,43 @@ void *uncad_object_entity_ptr(Dwg_Object *obj);
  */
 void *uncad_object_object_ptr(Dwg_Object *obj);
 
-/* One leader-line's vertices from a MULTILEADER, flattened into a single
- * malloc'd (x,y,z) array -- see uncad_multileader_get_lines. */
+/* One leader-line from a MULTILEADER. `points` is the stored vertices.
+ * The node's landing and dogleg are copied onto each line of that node.
+ * `arrow_override` means `arrow_size` replaces the entity default. */
 typedef struct uncad_multileader_line
 {
   unsigned int num_points;
   double *points; /* x0,y0,z0, x1,y1,z1, ... -- length 3*num_points */
+  int has_last_point;
+  double last_point[3];
+  int has_dogleg;
+  double dogleg_vector[3];
+  double dogleg_length;
+  int arrow_override;
+  double arrow_size;
 } uncad_multileader_line_t;
+
+/* kind: 0 none, 1 block, 2 text. Strings are malloc'd and may be NULL. */
+typedef struct uncad_multileader_content
+{
+  int kind;
+  char *text;
+  double location[3];
+  double height;
+  double rotation;
+  double width;
+  int frame;
+  char *block_name;
+  double block_scale[3];
+  double block_rotation;
+} uncad_multileader_content_t;
+
+/* One display wire from a REGION (or any 3DSOLID-shaped entity). */
+typedef struct uncad_region_wire
+{
+  unsigned int num_points;
+  double *points; /* x0,y0,z0, ... -- length 3*num_points */
+} uncad_region_wire_t;
 
 /* Flattens a MULTILEADER entity's ctx.leaders[].lines[] (every leader node
  * can own several lines/splines) into one array of polylines, skipping
@@ -102,6 +132,20 @@ unsigned int uncad_multileader_get_lines(void *entity,
 
 void uncad_multileader_free_lines(uncad_multileader_line_t *lines,
                                    unsigned int num_lines);
+
+/* Fills `out` from ctx content. Returns 0, or -1 when `entity` is NULL.
+ * `dwg` resolves a block content handle to a name; it may be NULL. */
+int uncad_multileader_get_content(Dwg_Data *dwg, void *entity,
+                                   uncad_multileader_content_t *out);
+
+void uncad_multileader_free_content(uncad_multileader_content_t *content);
+
+/* Copies REGION wireframe wires. Returns 0 when the wire cache is empty.
+ * Applies axis/translation/scale when a wire stores a transform. */
+unsigned int uncad_region_get_wires(void *entity,
+                                     uncad_region_wire_t **out_wires);
+
+void uncad_region_free_wires(uncad_region_wire_t *wires, unsigned int num_wires);
 
 #ifdef __cplusplus
 }

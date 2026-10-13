@@ -316,6 +316,13 @@ impl History {
         self.clean_revision = self.revision;
     }
 
+    /// Mark the drawing unsaved without an undo step.
+    pub fn mark_dirty(&mut self) {
+        if self.revision == self.clean_revision {
+            self.revision = self.revision.wrapping_add(1);
+        }
+    }
+
     pub fn clear(&mut self) {
         self.undo.clear();
         self.redo.clear();

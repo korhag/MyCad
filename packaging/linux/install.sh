@@ -31,7 +31,7 @@ refresh_caches() {
 }
 
 uninstall_entocad() {
-    rm -f "${BIN_FILE}" "${DESKTOP_FILE}" "${ICON_FILE}"
+    rm -f "${BIN_FILE}" "${BIN_DIR}/${APP_ID}.source.json" "${DESKTOP_FILE}" "${ICON_FILE}"
     refresh_caches
     printf '%s was removed. Saved drawings and preferences were left in place.\n' "${APP_NAME}"
 }
@@ -66,6 +66,16 @@ printf '%s%s%s\n' "${template%%@BIN@*}" "${BIN_FILE}" "${template#*@BIN@}" > "${
 chmod 0644 "${DESKTOP_FILE}"
 
 refresh_caches
+
+source_file="${BIN_DIR}/${APP_ID}.source.json"
+install_script="${ROOT}/packaging/linux/install.sh"
+json_escape() {
+    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+printf '{"repo":"%s","update_command":"%s"}\n' \
+    "$(json_escape "${ROOT}")" \
+    "$(json_escape "${install_script}")" > "${source_file}"
+chmod 0644 "${source_file}"
 
 printf '\n%s is installed.\n' "${APP_NAME}"
 printf 'Application menu: %s\n' "${DESKTOP_FILE}"

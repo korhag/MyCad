@@ -77,9 +77,7 @@ pub fn convert_dxf_to_dwg(
 
     let read_error = {
         let _span = cad_core::perf::span("dxf_read_file");
-        unsafe {
-            libredwg_sys::uncad_read_dxf_buffer(dxf.as_ptr().cast(), dxf.len(), dwg.as_mut())
-        }
+        unsafe { libredwg_sys::uncad_read_dxf_buffer(dxf.as_ptr().cast(), dxf.len(), dwg.as_mut()) }
     };
     #[allow(clippy::unnecessary_cast)]
     if read_error >= libredwg_sys::DWG_ERROR_DWG_ERR_CLASSESNOTFOUND as i32 {

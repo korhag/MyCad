@@ -26,7 +26,7 @@ use cad_io::{
     PDF_STROKE_WEIGHTS,
 };
 use cad_render::{
-    tessellate_document, tessellate_document_for_block_edit, upload_for_ranges, BlockEditView,
+    tessellate_document_for_block_edit_on, tessellate_document_on, upload_for_ranges, BlockEditView,
     BlockEditViewFrame, CadFrame, CadGpu, DisplayList, GpuUpload, OverlayBatches, SelectBoxMode,
 };
 use cad_viewport::Camera2;
@@ -196,6 +196,8 @@ enum PreviewMsg {
 pub(crate) struct ViewKey {
     pub(crate) generation: u64,
     pub(crate) frames: Vec<EntityId>,
+    /// Wipeout mask baked into this picture. RGB 33, 40, 48 is the default sheet.
+    pub(crate) background: [u8; 3],
 }
 
 struct CachedView {
@@ -256,16 +258,17 @@ impl ViewCache {
         });
     }
 
-    fn model_picture(&self, generation: u64) -> Option<Arc<DisplayList>> {
-        self.model_entry(generation)
+    fn model_picture(&self, generation: u64, background: [u8; 3]) -> Option<Arc<DisplayList>> {
+        self.model_entry(generation, background)
             .map(|entry| Arc::clone(&entry.display))
     }
 
-    fn model_entry(&self, generation: u64) -> Option<&CachedView> {
-        self.entries
-            .iter()
-            .rev()
-            .find(|entry| entry.key.generation == generation && entry.key.frames.is_empty())
+    fn model_entry(&self, generation: u64, background: [u8; 3]) -> Option<&CachedView> {
+        self.entries.iter().rev().find(|entry| {
+            entry.key.generation == generation
+                && entry.key.frames.is_empty()
+                && entry.key.background == background
+        })
     }
 
     fn retain_generation(&mut self, generation: u64) {
@@ -297,17 +300,27 @@ fn tessellate_block_view(
     document: &Document,
     model: Option<&DisplayList>,
     view: Option<&BlockEditView>,
+    mask: cad_core::Rgb,
 ) -> DisplayList {
+    let model = model.filter(|picture| picture.mask == mask);
     if let (Some(model), Some(view)) = (model, view) {
         if let Some(derived) = model.derive_block_edit(document, view) {
             return derived;
         }
     }
     if let Some(view) = view {
-        tessellate_document_for_block_edit(document, view)
+        tessellate_document_for_block_edit_on(document, view, mask)
     } else {
-        tessellate_document(document)
+        tessellate_document_on(document, mask)
     }
+}
+
+fn tessellate_live(
+    document: &Document,
+    view: Option<&BlockEditView>,
+    mask: cad_core::Rgb,
+) -> DisplayList {
+    tessellate_block_view(document, None, view, mask)
 }
 
 pub(crate) struct ViewTessMsg {
@@ -316,6 +329,8 @@ pub(crate) struct ViewTessMsg {
     pub(crate) display: Box<DisplayList>,
     pub(crate) snaps: Box<SnapIndex>,
     pub(crate) measures: Box<MeasureIndex>,
+    /// A sheet-color rebuild keeps the indexes already on screen.
+    pub(crate) keep_indexes: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -451,14 +466,8 @@ fn quantize_status_coord(value: f64) -> i64 {
     scaled.clamp(i64::MIN as f64, i64::MAX as f64) as i64
 }
 
-fn viewport_clear_color() -> [f32; 4] {
-    let color = egui::Color32::from_rgb(10, 14, 12);
-    [
-        color.r() as f32 / 255.0,
-        color.g() as f32 / 255.0,
-        color.b() as f32 / 255.0,
-        1.0,
-    ]
+fn rgb_from_background(background: [u8; 3]) -> crate::settings::RgbColor {
+    crate::settings::RgbColor::new(background[0], background[1], background[2])
 }
 
 // ------------------------------------------------------------
@@ -533,6 +542,10 @@ pub struct MyCadApp {
     view_job: u64,
     /// True while a block-edit picture is still being built off the UI thread.
     view_pending: bool,
+    pending_lwdisplay: Option<bool>,
+    /// Clear color of the picture on screen. Settings may already be newer.
+    shown_background: crate::settings::RgbColor,
+    pending_background: Option<crate::settings::RgbColor>,
     block_prefetch: BlockPrefetch,
     /// `ctx` time when the current background wait started.
     busy_since: Option<f64>,
@@ -561,6 +574,7 @@ pub struct MyCadApp {
     status_text: StatusText,
     brand: Option<crate::brand::BrandTextures>,
     splash: Option<crate::brand::SplashState>,
+    update_offer: Option<crate::update_check::UpdateOffer>,
 }
 
 impl MyCadApp {
@@ -586,6 +600,15 @@ impl MyCadApp {
 
     fn from_settings(settings: AppSettings, initial_path: Option<PathBuf>) -> Self {
         let drafting_preferences = settings.drafting;
+        let shown_background = settings.display.model_background;
+        let update_offer = match crate::update_check::check_installed() {
+            crate::update_check::UpdateStatus::Newer(offer)
+                if settings.dismissed_update.as_deref() != Some(offer.available.as_str()) =>
+            {
+                Some(offer)
+            }
+            _ => None,
+        };
         Self {
             camera: Camera2::default(),
             document: None,
@@ -650,6 +673,9 @@ impl MyCadApp {
             view_rx: None,
             view_job: 0,
             view_pending: false,
+            pending_lwdisplay: None,
+            shown_background,
+            pending_background: None,
             block_prefetch: BlockPrefetch::default(),
             busy_since: None,
             geometry_generation: None,
@@ -672,6 +698,7 @@ impl MyCadApp {
             status_text: StatusText::default(),
             brand: None,
             splash: None,
+            update_offer,
         }
     }
 
@@ -712,6 +739,7 @@ impl MyCadApp {
         let (tx, rx) = mpsc::channel();
         self.load_rx = Some(rx);
         let report_path = path.clone();
+        let mask = self.viewport_mask();
         let spawned = thread::Builder::new()
             .name("mycad-open".into())
             .spawn(move || {
@@ -734,7 +762,7 @@ impl MyCadApp {
                             let mut view = materialize_evaluated(&document, &mut cache, request)
                                 .unwrap_or_else(|_| document.clone());
                             warm_document_fonts(&mut view);
-                            let display = tessellate_document(&view);
+                            let display = tessellate_document_on(&view, mask);
                             let snaps = SnapIndex::build(&view);
                             let measures = MeasureIndex::build(&view);
                             drop(_prepare_span);
@@ -814,6 +842,11 @@ impl MyCadApp {
                 self.document = Some(Arc::new(document));
                 self.rebuild_block_tree();
                 self.display = Arc::new(display);
+                self.shown_background = rgb_from_background([
+                    self.display.mask.r,
+                    self.display.mask.g,
+                    self.display.mask.b,
+                ]);
                 self.snaps = Arc::new(*snaps);
                 self.measures = Arc::new(*measures);
                 self.gpu_upload = GpuUpload::Full;
@@ -822,6 +855,7 @@ impl MyCadApp {
                 self.loading_path = None;
                 self.load_rx = None;
                 self.error = None;
+                self.request_model_background();
             }
             Ok(LoadMsg::Failure { path, message }) => {
                 self.status = format!("Failed to open {}", file_name(&path));
@@ -1117,6 +1151,7 @@ impl MyCadApp {
         self.imported_dock = false;
         self.capture = None;
         self.show_settings = false;
+        self.request_model_background();
     }
 
     fn cancel_settings(&mut self) {
@@ -1142,6 +1177,31 @@ impl MyCadApp {
 
     pub(crate) fn is_dirty(&self) -> bool {
         self.history.is_dirty()
+    }
+
+    fn viewport_mask(&self) -> cad_core::Rgb {
+        let color = self.settings.display.model_background;
+        cad_core::Rgb {
+            r: color.r,
+            g: color.g,
+            b: color.b,
+        }
+    }
+
+    fn view_background(&self) -> [u8; 3] {
+        let color = self.settings.display.model_background;
+        [color.r, color.g, color.b]
+    }
+
+    /// Clear color of the picture already on screen.
+    fn viewport_clear_color(&self) -> [f32; 4] {
+        let color = self.shown_background;
+        [
+            f32::from(color.r) / 255.0,
+            f32::from(color.g) / 255.0,
+            f32::from(color.b) / 255.0,
+            1.0,
+        ]
     }
 
     pub(crate) fn start_line_command(&mut self) {
@@ -1826,6 +1886,7 @@ impl MyCadApp {
 
     pub(crate) fn refresh_derived(&mut self) {
         let _span = cad_core::perf::span("refresh_derived");
+        let mask = self.viewport_mask();
         self.rebuild_block_tree_if_stale();
         let mut cache = std::mem::take(&mut self.eval_cache);
         let tess_view = self.block_edit.tess_view();
@@ -1888,11 +1949,8 @@ impl MyCadApp {
                         }
                         if apply_display {
                             document.diagnostics.extents = evaluated.compute_extents();
-                            self.display = Arc::new(if let Some(view) = tess_view {
-                                tessellate_document_for_block_edit(&evaluated, &view)
-                            } else {
-                                tessellate_document(&evaluated)
-                            });
+                            self.display =
+                                Arc::new(tessellate_live(&evaluated, tess_view.as_ref(), mask));
                             let mut snaps = SnapIndex::build(&evaluated);
                             let mut measures = MeasureIndex::build(&evaluated);
                             if rekey {
@@ -1911,7 +1969,7 @@ impl MyCadApp {
                     Err(err) => {
                         status = Some(err.to_string());
                         if self.last_eval_ok {
-                            self.display = Arc::new(tessellate_document(document));
+                            self.display = Arc::new(tessellate_live(document, None, mask));
                             let mut snaps = SnapIndex::build(document);
                             let mut measures = MeasureIndex::build(document);
                             if rekey {
@@ -1929,11 +1987,7 @@ impl MyCadApp {
                     }
                 }
             } else if reuse_geometry {
-                self.display = Arc::new(if let Some(view) = tess_view {
-                    tessellate_document_for_block_edit(document, &view)
-                } else {
-                    tessellate_document(document)
-                });
+                self.display = Arc::new(tessellate_live(document, tess_view.as_ref(), mask));
                 if rekey && !self.block_indexes_ready {
                     if let Some(id) = rekey_id {
                         let snaps =
@@ -1950,11 +2004,7 @@ impl MyCadApp {
                     }
                 }
             } else {
-                self.display = Arc::new(if let Some(view) = tess_view {
-                    tessellate_document_for_block_edit(document, &view)
-                } else {
-                    tessellate_document(document)
-                });
+                self.display = Arc::new(tessellate_live(document, tess_view.as_ref(), mask));
                 let mut snaps = SnapIndex::build(document);
                 let mut measures = MeasureIndex::build(document);
                 if rekey {
@@ -1976,6 +2026,9 @@ impl MyCadApp {
         self.gpu_upload = GpuUpload::Full;
         self.display_generation = self.display_generation.wrapping_add(1);
         self.eval_cache = cache;
+        if self.display.mask == mask {
+            self.shown_background = self.settings.display.model_background;
+        }
         self.publish_live_view();
     }
 
@@ -2027,6 +2080,7 @@ impl MyCadApp {
                 .iter()
                 .map(|frame| frame.instance_id)
                 .collect(),
+            background: self.view_background(),
         })
     }
 
@@ -2141,16 +2195,18 @@ impl MyCadApp {
             return;
         };
         let view = self.block_edit.tess_view();
-        let generation = document.content_generation();
-        let model = self.view_cache.model_picture(generation);
+        let generation = key.generation;
+        let background = key.background;
+        let mask = self.viewport_mask();
+        let model = self.view_cache.model_picture(generation, background);
         let model_snaps = self
             .view_cache
-            .model_entry(generation)
+            .model_entry(generation, background)
             .map(|entry| Arc::clone(&entry.snaps))
             .unwrap_or_else(|| Arc::clone(&self.snaps));
         let model_measures = self
             .view_cache
-            .model_entry(generation)
+            .model_entry(generation, background)
             .map(|entry| Arc::clone(&entry.measures))
             .unwrap_or_else(|| Arc::clone(&self.measures));
         let world_from_local = self.block_edit.world_from_local();
@@ -2166,8 +2222,12 @@ impl MyCadApp {
             .spawn(move || {
                 let result = catch_worker(|| {
                     let _span = cad_core::perf::span("view_tessellation");
-                    let display =
-                        tessellate_block_view(document.as_ref(), model.as_deref(), view.as_ref());
+                    let display = tessellate_block_view(
+                        document.as_ref(),
+                        model.as_deref(),
+                        view.as_ref(),
+                        mask,
+                    );
                     let snaps = rekey_index(
                         model_snaps,
                         document.as_ref(),
@@ -2189,6 +2249,7 @@ impl MyCadApp {
                         display: Box::new(display),
                         snaps: Box::new(snaps),
                         measures: Box::new(measures),
+                        keep_indexes: false,
                     }
                 });
                 let _ = tx.send(result);
@@ -2211,6 +2272,7 @@ impl MyCadApp {
                     || self.current_view_key().as_ref() != Some(&message.key)
                 {
                     self.view_pending = false;
+                    self.finish_pending_background();
                     return;
                 }
                 self.apply_ready_view(message);
@@ -2232,8 +2294,15 @@ impl MyCadApp {
 
     fn apply_ready_view(&mut self, message: ViewTessMsg) {
         self.display = Arc::new(*message.display);
-        self.snaps = Arc::new(*message.snaps);
-        self.measures = Arc::new(*message.measures);
+        if !message.keep_indexes {
+            self.snaps = Arc::new(*message.snaps);
+            self.measures = Arc::new(*message.measures);
+        }
+        self.shown_background = rgb_from_background([
+            self.display.mask.r,
+            self.display.mask.g,
+            self.display.mask.b,
+        ]);
         self.block_indexes_ready = self.single_cell_block_edit();
         self.displayed_key = Some(message.key.clone());
         self.view_cache.insert(
@@ -2249,6 +2318,136 @@ impl MyCadApp {
         self.drafting.invalidate_snap_cache();
         if let Some(document) = self.document.as_ref() {
             self.selection.retain_valid(document);
+        }
+        self.apply_pending_lineweight();
+        self.finish_pending_background();
+    }
+
+    fn set_lineweight_display(&mut self, on: bool) {
+        self.view_cache
+            .detach_aliasing(&self.display, &self.snaps, &self.measures);
+        let busy = self
+            .document
+            .as_ref()
+            .is_some_and(|document| Arc::strong_count(document) != 1);
+        if busy {
+            self.pending_lwdisplay = Some(on);
+            return;
+        }
+        self.pending_lwdisplay = None;
+        let changed = {
+            let Some(document) = self.document.as_mut().map(Arc::make_mut) else {
+                return;
+            };
+            if document.lwdisplay == on {
+                false
+            } else {
+                document.lwdisplay = on;
+                document.bump_generation();
+                true
+            }
+        };
+        if !changed {
+            return;
+        }
+        self.history.mark_dirty();
+        if cfg!(test) {
+            self.schedule_full_refresh();
+        } else {
+            self.view_pending = true;
+            self.request_preview();
+            self.flush_preview();
+        }
+    }
+
+    fn apply_pending_lineweight(&mut self) {
+        if self.preview_rx.is_some() || self.view_rx.is_some() || self.preview_pending {
+            return;
+        }
+        let Some(on) = self.pending_lwdisplay else {
+            return;
+        };
+        self.set_lineweight_display(on);
+    }
+
+    /// Rebuild wipeouts for the display setting. The clear color stays with
+    /// the picture already on screen until that rebuild arrives.
+    fn request_model_background(&mut self) {
+        let next = self.settings.display.model_background;
+        if self.view_rx.is_some()
+            || self.preview_rx.is_some()
+            || self.preview_pending
+            || self.load_rx.is_some()
+        {
+            self.pending_background = Some(next);
+            return;
+        }
+        self.pending_background = None;
+        if self.document.is_none() {
+            self.shown_background = next;
+            return;
+        }
+        if next == self.shown_background {
+            return;
+        }
+        self.spawn_mask_picture();
+    }
+
+    fn finish_pending_background(&mut self) {
+        if self.pending_background.is_none()
+            && self.shown_background == self.settings.display.model_background
+        {
+            return;
+        }
+        if self.view_rx.is_some()
+            || self.preview_rx.is_some()
+            || self.preview_pending
+            || self.load_rx.is_some()
+        {
+            return;
+        }
+        self.pending_background = None;
+        self.request_model_background();
+    }
+
+    fn spawn_mask_picture(&mut self) {
+        let Some(document) = self.document.clone() else {
+            self.shown_background = self.settings.display.model_background;
+            return;
+        };
+        let Some(key) = self.current_view_key() else {
+            return;
+        };
+        let view = self.block_edit.tess_view();
+        let mask = self.viewport_mask();
+        self.view_job = self.view_job.wrapping_add(1);
+        let job = self.view_job;
+        let (tx, rx) = mpsc::channel();
+        self.view_rx = Some(rx);
+        self.view_pending = true;
+        let spawned = thread::Builder::new()
+            .name("mycad-view".into())
+            .spawn(move || {
+                let result = catch_worker(|| {
+                    let _span = cad_core::perf::span("view_tessellation");
+                    let display =
+                        tessellate_block_view(document.as_ref(), None, view.as_ref(), mask);
+                    drop(document);
+                    ViewTessMsg {
+                        job,
+                        key,
+                        display: Box::new(display),
+                        snaps: Box::new(SnapIndex::default()),
+                        measures: Box::new(MeasureIndex::default()),
+                        keep_indexes: true,
+                    }
+                });
+                let _ = tx.send(result);
+            });
+        if spawned.is_err() {
+            self.view_rx = None;
+            self.view_pending = false;
+            self.status = "Could not start background work".into();
         }
     }
 
@@ -2318,10 +2517,13 @@ impl MyCadApp {
     }
 
     fn store_prefetch(&mut self, message: ViewTessMsg) {
+        let background = self.view_background();
         let Some(document) = self.document.as_ref() else {
             return;
         };
-        if message.key.generation != document.content_generation() {
+        if message.key.generation != document.content_generation()
+            || message.key.background != background
+        {
             return;
         }
         self.view_cache.insert(
@@ -2343,6 +2545,7 @@ impl MyCadApp {
         let key = ViewKey {
             generation,
             frames: vec![instance_id],
+            background: self.view_background(),
         };
         if self.view_cache.get(&key).is_some() {
             return;
@@ -2376,7 +2579,7 @@ impl MyCadApp {
             || !self.block_edit.stack.is_empty()
             || self
                 .view_cache
-                .model_picture(document.content_generation())
+                .model_picture(document.content_generation(), self.view_background())
                 .is_none()
         {
             return PrefetchReadiness::Never;
@@ -2400,14 +2603,17 @@ impl MyCadApp {
             return;
         };
         let generation = document.content_generation();
+        let background = self.view_background();
+        let mask = self.viewport_mask();
         let key = ViewKey {
             generation,
             frames: vec![instance_id],
+            background,
         };
         if self.view_cache.get(&key).is_some() {
             return;
         }
-        let Some(model_entry) = self.view_cache.model_entry(generation) else {
+        let Some(model_entry) = self.view_cache.model_entry(generation, background) else {
             return;
         };
         let model = Arc::clone(&model_entry.display);
@@ -2437,8 +2643,12 @@ impl MyCadApp {
             .spawn(move || {
                 let result = catch_worker(|| {
                     let _span = cad_core::perf::span("block_prefetch");
-                    let display =
-                        tessellate_block_view(document.as_ref(), Some(model.as_ref()), Some(&view));
+                    let display = tessellate_block_view(
+                        document.as_ref(),
+                        Some(model.as_ref()),
+                        Some(&view),
+                        mask,
+                    );
                     let transform = document
                         .entity_by_id(instance_id)
                         .and_then(|entity| cad_core::insert_transform(document.as_ref(), entity))
@@ -2460,6 +2670,7 @@ impl MyCadApp {
                         display: Box::new(display),
                         snaps: Box::new(snaps),
                         measures: Box::new(measures),
+                        keep_indexes: false,
                     }
                 });
                 let _ = tx.send(result);
@@ -2537,6 +2748,7 @@ impl MyCadApp {
         let rekey = self.single_cell_block_edit();
         let instance_id = self.block_edit.current().map(|frame| frame.instance_id);
         let world_from_local = self.block_edit.world_from_local();
+        let mask = self.viewport_mask();
         let (tx, rx) = mpsc::channel();
         self.preview_rx = Some(rx);
         let spawned = thread::Builder::new()
@@ -2599,11 +2811,7 @@ impl MyCadApp {
                                     }
                                 }
                             }
-                            let display = if let Some(view) = tess_view {
-                                tessellate_document_for_block_edit(&evaluated, &view)
-                            } else {
-                                tessellate_document(&evaluated)
-                            };
+                            let display = tessellate_live(&evaluated, tess_view.as_ref(), mask);
                             let mut snaps = SnapIndex::build(&evaluated);
                             let mut measures = MeasureIndex::build(&evaluated);
                             if rekey {
@@ -2748,6 +2956,8 @@ impl MyCadApp {
                     self.preview_pending = false;
                     self.spawn_preview();
                 }
+                self.apply_pending_lineweight();
+                self.finish_pending_background();
                 ctx.request_repaint();
             }
             Err(TryRecvError::Empty) => ctx.request_repaint(),
@@ -2948,9 +3158,10 @@ impl MyCadApp {
         };
         let mut lines = Vec::new();
         let mut fills = Vec::new();
+        let mut weights = Vec::new();
         for entity in removed {
             if let Some(touched) = display.remove_entity(entity.id) {
-                touched.push_ranges(&mut lines, &mut fills);
+                touched.push_ranges(&mut lines, &mut fills, &mut weights);
             }
             snaps.remove_entity(entity.id);
             measures.remove_entity(entity.id);
@@ -2963,7 +3174,7 @@ impl MyCadApp {
                 display.replace_entity(&document, current)
             };
             if let Some(touched) = touched {
-                touched.push_ranges(&mut lines, &mut fills);
+                touched.push_ranges(&mut lines, &mut fills, &mut weights);
             }
             if in_block {
                 snaps.replace_entity_with(&document, current, transform, current.id);
@@ -2975,6 +3186,7 @@ impl MyCadApp {
         }
         let mut line_start = display.line_vertices.len() as u32;
         let mut fill_start = display.triangle_vertices.len() as u32;
+        let mut weight_start = display.weight_vertices.len() as u32;
         let mut appended_any = false;
         for entity in created {
             let range = if in_block {
@@ -2986,6 +3198,7 @@ impl MyCadApp {
                 if !appended_any {
                     line_start = range.line_start;
                     fill_start = range.fill_start;
+                    weight_start = range.weight_start;
                     appended_any = true;
                 }
             }
@@ -3000,11 +3213,15 @@ impl MyCadApp {
         if appended_any {
             let line_end = display.line_vertices.len() as u32;
             let fill_end = display.triangle_vertices.len() as u32;
+            let weight_end = display.weight_vertices.len() as u32;
             if line_end > line_start {
                 lines.push(line_start..line_end);
             }
             if fill_end > fill_start {
                 fills.push(fill_start..fill_end);
+            }
+            if weight_end > weight_start {
+                weights.push(weight_start..weight_end);
             }
         }
         if removed.is_empty() && replaced.is_empty() {
@@ -3012,12 +3229,13 @@ impl MyCadApp {
                 GpuUpload::Append {
                     line_start,
                     fill_start,
+                    weight_start,
                 }
             } else {
                 GpuUpload::Full
             };
         }
-        upload_for_ranges(&mut lines, &mut fills)
+        upload_for_ranges(&mut lines, &mut fills, &mut weights)
     }
 
     fn bump_display(&mut self, upload: GpuUpload) {
@@ -3109,6 +3327,7 @@ impl MyCadApp {
             Some(range) => GpuUpload::Append {
                 line_start: range.line_start,
                 fill_start: range.fill_start,
+                weight_start: range.weight_start,
             },
             None => GpuUpload::Full,
         };
@@ -4930,7 +5149,7 @@ impl MyCadApp {
                 } else {
                     self.settings.viewport_msaa
                 }),
-                clear_color: viewport_clear_color(),
+                clear_color: self.viewport_clear_color(),
                 interactive: settling.is_some(),
             },
         ));
@@ -5655,6 +5874,66 @@ impl MyCadApp {
         }
     }
 
+    fn check_for_updates(&mut self) {
+        match crate::update_check::check_installed() {
+            crate::update_check::UpdateStatus::Newer(offer) => {
+                self.update_offer = Some(offer);
+            }
+            crate::update_check::UpdateStatus::Current { version } => {
+                self.status = format!("This copy is {version}, the same as the workshop.");
+            }
+            crate::update_check::UpdateStatus::Unavailable { message } => {
+                self.status = message;
+            }
+        }
+    }
+
+    fn show_update_offer(&mut self, ctx: &egui::Context) -> bool {
+        let Some(offer) = self.update_offer.clone() else {
+            return false;
+        };
+        let mut update = false;
+        let mut later = false;
+        egui::Window::new("Update EntoCAD")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "This copy is {}. The workshop is {}.",
+                    offer.current, offer.available
+                ));
+                ui.label(
+                    "Update closes this window and runs the installer. The build can take several minutes, then EntoCAD opens again.",
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Update").clicked() {
+                        update = true;
+                    }
+                    if ui.button("Later").clicked() {
+                        later = true;
+                    }
+                });
+            });
+        if later {
+            self.settings.dismissed_update = Some(offer.available.clone());
+            self.settings_draft.dismissed_update = self.settings.dismissed_update.clone();
+            self.update_offer = None;
+            return true;
+        } else if update {
+            if self.is_dirty() || self.block_edit.is_active() {
+                self.status = "Save the drawing and leave block edit before updating.".into();
+                return false;
+            }
+            match crate::update_check::launch_update(&offer.update_command) {
+                Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                Err(message) => self.status = message,
+            }
+        }
+        false
+    }
+
     fn show_discard_dialog(&mut self, ctx: &egui::Context) {
         if self.io_busy() {
             return;
@@ -6096,6 +6375,16 @@ impl eframe::App for MyCadApp {
                     }
                 });
                 ui.menu_button("View", |ui| {
+                    let shown = self
+                        .document
+                        .as_ref()
+                        .map(|document| document.lwdisplay)
+                        .unwrap_or(false);
+                    let mut next = shown;
+                    if ui.checkbox(&mut next, "Display lineweight").changed() {
+                        ui.close();
+                        self.set_lineweight_display(next);
+                    }
                     if ui.button("Zoom Extents").clicked() {
                         ui.close();
                         let size = ctx.available_rect();
@@ -6135,6 +6424,10 @@ impl eframe::App for MyCadApp {
                     if ui.button("Preferences…").clicked() {
                         ui.close();
                         self.open_settings();
+                    }
+                    if ui.button("Check for updates").clicked() {
+                        ui.close();
+                        self.check_for_updates();
                     }
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -6284,6 +6577,11 @@ impl eframe::App for MyCadApp {
         self.show_pdf_plot_dialog(ctx);
         self.show_lossy_save_dialog(ctx);
         self.show_discard_dialog(ctx);
+        if self.show_update_offer(ctx) {
+            if let Some(storage) = frame.storage_mut() {
+                self.settings.save(storage);
+            }
+        }
         self.show_block_ui(ctx);
 
         match settings_ui::show(ctx, self) {
@@ -8174,11 +8472,36 @@ mod interaction_tests {
     }
 
     #[test]
+    fn model_background_change_keeps_the_drawing_clean() {
+        let mut app = MyCadApp::for_test();
+        let _ = app.ensure_document();
+        let generation = app.document.as_ref().unwrap().content_generation();
+        let dirty = app.is_dirty();
+        app.settings_draft.display.model_background = crate::settings::RgbColor::new(255, 255, 255);
+        app.apply_settings(None);
+        assert_eq!(
+            app.document.as_ref().unwrap().content_generation(),
+            generation
+        );
+        assert_eq!(app.is_dirty(), dirty);
+        assert_eq!(
+            app.shown_background,
+            crate::settings::RgbColor::new(33, 40, 48)
+        );
+        assert_eq!(
+            app.settings.display.model_background,
+            crate::settings::RgbColor::new(255, 255, 255)
+        );
+        assert!(app.view_rx.is_some());
+    }
+
+    #[test]
     fn view_cache_keeps_the_model_picture() {
         let mut cache = ViewCache::default();
         let model_key = ViewKey {
             generation: 1,
             frames: Vec::new(),
+            background: [33, 40, 48],
         };
         let picture = std::sync::Arc::new(cad_render::DisplayList::default());
         let snaps = std::sync::Arc::new(cad_core::SnapIndex::default());
@@ -8194,6 +8517,7 @@ mod interaction_tests {
                 ViewKey {
                     generation: 1,
                     frames: vec![EntityId(index + 1)],
+                    background: [33, 40, 48],
                 },
                 std::sync::Arc::new(cad_render::DisplayList::default()),
                 std::sync::Arc::new(cad_core::SnapIndex::default()),
@@ -8215,6 +8539,7 @@ mod interaction_tests {
         let key = ViewKey {
             generation,
             frames: vec![insert_id],
+            background: [33, 40, 48],
         };
         let (sender, receiver) = std::sync::mpsc::channel();
         let job = 41;
@@ -8242,6 +8567,7 @@ mod interaction_tests {
         let key = ViewKey {
             generation,
             frames: vec![insert_id],
+            background: [33, 40, 48],
         };
         let (sender, receiver) = std::sync::mpsc::channel();
         app.block_prefetch.running = Some(PrefetchJob {
@@ -8257,6 +8583,7 @@ mod interaction_tests {
                 display: Box::new(cad_render::DisplayList::default()),
                 snaps: Box::new(cad_core::SnapIndex::default()),
                 measures: Box::new(cad_core::MeasureIndex::default()),
+                keep_indexes: false,
             }))
             .unwrap();
         app.poll_block_prefetch();

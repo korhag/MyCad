@@ -61,8 +61,8 @@ pub fn hatch_path_points_with_tolerance(
                 .iter()
                 .map(|vertex| PolyVertex {
                     point: ocs_point(vertex.point, elevation),
-                    bulge: vertex.bulge,
                     vertex_id: Default::default(),
+                    ..*vertex
                 })
                 .collect();
             polyline_points_with_tolerance(&verts, *closed, extrusion, chord_tolerance)
@@ -1096,11 +1096,15 @@ mod tests {
                     point: Point3::from_xy(0.0, 0.0),
                     bulge: 1.0,
                     vertex_id: Default::default(),
+                    start_width: 0.0,
+                    end_width: 0.0,
                 },
                 PolyVertex {
                     point: Point3::from_xy(2.0, 0.0),
                     bulge: 0.0,
                     vertex_id: Default::default(),
+                    start_width: 0.0,
+                    end_width: 0.0,
                 },
             ],
             closed: false,

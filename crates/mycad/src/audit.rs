@@ -492,6 +492,28 @@ impl<'a> AuditCtx<'a> {
                     &vertices.iter().map(|p| p.xy()).collect::<Vec<_>>(),
                     transform,
                 ),
+            Geometry::MultiLeader { lines, .. } => {
+                for line in lines {
+                    self.consider_polyline(
+                        "MULTILEADER",
+                        &line
+                            .polyline()
+                            .iter()
+                            .map(|point| point.xy())
+                            .collect::<Vec<_>>(),
+                        transform,
+                    );
+                }
+            }
+            Geometry::Region { wires } => {
+                for wire in wires {
+                    self.consider_polyline(
+                        "REGION",
+                        &wire.iter().map(|point| point.xy()).collect::<Vec<_>>(),
+                        transform,
+                    );
+                }
+            }
             Geometry::Image(frame) | Geometry::Wipeout(frame) => {
                 for corner in frame.corners() {
                     self.consider_point("RASTER", corner.xy(), transform);

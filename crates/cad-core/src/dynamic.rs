@@ -2576,6 +2576,8 @@ fn geometry_can_move(geometry: &Geometry) -> bool {
             | Geometry::Solid { .. }
             | Geometry::Leader { .. }
             | Geometry::MLine { .. }
+            | Geometry::MultiLeader { .. }
+            | Geometry::Region { .. }
             | Geometry::Viewport(_)
             | Geometry::Image(_)
             | Geometry::Wipeout(_)
@@ -2806,6 +2808,8 @@ mod tests {
                 point: Point3::from_xy(0.0, 0.0),
                 bulge: 0.5,
                 vertex_id: VertexId(1),
+                start_width: 0.0,
+                end_width: 0.0,
             }],
             closed: false,
             extrusion: Point3::new(0.0, 0.0, 1.0),
@@ -3037,11 +3041,15 @@ mod tests {
                     point: Point3::from_xy(0.0, 0.0),
                     bulge: 0.0,
                     vertex_id: VertexId(1),
+                    start_width: 0.0,
+                    end_width: 0.0,
                 },
                 crate::entity::PolyVertex {
                     point: Point3::from_xy(10.0, 0.0),
                     bulge: 0.0,
                     vertex_id: VertexId(2),
+                    start_width: 0.0,
+                    end_width: 0.0,
                 },
             ],
             closed: false,

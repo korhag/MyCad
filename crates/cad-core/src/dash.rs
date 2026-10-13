@@ -841,11 +841,15 @@ mod tests {
                 point: Point3::from_xy(0.0, 0.0),
                 bulge: 1.0,
                 vertex_id: Default::default(),
+                start_width: 0.0,
+                end_width: 0.0,
             },
             PolyVertex {
                 point: Point3::from_xy(2.0, 0.0),
                 bulge: 0.0,
                 vertex_id: Default::default(),
+                start_width: 0.0,
+                end_width: 0.0,
             },
         ];
         let segs = polyline_path_segs(

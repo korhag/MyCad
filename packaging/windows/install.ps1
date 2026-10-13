@@ -161,6 +161,14 @@ New-ItemProperty -LiteralPath $UninstallKey -Name "NoModify" -PropertyType DWord
 New-ItemProperty -LiteralPath $UninstallKey -Name "NoRepair" -PropertyType DWord -Value 1 -Force | Out-Null
 New-ItemProperty -LiteralPath $UninstallKey -Name "EstimatedSize" -PropertyType DWord -Value $sizeKb -Force | Out-Null
 
+# The installed app reads this to notice a newer workshop version.
+$sourcePath = Join-Path $InstallDir "EntoCAD.source.json"
+$source = [ordered]@{
+    repo = $RepoRoot
+    update_command = (Join-Path $PSScriptRoot "Install EntoCAD.cmd")
+}
+$source | ConvertTo-Json | Set-Content -LiteralPath $sourcePath -Encoding utf8
+
 Write-Host ""
 Write-Host "$AppName $version is installed."
 Write-Host "Start menu: $ShortcutPath"

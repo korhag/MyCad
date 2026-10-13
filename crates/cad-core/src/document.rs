@@ -198,6 +198,23 @@ pub struct ImportDiagnostics {
     /// Content a save still cannot keep, besides unsupported entity counts.
     pub lossy_notes: Vec<String>,
     pub object_count: u64,
+    /// AutoCAD dynamic block definitions that became editable.
+    pub dynamic_definitions: usize,
+    /// INSERT references whose dynamic properties can be edited.
+    pub dynamic_editable: usize,
+    /// Dynamic references left as static geometry, with the reason in `dynamic_lines`.
+    pub dynamic_kept_static: usize,
+    /// One line per definition, anonymous reference, or import note.
+    pub dynamic_lines: Vec<String>,
+    /// AutoCAD display features this file uses. Keys are `SPATIAL_FILTER`,
+    /// `SORTENTSTABLE`, `WIDE_LWPOLYLINE`, and `WIDE_POLYLINE_2D`.
+    pub feature_counts: BTreeMap<String, u64>,
+    /// `$LWDISPLAY` from the file header. `None` when the header did not store it.
+    pub lwdisplay: Option<bool>,
+    /// Largest LWPOLYLINE or POLYLINE_2D width seen, in drawing units.
+    pub max_polyline_width: f64,
+    /// Largest SORTENTSTABLE entity count LibreDWG returned.
+    pub max_sort_ents: u32,
 }
 
 impl ImportDiagnostics {
@@ -210,6 +227,21 @@ impl ImportDiagnostics {
             .unsupported_counts
             .entry(type_name.to_string())
             .or_insert(0) += 1;
+    }
+
+    pub fn bump_feature(&mut self, name: &str) {
+        *self.feature_counts.entry(name.to_string()).or_insert(0) += 1;
+    }
+
+    /// Keep the widest finite polyline width. Zero and non-finite values are ignored.
+    pub fn note_polyline_width(&mut self, width: f64) {
+        if width.is_finite() && width > self.max_polyline_width {
+            self.max_polyline_width = width;
+        }
+    }
+
+    pub fn note_sort_ents(&mut self, count: u32) {
+        self.max_sort_ents = self.max_sort_ents.max(count);
     }
 
     pub fn unsupported_total(&self) -> u64 {
@@ -459,6 +491,14 @@ pub struct Document {
     pub model_space: Vec<Entity>,
     pub diagnostics: ImportDiagnostics,
     pub ltscale: f64,
+    /// WIPEOUTFRAME: 0 hides frames, 1 shows them, 2 shows them on screen only.
+    pub wipeout_frame: u8,
+    /// XCLIPFRAME when the file stored one. Absent means each clip uses its own flag.
+    pub xclip_frame: Option<u8>,
+    /// `$LWDISPLAY`. Off keeps strokes at one pixel.
+    pub lwdisplay: bool,
+    /// `$LWDEFAULT` in hundredths of a millimetre. Default is 0.25 mm.
+    pub lwdefault: i16,
     pub current_layer: String,
     pub units: DrawingUnits,
     next_entity_id: u64,
@@ -487,6 +527,10 @@ impl Default for Document {
             model_space: Vec::new(),
             diagnostics: ImportDiagnostics::default(),
             ltscale: 1.0,
+            wipeout_frame: 1,
+            xclip_frame: None,
+            lwdisplay: false,
+            lwdefault: crate::LWDEFAULT_HUNDREDTHS,
             current_layer: "0".into(),
             units: DrawingUnits::Unspecified,
             next_entity_id: 1,
@@ -837,6 +881,15 @@ impl Document {
             entity.id = self.allocate_id();
         }
         assign_entity_vertex_ids(&mut entity, &mut self.next_vertex_id);
+        if entity.draw_order == 0 {
+            if let Some(existing) = self.entities(space) {
+                if let Some(front) = existing.iter().map(|item| item.draw_order).max() {
+                    if front > 0 {
+                        entity.draw_order = front.saturating_add(1);
+                    }
+                }
+            }
+        }
         let space = self.canonical_space(space)?;
         let index = {
             let entities = self.entities_mut(&space)?;
@@ -1393,6 +1446,7 @@ fn collect_entity_points(
             row_spacing,
             attribs,
             configuration: _,
+            clip: _,
         } => {
             if crate::nesting_too_deep(block_stack)
                 || block_stack
@@ -1536,6 +1590,23 @@ fn collect_entity_points(
         | crate::entity::Geometry::MLine { vertices, .. } => {
             for p in vertices {
                 visit(transform.apply(p.xy()));
+            }
+        }
+        crate::entity::Geometry::MultiLeader { lines, content, .. } => {
+            for line in lines {
+                for point in line.polyline() {
+                    visit(transform.apply(point.xy()));
+                }
+            }
+            if let Some(location) = content.location() {
+                visit(transform.apply(location.xy()));
+            }
+        }
+        crate::entity::Geometry::Region { wires } => {
+            for wire in wires {
+                for point in wire {
+                    visit(transform.apply(point.xy()));
+                }
             }
         }
         crate::entity::Geometry::Viewport(viewport) => {
@@ -1727,6 +1798,7 @@ mod tests {
             column_spacing: 0.0,
             row_spacing: 0.0,
             configuration: None,
+            clip: None,
         }));
         let e = document.compute_extents().unwrap();
         assert!((e.min.x - 100.0).abs() < 1e-9);
@@ -1786,6 +1858,7 @@ mod tests {
             column_spacing: 0.0,
             row_spacing: 0.0,
             configuration: None,
+            clip: None,
         }));
         let e = document.compute_extents().unwrap();
         assert!((e.min.x - 100.0).abs() < 1e-9);
@@ -1834,11 +1907,15 @@ mod tests {
                     point: Point3::from_xy(0.0, 0.0),
                     bulge: 0.0,
                     vertex_id: Default::default(),
+                    start_width: 0.0,
+                    end_width: 0.0,
                 },
                 PolyVertex {
                     point: Point3::from_xy(8.0, 2.0),
                     bulge: 0.0,
                     vertex_id: Default::default(),
+                    start_width: 0.0,
+                    end_width: 0.0,
                 },
             ],
             closed: false,

@@ -258,6 +258,7 @@ pub fn transform_geometry(
             column_spacing,
             row_spacing,
             configuration,
+            clip,
         } => {
             let combined = matrix.then(Transform2::insert(*insertion, *scale, *rotation));
             let (insertion_xy, new_scale, new_rotation) = decompose_insert(combined, scale.z);
@@ -276,6 +277,7 @@ pub fn transform_geometry(
                 column_spacing: *column_spacing * matrix.scale_x(),
                 row_spacing: *row_spacing * matrix.scale_x(),
                 configuration: configuration.clone(),
+                clip: clip.clone(),
             }
         }
         Geometry::Text(data) => Geometry::Text(transform_text(data, matrix)),
@@ -293,9 +295,53 @@ pub fn transform_geometry(
         Geometry::Leader { vertices } => Geometry::Leader {
             vertices: vertices.iter().map(|p| matrix.apply3(*p)).collect(),
         },
-        Geometry::MLine { vertices, closed } => Geometry::MLine {
-            vertices: vertices.iter().map(|p| matrix.apply3(*p)).collect(),
-            closed: *closed,
+        Geometry::MLine {
+            vertices,
+            miters,
+            closed,
+            scale,
+            justification,
+            offsets,
+        } => {
+            let geom_scale = (matrix.scale_x() * matrix.scale_y()).abs().sqrt();
+            Geometry::MLine {
+                vertices: vertices.iter().map(|p| matrix.apply3(*p)).collect(),
+                miters: miters
+                    .iter()
+                    .map(|miter| apply_vector3(matrix, *miter))
+                    .collect(),
+                closed: *closed,
+                scale: *scale * geom_scale,
+                justification: *justification,
+                offsets: offsets.clone(),
+            }
+        }
+        Geometry::MultiLeader {
+            lines,
+            content,
+            arrow_size,
+        } => {
+            let geom_scale = (matrix.scale_x() * matrix.scale_y()).abs().sqrt();
+            Geometry::MultiLeader {
+                lines: lines
+                    .iter()
+                    .map(|line| crate::entity::LeaderLine {
+                        points: line.points.iter().map(|p| matrix.apply3(*p)).collect(),
+                        last_point: line.last_point.map(|point| matrix.apply3(point)),
+                        dogleg: line.dogleg.map(|dir| apply_vector3(matrix, dir)),
+                        dogleg_length: line.dogleg_length * geom_scale,
+                        arrow_size: line.arrow_size.map(|size| size * geom_scale),
+                    })
+                    .collect(),
+                content: transform_leader_content(content, matrix, geom_scale),
+                arrow_size: *arrow_size * geom_scale,
+            }
+        }
+        Geometry::Region { wires } => Geometry::Region {
+            wires: wires
+                .iter()
+                .map(|wire| wire.iter().map(|point| matrix.apply3(*point)).collect())
+                .collect(),
         },
         Geometry::Viewport(data) => {
             let mut next = data.clone();
@@ -311,6 +357,46 @@ pub fn transform_geometry(
         Geometry::Image(frame) => Geometry::Image(transform_frame(frame, matrix)),
         Geometry::Wipeout(frame) => Geometry::Wipeout(transform_frame(frame, matrix)),
     })
+}
+
+fn transform_leader_content(
+    content: &crate::entity::LeaderContent,
+    matrix: Transform2,
+    geom_scale: f64,
+) -> crate::entity::LeaderContent {
+    match content {
+        crate::entity::LeaderContent::None => crate::entity::LeaderContent::None,
+        crate::entity::LeaderContent::Text {
+            value,
+            location,
+            height,
+            rotation,
+            width,
+            frame,
+        } => crate::entity::LeaderContent::Text {
+            value: value.clone(),
+            location: matrix.apply3(*location),
+            height: *height * geom_scale,
+            rotation: *rotation + matrix.rotation_component(),
+            width: *width * geom_scale,
+            frame: *frame,
+        },
+        crate::entity::LeaderContent::Block {
+            name,
+            location,
+            scale,
+            rotation,
+        } => crate::entity::LeaderContent::Block {
+            name: name.clone(),
+            location: matrix.apply3(*location),
+            scale: Point3::new(
+                scale.x * matrix.scale_x(),
+                scale.y * matrix.scale_y(),
+                scale.z,
+            ),
+            rotation: *rotation + matrix.rotation_component(),
+        },
+    }
 }
 
 fn transform_frame(
@@ -354,6 +440,8 @@ fn geometry_supported(geometry: &Geometry) -> Result<(), TransformError> {
         | Geometry::Spline { .. }
         | Geometry::Leader { .. }
         | Geometry::MLine { .. }
+        | Geometry::MultiLeader { .. }
+        | Geometry::Region { .. }
         | Geometry::Viewport(_)
         | Geometry::Image(_)
         | Geometry::Wipeout(_) => Ok(()),
@@ -379,14 +467,19 @@ fn transform_poly_vertices(vertices: &[PolyVertex], matrix: Transform2) -> Vec<P
     let reverse_bulge = matrix.reverses_orientation();
     vertices
         .iter()
-        .map(|vertex| PolyVertex {
-            point: matrix.apply3(vertex.point),
-            bulge: if reverse_bulge {
-                -vertex.bulge
-            } else {
-                vertex.bulge
-            },
-            vertex_id: vertex.vertex_id,
+        .map(|vertex| {
+            let scale = (matrix.scale_x() * matrix.scale_y()).sqrt();
+            PolyVertex {
+                point: matrix.apply3(vertex.point),
+                bulge: if reverse_bulge {
+                    -vertex.bulge
+                } else {
+                    vertex.bulge
+                },
+                vertex_id: vertex.vertex_id,
+                start_width: vertex.start_width * scale,
+                end_width: vertex.end_width * scale,
+            }
         })
         .collect()
 }
@@ -645,6 +738,21 @@ fn representative_points(geometry: &Geometry) -> Vec<Point2> {
         Geometry::Leader { vertices } | Geometry::MLine { vertices, .. } => {
             vertices.iter().map(|p| p.xy()).collect()
         }
+        Geometry::MultiLeader { lines, content, .. } => {
+            let mut points: Vec<Point2> = lines
+                .iter()
+                .flat_map(|line| line.polyline())
+                .map(|point| point.xy())
+                .collect();
+            if let Some(location) = content.location() {
+                points.push(location.xy());
+            }
+            points
+        }
+        Geometry::Region { wires } => wires
+            .iter()
+            .flat_map(|wire| wire.iter().map(|point| point.xy()))
+            .collect(),
         Geometry::Viewport(viewport) => viewport.corners().iter().map(|p| p.xy()).collect(),
         Geometry::Image(frame) | Geometry::Wipeout(frame) => {
             frame.corners().iter().map(|point| point.xy()).collect()
@@ -805,11 +913,15 @@ mod tests {
                     point: Point3::from_xy(0.0, 0.0),
                     bulge: 0.5,
                     vertex_id: Default::default(),
+                    start_width: 0.0,
+                    end_width: 0.0,
                 },
                 PolyVertex {
                     point: Point3::from_xy(2.0, 0.0),
                     bulge: -0.25,
                     vertex_id: Default::default(),
+                    start_width: 0.0,
+                    end_width: 0.0,
                 },
             ],
             closed: false,
@@ -879,6 +991,7 @@ mod tests {
             column_spacing: 0.0,
             row_spacing: 0.0,
             configuration: None,
+            clip: None,
         });
         let moved = transform_entity(&entity, EntityTransform::Translate { dx: 5.0, dy: -1.0 })
             .expect("move insert");
@@ -1052,6 +1165,7 @@ mod tests {
             column_spacing: 0.0,
             row_spacing: 0.0,
             configuration: None,
+            clip: None,
         }));
         let moved = transform_entity(&insert, EntityTransform::Translate { dx: 5.0, dy: 0.0 })
             .expect("move insert");

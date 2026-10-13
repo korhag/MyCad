@@ -601,6 +601,7 @@ pub fn identity_insert(block_name: String, insertion: Point3) -> Geometry {
         column_spacing: 0.0,
         row_spacing: 0.0,
         configuration: None,
+        clip: None,
     }
 }
 
@@ -946,6 +947,8 @@ fn geometry_survives_non_uniform(geometry: &Geometry) -> bool {
             | Geometry::Spline { .. }
             | Geometry::Leader { .. }
             | Geometry::MLine { .. }
+            | Geometry::MultiLeader { .. }
+            | Geometry::Region { .. }
             | Geometry::Viewport(_)
             | Geometry::Image(_)
             | Geometry::Wipeout(_)

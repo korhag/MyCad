@@ -14,16 +14,21 @@ use crate::dash::{
     polyline_path_segs, scaled_pattern, PathSeg,
 };
 use crate::document::Document;
-use crate::entity::{Entity, Geometry, TextData, TextHAlign, TextVAlign};
+use crate::entity::{
+    default_extrusion, mline_offset_polylines, polyline_is_wide, Entity, Geometry, LeaderContent,
+    MTextData, PolyVertex, TextData, TextHAlign, TextVAlign,
+};
 use crate::extents::Extents2;
 use crate::geom::{ocs_to_wcs, Point2, Point3};
 use crate::hatch::{
     hatch_fill_contours, hatch_path_points_with_tolerance, hatch_pattern_segments, GradientRamp,
 };
 use crate::linetype::LineType;
+use crate::polygon::{clip_open_polyline, clip_polygon, intersect_polygons};
 use crate::stroke_font::{mtext_paragraphs, MTextAlign, MTextRun};
 use crate::transform::Transform2;
 use crate::ttf_font::TextFont;
+use crate::wide_poly::wide_polyline_quads;
 
 // ------------------------------------------------------------
 // Enum: VectorVisibility
@@ -88,6 +93,121 @@ pub trait VectorSink {
     fn push_span(&mut self, _label: &str) {}
 
     fn pop_span(&mut self) {}
+
+    /// Push one entity's slice of the current draw-order band.
+    /// A higher rank is closer to the camera.
+    fn begin_entity_draw(&mut self, _rank: u32, _span: u32) {}
+
+    fn end_entity_draw(&mut self) {}
+
+    /// Viewport mask color. PDF stays white because the page is white.
+    fn fill_mask(&mut self, pts: &[Point2]) {
+        self.fill(
+            pts,
+            Rgb {
+                r: 255,
+                g: 255,
+                b: 255,
+            },
+        );
+    }
+
+    fn for_plot(&self) -> bool {
+        false
+    }
+}
+
+// ------------------------------------------------------------
+// Type: DrawBand
+// Purpose: Nested painter's order mapped into a depth in (0, 0.5).
+//          Smaller depth is closer. Children subdivide their parent.
+// ------------------------------------------------------------
+#[derive(Clone, Debug)]
+pub struct DrawBand {
+    stack: Vec<(f32, f32)>,
+    pub depth: f32,
+}
+
+impl Default for DrawBand {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DrawBand {
+    pub fn new() -> Self {
+        Self {
+            stack: Vec::new(),
+            depth: 0.25,
+        }
+    }
+
+    pub fn begin(&mut self, rank: u32, span: u32) {
+        let (origin, width) = self.stack.last().copied().unwrap_or((0.0, 0.5));
+        let span = span.max(1);
+        let rank = rank.min(span - 1);
+        let slice = width / span as f32;
+        let start = origin + (span - 1 - rank) as f32 * slice;
+        self.depth = start + slice * 0.5;
+        self.stack.push((start, slice));
+    }
+
+    pub fn end(&mut self) {
+        self.stack.pop();
+        self.depth = self
+            .stack
+            .last()
+            .map(|(start, width)| start + width * 0.5)
+            .unwrap_or(0.25);
+    }
+}
+
+// ------------------------------------------------------------
+// Type: PaintList
+// Purpose: Rank and span for one entity list. A list whose orders
+//          are all equal uses the stored index, later entities in front.
+// ------------------------------------------------------------
+#[derive(Clone, Copy, Debug)]
+pub struct PaintList {
+    flat: bool,
+    pub span: u32,
+}
+
+impl PaintList {
+    pub fn from_entities(entities: &[Entity]) -> Self {
+        let len = entities.len() as u32;
+        if len == 0 {
+            return Self {
+                flat: true,
+                span: 1,
+            };
+        }
+        let first = entities[0].draw_order;
+        let flat = entities.iter().all(|entity| entity.draw_order == first);
+        let span = if flat {
+            len.max(1)
+        } else {
+            entities
+                .iter()
+                .map(|entity| entity.draw_order)
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1)
+                .max(len)
+        };
+        Self { flat, span }
+    }
+
+    pub fn rank(self, entities: &[Entity], index: usize) -> u32 {
+        if self.flat {
+            index as u32
+        } else {
+            entities
+                .get(index)
+                .map(|entity| entity.draw_order)
+                .unwrap_or(0)
+        }
+    }
 }
 
 fn continuous() -> LineType {
@@ -102,19 +222,46 @@ fn inherited_layer<'a>(entity_layer: &'a str, block_layer: &'a str) -> &'a str {
     }
 }
 
-fn resolved_stroke_mm(document: &Document, entity: &Entity, layer_name: &str) -> f64 {
-    let raw = match entity.lineweight {
+fn resolved_lineweight_hundredths(
+    document: &Document,
+    weight: i16,
+    layer_name: &str,
+    parent: Option<i16>,
+) -> i16 {
+    let raw = match weight {
+        crate::LINEWEIGHT_BYBLOCK => {
+            return parent.unwrap_or_else(|| concrete_default(document));
+        }
         crate::LINEWEIGHT_BYLAYER => document
             .layer(layer_name)
             .map(|layer| layer.lineweight)
             .unwrap_or(crate::LINEWEIGHT_DEFAULT),
-        crate::LINEWEIGHT_BYBLOCK | crate::LINEWEIGHT_DEFAULT => crate::LINEWEIGHT_DEFAULT,
         other => other,
     };
-    if raw < 0 {
-        0.0
+    concrete_weight(document, raw)
+}
+
+fn concrete_weight(document: &Document, raw: i16) -> i16 {
+    if raw >= 0 {
+        raw
     } else {
-        f64::from(raw) / 100.0
+        concrete_default(document)
+    }
+}
+
+fn concrete_default(document: &Document) -> i16 {
+    if document.lwdefault >= 0 {
+        document.lwdefault
+    } else {
+        crate::LWDEFAULT_HUNDREDTHS
+    }
+}
+
+fn stroke_mm_from_hundredths(hundredths: i16) -> f64 {
+    if hundredths > 0 {
+        f64::from(hundredths) / 100.0
+    } else {
+        0.0
     }
 }
 
@@ -636,6 +783,81 @@ fn emit_attrib(
     emit_text_data(sink, document, transform, rgb, attrib);
 }
 
+fn emit_polyline(
+    sink: &mut impl VectorSink,
+    vertices: &[PolyVertex],
+    closed: bool,
+    extrusion: Point3,
+    plinegen: bool,
+    transform: Transform2,
+    chord_tol: f64,
+    rgb: Rgb,
+    linetype: &LineType,
+    scale: f64,
+) {
+    if polyline_is_wide(vertices) {
+        let center = polyline_points_with_tolerance(vertices, closed, extrusion, Some(chord_tol))
+            .into_iter()
+            .map(|point| transform.apply(point))
+            .collect::<Vec<_>>();
+        sink.pick_outline(&center, closed);
+        for quad in wide_polyline_quads(vertices, closed, extrusion, Some(chord_tol)) {
+            let band: Vec<Point2> = quad
+                .iter()
+                .copied()
+                .map(|point| transform.apply(point))
+                .collect();
+            sink.fill(&band, rgb);
+        }
+        emit_thin_polyline_segments(
+            sink, vertices, closed, extrusion, plinegen, transform, chord_tol, rgb, linetype, scale,
+        );
+        return;
+    }
+    let pts: Vec<Point2> =
+        polyline_points_with_tolerance(vertices, closed, extrusion, Some(chord_tol))
+            .into_iter()
+            .map(|point| transform.apply(point))
+            .collect();
+    let segs = polyline_path_segs(vertices, closed, extrusion, transform);
+    sink.path(&pts, closed, &segs, plinegen, rgb, linetype, scale);
+}
+
+fn emit_thin_polyline_segments(
+    sink: &mut impl VectorSink,
+    vertices: &[PolyVertex],
+    closed: bool,
+    extrusion: Point3,
+    plinegen: bool,
+    transform: Transform2,
+    chord_tol: f64,
+    rgb: Rgb,
+    linetype: &LineType,
+    scale: f64,
+) {
+    let count = if closed {
+        vertices.len()
+    } else {
+        vertices.len().saturating_sub(1)
+    };
+    for index in 0..count {
+        if vertices[index].is_wide() {
+            continue;
+        }
+        let pair = [vertices[index], vertices[(index + 1) % vertices.len()]];
+        let pts: Vec<Point2> =
+            polyline_points_with_tolerance(&pair, false, extrusion, Some(chord_tol))
+                .into_iter()
+                .map(|point| transform.apply(point))
+                .collect();
+        if pts.len() < 2 {
+            continue;
+        }
+        let segs = polyline_path_segs(&pair, false, extrusion, transform);
+        sink.path(&pts, false, &segs, plinegen, rgb, linetype, scale);
+    }
+}
+
 // ------------------------------------------------------------
 // Function: vectorize_entity
 // Purpose: Walk one entity, including nested INSERT/DIMENSION,
@@ -652,6 +874,34 @@ pub fn vectorize_entity(
     visibility: VectorVisibility,
     sink: &mut impl VectorSink,
 ) {
+    vectorize_entity_with_clip(
+        document,
+        entity,
+        transform,
+        block_color,
+        block_linetype,
+        block_layer,
+        stack,
+        visibility,
+        &[],
+        None,
+        sink,
+    );
+}
+
+fn vectorize_entity_with_clip(
+    document: &Document,
+    entity: &Entity,
+    transform: Transform2,
+    block_color: CadColor,
+    block_linetype: &str,
+    block_layer: &str,
+    stack: &mut Vec<String>,
+    visibility: VectorVisibility,
+    inherited_clip: &[Point2],
+    parent_hundredths: Option<i16>,
+    sink: &mut impl VectorSink,
+) {
     let layer_name = inherited_layer(&entity.layer, block_layer);
     if !entity.visible || !visibility.layer_allowed(document, layer_name) {
         return;
@@ -661,7 +911,13 @@ pub fn vectorize_entity(
         .map(|l| l.color)
         .unwrap_or(CadColor::Aci(7));
     let rgb = entity.color.resolve(layer_color, block_color);
-    sink.stroke_mm(resolved_stroke_mm(document, entity, layer_name));
+    let hundredths = resolved_lineweight_hundredths(
+        document,
+        entity.lineweight,
+        layer_name,
+        parent_hundredths,
+    );
+    sink.stroke_mm(stroke_mm_from_hundredths(hundredths));
     let linetype_name = document.linetype_resolved(&entity.linetype, layer_name, block_linetype);
     let linetype = document
         .linetype(&linetype_name)
@@ -686,6 +942,7 @@ pub fn vectorize_entity(
             column_spacing,
             row_spacing,
             configuration: _,
+            clip,
         } => {
             if crate::nesting_too_deep(stack)
                 || stack.iter().any(|n| n.eq_ignore_ascii_case(block_name))
@@ -726,23 +983,97 @@ pub fn vectorize_entity(
                         )
                         .then(extra),
                     );
-                    for child in &block.entities {
-                        vectorize_entity(
+                    let own_world = clip.as_ref().filter(|item| item.is_active()).map(|item| {
+                        item.block_boundary()
+                            .into_iter()
+                            .map(|point| nested.apply(point))
+                            .collect::<Vec<_>>()
+                    });
+                    let active = active_clip(inherited_clip, own_world.as_deref());
+                    let blocked = (inherited_clip.len() >= 3
+                        || own_world.as_ref().is_some_and(|points| points.len() >= 3))
+                        && active.len() < 3;
+                    if !blocked {
+                        if active.len() >= 3 {
+                            let mut clipped = ClipSink {
+                                inner: sink,
+                                clip: &active,
+                            };
+                            emit_insert_children(
+                                document,
+                                &block.entities,
+                                nested,
+                                inherit,
+                                inherit_lt.as_str(),
+                                layer_name,
+                                stack,
+                                visibility,
+                                &active,
+                                Some(hundredths),
+                                &mut clipped,
+                            );
+                        } else {
+                            emit_insert_children(
+                                document,
+                                &block.entities,
+                                nested,
+                                inherit,
+                                inherit_lt.as_str(),
+                                layer_name,
+                                stack,
+                                visibility,
+                                &[],
+                                Some(hundredths),
+                                sink,
+                            );
+                        }
+                    }
+                    if let Some(boundary) = own_world.as_ref().filter(|points| points.len() >= 3) {
+                        if xclip_frame_visible(
                             document,
-                            child,
-                            nested,
-                            inherit,
-                            inherit_lt.as_str(),
-                            layer_name,
-                            stack,
-                            visibility,
-                            sink,
-                        );
+                            clip.as_ref().is_some_and(|item| item.frame_on),
+                            sink.for_plot(),
+                        ) {
+                            sink.stroke_mm(0.0);
+                            sink.path(
+                                boundary,
+                                true,
+                                &line_chain(boundary, true),
+                                true,
+                                rgb,
+                                &continuous(),
+                                1.0,
+                            );
+                        }
                     }
                 }
             }
-            for attrib in attribs {
-                emit_attrib(sink, document, transform, rgb, attrib);
+            let base = transform.then(Transform2::block_insert(
+                *insertion,
+                *ins_scale,
+                *rotation,
+                *extrusion,
+                block.base_pt,
+            ));
+            let own_base = clip.as_ref().filter(|item| item.is_active()).map(|item| {
+                item.block_boundary()
+                    .into_iter()
+                    .map(|point| base.apply(point))
+                    .collect::<Vec<_>>()
+            });
+            let attrib_clip = active_clip(inherited_clip, own_base.as_deref());
+            if attrib_clip.len() >= 3 {
+                let mut clipped = ClipSink {
+                    inner: sink,
+                    clip: &attrib_clip,
+                };
+                for attrib in attribs {
+                    emit_attrib(&mut clipped, document, transform, rgb, attrib);
+                }
+            } else if inherited_clip.len() < 3 && own_base.is_none() {
+                for attrib in attribs {
+                    emit_attrib(sink, document, transform, rgb, attrib);
+                }
             }
             stack.pop();
         }
@@ -758,8 +1089,10 @@ pub fn vectorize_entity(
             }
             if let Some(block) = document.blocks.get(block_name) {
                 stack.push(block_name.clone());
-                for child in &block.entities {
-                    vectorize_entity(
+                let paint = PaintList::from_entities(&block.entities);
+                for (index, child) in block.entities.iter().enumerate() {
+                    sink.begin_entity_draw(paint.rank(&block.entities, index), paint.span);
+                    vectorize_entity_with_clip(
                         document,
                         child,
                         transform,
@@ -768,8 +1101,11 @@ pub fn vectorize_entity(
                         layer_name,
                         stack,
                         visibility,
+                        inherited_clip,
+                        Some(hundredths),
                         sink,
                     );
+                    sink.end_entity_draw();
                 }
                 stack.pop();
             }
@@ -904,17 +1240,14 @@ pub fn vectorize_entity(
             extrusion,
             linetype_generation_continuous,
         } => {
-            let pts: Vec<Point2> =
-                polyline_points_with_tolerance(vertices, *closed, *extrusion, Some(chord_tol))
-                    .into_iter()
-                    .map(|p| transform.apply(p))
-                    .collect();
-            let segs = polyline_path_segs(vertices, *closed, *extrusion, transform);
-            sink.path(
-                &pts,
+            emit_polyline(
+                sink,
+                vertices,
                 *closed,
-                &segs,
+                *extrusion,
                 *linetype_generation_continuous,
+                transform,
+                chord_tol,
                 rgb,
                 &linetype,
                 scale,
@@ -925,18 +1258,14 @@ pub fn vectorize_entity(
             closed,
             linetype_generation_continuous,
         } => {
-            let extrusion = Point3::new(0.0, 0.0, 1.0);
-            let pts: Vec<Point2> =
-                polyline_points_with_tolerance(vertices, *closed, extrusion, Some(chord_tol))
-                    .into_iter()
-                    .map(|p| transform.apply(p))
-                    .collect();
-            let segs = polyline_path_segs(vertices, *closed, extrusion, transform);
-            sink.path(
-                &pts,
+            emit_polyline(
+                sink,
+                vertices,
                 *closed,
-                &segs,
+                Point3::new(0.0, 0.0, 1.0),
                 *linetype_generation_continuous,
+                transform,
+                chord_tol,
                 rgb,
                 &linetype,
                 scale,
@@ -1041,7 +1370,7 @@ pub fn vectorize_entity(
             );
             sink.fill(&pts, rgb);
         }
-        Geometry::Leader { vertices } | Geometry::MLine { vertices, .. } => {
+        Geometry::Leader { vertices } => {
             let pts: Vec<Point2> = vertices.iter().map(|p| transform.apply(p.xy())).collect();
             sink.path(
                 &pts,
@@ -1053,7 +1382,167 @@ pub fn vectorize_entity(
                 scale,
             );
         }
-        Geometry::Image(frame) | Geometry::Wipeout(frame) => {
+        Geometry::MLine {
+            vertices,
+            miters,
+            closed,
+            scale: mline_scale,
+            justification,
+            offsets,
+        } => {
+            for line in mline_offset_polylines(
+                vertices,
+                miters,
+                *closed,
+                *mline_scale,
+                *justification,
+                offsets,
+            ) {
+                let pts: Vec<Point2> = line.iter().map(|p| transform.apply(p.xy())).collect();
+                let close = *closed && pts.len() >= 3;
+                sink.path(
+                    &pts,
+                    close,
+                    &line_chain(&pts, close),
+                    true,
+                    rgb,
+                    &linetype,
+                    scale,
+                );
+            }
+        }
+        Geometry::MultiLeader {
+            lines,
+            content,
+            arrow_size,
+        } => {
+            for line in lines {
+                let model = line.polyline();
+                let pts: Vec<Point2> = model.iter().map(|p| transform.apply(p.xy())).collect();
+                if pts.len() >= 2 {
+                    sink.path(
+                        &pts,
+                        false,
+                        &line_chain(&pts, false),
+                        true,
+                        rgb,
+                        &linetype,
+                        scale,
+                    );
+                    if let Some(tri) =
+                        arrow_triangle(model[0].xy(), model[1].xy(), line.arrow_size(*arrow_size))
+                    {
+                        let tri: Vec<Point2> = tri
+                            .into_iter()
+                            .map(|point| transform.apply(point))
+                            .collect();
+                        sink.fill(&tri, rgb);
+                    }
+                }
+            }
+            match content {
+                LeaderContent::Text {
+                    value,
+                    location,
+                    height,
+                    rotation,
+                    width,
+                    frame,
+                } => {
+                    if *frame && *width > 0.0 && *height > 0.0 {
+                        let origin = location.xy();
+                        let (sin, cos) = rotation.sin_cos();
+                        let along = Point2::new(cos, sin) * *width;
+                        let down = Point2::new(-sin, cos) * -*height;
+                        let corners =
+                            [origin, origin + along, origin + along + down, origin + down];
+                        let pts: Vec<Point2> = corners
+                            .into_iter()
+                            .map(|point| transform.apply(point))
+                            .collect();
+                        sink.path(
+                            &pts,
+                            true,
+                            &line_chain(&pts, true),
+                            true,
+                            rgb,
+                            &continuous(),
+                            1.0,
+                        );
+                    }
+                    if !value.is_empty() {
+                        let text = MTextData {
+                            insertion: *location,
+                            height: *height,
+                            rotation: *rotation,
+                            width: *width,
+                            value: value.clone(),
+                            ..MTextData::default()
+                        };
+                        let style = resolve_text_style(document, &text.style);
+                        emit_mtext(sink, transform, rgb, &text, &style);
+                    }
+                }
+                LeaderContent::Block {
+                    name,
+                    location,
+                    scale: block_scale,
+                    rotation,
+                } => {
+                    if !crate::nesting_too_deep(stack)
+                        && !stack.iter().any(|item| item.eq_ignore_ascii_case(name))
+                    {
+                        if let Some(block) = document.blocks.get(name) {
+                            stack.push(name.clone());
+                            let nested = transform.then(Transform2::block_insert(
+                                *location,
+                                *block_scale,
+                                *rotation,
+                                default_extrusion(),
+                                block.base_pt,
+                            ));
+                            let inherit = match entity.color {
+                                CadColor::ByBlock => block_color,
+                                CadColor::ByLayer => layer_color,
+                                other => other,
+                            };
+                            emit_insert_children(
+                                document,
+                                &block.entities,
+                                nested,
+                                inherit,
+                                linetype_name.as_str(),
+                                layer_name,
+                                stack,
+                                visibility,
+                                inherited_clip,
+                                Some(hundredths),
+                                sink,
+                            );
+                            stack.pop();
+                        }
+                    }
+                }
+                LeaderContent::None => {}
+            }
+        }
+        Geometry::Region { wires } => {
+            for wire in wires {
+                let pts: Vec<Point2> = wire.iter().map(|p| transform.apply(p.xy())).collect();
+                if pts.len() >= 2 {
+                    sink.path(
+                        &pts,
+                        false,
+                        &line_chain(&pts, false),
+                        true,
+                        rgb,
+                        &linetype,
+                        scale,
+                    );
+                }
+            }
+        }
+        Geometry::Image(frame) => {
             let pts: Vec<Point2> = frame
                 .corners()
                 .iter()
@@ -1068,6 +1557,21 @@ pub fn vectorize_entity(
                 &linetype,
                 scale,
             );
+        }
+        Geometry::Wipeout(frame) => {
+            let pts = wipeout_boundary(frame, transform);
+            sink.fill_mask(&pts);
+            if wipeout_frame_visible(document, sink.for_plot()) {
+                sink.path(
+                    &pts,
+                    true,
+                    &line_chain(&pts, true),
+                    true,
+                    rgb,
+                    &linetype,
+                    scale,
+                );
+            }
         }
         Geometry::Viewport(viewport) => {
             let pts: Vec<Point2> = viewport
@@ -1141,6 +1645,9 @@ pub struct PlotStroke {
     pub rgb: Rgb,
     /// Millimetres. Zero keeps the PDF page default.
     pub width_mm: f64,
+    /// Smaller values are closer and are painted later.
+    pub depth: f32,
+    pub seq: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -1148,6 +1655,9 @@ pub struct PlotFill {
     pub contours: Vec<Vec<Point2>>,
     pub even_odd: bool,
     pub rgb: Rgb,
+    /// Smaller values are closer and are painted later.
+    pub depth: f32,
+    pub seq: u32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1188,6 +1698,24 @@ struct CollectingSink {
     geometry: PlotGeometry,
     chord_tolerance: f64,
     stroke_mm: f64,
+    band: DrawBand,
+    seq: u32,
+}
+
+fn arrow_triangle(tip: Point2, next: Point2, size: f64) -> Option<Vec<Point2>> {
+    if !(size.is_finite() && size > 1e-9) {
+        return None;
+    }
+    let delta = next - tip;
+    let len = (delta.x * delta.x + delta.y * delta.y).sqrt();
+    if len < 1e-12 {
+        return None;
+    }
+    let dir = Point2::new(delta.x / len, delta.y / len);
+    let side = Point2::new(-dir.y, dir.x);
+    let base = tip + dir * size;
+    let half = size / 6.0;
+    Some(vec![tip, base + side * half, base - side * half])
 }
 
 fn points_usable(pts: &[Point2]) -> bool {
@@ -1218,11 +1746,14 @@ impl VectorSink for CollectingSink {
             return;
         }
         if linetype.is_continuous() {
+            let seq = self.next_seq();
             self.geometry.strokes.push(PlotStroke {
                 points: pts.to_vec(),
                 closed,
                 rgb,
                 width_mm: self.stroke_mm,
+                depth: self.band.depth,
+                seq,
             });
             return;
         }
@@ -1240,11 +1771,14 @@ impl VectorSink for CollectingSink {
                     .push("Skipped non-finite plot coordinates".into());
                 continue;
             }
+            let seq = self.next_seq();
             self.geometry.strokes.push(PlotStroke {
                 points: vec![a, b],
                 closed: false,
                 rgb,
                 width_mm: self.stroke_mm,
+                depth: self.band.depth,
+                seq,
             });
         }
     }
@@ -1258,10 +1792,13 @@ impl VectorSink for CollectingSink {
             }
             return;
         }
+        let seq = self.next_seq();
         self.geometry.fills.push(PlotFill {
             contours: vec![pts.to_vec()],
             even_odd: false,
             rgb,
+            depth: self.band.depth,
+            seq,
         });
     }
 
@@ -1281,11 +1818,34 @@ impl VectorSink for CollectingSink {
         if kept.is_empty() {
             return;
         }
+        let seq = self.next_seq();
         self.geometry.fills.push(PlotFill {
             contours: kept,
             even_odd: true,
             rgb,
+            depth: self.band.depth,
+            seq,
         });
+    }
+
+    fn begin_entity_draw(&mut self, rank: u32, span: u32) {
+        self.band.begin(rank, span);
+    }
+
+    fn end_entity_draw(&mut self) {
+        self.band.end();
+    }
+
+    fn for_plot(&self) -> bool {
+        true
+    }
+}
+
+impl CollectingSink {
+    fn next_seq(&mut self) -> u32 {
+        let seq = self.seq;
+        self.seq = self.seq.saturating_add(1);
+        seq
     }
 }
 
@@ -1298,10 +1858,14 @@ pub fn plot_geometry(document: &Document) -> PlotGeometry {
         geometry: PlotGeometry::default(),
         chord_tolerance: document.display_chord_tolerance(),
         stroke_mm: 0.0,
+        band: DrawBand::new(),
+        seq: 0,
     };
+    let paint = PaintList::from_entities(&document.model_space);
     let mut stack = Vec::new();
-    for entity in &document.model_space {
+    for (index, entity) in document.model_space.iter().enumerate() {
         let before = sink.geometry.strokes.len() + sink.geometry.fills.len();
+        sink.begin_entity_draw(paint.rank(&document.model_space, index), paint.span);
         vectorize_entity(
             document,
             entity,
@@ -1313,12 +1877,224 @@ pub fn plot_geometry(document: &Document) -> PlotGeometry {
             VectorVisibility::Plot,
             &mut sink,
         );
+        sink.end_entity_draw();
         let after = sink.geometry.strokes.len() + sink.geometry.fills.len();
         if after > before {
             sink.geometry.entities_written += 1;
         }
     }
     sink.geometry
+}
+
+fn emit_insert_children(
+    document: &Document,
+    entities: &[Entity],
+    transform: Transform2,
+    block_color: CadColor,
+    block_linetype: &str,
+    block_layer: &str,
+    stack: &mut Vec<String>,
+    visibility: VectorVisibility,
+    clip: &[Point2],
+    parent_hundredths: Option<i16>,
+    sink: &mut impl VectorSink,
+) {
+    let paint = PaintList::from_entities(entities);
+    for (index, child) in entities.iter().enumerate() {
+        sink.begin_entity_draw(paint.rank(entities, index), paint.span);
+        vectorize_entity_with_clip(
+            document,
+            child,
+            transform,
+            block_color,
+            block_linetype,
+            block_layer,
+            stack,
+            visibility,
+            clip,
+            parent_hundredths,
+            sink,
+        );
+        sink.end_entity_draw();
+    }
+}
+
+fn active_clip(inherited: &[Point2], own: Option<&[Point2]>) -> Vec<Point2> {
+    let own = own.filter(|points| points.len() >= 3);
+    match (inherited.len() >= 3, own) {
+        (true, Some(own)) => intersect_polygons(inherited, own),
+        (false, Some(own)) => own.to_vec(),
+        (true, None) => inherited.to_vec(),
+        (false, None) => Vec::new(),
+    }
+}
+
+fn xclip_frame_visible(document: &Document, filter_frame: bool, plot: bool) -> bool {
+    let mode = document
+        .xclip_frame
+        .unwrap_or(if filter_frame { 1 } else { 0 });
+    match mode {
+        0 => false,
+        2 => !plot,
+        _ => true,
+    }
+}
+
+struct ClipSink<'a> {
+    inner: &'a mut dyn VectorSink,
+    clip: &'a [Point2],
+}
+
+impl VectorSink for ClipSink<'_> {
+    fn path(
+        &mut self,
+        pts: &[Point2],
+        closed: bool,
+        _segs: &[PathSeg],
+        plinegen: bool,
+        rgb: Rgb,
+        linetype: &LineType,
+        scale: f64,
+    ) {
+        let mut points = pts.to_vec();
+        if closed && points.len() >= 2 {
+            points.push(points[0]);
+        }
+        for chain in clip_open_polyline(&points, self.clip) {
+            let segs = line_chain(&chain, false);
+            self.inner
+                .path(&chain, false, &segs, plinegen, rgb, linetype, scale);
+        }
+    }
+
+    fn fill(&mut self, pts: &[Point2], rgb: Rgb) {
+        let polygon = clip_polygon(pts, self.clip);
+        if polygon.len() >= 3 {
+            self.inner.fill(&polygon, rgb);
+        }
+    }
+
+    fn fill_mask(&mut self, pts: &[Point2]) {
+        let polygon = clip_polygon(pts, self.clip);
+        if polygon.len() >= 3 {
+            self.inner.fill_mask(&polygon);
+        }
+    }
+
+    fn fill_even_odd(&mut self, contours: &[Vec<Point2>], rgb: Rgb) {
+        let kept: Vec<Vec<Point2>> = contours
+            .iter()
+            .map(|contour| clip_polygon(contour, self.clip))
+            .filter(|contour| contour.len() >= 3)
+            .collect();
+        if !kept.is_empty() {
+            self.inner.fill_even_odd(&kept, rgb);
+        }
+    }
+
+    fn fill_gradient(&mut self, contours: &[Vec<Point2>], ramp: &crate::hatch::GradientRamp) {
+        let kept: Vec<Vec<Point2>> = contours
+            .iter()
+            .map(|contour| clip_polygon(contour, self.clip))
+            .filter(|contour| contour.len() >= 3)
+            .collect();
+        if !kept.is_empty() {
+            self.inner.fill_gradient(&kept, ramp);
+        }
+    }
+
+    fn pick_outline(&mut self, pts: &[Point2], closed: bool) {
+        let mut points = pts.to_vec();
+        if closed && points.len() >= 2 {
+            points.push(points[0]);
+        }
+        for chain in clip_open_polyline(&points, self.clip) {
+            self.inner.pick_outline(&chain, false);
+        }
+    }
+
+    fn stroke_mm(&mut self, mm: f64) {
+        self.inner.stroke_mm(mm);
+    }
+
+    fn wants_spans(&self) -> bool {
+        self.inner.wants_spans()
+    }
+
+    fn push_span(&mut self, label: &str) {
+        self.inner.push_span(label);
+    }
+
+    fn pop_span(&mut self) {
+        self.inner.pop_span();
+    }
+
+    fn begin_entity_draw(&mut self, rank: u32, span: u32) {
+        self.inner.begin_entity_draw(rank, span);
+    }
+
+    fn end_entity_draw(&mut self) {
+        self.inner.end_entity_draw();
+    }
+
+    fn for_plot(&self) -> bool {
+        self.inner.for_plot()
+    }
+}
+
+fn wipeout_frame_visible(document: &Document, plot: bool) -> bool {
+    match document.wipeout_frame {
+        0 => false,
+        2 => !plot,
+        _ => true,
+    }
+}
+
+fn wipeout_boundary(frame: &crate::entity::RasterFrame, transform: Transform2) -> Vec<Point2> {
+    let clip = rectangular_clip(&frame.clip);
+    if clip.len() >= 3 {
+        clip.iter()
+            .map(|point| transform.apply(clip_to_world(frame, point.x, point.y)))
+            .collect()
+    } else {
+        frame
+            .corners()
+            .iter()
+            .map(|corner| transform.apply(corner.xy()))
+            .collect()
+    }
+}
+
+/// A rectangular IMAGE/WIPEOUT clip is two opposite corners in pixel space.
+fn rectangular_clip(clip: &[Point2]) -> Vec<Point2> {
+    if clip.len() != 2 || !clip[0].is_finite() || !clip[1].is_finite() {
+        return clip.to_vec();
+    }
+    let (a, b) = (clip[0], clip[1]);
+    if (a.x - b.x).abs() <= 1e-9 && (a.y - b.y).abs() <= 1e-9 {
+        return Vec::new();
+    }
+    vec![
+        Point2::new(a.x, a.y),
+        Point2::new(b.x, a.y),
+        Point2::new(b.x, b.y),
+        Point2::new(a.x, b.y),
+    ]
+}
+
+fn clip_to_world(frame: &crate::entity::RasterFrame, x: f64, y: f64) -> Point2 {
+    let width = frame.size.x;
+    let height = frame.size.y;
+    let px = if width.abs() > 1e-12 { x / width } else { 0.0 };
+    let py = if height.abs() > 1e-12 {
+        y / height
+    } else {
+        0.0
+    };
+    Point2::new(
+        frame.corner.x + frame.u_vector.x * width * px + frame.v_vector.x * height * py,
+        frame.corner.y + frame.u_vector.y * width * px + frame.v_vector.y * height * py,
+    )
 }
 
 #[cfg(test)]
@@ -1330,6 +2106,17 @@ mod tests {
         MAX_HATCH_PATTERN_SEGMENTS,
     };
     use crate::stroke_font::{measure_styled_width, stroke_text, stroke_text_styled};
+
+    fn plain_mline(vertices: Vec<Point3>, closed: bool) -> Geometry {
+        Geometry::MLine {
+            vertices,
+            miters: Vec::new(),
+            closed,
+            scale: 1.0,
+            justification: 1,
+            offsets: Vec::new(),
+        }
+    }
 
     fn layer0(document: &mut Document) {
         document.layers.insert(
@@ -1369,6 +2156,29 @@ mod tests {
         assert!(extents.width() > 0.0 && extents.height() > 0.0);
         assert!(extents.min.x > 1000.0);
         assert!(stroke_has_text(&plot, "TAG"));
+    }
+
+    #[test]
+    fn rectangular_wipeout_clip_fills_the_two_corners() {
+        let mut document = Document::default();
+        layer0(&mut document);
+        document.add_entity(Entity::new(Geometry::Wipeout(crate::entity::RasterFrame {
+            corner: Point3::default(),
+            u_vector: Point3::from_xy(1.0, 0.0),
+            v_vector: Point3::from_xy(0.0, 1.0),
+            size: Point2::new(100.0, 100.0),
+            clip: vec![Point2::new(10.0, 20.0), Point2::new(30.0, 50.0)],
+            path: String::new(),
+        })));
+        let plot = plot_geometry(&document);
+        let contour = &plot.fills.first().expect("wipeout fill").contours[0];
+        assert_eq!(contour.len(), 4);
+        let has = |x: f64, y: f64| {
+            contour
+                .iter()
+                .any(|point| (point.x - x).abs() < 1e-6 && (point.y - y).abs() < 1e-6)
+        };
+        assert!(has(10.0, 20.0) && has(30.0, 20.0) && has(30.0, 50.0) && has(10.0, 50.0));
     }
 
     #[test]
@@ -1418,6 +2228,7 @@ mod tests {
             column_spacing: 0.0,
             row_spacing: 0.0,
             configuration: None,
+            clip: None,
         }));
         let plot = plot_geometry(&document);
         let placeholder = stroke_text(Point2::new(0.0, 1.0), 1.0, 0.0, "PLACEHOLDER");
@@ -1437,6 +2248,134 @@ mod tests {
         });
         assert!(!has_placeholder, "ATTDEF must not plot inside the insert");
         assert!(has_attrib, "ATTRIB value must plot");
+    }
+
+    #[test]
+    fn closed_mline_returns_to_the_first_vertex() {
+        let mut document = Document::default();
+        layer0(&mut document);
+        let vertices = vec![
+            Point3::from_xy(0.0, 0.0),
+            Point3::from_xy(10.0, 0.0),
+            Point3::from_xy(0.0, 10.0),
+        ];
+        document.add_entity(Entity::new(plain_mline(vertices.clone(), true)));
+        document.add_entity(Entity::new(plain_mline(vertices, false)));
+        let plot = plot_geometry(&document);
+        assert_eq!(
+            plot.strokes.iter().filter(|stroke| stroke.closed).count(),
+            1
+        );
+        assert_eq!(
+            plot.strokes.iter().filter(|stroke| !stroke.closed).count(),
+            1
+        );
+        assert!(plot.strokes.iter().all(|stroke| stroke.points.len() == 3));
+    }
+
+    #[test]
+    fn mline_offsets_are_drawn_at_scale() {
+        let mut document = Document::default();
+        layer0(&mut document);
+        document.add_entity(Entity::new(Geometry::MLine {
+            vertices: vec![Point3::from_xy(0.0, 0.0), Point3::from_xy(10.0, 0.0)],
+            miters: Vec::new(),
+            closed: false,
+            scale: 200.0,
+            justification: 1,
+            offsets: vec![0.5, -0.5],
+        }));
+        let plot = plot_geometry(&document);
+        let has = |y: f64| {
+            plot.strokes.iter().any(|stroke| {
+                stroke.points.len() == 2
+                    && stroke.points[0].distance(Point2::new(0.0, y)) < 1e-6
+                    && stroke.points[1].distance(Point2::new(10.0, y)) < 1e-6
+            })
+        };
+        assert!(has(100.0));
+        assert!(has(-100.0));
+    }
+
+    #[test]
+    fn closed_mline_closes_each_offset() {
+        let mut document = Document::default();
+        layer0(&mut document);
+        document.add_entity(Entity::new(Geometry::MLine {
+            vertices: vec![
+                Point3::from_xy(0.0, 0.0),
+                Point3::from_xy(10.0, 0.0),
+                Point3::from_xy(0.0, 10.0),
+            ],
+            miters: Vec::new(),
+            closed: true,
+            scale: 1.0,
+            justification: 1,
+            offsets: vec![1.0, -1.0],
+        }));
+        let plot = plot_geometry(&document);
+        assert_eq!(plot.strokes.len(), 2);
+        assert!(plot.strokes.iter().all(|stroke| stroke.closed));
+    }
+
+    #[test]
+    fn multileader_draws_the_landing_arrow_and_text() {
+        let mut document = Document::default();
+        layer0(&mut document);
+        document.add_entity(Entity::new(Geometry::MultiLeader {
+            lines: vec![crate::entity::LeaderLine {
+                points: vec![Point3::from_xy(0.0, 0.0)],
+                last_point: Some(Point3::from_xy(10.0, 0.0)),
+                dogleg: Some(Point3::from_xy(0.0, 1.0)),
+                dogleg_length: 4.0,
+                arrow_size: None,
+            }],
+            content: crate::entity::LeaderContent::Text {
+                value: "BUS".into(),
+                location: Point3::from_xy(10.0, 8.0),
+                height: 2.0,
+                rotation: 0.0,
+                width: 0.0,
+                frame: false,
+            },
+            arrow_size: 2.0,
+        }));
+        let plot = plot_geometry(&document);
+        let leader = plot.strokes.iter().find(|stroke| {
+            stroke.points.len() == 3
+                && stroke.points[0].distance(Point2::new(0.0, 0.0)) < 1e-6
+                && stroke.points[1].distance(Point2::new(10.0, 0.0)) < 1e-6
+                && stroke.points[2].distance(Point2::new(10.0, 4.0)) < 1e-6
+        });
+        assert!(leader.is_some(), "leader segment and dogleg");
+        assert!(plot.fills.iter().any(|fill| {
+            fill.contours
+                .iter()
+                .flatten()
+                .any(|point| point.distance(Point2::new(0.0, 0.0)) < 1e-6)
+        }));
+        let text = stroke_text(Point2::new(10.0, 6.0), 2.0, 0.0, "BUS");
+        assert!(!text.is_empty());
+        assert!(plot.strokes.iter().any(|stroke| {
+            stroke
+                .points
+                .first()
+                .is_some_and(|point| point.distance(text[0][0]) < 1e-6)
+        }));
+    }
+
+    #[test]
+    fn region_strokes_its_wires_and_an_empty_region_draws_nothing() {
+        let mut document = Document::default();
+        layer0(&mut document);
+        document.add_entity(Entity::new(Geometry::Region {
+            wires: vec![vec![Point3::from_xy(0.0, 0.0), Point3::from_xy(4.0, 0.0)]],
+        }));
+        document.add_entity(Entity::new(Geometry::Region { wires: Vec::new() }));
+        let plot = plot_geometry(&document);
+        assert_eq!(plot.strokes.len(), 1);
+        assert!(plot.strokes[0].points[0].distance(Point2::new(0.0, 0.0)) < 1e-6);
+        assert!(plot.strokes[0].points[1].distance(Point2::new(4.0, 0.0)) < 1e-6);
     }
 
     #[test]
@@ -1502,21 +2441,29 @@ mod tests {
                             point: Point3::from_xy(0.0, 0.0),
                             bulge: 0.0,
                             vertex_id: Default::default(),
+                            start_width: 0.0,
+                            end_width: 0.0,
                         },
                         PolyVertex {
                             point: Point3::from_xy(10.0, 0.0),
                             bulge: 0.0,
                             vertex_id: Default::default(),
+                            start_width: 0.0,
+                            end_width: 0.0,
                         },
                         PolyVertex {
                             point: Point3::from_xy(10.0, 10.0),
                             bulge: 0.0,
                             vertex_id: Default::default(),
+                            start_width: 0.0,
+                            end_width: 0.0,
                         },
                         PolyVertex {
                             point: Point3::from_xy(0.0, 10.0),
                             bulge: 0.0,
                             vertex_id: Default::default(),
+                            start_width: 0.0,
+                            end_width: 0.0,
                         },
                     ],
                     closed: true,
@@ -1527,21 +2474,29 @@ mod tests {
                             point: Point3::from_xy(3.0, 3.0),
                             bulge: 0.0,
                             vertex_id: Default::default(),
+                            start_width: 0.0,
+                            end_width: 0.0,
                         },
                         PolyVertex {
                             point: Point3::from_xy(7.0, 3.0),
                             bulge: 0.0,
                             vertex_id: Default::default(),
+                            start_width: 0.0,
+                            end_width: 0.0,
                         },
                         PolyVertex {
                             point: Point3::from_xy(7.0, 7.0),
                             bulge: 0.0,
                             vertex_id: Default::default(),
+                            start_width: 0.0,
+                            end_width: 0.0,
                         },
                         PolyVertex {
                             point: Point3::from_xy(3.0, 7.0),
                             bulge: 0.0,
                             vertex_id: Default::default(),
+                            start_width: 0.0,
+                            end_width: 0.0,
                         },
                     ],
                     closed: true,
@@ -1713,6 +2668,8 @@ mod tests {
                     point: Point3::from_xy(x, y),
                     bulge: 0.0,
                     vertex_id: Default::default(),
+                    start_width: 0.0,
+                    end_width: 0.0,
                 })
                 .collect(),
             closed: true,
@@ -1937,6 +2894,7 @@ mod tests {
             column_spacing: 0.0,
             row_spacing: 0.0,
             configuration: None,
+            clip: None,
         }));
         let transform = Transform2::block_insert(
             Point3::from_xy(100.0, 200.0),
@@ -2019,6 +2977,7 @@ mod tests {
             column_spacing: 0.0,
             row_spacing: 0.0,
             configuration: None,
+            clip: None,
         });
         insert.layer = layer.to_string();
         insert.color = color;
@@ -2109,5 +3068,236 @@ mod tests {
                 .first()
                 .is_some_and(|start| start.distance(point) < 1e-6)
         })
+    }
+
+    fn unit_square(half: f64) -> Vec<Point2> {
+        vec![
+            Point2::new(-half, -half),
+            Point2::new(half, -half),
+            Point2::new(half, half),
+            Point2::new(-half, half),
+        ]
+    }
+
+    fn bar_document(clip: Option<crate::entity::SpatialClip>) -> Document {
+        let mut document = Document::default();
+        layer0(&mut document);
+        document.xclip_frame = Some(0);
+        document.blocks.insert(
+            "BAR".into(),
+            BlockDefinition {
+                name: "BAR".into(),
+                base_pt: Point3::default(),
+                entities: vec![Entity::new(Geometry::Line {
+                    start: Point3::from_xy(-10.0, 0.0),
+                    end: Point3::from_xy(10.0, 0.0),
+                })],
+                ..Default::default()
+            },
+        );
+        document.add_entity(Entity::new(Geometry::Insert {
+            block_name: "BAR".into(),
+            insertion: Point3::default(),
+            scale: Point3::new(1.0, 1.0, 1.0),
+            rotation: 0.0,
+            extrusion: default_extrusion(),
+            attribs: Vec::new(),
+            column_count: 1,
+            row_count: 1,
+            column_spacing: 0.0,
+            row_spacing: 0.0,
+            configuration: None,
+            clip,
+        }));
+        document
+    }
+
+    fn has_open_segment(plot: &PlotGeometry, x0: f64, x1: f64) -> bool {
+        plot.strokes.iter().any(|stroke| {
+            if stroke.closed || stroke.points.len() != 2 {
+                return false;
+            }
+            let a = stroke.points[0].x.min(stroke.points[1].x);
+            let b = stroke.points[0].x.max(stroke.points[1].x);
+            (a - x0).abs() < 1e-6
+                && (b - x1).abs() < 1e-6
+                && stroke.points.iter().all(|point| point.y.abs() < 1e-6)
+        })
+    }
+
+    #[test]
+    fn xclip_keeps_only_the_line_inside_the_boundary() {
+        let document = bar_document(Some(crate::entity::SpatialClip::new(unit_square(1.0))));
+        let plot = plot_geometry(&document);
+        assert!(has_open_segment(&plot, -1.0, 1.0), "{:?}", plot.strokes);
+        assert!(
+            plot.strokes.iter().all(|stroke| stroke
+                .points
+                .iter()
+                .all(|point| point.x.abs() <= 1.0 + 1e-6)),
+            "{:?}",
+            plot.strokes
+        );
+    }
+
+    #[test]
+    fn nested_xclip_draws_the_intersection() {
+        let mut document = Document::default();
+        layer0(&mut document);
+        document.xclip_frame = Some(0);
+        document.blocks.insert(
+            "BAR".into(),
+            BlockDefinition {
+                name: "BAR".into(),
+                base_pt: Point3::default(),
+                entities: vec![Entity::new(Geometry::Line {
+                    start: Point3::from_xy(-10.0, 0.0),
+                    end: Point3::from_xy(10.0, 0.0),
+                })],
+                ..Default::default()
+            },
+        );
+        document.blocks.insert(
+            "OUTER".into(),
+            BlockDefinition {
+                name: "OUTER".into(),
+                base_pt: Point3::default(),
+                entities: vec![Entity::new(Geometry::Insert {
+                    block_name: "BAR".into(),
+                    insertion: Point3::default(),
+                    scale: Point3::new(1.0, 1.0, 1.0),
+                    rotation: 0.0,
+                    extrusion: default_extrusion(),
+                    attribs: Vec::new(),
+                    column_count: 1,
+                    row_count: 1,
+                    column_spacing: 0.0,
+                    row_spacing: 0.0,
+                    configuration: None,
+                    clip: Some(crate::entity::SpatialClip::new(unit_square(0.5))),
+                })],
+                ..Default::default()
+            },
+        );
+        document.add_entity(Entity::new(Geometry::Insert {
+            block_name: "OUTER".into(),
+            insertion: Point3::default(),
+            scale: Point3::new(1.0, 1.0, 1.0),
+            rotation: 0.0,
+            extrusion: default_extrusion(),
+            attribs: Vec::new(),
+            column_count: 1,
+            row_count: 1,
+            column_spacing: 0.0,
+            row_spacing: 0.0,
+            configuration: None,
+            clip: Some(crate::entity::SpatialClip::new(unit_square(1.0))),
+        }));
+        let plot = plot_geometry(&document);
+        assert!(has_open_segment(&plot, -0.5, 0.5), "{:?}", plot.strokes);
+        assert!(
+            !has_open_segment(&plot, -1.0, 1.0),
+            "parent clip alone would keep the wider segment: {:?}",
+            plot.strokes
+        );
+    }
+
+    #[test]
+    fn xclip_frame_follows_the_header_on_screen_and_on_the_plot() {
+        let mut document = bar_document(Some(crate::entity::SpatialClip::new(unit_square(1.0))));
+        let framed = |plot: &PlotGeometry| {
+            plot.strokes
+                .iter()
+                .any(|stroke| stroke.closed && stroke.points.len() == 4)
+        };
+        document.xclip_frame = Some(0);
+        assert!(!framed(&plot_geometry(&document)));
+        document.xclip_frame = Some(1);
+        assert!(framed(&plot_geometry(&document)));
+        document.xclip_frame = Some(2);
+        assert!(!framed(&plot_geometry(&document)));
+        assert!(xclip_frame_visible(&document, true, false));
+        assert!(!xclip_frame_visible(&document, true, true));
+        document.xclip_frame = None;
+        assert!(xclip_frame_visible(&document, true, true));
+        assert!(!xclip_frame_visible(&document, false, false));
+    }
+
+    #[test]
+    fn xclip_array_cells_use_their_own_boundary() {
+        let mut document = bar_document(Some(crate::entity::SpatialClip::new(unit_square(1.0))));
+        let Geometry::Insert {
+            column_count,
+            column_spacing,
+            ..
+        } = &mut document.model_space[0].geometry
+        else {
+            panic!("insert");
+        };
+        *column_count = 2;
+        *column_spacing = 20.0;
+        let plot = plot_geometry(&document);
+        assert!(has_open_segment(&plot, -1.0, 1.0), "{:?}", plot.strokes);
+        assert!(has_open_segment(&plot, 19.0, 21.0), "{:?}", plot.strokes);
+    }
+
+    fn stroke_widths(document: &Document) -> Vec<f64> {
+        plot_geometry(document)
+            .strokes
+            .iter()
+            .map(|stroke| stroke.width_mm)
+            .collect()
+    }
+
+    #[test]
+    fn default_and_byblock_lineweights_resolve_to_millimetres() {
+        let mut document = Document::default();
+        layer0(&mut document);
+        document.lwdisplay = false;
+        let mut fallback = Entity::new(Geometry::Line {
+            start: Point3::from_xy(0.0, 0.0),
+            end: Point3::from_xy(10.0, 0.0),
+        });
+        fallback.lineweight = crate::LINEWEIGHT_DEFAULT;
+        document.add_entity(fallback);
+        let mut hairline = Entity::new(Geometry::Line {
+            start: Point3::from_xy(0.0, 2.0),
+            end: Point3::from_xy(10.0, 2.0),
+        });
+        hairline.lineweight = 0;
+        document.add_entity(hairline);
+        let mut child = Entity::new(Geometry::Line {
+            start: Point3::from_xy(0.0, 0.0),
+            end: Point3::from_xy(4.0, 0.0),
+        });
+        child.lineweight = crate::LINEWEIGHT_BYBLOCK;
+        document.blocks.insert(
+            "BAR".into(),
+            BlockDefinition {
+                name: "BAR".into(),
+                entities: vec![child],
+                ..BlockDefinition::default()
+            },
+        );
+        let mut insert = Entity::new(Geometry::Insert {
+            block_name: "BAR".into(),
+            insertion: Point3::from_xy(0.0, 4.0),
+            scale: Point3::new(1.0, 1.0, 1.0),
+            rotation: 0.0,
+            extrusion: default_extrusion(),
+            attribs: Vec::new(),
+            column_count: 1,
+            row_count: 1,
+            column_spacing: 0.0,
+            row_spacing: 0.0,
+            configuration: None,
+            clip: None,
+        });
+        insert.lineweight = 100;
+        document.add_entity(insert);
+        let widths = stroke_widths(&document);
+        assert!((widths[0] - 0.25).abs() < 1e-9, "{widths:?}");
+        assert_eq!(widths[1], 0.0, "{widths:?}");
+        assert!((widths[2] - 1.0).abs() < 1e-9, "{widths:?}");
     }
 }

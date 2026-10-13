@@ -90,21 +90,23 @@ mod tests {
         }
         let detail = missing
             .iter()
-            .map(|(ch, path, line)| {
-                format!(
-                    "  {ch} U+{code:04X} {path}:{line}",
-                    code = *ch as u32
-                )
-            })
+            .map(|(ch, path, line)| format!("  {ch} U+{code:04X} {path}:{line}", code = *ch as u32))
             .collect::<Vec<_>>()
             .join("\n");
         panic!("UI text uses characters no bundled proportional font can draw:\n{detail}");
     }
 
-    fn visit_sources(dir: &Path, faces: &[ttf_parser::Face<'_>], missing: &mut Vec<(char, String, usize)>) {
-        let entries = fs::read_dir(dir).unwrap_or_else(|err| panic!("could not read {}: {err}", dir.display()));
+    fn visit_sources(
+        dir: &Path,
+        faces: &[ttf_parser::Face<'_>],
+        missing: &mut Vec<(char, String, usize)>,
+    ) {
+        let entries = fs::read_dir(dir)
+            .unwrap_or_else(|err| panic!("could not read {}: {err}", dir.display()));
         for entry in entries {
-            let entry = entry.unwrap_or_else(|err| panic!("could not read an entry in {}: {err}", dir.display()));
+            let entry = entry.unwrap_or_else(|err| {
+                panic!("could not read an entry in {}: {err}", dir.display())
+            });
             let path = entry.path();
             if path.is_dir() {
                 visit_sources(&path, faces, missing);

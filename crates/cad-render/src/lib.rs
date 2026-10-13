@@ -4,6 +4,17 @@
 /// window stays at one sample; this value is only the starting choice.
 pub const VIEWPORT_MSAA_SAMPLES: u32 = 4;
 
+/// AutoCAD Dark theme, 2D model space, uniform background (RGB 33, 40, 48).
+pub const VIEWPORT_CLEAR_RGB: [u8; 3] = [33, 40, 48];
+
+/// Model-space clear color. Wipeouts fill with this so they cover what is behind them.
+pub const VIEWPORT_CLEAR: [f32; 4] = [
+    VIEWPORT_CLEAR_RGB[0] as f32 / 255.0,
+    VIEWPORT_CLEAR_RGB[1] as f32 / 255.0,
+    VIEWPORT_CLEAR_RGB[2] as f32 / 255.0,
+    1.0,
+];
+
 pub mod dash;
 pub mod gpu;
 pub mod pick;
@@ -22,8 +33,8 @@ pub use pick::{
 };
 pub use tessellate::{
     merge_vertex_ranges, overlay_batches, tessellate_document, tessellate_document_for_block_edit,
-    AppendedGeometry, BlockEditView, BlockEditViewFrame, DisplayList, EntityDrawRange, GpuVertex,
-    OverlayBatches,
+    tessellate_document_for_block_edit_on, tessellate_document_on, AppendedGeometry, BlockEditView,
+    BlockEditViewFrame, DisplayList, EntityDrawRange, GpuVertex, OverlayBatches, WeightVertex,
 };
 
 #[cfg(test)]

@@ -9,13 +9,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
+use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use cad_core::{
-    is_paper_layout_block, nearest_aci, sorted_paper_layout_blocks, BlockDefinition, CadColor,
-    DimensionData, DimensionKind, Document, DrawingUnits, Entity, Extents2, Geometry, HatchData,
-    HatchEdge, HatchPath, Layer, LineType, LineTypeShape, MTextData, Point3, PolyVertex,
-    RasterFrame, TextData, TextStyle, ViewportData,
+    is_paper_layout_block, mline_offset_polylines, nearest_aci, sorted_paper_layout_blocks,
+    BlockDefinition, CadColor, DimensionData, DimensionKind, Document, DrawingUnits, Entity,
+    Extents2, Geometry, HatchData, HatchEdge, HatchPath, Layer, LeaderContent, LineType,
+    LineTypeShape, MTextData, Point3, PolyVertex, RasterFrame, SpatialClip, TextData, TextStyle,
+    ViewportData,
 };
 
 use crate::error::ExportError;
@@ -30,6 +32,85 @@ const WORLD: Point3 = Point3 {
 
 /// Extra view around the drawing so the opening view is not flush with the edges.
 const VIEW_PAD: f64 = 0.05;
+
+/// `$LWDISPLAY` and `$LWDEFAULT` from an ASCII DXF header.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DxfLineweightHeader {
+    pub lwdisplay: Option<bool>,
+    pub lwdefault: Option<i16>,
+}
+
+/// Read the two lineweight header variables. Stops at the end of HEADER.
+pub fn read_dxf_lineweight_header(text: &str) -> DxfLineweightHeader {
+    parse_lineweight_pairs(text.lines().map(str::trim))
+}
+
+/// Read the header from a DXF file without loading the entity section.
+pub fn read_dxf_lineweight_header_file(path: &Path) -> std::io::Result<DxfLineweightHeader> {
+    let file = std::fs::File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut text = String::new();
+    let mut saw_header = false;
+    for (index, line) in reader.lines().enumerate() {
+        if index >= 20_000 {
+            break;
+        }
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed == "HEADER" {
+            saw_header = true;
+        }
+        text.push_str(trimmed);
+        text.push('\n');
+        if saw_header && trimmed == "ENDSEC" {
+            break;
+        }
+    }
+    Ok(read_dxf_lineweight_header(&text))
+}
+
+fn parse_lineweight_pairs<'a>(lines: impl Iterator<Item = &'a str>) -> DxfLineweightHeader {
+    let mut header = DxfLineweightHeader::default();
+    let mut lines = lines;
+    let mut in_header = false;
+    while let Some(code) = lines.next() {
+        let Some(value) = lines.next() else {
+            break;
+        };
+        if code == "0" && value == "ENDSEC" && in_header {
+            break;
+        }
+        if code == "2" && value == "HEADER" {
+            in_header = true;
+            continue;
+        }
+        if !in_header {
+            continue;
+        }
+        if code == "9" && value.eq_ignore_ascii_case("$LWDISPLAY") {
+            let Some(next_code) = lines.next() else {
+                break;
+            };
+            let Some(next_value) = lines.next() else {
+                break;
+            };
+            if next_code == "290" {
+                header.lwdisplay = Some(next_value != "0");
+            }
+        } else if code == "9" && value.eq_ignore_ascii_case("$LWDEFAULT") {
+            let Some(next_code) = lines.next() else {
+                break;
+            };
+            let Some(next_value) = lines.next() else {
+                break;
+            };
+            if next_code == "370" {
+                header.lwdefault = next_value.parse().ok();
+            }
+        }
+    }
+    header
+}
 
 // ------------------------------------------------------------
 // Function: write_dxf
@@ -106,6 +187,16 @@ struct DxfWriter<'a> {
     paper_entity: bool,
     nonfinite: bool,
     export_extents: Option<Extents2>,
+    pending_xdict: Option<String>,
+    spatial_filters: Vec<PendingSpatial>,
+}
+
+struct PendingSpatial {
+    owner: String,
+    xdict: String,
+    filter_dict: String,
+    filter: String,
+    clip: SpatialClip,
 }
 
 impl<'a> DxfWriter<'a> {
@@ -132,6 +223,8 @@ impl<'a> DxfWriter<'a> {
             paper_entity: false,
             nonfinite: false,
             export_extents: None,
+            pending_xdict: None,
+            spatial_filters: Vec::new(),
         }
     }
 
@@ -232,7 +325,13 @@ impl<'a> DxfWriter<'a> {
         self.pair(2, "STANDARD");
         self.write_dim_header();
         self.pair(9, "$LWDISPLAY");
-        self.pair_i(290, 0);
+        self.pair_i(290, i32::from(self.document.lwdisplay));
+        self.pair(9, "$LWDEFAULT");
+        self.pair_i(370, i32::from(self.document.lwdefault));
+        if let Some(frame) = self.document.xclip_frame {
+            self.pair(9, "$XCLIPFRAME");
+            self.pair_i(290, i32::from(frame));
+        }
         self.pair(9, "$LTSCALE");
         self.pair_f(40, self.document.ltscale.max(1e-12));
         self.write_system_header();
@@ -307,6 +406,7 @@ impl<'a> DxfWriter<'a> {
         self.write_class("ACDBDICTIONARYWDFLT", "AcDbDictionaryWithDefault", 0);
         self.write_class("ACDBPLACEHOLDER", "AcDbPlaceHolder", 0);
         self.write_class("LAYOUT", "AcDbLayout", 0);
+        self.write_class("SPATIAL_FILTER", "AcDbSpatialFilter", 0);
         self.pair(0, "ENDSEC");
     }
 
@@ -1020,8 +1120,12 @@ impl<'a> DxfWriter<'a> {
                         self.pair_f(38, elevation);
                     }
                     self.extrusion(*extrusion);
+                    let constant = self.constant_polyline_width(vertices);
+                    if let Some(width) = constant {
+                        self.pair_f(43, width);
+                    }
                     for vertex in vertices {
-                        self.write_lw_vertex(vertex);
+                        self.write_lw_vertex(vertex, constant.is_some());
                     }
                     self.report.entities_written += 1;
                 }
@@ -1108,13 +1212,32 @@ impl<'a> DxfWriter<'a> {
                 row_spacing,
                 attribs,
                 configuration: _,
+                clip,
             } => {
                 if self.block_by_name(block_name).is_none() {
                     self.warn(&format!(
                         "INSERT '{block_name}' references a missing block; the INSERT was still written"
                     ));
                 }
+                if let Some(clip) = clip.as_ref().filter(|item| item.is_active()) {
+                    let xdict = self.next_handle();
+                    let filter_dict = self.next_handle();
+                    let filter = self.next_handle();
+                    self.pending_xdict = Some(xdict.clone());
+                    self.spatial_filters.push(PendingSpatial {
+                        owner: String::new(),
+                        xdict,
+                        filter_dict,
+                        filter,
+                        clip: clip.clone(),
+                    });
+                }
                 let insert_handle = self.begin_entity("INSERT", entity);
+                if let Some(pending) = self.spatial_filters.last_mut() {
+                    if pending.owner.is_empty() {
+                        pending.owner = insert_handle.clone();
+                    }
+                }
                 self.pair(2, &export_block_name(block_name));
                 self.point(10, *insertion);
                 self.pair_f(41, scale.x);
@@ -1199,9 +1322,28 @@ impl<'a> DxfWriter<'a> {
                     self.report.entities_written += 1;
                 }
             }
-            Geometry::MLine { vertices, closed } => {
-                self.write_mline_as_lines(entity, vertices, *closed)
-            }
+            Geometry::MLine {
+                vertices,
+                miters,
+                closed,
+                scale,
+                justification,
+                offsets,
+            } => self.write_mline_as_lines(
+                entity,
+                vertices,
+                miters,
+                *closed,
+                *scale,
+                *justification,
+                offsets,
+            ),
+            Geometry::MultiLeader {
+                lines,
+                content,
+                arrow_size: _,
+            } => self.write_multileader(entity, lines, content),
+            Geometry::Region { wires } => self.write_region_wires(entity, wires),
             Geometry::Viewport(viewport) => self.write_viewport(entity, viewport),
             Geometry::Image(frame) => self.write_raster(entity, "IMAGE", frame),
             Geometry::Wipeout(frame) => self.write_raster(entity, "WIPEOUT", frame),
@@ -1242,6 +1384,10 @@ impl<'a> DxfWriter<'a> {
             self.pair(100, "AcDbVertex");
             self.pair(100, "AcDb2dVertex");
             self.point(10, vertex.point);
+            if vertex.start_width > 1e-12 || vertex.end_width > 1e-12 {
+                self.pair_f(40, vertex.start_width);
+                self.pair_f(41, vertex.end_width);
+            }
             if vertex.bulge.abs() > 1e-15 {
                 self.pair_f(42, vertex.bulge);
             }
@@ -1290,24 +1436,118 @@ impl<'a> DxfWriter<'a> {
         self.report.entities_written += 1;
     }
 
-    fn write_mline_as_lines(&mut self, entity: &Entity, vertices: &[Point3], closed: bool) {
-        if vertices.len() < 2 {
+    fn write_mline_as_lines(
+        &mut self,
+        entity: &Entity,
+        vertices: &[Point3],
+        miters: &[Point3],
+        closed: bool,
+        scale: f64,
+        justification: u8,
+        offsets: &[f64],
+    ) {
+        let lines = mline_offset_polylines(vertices, miters, closed, scale, justification, offsets);
+        if lines.is_empty() {
             self.warn("MLINE with fewer than two vertices was not written");
             return;
         }
-        let count = if closed {
-            vertices.len()
-        } else {
-            vertices.len().saturating_sub(1)
-        };
         self.warn("MLINE exported as LINE segments");
-        for i in 0..count {
-            let start = vertices[i];
-            let end = vertices[(i + 1) % vertices.len()];
-            self.begin_entity("LINE", entity);
-            self.point(10, start);
-            self.point(11, end);
+        for line in &lines {
+            let count = if closed && line.len() >= 3 {
+                line.len()
+            } else {
+                line.len().saturating_sub(1)
+            };
+            for i in 0..count {
+                self.begin_entity("LINE", entity);
+                self.point(10, line[i]);
+                self.point(11, line[(i + 1) % line.len()]);
+                self.report.entities_written += 1;
+            }
+        }
+    }
+
+    fn write_multileader(
+        &mut self,
+        entity: &Entity,
+        lines: &[cad_core::LeaderLine],
+        content: &LeaderContent,
+    ) {
+        self.warn("MULTILEADER exported as leader geometry and text");
+        for line in lines {
+            let points = line.polyline();
+            if points.len() < 2 {
+                continue;
+            }
+            self.begin_entity("LEADER", entity);
+            self.pair(3, "STANDARD");
+            self.pair_i(71, 1);
+            self.pair_i(72, 0);
+            self.pair_i(73, 3);
+            self.pair_i(74, 0);
+            self.pair_i(75, 0);
+            self.pair_f(40, 0.0);
+            self.pair_f(41, 0.0);
+            self.pair_i(76, points.len() as i32);
+            for point in &points {
+                self.point(10, *point);
+            }
+            self.point(210, WORLD);
             self.report.entities_written += 1;
+        }
+        match content {
+            LeaderContent::Text {
+                value,
+                location,
+                height,
+                rotation,
+                width,
+                ..
+            } if !value.is_empty() => {
+                self.write_mtext(
+                    entity,
+                    &MTextData {
+                        insertion: *location,
+                        height: *height,
+                        rotation: *rotation,
+                        width: *width,
+                        value: value.clone(),
+                        ..MTextData::default()
+                    },
+                );
+                self.report.entities_written += 1;
+            }
+            LeaderContent::Block {
+                name,
+                location,
+                scale,
+                rotation,
+            } => {
+                self.begin_entity("INSERT", entity);
+                self.pair(2, &export_block_name(name));
+                self.point(10, *location);
+                self.pair_f(41, scale.x);
+                self.pair_f(42, scale.y);
+                self.pair_f(43, scale.z);
+                self.pair_f(50, rotation.to_degrees());
+                self.report.entities_written += 1;
+            }
+            _ => {}
+        }
+    }
+
+    fn write_region_wires(&mut self, entity: &Entity, wires: &[Vec<Point3>]) {
+        self.warn("REGION exported as its wire outline");
+        for wire in wires {
+            if wire.len() < 2 {
+                continue;
+            }
+            for index in 0..wire.len() - 1 {
+                self.begin_entity("LINE", entity);
+                self.point(10, wire[index]);
+                self.point(11, wire[index + 1]);
+                self.report.entities_written += 1;
+            }
         }
     }
 
@@ -1318,18 +1558,14 @@ impl<'a> DxfWriter<'a> {
         let vertices: Vec<PolyVertex> = frame
             .corners()
             .into_iter()
-            .map(|point| PolyVertex {
-                point,
-                bulge: 0.0,
-                vertex_id: Default::default(),
-            })
+            .map(|point| PolyVertex::new(point, 0.0))
             .collect();
         self.begin_entity("LWPOLYLINE", entity);
         self.pair_i(90, vertices.len() as i32);
         self.pair_i(70, 1);
         self.extrusion(Point3::new(0.0, 0.0, 1.0));
         for vertex in &vertices {
-            self.write_lw_vertex(vertex);
+            self.write_lw_vertex(vertex, true);
         }
         self.report.entities_written += 1;
     }
@@ -1712,6 +1948,11 @@ impl<'a> DxfWriter<'a> {
         if entity.lineweight != cad_core::LINEWEIGHT_BYLAYER {
             self.pair_i(370, i32::from(entity.lineweight));
         }
+        if let Some(handle) = self.pending_xdict.take() {
+            self.pair(102, "{ACAD_XDICTIONARY");
+            self.pair(360, &handle);
+            self.pair(102, "}");
+        }
         self.pair(100, class_name);
         handle
     }
@@ -1784,7 +2025,53 @@ impl<'a> DxfWriter<'a> {
         // LibreDWG's PLACEHOLDER has no subclass. Group 100 AcDbPlaceHolder
         // makes dxf_read reject the whole drawing.
         self.begin_object("ACDBPLACEHOLDER", &placeholder, &plotstyle);
+        let filters = std::mem::take(&mut self.spatial_filters);
+        for pending in filters {
+            self.write_spatial_filter(&pending);
+        }
         self.pair(0, "ENDSEC");
+    }
+
+    fn write_spatial_filter(&mut self, pending: &PendingSpatial) {
+        self.begin_object("DICTIONARY", &pending.xdict, &pending.owner);
+        self.pair(100, "AcDbDictionary");
+        self.pair_i(280, 1);
+        self.pair_i(281, 1);
+        self.hard_dict_entry("ACAD_FILTER", &pending.filter_dict);
+
+        self.begin_object("DICTIONARY", &pending.filter_dict, &pending.xdict);
+        self.pair(100, "AcDbDictionary");
+        self.pair_i(280, 1);
+        self.pair_i(281, 1);
+        self.hard_dict_entry("SPATIAL", &pending.filter);
+
+        self.begin_object("SPATIAL_FILTER", &pending.filter, &pending.filter_dict);
+        self.pair(100, "AcDbFilter");
+        self.pair(100, "AcDbSpatialFilter");
+        self.pair_i(70, pending.clip.boundary.len() as i32);
+        // LibreDWG reads SPATIAL_FILTER vertices from groups 11/21. Group 10
+        // leaves the first X at 0, and a following origin (also group 11)
+        // is appended as another vertex.
+        for point in &pending.clip.boundary {
+            self.pair_f(11, point.x);
+            self.pair_f(21, point.y);
+        }
+        self.point(210, pending.clip.extrusion);
+        self.pair_i(71, i32::from(pending.clip.frame_on));
+        self.pair_i(72, i32::from(pending.clip.front_clip.is_some()));
+        if let Some(distance) = pending.clip.front_clip {
+            self.pair_f(40, distance);
+        }
+        self.pair_i(73, i32::from(pending.clip.back_clip.is_some()));
+        if let Some(distance) = pending.clip.back_clip {
+            self.pair_f(41, distance);
+        }
+        for value in pending.clip.inverse_transform {
+            self.pair_f(40, value);
+        }
+        for value in pending.clip.transform {
+            self.pair_f(40, value);
+        }
     }
 
     fn begin_object(&mut self, kind: &str, handle: &str, owner: &str) {
@@ -1796,6 +2083,12 @@ impl<'a> DxfWriter<'a> {
     fn dict_entry(&mut self, name: &str, handle: &str) {
         self.pair(3, name);
         self.pair(350, handle);
+    }
+
+    /// ACAD_FILTER and SPATIAL are hard owners. LibreDWG only keeps a 360 pointer.
+    fn hard_dict_entry(&mut self, name: &str, handle: &str) {
+        self.pair(3, name);
+        self.pair(360, handle);
     }
 
     fn write_viewport(&mut self, entity: &Entity, viewport: &ViewportData) {
@@ -1924,9 +2217,28 @@ impl<'a> DxfWriter<'a> {
         self.pair(6, "CONTINUOUS");
     }
 
-    fn write_lw_vertex(&mut self, vertex: &PolyVertex) {
+    fn constant_polyline_width(&self, vertices: &[PolyVertex]) -> Option<f64> {
+        let first = vertices.first()?;
+        let width = first.start_width;
+        if width <= 1e-12 || (first.end_width - width).abs() > 1e-9 {
+            return None;
+        }
+        vertices
+            .iter()
+            .all(|vertex| {
+                (vertex.start_width - width).abs() <= 1e-9
+                    && (vertex.end_width - width).abs() <= 1e-9
+            })
+            .then_some(width)
+    }
+
+    fn write_lw_vertex(&mut self, vertex: &PolyVertex, constant_width: bool) {
         self.pair_f(10, vertex.point.x);
         self.pair_f(20, vertex.point.y);
+        if !constant_width && (vertex.start_width > 1e-12 || vertex.end_width > 1e-12) {
+            self.pair_f(40, vertex.start_width);
+            self.pair_f(41, vertex.end_width);
+        }
         if vertex.bulge.abs() > 1e-15 {
             self.pair_f(42, vertex.bulge);
         }
@@ -2763,11 +3075,15 @@ mod tests {
                     point: Point3::from_xy(1.0, 2.0),
                     bulge: 0.0,
                     vertex_id: Default::default(),
+                    start_width: 0.0,
+                    end_width: 0.0,
                 },
                 PolyVertex {
                     point: Point3::from_xy(4.0, 2.0),
                     bulge: 0.0,
                     vertex_id: Default::default(),
+                    start_width: 0.0,
+                    end_width: 0.0,
                 },
             ],
             closed: false,
@@ -2792,11 +3108,15 @@ mod tests {
                     point: Point3::from_xy(0.0, 0.0),
                     bulge: 0.5,
                     vertex_id: Default::default(),
+                    start_width: 0.0,
+                    end_width: 0.0,
                 },
                 PolyVertex {
                     point: Point3::from_xy(2.0, 0.0),
                     bulge: 0.0,
                     vertex_id: Default::default(),
+                    start_width: 0.0,
+                    end_width: 0.0,
                 },
             ],
             closed: true,
@@ -2897,7 +3217,11 @@ mod tests {
         let mut document = Document::default();
         document.add_entity(Entity::new(Geometry::MLine {
             vertices: vec![Point3::from_xy(0.0, 0.0), Point3::from_xy(1.0, 0.0)],
+            miters: Vec::new(),
             closed: false,
+            scale: 1.0,
+            justification: 1,
+            offsets: Vec::new(),
         }));
         let (report, text) = write_to_string(&document);
         assert_eq!(report.entities_written, 1);
@@ -2907,6 +3231,29 @@ mod tests {
             .any(|warning| warning.contains("MLINE")));
         assert!(entities_section(&text).contains("LINE"));
         assert!(!entities_section(&text).contains("  0\nMLINE"));
+    }
+
+    #[test]
+    fn mline_export_writes_each_offset_line() {
+        let mut document = Document::default();
+        document.add_entity(Entity::new(Geometry::MLine {
+            vertices: vec![Point3::from_xy(0.0, 0.0), Point3::from_xy(10.0, 0.0)],
+            miters: Vec::new(),
+            closed: false,
+            scale: 200.0,
+            justification: 1,
+            offsets: vec![0.5, -0.5],
+        }));
+        let (report, text) = write_to_string(&document);
+        assert_eq!(report.entities_written, 2);
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("MLINE")));
+        let entities = entities_section(&text);
+        assert!(entities.contains(" 20\n100.0") || entities.contains(" 20\n100"));
+        assert!(entities.contains(" 20\n-100.0") || entities.contains(" 20\n-100"));
+        assert!(!entities.contains("  0\nMLINE"));
     }
 
     #[test]
@@ -2969,6 +3316,7 @@ mod tests {
             column_spacing: 0.0,
             row_spacing: 0.0,
             configuration: None,
+            clip: None,
         }));
         let (report, text) = write_to_string(&document);
         assert!(report
@@ -3145,16 +3493,22 @@ mod tests {
                         point: Point3::from_xy(0.0, 0.0),
                         bulge: 0.0,
                         vertex_id: Default::default(),
+                        start_width: 0.0,
+                        end_width: 0.0,
                     },
                     PolyVertex {
                         point: Point3::from_xy(1.0, 0.0),
                         bulge: 0.0,
                         vertex_id: Default::default(),
+                        start_width: 0.0,
+                        end_width: 0.0,
                     },
                     PolyVertex {
                         point: Point3::from_xy(1.0, 1.0),
                         bulge: 0.0,
                         vertex_id: Default::default(),
+                        start_width: 0.0,
+                        end_width: 0.0,
                     },
                 ],
                 closed: true,
@@ -3327,11 +3681,15 @@ mod tests {
                     point: Point3::new(0.0, 0.0, 0.0),
                     bulge: 0.0,
                     vertex_id: Default::default(),
+                    start_width: 0.0,
+                    end_width: 0.0,
                 },
                 PolyVertex {
                     point: Point3::new(1.0, 0.0, 5.0),
                     bulge: 0.25,
                     vertex_id: Default::default(),
+                    start_width: 0.0,
+                    end_width: 0.0,
                 },
             ],
             closed: false,
@@ -3499,5 +3857,19 @@ mod tests {
         assert_eq!(sanitize_name("a/b:c"), "a_b_c");
         assert_eq!(sanitize_name("*MODEL_SPACE"), "*MODEL_SPACE");
         assert_eq!(sanitize_name("*D1"), "*D1");
+    }
+
+    #[test]
+    fn lineweight_header_is_written_and_read_back() {
+        let mut document = Document::default();
+        document.lwdisplay = true;
+        document.lwdefault = 35;
+        let (_, text) = write_to_string(&document);
+        let header = read_dxf_lineweight_header(&text);
+        assert_eq!(header.lwdisplay, Some(true));
+        assert_eq!(header.lwdefault, Some(35));
+        document.lwdisplay = false;
+        let (_, off) = write_to_string(&document);
+        assert_eq!(read_dxf_lineweight_header(&off).lwdisplay, Some(false));
     }
 }

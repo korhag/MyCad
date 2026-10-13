@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use cad_core::{
     autocad_features_document, compare_documents, primitives_document, AttributeInfo,
     BlockDefinition, CompareTol, Document, DrawingUnits, Entity, Geometry, PaperLayout, Point2,
-    Point3, TextData, TextStyle, ViewportData, ATTRIB_INVISIBLE, ATTRIB_PRESET,
+    Point3, SpatialClip, TextData, TextStyle, ViewportData, ATTRIB_INVISIBLE, ATTRIB_PRESET,
 };
 use cad_io::{write_dxf, DxfExportOptions};
 use dwg_import::{convert_dxf_to_dwg, import_dwg, import_dxf, write_dwg, DwgOutputVersion};
@@ -134,11 +134,15 @@ fn varying_z_polyline_survives_dxf_roundtrip() {
                 point: Point3::new(0.0, 0.0, 1.5),
                 bulge: 0.0,
                 vertex_id: Default::default(),
+                start_width: 0.0,
+                end_width: 0.0,
             },
             cad_core::PolyVertex {
                 point: Point3::new(10.0, 0.0, 4.5),
                 bulge: 0.0,
                 vertex_id: Default::default(),
+                start_width: 0.0,
+                end_width: 0.0,
             },
         ],
         closed: false,
@@ -562,6 +566,7 @@ fn attribute_block() -> Document {
         column_spacing: 0.0,
         row_spacing: 0.0,
         configuration: None,
+        clip: None,
     }));
     document
 }
@@ -735,6 +740,83 @@ fn complex_linetypes_survive_dwg_roundtrip() {
         "complex linetypes did not survive DWG: {linetype_misses:?}\nwarnings: {:?}",
         actual.diagnostics.warnings
     );
+}
+
+#[test]
+fn xclip_survives_dwg_roundtrip() {
+    let mut expected = Document::default();
+    expected.ensure_layer_zero();
+    expected.xclip_frame = Some(1);
+    expected.blocks.insert(
+        "BAR".into(),
+        BlockDefinition {
+            name: "BAR".into(),
+            base_pt: Point3::default(),
+            entities: vec![Entity::new(Geometry::Line {
+                start: Point3::from_xy(-10.0, 0.0),
+                end: Point3::from_xy(10.0, 0.0),
+            })],
+            ..Default::default()
+        },
+    );
+    let boundary = vec![
+        Point2::new(-1.0, -1.0),
+        Point2::new(1.0, -1.0),
+        Point2::new(1.0, 1.0),
+        Point2::new(-1.0, 1.0),
+    ];
+    expected.add_entity(Entity::new(Geometry::Insert {
+        block_name: "BAR".into(),
+        insertion: Point3::default(),
+        scale: Point3::new(1.0, 1.0, 1.0),
+        rotation: 0.0,
+        extrusion: Point3::new(0.0, 0.0, 1.0),
+        attribs: Vec::new(),
+        column_count: 1,
+        row_count: 1,
+        column_spacing: 0.0,
+        row_spacing: 0.0,
+        configuration: None,
+        clip: Some(SpatialClip::new(boundary.clone())),
+    }));
+    let dwg = temp_path("dwg");
+    if let Err(err) = write_dwg(&expected, &dwg) {
+        cleanup(&[&dwg]);
+        panic!("write_dwg failed: {err}");
+    }
+    let actual = match import_dwg(&dwg) {
+        Ok(document) => document,
+        Err(err) => {
+            cleanup(&[&dwg]);
+            panic!("import_dwg failed: {err}");
+        }
+    };
+    cleanup(&[&dwg]);
+    assert_eq!(
+        actual
+            .diagnostics
+            .feature_counts
+            .get("SPATIAL_FILTER")
+            .copied(),
+        Some(1),
+        "warnings: {:?}",
+        actual.diagnostics.warnings
+    );
+    // R2000 does not store $XCLIPFRAME. The filter keeps its own frame flag.
+    assert_eq!(actual.xclip_frame, None);
+    let Geometry::Insert { clip, .. } = &actual.model_space[0].geometry else {
+        panic!("insert missing");
+    };
+    let clip = clip.as_ref().expect("spatial clip was dropped");
+    assert!(clip.frame_on);
+    assert_eq!(clip.boundary.len(), boundary.len(), "{:?}", clip.boundary);
+    for (loaded, point) in clip.boundary.iter().zip(&boundary) {
+        assert!(
+            loaded.distance(*point) < 1e-6,
+            "boundary {:?} vs {point:?}",
+            clip.boundary
+        );
+    }
 }
 
 #[test]

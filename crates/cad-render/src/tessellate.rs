@@ -5,8 +5,8 @@ use std::collections::HashMap;
 
 use cad_core::dash::{generate_path_dashes_with_tolerance, scaled_pattern, PathSeg};
 use cad_core::{
-    vectorize_entity, CadColor, Document, Entity, EntityId, Extents2, GradientRamp, LineType,
-    Point2, Rgb, Transform2, VectorSink, VectorVisibility,
+    vectorize_entity, CadColor, Document, DrawBand, Entity, EntityId, Extents2, GradientRamp,
+    LineType, PaintList, Point2, Rgb, Transform2, VectorSink, VectorVisibility,
 };
 
 use crate::pick::{box_select_into, EntityPick, SelectBoxMode, SpatialIndex};
@@ -17,7 +17,28 @@ use crate::triangulate::{triangulate_even_odd, triangulate_polygon};
 pub struct GpuVertex {
     pub position: [f32; 2],
     pub color: [f32; 4],
+    /// Smaller values are closer. Zero is in front of imported geometry.
+    pub depth: f32,
 }
+
+/// One corner of a screen-space lineweight quad.
+///
+/// `position` is this end of the segment and `other` is the far end, both
+/// relative to the display origin. The shader turns `half_px` into a pixel
+/// offset, so zooming does not rebuild the buffer.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct WeightVertex {
+    pub position: [f32; 2],
+    pub other: [f32; 2],
+    pub color: [f32; 4],
+    pub depth: f32,
+    pub side: f32,
+    pub half_px: f32,
+    _pad: f32,
+}
+
+const _: () = assert!(std::mem::size_of::<WeightVertex>() == 48);
 
 // ------------------------------------------------------------
 // Type: EntityDrawRange
@@ -29,6 +50,8 @@ pub struct EntityDrawRange {
     pub line_end: u32,
     pub fill_start: u32,
     pub fill_end: u32,
+    pub weight_start: u32,
+    pub weight_end: u32,
 }
 
 /// A half-open span of GPU vertices rewritten by one edit.
@@ -60,17 +83,21 @@ impl VertexSpan {
 pub struct TouchedVertices {
     pub lines: VertexSpan,
     pub fills: VertexSpan,
+    pub weights: VertexSpan,
     pub appended_lines: VertexSpan,
     pub appended_fills: VertexSpan,
+    pub appended_weights: VertexSpan,
 }
 
 impl TouchedVertices {
-    fn rewritten(lines: VertexSpan, fills: VertexSpan) -> Self {
+    fn rewritten(lines: VertexSpan, fills: VertexSpan, weights: VertexSpan) -> Self {
         Self {
             lines,
             fills,
+            weights,
             appended_lines: VertexSpan::EMPTY,
             appended_fills: VertexSpan::EMPTY,
+            appended_weights: VertexSpan::EMPTY,
         }
     }
 
@@ -78,11 +105,14 @@ impl TouchedVertices {
         self,
         lines: &mut Vec<std::ops::Range<u32>>,
         fills: &mut Vec<std::ops::Range<u32>>,
+        weights: &mut Vec<std::ops::Range<u32>>,
     ) {
         push_span(lines, self.lines);
         push_span(lines, self.appended_lines);
         push_span(fills, self.fills);
         push_span(fills, self.appended_fills);
+        push_span(weights, self.weights);
+        push_span(weights, self.appended_weights);
     }
 }
 
@@ -101,6 +131,7 @@ fn push_span(out: &mut Vec<std::ops::Range<u32>>, span: VertexSpan) {
 pub struct AppendedGeometry {
     pub line_start: u32,
     pub fill_start: u32,
+    pub weight_start: u32,
 }
 
 // ------------------------------------------------------------
@@ -111,15 +142,16 @@ pub struct AppendedGeometry {
 pub struct OverlayBatches {
     pub lines: Vec<std::ops::Range<u32>>,
     pub fills: Vec<std::ops::Range<u32>>,
+    pub weights: Vec<std::ops::Range<u32>>,
 }
 
 impl OverlayBatches {
     pub fn is_empty(&self) -> bool {
-        self.lines.is_empty() && self.fills.is_empty()
+        self.lines.is_empty() && self.fills.is_empty() && self.weights.is_empty()
     }
 
     pub fn range_count(&self) -> usize {
-        self.lines.len() + self.fills.len()
+        self.lines.len() + self.fills.len() + self.weights.len()
     }
 }
 
@@ -128,20 +160,41 @@ impl OverlayBatches {
 // Purpose: Cached tessellation for the wgpu renderer. Document
 //          coordinates remain f64 in cad-core; this is a display cache.
 // ------------------------------------------------------------
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct DisplayList {
     pub origin: Point2,
     pub line_vertices: Vec<GpuVertex>,
     pub triangle_vertices: Vec<GpuVertex>,
+    pub weight_vertices: Vec<WeightVertex>,
     pub picks: Vec<EntityPick>,
     pub draw_ranges: Vec<EntityDrawRange>,
+    /// Wipeout fill. Edits of one entity reuse this color.
+    pub mask: Rgb,
     pick_of: HashMap<EntityId, u32>,
     spatial: SpatialIndex,
 }
 
+impl Default for DisplayList {
+    fn default() -> Self {
+        Self {
+            origin: Point2::default(),
+            line_vertices: Vec::new(),
+            triangle_vertices: Vec::new(),
+            weight_vertices: Vec::new(),
+            picks: Vec::new(),
+            draw_ranges: Vec::new(),
+            mask: viewport_mask_rgb(),
+            pick_of: HashMap::new(),
+            spatial: SpatialIndex::default(),
+        }
+    }
+}
+
 impl DisplayList {
     pub fn is_empty(&self) -> bool {
-        self.line_vertices.is_empty() && self.triangle_vertices.is_empty()
+        self.line_vertices.is_empty()
+            && self.triangle_vertices.is_empty()
+            && self.weight_vertices.is_empty()
     }
 
     pub fn line_count(&self) -> usize {
@@ -184,6 +237,7 @@ impl DisplayList {
         );
         cad_core::perf::reserve_vec_headroom(&mut self.line_vertices);
         cad_core::perf::reserve_vec_headroom(&mut self.triangle_vertices);
+        cad_core::perf::reserve_vec_headroom(&mut self.weight_vertices);
         cad_core::perf::reserve_vec_headroom(&mut self.picks);
         cad_core::perf::reserve_vec_headroom(&mut self.draw_ranges);
         cad_core::perf::reserve_map_headroom(&mut self.pick_of);
@@ -211,10 +265,12 @@ impl DisplayList {
     ) -> Option<AppendedGeometry> {
         let line_start = self.line_vertices.len() as u32;
         let fill_start = self.triangle_vertices.len() as u32;
+        let weight_start = self.weight_vertices.len() as u32;
         let before = self.picks.len();
         let mut stack = Vec::new();
+        let (rank, span) = paint_for(document, entity);
         emit_pickable_entity(
-            document, entity, transform, entity.id, dim, self, &mut stack,
+            document, entity, transform, entity.id, dim, rank, span, self, &mut stack,
         );
         if self.picks.len() == before {
             return None;
@@ -234,6 +290,7 @@ impl DisplayList {
         Some(AppendedGeometry {
             line_start,
             fill_start,
+            weight_start,
         })
     }
 
@@ -258,16 +315,20 @@ impl DisplayList {
         }
         let mut scratch = DisplayList {
             origin: self.origin,
+            mask: self.mask,
             ..DisplayList::default()
         };
         let before = scratch.picks.len();
         let mut stack = Vec::new();
+        let (rank, span) = paint_for(document, entity);
         emit_pickable_entity(
             document,
             entity,
             transform,
             entity.id,
             false,
+            rank,
+            span,
             &mut scratch,
             &mut stack,
         );
@@ -281,21 +342,30 @@ impl DisplayList {
         let new_range = scratch.draw_ranges.pop()?;
         let new_line_count = new_range.line_end - new_range.line_start;
         let new_fill_count = new_range.fill_end - new_range.fill_start;
+        let new_weight_count = new_range.weight_end - new_range.weight_start;
         let old_line_count = old_range.line_end - old_range.line_start;
         let old_fill_count = old_range.fill_end - old_range.fill_start;
+        let old_weight_count = old_range.weight_end - old_range.weight_start;
         self.spatial.remove(slot, old_bounds);
-        if new_line_count == old_line_count && new_fill_count == old_fill_count {
+        if new_line_count == old_line_count
+            && new_fill_count == old_fill_count
+            && new_weight_count == old_weight_count
+        {
             let line_start = old_range.line_start as usize;
             let fill_start = old_range.fill_start as usize;
+            let weight_start = old_range.weight_start as usize;
             self.line_vertices[line_start..line_start + new_line_count as usize]
                 .copy_from_slice(&scratch.line_vertices);
             self.triangle_vertices[fill_start..fill_start + new_fill_count as usize]
                 .copy_from_slice(&scratch.triangle_vertices);
+            self.weight_vertices[weight_start..weight_start + new_weight_count as usize]
+                .copy_from_slice(&scratch.weight_vertices);
             self.picks[slot as usize] = new_pick;
             self.spatial.insert(slot, self.picks[slot as usize].bounds);
             return Some(TouchedVertices::rewritten(
                 VertexSpan::new(old_range.line_start, old_range.line_end),
                 VertexSpan::new(old_range.fill_start, old_range.fill_end),
+                VertexSpan::new(old_range.weight_start, old_range.weight_end),
             ));
         }
         collapse_vertices(
@@ -308,24 +378,36 @@ impl DisplayList {
             old_range.fill_start,
             old_range.fill_end,
         );
+        collapse_weights(
+            &mut self.weight_vertices,
+            old_range.weight_start,
+            old_range.weight_end,
+        );
         let line_start = self.line_vertices.len() as u32;
         let fill_start = self.triangle_vertices.len() as u32;
+        let weight_start = self.weight_vertices.len() as u32;
         self.line_vertices.extend_from_slice(&scratch.line_vertices);
         self.triangle_vertices
             .extend_from_slice(&scratch.triangle_vertices);
+        self.weight_vertices
+            .extend_from_slice(&scratch.weight_vertices);
         self.draw_ranges[slot as usize] = EntityDrawRange {
             line_start,
             line_end: self.line_vertices.len() as u32,
             fill_start,
             fill_end: self.triangle_vertices.len() as u32,
+            weight_start,
+            weight_end: self.weight_vertices.len() as u32,
         };
         self.picks[slot as usize] = new_pick;
         self.spatial.insert(slot, self.picks[slot as usize].bounds);
         Some(TouchedVertices {
             lines: VertexSpan::new(old_range.line_start, old_range.line_end),
             fills: VertexSpan::new(old_range.fill_start, old_range.fill_end),
+            weights: VertexSpan::new(old_range.weight_start, old_range.weight_end),
             appended_lines: VertexSpan::new(line_start, self.line_vertices.len() as u32),
             appended_fills: VertexSpan::new(fill_start, self.triangle_vertices.len() as u32),
+            appended_weights: VertexSpan::new(weight_start, self.weight_vertices.len() as u32),
         })
     }
 
@@ -339,6 +421,11 @@ impl DisplayList {
             range.fill_start,
             range.fill_end,
         );
+        collapse_weights(
+            &mut self.weight_vertices,
+            range.weight_start,
+            range.weight_end,
+        );
         self.spatial.remove(slot, old_bounds);
         self.picks[slot as usize] = EntityPick::new(entity_id);
         self.draw_ranges[slot as usize] = EntityDrawRange::default();
@@ -346,6 +433,7 @@ impl DisplayList {
         Some(TouchedVertices::rewritten(
             VertexSpan::new(range.line_start, range.line_end),
             VertexSpan::new(range.fill_start, range.fill_end),
+            VertexSpan::new(range.weight_start, range.weight_end),
         ))
     }
 
@@ -353,8 +441,13 @@ impl DisplayList {
         TouchedVertices {
             lines: VertexSpan::EMPTY,
             fills: VertexSpan::EMPTY,
+            weights: VertexSpan::EMPTY,
             appended_lines: VertexSpan::new(range.line_start, self.line_vertices.len() as u32),
             appended_fills: VertexSpan::new(range.fill_start, self.triangle_vertices.len() as u32),
+            appended_weights: VertexSpan::new(
+                range.weight_start,
+                self.weight_vertices.len() as u32,
+            ),
         }
     }
 
@@ -386,6 +479,7 @@ impl DisplayList {
         let mut list = self.clone();
         dim_vertex_colors(&mut list.line_vertices);
         dim_vertex_colors(&mut list.triangle_vertices);
+        dim_weight_colors(&mut list.weight_vertices);
         list.remove_entity(entity.id);
         let appended_at = list.picks.len();
         let mut stack = Vec::new();
@@ -421,6 +515,17 @@ impl DisplayList {
     }
 }
 
+fn collapse_weights(verts: &mut [WeightVertex], start: u32, end: u32) {
+    let start = start as usize;
+    let end = (end as usize).min(verts.len());
+    if start >= end {
+        return;
+    }
+    for vertex in &mut verts[start..end] {
+        vertex.color = [0.0; 4];
+    }
+}
+
 fn collapse_vertices(verts: &mut [GpuVertex], start: u32, end: u32) {
     let start = start as usize;
     let end = (end as usize).min(verts.len());
@@ -430,6 +535,7 @@ fn collapse_vertices(verts: &mut [GpuVertex], start: u32, end: u32) {
     let collapsed = GpuVertex {
         position: verts[start].position,
         color: [0.0; 4],
+        depth: verts[start].depth,
     };
     for vertex in &mut verts[start..end] {
         *vertex = collapsed;
@@ -440,6 +546,7 @@ pub fn overlay_batches(display: &DisplayList, ids: &[EntityId]) -> OverlayBatche
     let _span = cad_core::perf::span("overlay_batches");
     let mut lines = Vec::with_capacity(ids.len());
     let mut fills = Vec::with_capacity(ids.len());
+    let mut weights = Vec::with_capacity(ids.len());
     for &entity_id in ids {
         let Some(range) = display.draw_range_for(entity_id) else {
             continue;
@@ -450,10 +557,18 @@ pub fn overlay_batches(display: &DisplayList, ids: &[EntityId]) -> OverlayBatche
         if range.fill_end > range.fill_start {
             fills.push(range.fill_start..range.fill_end);
         }
+        if range.weight_end > range.weight_start {
+            weights.push(range.weight_start..range.weight_end);
+        }
     }
     merge_vertex_ranges(&mut lines);
     merge_vertex_ranges(&mut fills);
-    OverlayBatches { lines, fills }
+    merge_vertex_ranges(&mut weights);
+    OverlayBatches {
+        lines,
+        fills,
+        weights,
+    }
 }
 
 pub fn merge_vertex_ranges(ranges: &mut Vec<std::ops::Range<u32>>) {
@@ -477,18 +592,36 @@ struct TessSink<'a> {
     list: &'a mut DisplayList,
     pick: Option<&'a mut EntityPick>,
     dim: bool,
+    show_weights: bool,
+    stroke_mm: f64,
     chord_tolerance: f64,
+    band: DrawBand,
 }
 
 impl TessSink<'_> {
-    /// Contrast substitution first, then the block-edit dim, so black context
-    /// geometry dims to the same gray as white geometry.
+    /// On a light sheet, near-white ink becomes black so color 7 stays visible.
+    /// Stored dark colors stay as they are. Block-edit dimming follows that.
     fn display_rgb(&self, rgb: Rgb) -> Rgb {
-        let rgb = rgb.readable_on_dark_background();
+        let rgb = ink_on_background(rgb, self.list.mask);
         if self.dim {
             rgb.dim_for_block_context()
         } else {
             rgb
+        }
+    }
+
+    /// Pixel half-width when lineweight display is on and the stroke is
+    /// wider than one pixel. `None` keeps the hairline line list.
+    fn weight_half_px(&self) -> Option<f32> {
+        if !self.show_weights {
+            return None;
+        }
+        let hundredths = (self.stroke_mm * 100.0).round() as i16;
+        let pixels = cad_core::lineweight_pixels(hundredths);
+        if pixels <= 1 {
+            None
+        } else {
+            Some(pixels as f32 * 0.5)
         }
     }
 }
@@ -508,8 +641,9 @@ impl VectorSink for TessSink<'_> {
             pick.add_stroke(pick_pts, closed);
         }
         let rgb = self.display_rgb(rgb);
+        let half_px = self.weight_half_px();
         if linetype.is_continuous() {
-            emit_solid_polyline(self.list, pick_pts, closed, rgb);
+            emit_solid_polyline(self.list, pick_pts, closed, rgb, self.band.depth, half_px);
             return;
         }
         let pattern = scaled_pattern(&linetype.dashes, scale);
@@ -520,8 +654,12 @@ impl VectorSink for TessSink<'_> {
             0,
             Some(self.chord_tolerance),
         ) {
-            push_line(self.list, a, b, rgb);
+            push_stroke(self.list, a, b, rgb, self.band.depth, half_px);
         }
+    }
+
+    fn stroke_mm(&mut self, mm: f64) {
+        self.stroke_mm = if mm.is_finite() && mm > 0.0 { mm } else { 0.0 };
     }
 
     fn fill(&mut self, pts: &[Point2], rgb: Rgb) {
@@ -529,7 +667,23 @@ impl VectorSink for TessSink<'_> {
             pick.add_fill(pts);
         }
         let rgb = self.display_rgb(rgb);
-        emit_triangles(self.list, &triangulate_polygon(pts), rgb);
+        emit_triangles(self.list, &triangulate_polygon(pts), rgb, self.band.depth);
+    }
+
+    fn fill_mask(&mut self, pts: &[Point2]) {
+        if let Some(pick) = self.pick.as_mut() {
+            pick.add_fill(pts);
+        }
+        let rgb = self.list.mask;
+        emit_triangles(self.list, &triangulate_polygon(pts), rgb, self.band.depth);
+    }
+
+    fn begin_entity_draw(&mut self, rank: u32, span: u32) {
+        self.band.begin(rank, span);
+    }
+
+    fn end_entity_draw(&mut self) {
+        self.band.end();
     }
 
     fn fill_even_odd(&mut self, contours: &[Vec<Point2>], rgb: Rgb) {
@@ -539,7 +693,12 @@ impl VectorSink for TessSink<'_> {
                 pick.add_fill(contour);
             }
         }
-        emit_triangles(self.list, &triangulate_even_odd(contours), rgb);
+        emit_triangles(
+            self.list,
+            &triangulate_even_odd(contours),
+            rgb,
+            self.band.depth,
+        );
     }
 
     fn fill_gradient(&mut self, contours: &[Vec<Point2>], ramp: &GradientRamp) {
@@ -553,9 +712,12 @@ impl VectorSink for TessSink<'_> {
         for tri in triangulate_even_odd(contours) {
             for point in tri {
                 let rgb = self.display_rgb(ramp.color_at(ramp.parameter(point, min, max)));
-                self.list
-                    .triangle_vertices
-                    .push(to_gpu(point, origin, rgb.to_array()));
+                self.list.triangle_vertices.push(to_gpu(
+                    point,
+                    origin,
+                    rgb.to_array(),
+                    self.band.depth,
+                ));
             }
         }
     }
@@ -589,6 +751,10 @@ fn contour_bounds(contours: &[Vec<Point2>]) -> (Point2, Point2) {
 }
 
 pub fn tessellate_document(document: &Document) -> DisplayList {
+    tessellate_document_on(document, viewport_mask_rgb())
+}
+
+pub fn tessellate_document_on(document: &Document, mask: Rgb) -> DisplayList {
     let _span = cad_core::perf::span("tessellate_document");
     let origin = document
         .diagnostics
@@ -600,14 +766,25 @@ pub fn tessellate_document(document: &Document) -> DisplayList {
         origin,
         line_vertices: Vec::with_capacity(64 * 1024),
         triangle_vertices: Vec::new(),
+        weight_vertices: Vec::new(),
         picks: Vec::with_capacity(document.model_space.len()),
         draw_ranges: Vec::with_capacity(document.model_space.len()),
+        mask,
         pick_of: HashMap::with_capacity(document.model_space.len()),
         spatial: SpatialIndex::empty(),
     };
+    let paint = PaintList::from_entities(&document.model_space);
     let mut stack = Vec::new();
     for (entity_index, entity) in document.model_space.iter().enumerate() {
-        emit_top_level_entity(document, entity, entity_index, &mut list, &mut stack);
+        emit_top_level_entity(
+            document,
+            entity,
+            entity_index,
+            paint.rank(&document.model_space, entity_index),
+            paint.span,
+            &mut list,
+            &mut stack,
+        );
     }
     list.finish_build();
     list
@@ -632,6 +809,14 @@ pub fn tessellate_document_for_block_edit(
     document: &Document,
     view: &BlockEditView,
 ) -> DisplayList {
+    tessellate_document_for_block_edit_on(document, view, viewport_mask_rgb())
+}
+
+pub fn tessellate_document_for_block_edit_on(
+    document: &Document,
+    view: &BlockEditView,
+    mask: Rgb,
+) -> DisplayList {
     let _span = cad_core::perf::span("tessellate_document_for_block_edit");
     let origin = document
         .diagnostics
@@ -643,8 +828,10 @@ pub fn tessellate_document_for_block_edit(
         origin,
         line_vertices: Vec::with_capacity(64 * 1024),
         triangle_vertices: Vec::new(),
+        weight_vertices: Vec::new(),
         picks: Vec::with_capacity(document.model_space.len() + 16),
         draw_ranges: Vec::with_capacity(document.model_space.len() + 16),
+        mask,
         pick_of: HashMap::with_capacity(document.model_space.len() + 16),
         spatial: SpatialIndex::empty(),
     };
@@ -671,15 +858,26 @@ fn emit_block_edit_space(
     list: &mut DisplayList,
     stack: &mut Vec<String>,
 ) {
+    let paint = PaintList::from_entities(entities);
     let next = view.frames.get(depth);
-    for entity in entities {
+    for (index, entity) in entities.iter().enumerate() {
         if next.is_some_and(|frame| entity.id == frame.instance_id)
             && emit_edited_insert(document, entity, transform, depth, view, list, stack)
         {
             continue;
         }
         let dim = true;
-        emit_pickable_entity(document, entity, transform, entity.id, dim, list, stack);
+        emit_pickable_entity(
+            document,
+            entity,
+            transform,
+            entity.id,
+            dim,
+            paint.rank(entities, index),
+            paint.span,
+            list,
+            stack,
+        );
     }
 }
 
@@ -735,8 +933,19 @@ fn emit_edited_insert(
                 Transform2::translate(col as f64 * *column_spacing, row as f64 * *row_spacing);
             let instance = nested.then(extra);
             if at_leaf {
-                for child in &block.entities {
-                    emit_pickable_entity(document, child, instance, child.id, false, list, stack);
+                let paint = PaintList::from_entities(&block.entities);
+                for (index, child) in block.entities.iter().enumerate() {
+                    emit_pickable_entity(
+                        document,
+                        child,
+                        instance,
+                        child.id,
+                        false,
+                        paint.rank(&block.entities, index),
+                        paint.span,
+                        list,
+                        stack,
+                    );
                 }
             } else {
                 emit_block_edit_space(
@@ -753,6 +962,22 @@ fn emit_edited_insert(
     }
     stack.pop();
     true
+}
+
+fn dim_weight_colors(vertices: &mut [WeightVertex]) {
+    for vertex in vertices {
+        let alpha = vertex.color[3];
+        if alpha <= 0.0 {
+            continue;
+        }
+        let rgb = Rgb {
+            r: unorm8(vertex.color[0]),
+            g: unorm8(vertex.color[1]),
+            b: unorm8(vertex.color[2]),
+        };
+        let dimmed = rgb.dim_for_block_context().to_array();
+        vertex.color = [dimmed[0], dimmed[1], dimmed[2], alpha];
+    }
 }
 
 fn dim_vertex_colors(vertices: &mut [GpuVertex]) {
@@ -775,12 +1000,29 @@ fn unorm8(channel: f32) -> u8 {
     (channel * 255.0).round().clamp(0.0, 255.0) as u8
 }
 
+fn paint_for(document: &Document, entity: &Entity) -> (u32, u32) {
+    let paint = PaintList::from_entities(&document.model_space);
+    if let Some(index) = document
+        .model_space
+        .iter()
+        .position(|item| item.id == entity.id && item.id.is_assigned())
+    {
+        return (paint.rank(&document.model_space, index), paint.span);
+    }
+    (
+        entity.draw_order,
+        paint.span.max(entity.draw_order.saturating_add(1)),
+    )
+}
+
 fn emit_pickable_entity(
     document: &Document,
     entity: &cad_core::Entity,
     transform: Transform2,
     pick_id: EntityId,
     dim: bool,
+    rank: u32,
+    span: u32,
     list: &mut DisplayList,
     stack: &mut Vec<String>,
 ) {
@@ -791,14 +1033,19 @@ fn emit_pickable_entity(
     };
     let line_start = list.line_vertices.len() as u32;
     let fill_start = list.triangle_vertices.len() as u32;
+    let weight_start = list.weight_vertices.len() as u32;
     let mut pick = EntityPick::new(pick_id);
     {
         let mut sink = TessSink {
             list,
             pick: Some(&mut pick),
             dim,
+            show_weights: document.lwdisplay,
+            stroke_mm: 0.0,
             chord_tolerance: document.display_chord_tolerance(),
+            band: DrawBand::new(),
         };
+        sink.band.begin(rank, span);
         vectorize_entity(
             document,
             entity,
@@ -822,6 +1069,8 @@ fn emit_pickable_entity(
         line_end: list.line_vertices.len() as u32,
         fill_start,
         fill_end: list.triangle_vertices.len() as u32,
+        weight_start,
+        weight_end: list.weight_vertices.len() as u32,
     });
 }
 
@@ -829,6 +1078,8 @@ fn emit_top_level_entity(
     document: &Document,
     entity: &Entity,
     entity_index: usize,
+    rank: u32,
+    span: u32,
     list: &mut DisplayList,
     stack: &mut Vec<String>,
 ) -> Option<AppendedGeometry> {
@@ -839,14 +1090,19 @@ fn emit_top_level_entity(
     };
     let line_start = list.line_vertices.len() as u32;
     let fill_start = list.triangle_vertices.len() as u32;
+    let weight_start = list.weight_vertices.len() as u32;
     let mut pick = EntityPick::new(entity_id);
     {
         let mut sink = TessSink {
             list,
             pick: Some(&mut pick),
             dim: false,
+            show_weights: document.lwdisplay,
+            stroke_mm: 0.0,
             chord_tolerance: document.display_chord_tolerance(),
+            band: DrawBand::new(),
         };
+        sink.band.begin(rank, span);
         vectorize_entity(
             document,
             entity,
@@ -870,14 +1126,24 @@ fn emit_top_level_entity(
         line_end: list.line_vertices.len() as u32,
         fill_start,
         fill_end: list.triangle_vertices.len() as u32,
+        weight_start,
+        weight_end: list.weight_vertices.len() as u32,
     });
     Some(AppendedGeometry {
         line_start,
         fill_start,
+        weight_start,
     })
 }
 
-fn emit_solid_polyline(list: &mut DisplayList, pts: &[Point2], closed: bool, rgb: Rgb) {
+fn emit_solid_polyline(
+    list: &mut DisplayList,
+    pts: &[Point2],
+    closed: bool,
+    rgb: Rgb,
+    depth: f32,
+    half_px: Option<f32>,
+) {
     if pts.len() < 2 {
         return;
     }
@@ -885,32 +1151,102 @@ fn emit_solid_polyline(list: &mut DisplayList, pts: &[Point2], closed: bool, rgb
     for i in 0..n {
         let a = pts[i];
         let b = pts[(i + 1) % pts.len()];
-        push_line(list, a, b, rgb);
+        push_stroke(list, a, b, rgb, depth, half_px);
     }
 }
 
-fn emit_triangles(list: &mut DisplayList, tris: &[[Point2; 3]], rgb: Rgb) {
+fn emit_triangles(list: &mut DisplayList, tris: &[[Point2; 3]], rgb: Rgb, depth: f32) {
     let color = rgb.to_array();
     let origin = list.origin;
     for tri in tris {
         for point in tri {
-            list.triangle_vertices.push(to_gpu(*point, origin, color));
+            list.triangle_vertices
+                .push(to_gpu(*point, origin, color, depth));
         }
     }
 }
 
-fn push_line(list: &mut DisplayList, a: Point2, b: Point2, rgb: Rgb) {
+fn push_stroke(
+    list: &mut DisplayList,
+    a: Point2,
+    b: Point2,
+    rgb: Rgb,
+    depth: f32,
+    half_px: Option<f32>,
+) {
+    if let Some(half_px) = half_px {
+        push_weight_segment(list, a, b, rgb, depth, half_px);
+    } else {
+        push_line(list, a, b, rgb, depth);
+    }
+}
+
+fn push_line(list: &mut DisplayList, a: Point2, b: Point2, rgb: Rgb, depth: f32) {
     if !a.is_finite() || !b.is_finite() {
         return;
     }
     let color = rgb.to_array();
-    list.line_vertices.push(to_gpu(a, list.origin, color));
-    list.line_vertices.push(to_gpu(b, list.origin, color));
+    list.line_vertices
+        .push(to_gpu(a, list.origin, color, depth));
+    list.line_vertices
+        .push(to_gpu(b, list.origin, color, depth));
 }
 
-fn to_gpu(p: Point2, origin: Point2, color: [f32; 4]) -> GpuVertex {
+fn push_weight_segment(
+    list: &mut DisplayList,
+    a: Point2,
+    b: Point2,
+    rgb: Rgb,
+    depth: f32,
+    half_px: f32,
+) {
+    if !a.is_finite() || !b.is_finite() || !half_px.is_finite() || half_px <= 0.0 {
+        return;
+    }
+    let color = rgb.to_array();
+    let origin = list.origin;
+    // Perpendicular flips when the shader walks the segment backwards,
+    // so the far end uses the opposite side sign.
+    let corners = [(a, b, -1.0), (a, b, 1.0), (b, a, 1.0), (a, b, 1.0), (b, a, -1.0), (b, a, 1.0)];
+    for (position, other, side) in corners {
+        list.weight_vertices.push(WeightVertex {
+            position: to_local(position, origin),
+            other: to_local(other, origin),
+            color,
+            depth,
+            side,
+            half_px,
+            _pad: 0.0,
+        });
+    }
+}
+
+fn to_local(point: Point2, origin: Point2) -> [f32; 2] {
+    [(point.x - origin.x) as f32, (point.y - origin.y) as f32]
+}
+
+fn to_gpu(p: Point2, origin: Point2, color: [f32; 4], depth: f32) -> GpuVertex {
     GpuVertex {
         position: [(p.x - origin.x) as f32, (p.y - origin.y) as f32],
         color,
+        depth,
+    }
+}
+
+/// Near-white ink on a light sheet becomes black. Dark colors stay stored.
+fn ink_on_background(rgb: Rgb, mask: Rgb) -> Rgb {
+    if mask.luma() >= 0.5 && rgb.r > 250 && rgb.g > 250 && rgb.b > 250 {
+        Rgb { r: 0, g: 0, b: 0 }
+    } else {
+        rgb
+    }
+}
+
+fn viewport_mask_rgb() -> Rgb {
+    let [r, g, b, _] = crate::VIEWPORT_CLEAR;
+    Rgb {
+        r: (r * 255.0).round() as u8,
+        g: (g * 255.0).round() as u8,
+        b: (b * 255.0).round() as u8,
     }
 }

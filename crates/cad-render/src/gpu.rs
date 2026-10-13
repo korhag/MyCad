@@ -7,7 +7,7 @@ use cad_viewport::Camera2;
 use egui::PaintCallbackInfo;
 use egui_wgpu::wgpu;
 
-use crate::tessellate::{DisplayList, GpuVertex, OverlayBatches};
+use crate::tessellate::{DisplayList, GpuVertex, OverlayBatches, WeightVertex};
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -39,12 +39,16 @@ pub struct CadGpu {
     preview: UniformSlot,
     line_chunks: Vec<VertexChunk>,
     fill_chunks: Vec<VertexChunk>,
+    weight_chunks: Vec<VertexChunk>,
     line_count: u32,
     fill_count: u32,
+    weight_count: u32,
     line_capacity: u32,
     fill_capacity: u32,
+    weight_capacity: u32,
     max_line_vertices: u32,
     max_fill_vertices: u32,
+    max_weight_vertices: u32,
     uploaded_generation: u64,
     target_format: wgpu::TextureFormat,
     max_texture_px: u32,
@@ -68,8 +72,10 @@ struct ScenePipelines {
     samples: u32,
     line: wgpu::RenderPipeline,
     fill: wgpu::RenderPipeline,
+    weight: wgpu::RenderPipeline,
     line_premul: wgpu::RenderPipeline,
     fill_premul: wgpu::RenderPipeline,
+    weight_premul: wgpu::RenderPipeline,
 }
 
 struct VertexChunk {
@@ -91,10 +97,16 @@ struct CachedPicture {
     used: [u32; 2],
     msaa_samples: u32,
     color_view: wgpu::TextureView,
+    depth_view: wgpu::TextureView,
+    /// One-sample depth for the frames drawn while the view is moving.
+    /// The multisample depth stays on `depth_view`.
+    single_depth_view: Option<wgpu::TextureView>,
     msaa_view: Option<wgpu::TextureView>,
     bind_group: wgpu::BindGroup,
     scale: wgpu::Buffer,
     _color: wgpu::Texture,
+    _depth: wgpu::Texture,
+    _single_depth: Option<wgpu::Texture>,
     _msaa: Option<wgpu::Texture>,
 }
 
@@ -124,6 +136,32 @@ impl CachedPicture {
             view_formats: &[],
         });
         let color_view = color.create_view(&wgpu::TextureViewDescriptor::default());
+        let depth = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size,
+            mip_level_count: 1,
+            sample_count: samples,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());
+        let single_depth = (samples > 1).then(|| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Depth32Float,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            })
+        });
+        let single_depth_view = single_depth
+            .as_ref()
+            .map(|texture| texture.create_view(&wgpu::TextureViewDescriptor::default()));
         let msaa = (samples > 1).then(|| {
             device.create_texture(&wgpu::TextureDescriptor {
                 label: Some(label),
@@ -168,10 +206,14 @@ impl CachedPicture {
             used: [0, 0],
             msaa_samples: samples,
             color_view,
+            depth_view,
+            single_depth_view,
             msaa_view,
             bind_group,
             scale,
             _color: color,
+            _depth: depth,
+            _single_depth: single_depth,
             _msaa: msaa,
         }
     }
@@ -231,6 +273,25 @@ fn overlay_has_content(selection: &OverlayBatches, preview: &OverlayBatches) -> 
     !selection.is_empty() || !preview.is_empty()
 }
 
+/// Which attachments a cached picture can draw into. Color and depth in
+/// one pass must share a sample count. A moving view uses the one-sample
+/// pair; a still view uses the multisample pair.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CachedPass {
+    Single,
+    Multisample,
+}
+
+fn cached_pass(picture_samples: u32, frame_samples: u32) -> Option<CachedPass> {
+    if frame_samples <= 1 {
+        Some(CachedPass::Single)
+    } else if picture_samples == frame_samples {
+        Some(CachedPass::Multisample)
+    } else {
+        None
+    }
+}
+
 /// The scene renders at one sample while the view moves, then settles
 /// to the chosen MSAA.
 pub fn motion_samples(interactive: bool, chosen: u32) -> u32 {
@@ -257,6 +318,7 @@ pub fn viewport_pixel_size(min: [f32; 2], max: [f32; 2], pixels_per_point: f32) 
 
 const MIN_VERTEX_CAPACITY: u32 = 1024;
 const VERTEX_STRIDE: u64 = std::mem::size_of::<GpuVertex>() as u64;
+const WEIGHT_STRIDE: u64 = std::mem::size_of::<WeightVertex>() as u64;
 const DEFAULT_MAX_BUFFER_SIZE: u64 = 256 * 1024 * 1024;
 
 fn device_max_buffer_size(device: &wgpu::Device) -> u64 {
@@ -288,6 +350,7 @@ pub enum GpuUpload {
     Append {
         line_start: u32,
         fill_start: u32,
+        weight_start: u32,
     },
     /// Rewritten spans plus any appended tail. More than
     /// [`MAX_PATCH_RANGES`] in either buffer falls back to [`Self::Full`].
@@ -296,6 +359,8 @@ pub enum GpuUpload {
         line_count: u8,
         fills: [UploadRange; MAX_PATCH_RANGES],
         fill_count: u8,
+        weights: [UploadRange; MAX_PATCH_RANGES],
+        weight_count: u8,
     },
 }
 
@@ -309,12 +374,15 @@ pub enum GpuUploadPlan {
     Append {
         line_start: u32,
         fill_start: u32,
+        weight_start: u32,
     },
     Patch {
         lines: [UploadRange; MAX_PATCH_RANGES],
         line_count: u8,
         fills: [UploadRange; MAX_PATCH_RANGES],
         fill_count: u8,
+        weights: [UploadRange; MAX_PATCH_RANGES],
+        weight_count: u8,
     },
     Full,
     GrowAndFull,
@@ -325,27 +393,38 @@ pub fn plan_gpu_upload(
     generation: u64,
     uploaded_line_count: u32,
     uploaded_fill_count: u32,
+    uploaded_weight_count: u32,
     line_capacity: u32,
     fill_capacity: u32,
+    weight_capacity: u32,
     new_line_count: u32,
     new_fill_count: u32,
+    new_weight_count: u32,
     kind: GpuUpload,
 ) -> GpuUploadPlan {
     if generation == uploaded_generation {
         return GpuUploadPlan::Skip;
     }
-    let fits = new_line_count <= line_capacity && new_fill_count <= fill_capacity;
+    let fits = new_line_count <= line_capacity
+        && new_fill_count <= fill_capacity
+        && new_weight_count <= weight_capacity;
     match kind {
         GpuUpload::Append {
             line_start,
             fill_start,
+            weight_start,
         } => {
-            let contiguous = line_start == uploaded_line_count && fill_start == uploaded_fill_count;
-            let ordered = new_line_count >= line_start && new_fill_count >= fill_start;
+            let contiguous = line_start == uploaded_line_count
+                && fill_start == uploaded_fill_count
+                && weight_start == uploaded_weight_count;
+            let ordered = new_line_count >= line_start
+                && new_fill_count >= fill_start
+                && new_weight_count >= weight_start;
             if fits && contiguous && ordered {
                 return GpuUploadPlan::Append {
                     line_start,
                     fill_start,
+                    weight_start,
                 };
             }
         }
@@ -354,16 +433,21 @@ pub fn plan_gpu_upload(
             line_count,
             fills,
             fill_count,
+            weights,
+            weight_count,
         } => {
             if fits
                 && ranges_fit(&lines, line_count, new_line_count)
                 && ranges_fit(&fills, fill_count, new_fill_count)
+                && ranges_fit(&weights, weight_count, new_weight_count)
             {
                 return GpuUploadPlan::Patch {
                     lines,
                     line_count,
                     fills,
                     fill_count,
+                    weights,
+                    weight_count,
                 };
             }
         }
@@ -387,19 +471,26 @@ fn ranges_fit(ranges: &[UploadRange; MAX_PATCH_RANGES], count: u8, vertices: u32
 pub fn upload_for_ranges(
     lines: &mut Vec<std::ops::Range<u32>>,
     fills: &mut Vec<std::ops::Range<u32>>,
+    weights: &mut Vec<std::ops::Range<u32>>,
 ) -> GpuUpload {
     crate::tessellate::merge_vertex_ranges(lines);
     crate::tessellate::merge_vertex_ranges(fills);
+    crate::tessellate::merge_vertex_ranges(weights);
     lines.retain(|range| range.end > range.start);
     fills.retain(|range| range.end > range.start);
-    if lines.is_empty() && fills.is_empty() {
+    weights.retain(|range| range.end > range.start);
+    if lines.is_empty() && fills.is_empty() && weights.is_empty() {
         return GpuUpload::Full;
     }
-    if lines.len() > MAX_PATCH_RANGES || fills.len() > MAX_PATCH_RANGES {
+    if lines.len() > MAX_PATCH_RANGES
+        || fills.len() > MAX_PATCH_RANGES
+        || weights.len() > MAX_PATCH_RANGES
+    {
         return GpuUpload::Full;
     }
     let mut line_ranges = [UploadRange { start: 0, end: 0 }; MAX_PATCH_RANGES];
     let mut fill_ranges = [UploadRange { start: 0, end: 0 }; MAX_PATCH_RANGES];
+    let mut weight_ranges = [UploadRange { start: 0, end: 0 }; MAX_PATCH_RANGES];
     for (index, range) in lines.iter().enumerate() {
         line_ranges[index] = UploadRange {
             start: range.start,
@@ -412,17 +503,29 @@ pub fn upload_for_ranges(
             end: range.end,
         };
     }
+    for (index, range) in weights.iter().enumerate() {
+        weight_ranges[index] = UploadRange {
+            start: range.start,
+            end: range.end,
+        };
+    }
     GpuUpload::Patch {
         lines: line_ranges,
         line_count: lines.len() as u8,
         fills: fill_ranges,
         fill_count: fills.len() as u8,
+        weights: weight_ranges,
+        weight_count: weights.len() as u8,
     }
 }
 
 fn max_vertices_for_buffer(max_buffer_size: u64, align: u32) -> u32 {
+    max_vertices_for_stride(max_buffer_size, VERTEX_STRIDE, align)
+}
+
+fn max_vertices_for_stride(max_buffer_size: u64, stride: u64, align: u32) -> u32 {
     let align = align.max(1);
-    let n = (max_buffer_size / VERTEX_STRIDE).min(u64::from(u32::MAX)) as u32;
+    let n = (max_buffer_size / stride.max(1)).min(u64::from(u32::MAX)) as u32;
     (n / align) * align
 }
 
@@ -491,12 +594,20 @@ impl CadGpu {
             pipeline_layout,
             line_chunks: Vec::new(),
             fill_chunks: Vec::new(),
+            weight_chunks: Vec::new(),
             line_count: 0,
             fill_count: 0,
+            weight_count: 0,
             line_capacity: 0,
             fill_capacity: 0,
+            weight_capacity: 0,
             max_line_vertices: max_vertices_for_buffer(device_max_buffer_size(device), 2),
             max_fill_vertices: max_vertices_for_buffer(device_max_buffer_size(device), 3),
+            max_weight_vertices: max_vertices_for_stride(
+                device_max_buffer_size(device),
+                WEIGHT_STRIDE,
+                6,
+            ),
             uploaded_generation: 0,
             target_format,
             max_texture_px: device.limits().max_texture_dimension_2d,
@@ -521,15 +632,19 @@ impl CadGpu {
     ) {
         let new_line_count = list.line_vertices.len() as u32;
         let new_fill_count = list.triangle_vertices.len() as u32;
+        let new_weight_count = list.weight_vertices.len() as u32;
         let plan = plan_gpu_upload(
             self.uploaded_generation,
             generation,
             self.line_count,
             self.fill_count,
+            self.weight_count,
             self.line_capacity,
             self.fill_capacity,
+            self.weight_capacity,
             new_line_count,
             new_fill_count,
+            new_weight_count,
             kind,
         );
         match plan {
@@ -537,6 +652,7 @@ impl CadGpu {
             GpuUploadPlan::Append {
                 line_start,
                 fill_start,
+                weight_start,
             } => {
                 write_vertex_tail(queue, &self.line_chunks, line_start, &list.line_vertices);
                 write_vertex_tail(
@@ -545,8 +661,15 @@ impl CadGpu {
                     fill_start,
                     &list.triangle_vertices,
                 );
+                write_vertex_tail(
+                    queue,
+                    &self.weight_chunks,
+                    weight_start,
+                    &list.weight_vertices,
+                );
                 self.line_count = new_line_count;
                 self.fill_count = new_fill_count;
+                self.weight_count = new_weight_count;
                 self.uploaded_generation = generation;
             }
             GpuUploadPlan::Patch {
@@ -554,6 +677,8 @@ impl CadGpu {
                 line_count,
                 fills,
                 fill_count,
+                weights,
+                weight_count,
             } => {
                 write_upload_ranges(
                     queue,
@@ -569,16 +694,25 @@ impl CadGpu {
                     fill_count,
                     &list.triangle_vertices,
                 );
+                write_upload_ranges(
+                    queue,
+                    &self.weight_chunks,
+                    &weights,
+                    weight_count,
+                    &list.weight_vertices,
+                );
                 self.line_count = new_line_count;
                 self.fill_count = new_fill_count;
+                self.weight_count = new_weight_count;
                 self.uploaded_generation = generation;
             }
             GpuUploadPlan::Full | GpuUploadPlan::GrowAndFull => {
                 if matches!(plan, GpuUploadPlan::GrowAndFull) {
-                    self.grow_buffers(device, new_line_count, new_fill_count);
+                    self.grow_buffers(device, new_line_count, new_fill_count, new_weight_count);
                 }
                 write_vertex_range(queue, &self.line_chunks, 0, &list.line_vertices);
                 write_vertex_range(queue, &self.fill_chunks, 0, &list.triangle_vertices);
+                write_vertex_range(queue, &self.weight_chunks, 0, &list.weight_vertices);
                 if new_line_count == 0 {
                     self.line_chunks.clear();
                     self.line_capacity = 0;
@@ -587,8 +721,13 @@ impl CadGpu {
                     self.fill_chunks.clear();
                     self.fill_capacity = 0;
                 }
+                if new_weight_count == 0 {
+                    self.weight_chunks.clear();
+                    self.weight_capacity = 0;
+                }
                 self.line_count = new_line_count;
                 self.fill_count = new_fill_count;
+                self.weight_count = new_weight_count;
                 self.uploaded_generation = generation;
             }
         }
@@ -626,6 +765,7 @@ impl CadGpu {
                 [0.0; 4],
                 0.0,
                 0.0,
+                used,
                 Transform2::identity_mat4(),
             );
             self.render_cached(
@@ -659,6 +799,7 @@ impl CadGpu {
             frame.selection_color,
             1.0,
             1.0,
+            used,
             Transform2::identity_mat4(),
         );
         self.preview.write(
@@ -669,6 +810,7 @@ impl CadGpu {
             frame.preview_color,
             1.0,
             1.0,
+            used,
             frame.preview_model,
         );
         self.render_cached(
@@ -792,17 +934,38 @@ impl CadGpu {
         }) else {
             return;
         };
-        let Some(pipelines) = self.pipelines_for(samples) else {
+        let Some(pass_kind) = cached_pass(picture.msaa_samples, samples) else {
             return;
         };
-        let multisampled = samples > 1;
-        if multisampled && picture.msaa_samples != samples {
+        let (view, resolve_target, store, depth_view, pass_samples) = match pass_kind {
+            CachedPass::Multisample => {
+                let Some(msaa) = picture.msaa_view.as_ref() else {
+                    return;
+                };
+                (
+                    msaa,
+                    Some(&picture.color_view),
+                    wgpu::StoreOp::Discard,
+                    &picture.depth_view,
+                    picture.msaa_samples,
+                )
+            }
+            CachedPass::Single => {
+                let depth = picture
+                    .single_depth_view
+                    .as_ref()
+                    .unwrap_or(&picture.depth_view);
+                (
+                    &picture.color_view,
+                    None,
+                    wgpu::StoreOp::Store,
+                    depth,
+                    1,
+                )
+            }
+        };
+        let Some(pipelines) = self.pipelines_for(pass_samples) else {
             return;
-        }
-        let msaa_view = picture.msaa_view.as_ref().filter(|_| multisampled);
-        let (view, resolve_target, store) = match msaa_view {
-            Some(msaa) => (msaa, Some(&picture.color_view), wgpu::StoreOp::Discard),
-            None => (&picture.color_view, None, wgpu::StoreOp::Store),
         };
         let label = if scene {
             "mycad.scene.cache"
@@ -824,7 +987,14 @@ impl CadGpu {
                     store,
                 },
             })],
-            depth_stencil_attachment: None,
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Discard,
+                }),
+                stencil_ops: None,
+            }),
             timestamp_writes: None,
             occlusion_query_set: None,
         });
@@ -839,18 +1009,33 @@ impl CadGpu {
         draw(self, pipelines, &mut pass);
     }
 
-    fn grow_buffers(&mut self, device: &wgpu::Device, line_count: u32, fill_count: u32) {
+    fn grow_buffers(
+        &mut self,
+        device: &wgpu::Device,
+        line_count: u32,
+        fill_count: u32,
+        weight_count: u32,
+    ) {
         let line_caps = chunk_capacities(line_count, self.max_line_vertices);
         let fill_caps = chunk_capacities(fill_count, self.max_fill_vertices);
+        let weight_caps = chunk_capacities(weight_count, self.max_weight_vertices);
         let line_capacity = line_caps.iter().copied().sum();
         let fill_capacity = fill_caps.iter().copied().sum();
+        let weight_capacity = weight_caps.iter().copied().sum();
         if line_capacity > self.line_capacity {
-            self.line_chunks = create_vertex_chunks(device, &line_caps, "mycad.linevb");
+            self.line_chunks =
+                create_vertex_chunks(device, &line_caps, VERTEX_STRIDE, "mycad.linevb");
             self.line_capacity = line_capacity;
         }
         if fill_capacity > self.fill_capacity {
-            self.fill_chunks = create_vertex_chunks(device, &fill_caps, "mycad.fillvb");
+            self.fill_chunks =
+                create_vertex_chunks(device, &fill_caps, VERTEX_STRIDE, "mycad.fillvb");
             self.fill_capacity = fill_capacity;
+        }
+        if weight_capacity > self.weight_capacity {
+            self.weight_chunks =
+                create_vertex_chunks(device, &weight_caps, WEIGHT_STRIDE, "mycad.weightvb");
+            self.weight_capacity = weight_capacity;
         }
     }
 }
@@ -883,19 +1068,30 @@ impl UniformSlot {
         overlay_color: [f32; 4],
         overlay_mix: f32,
         premul: f32,
+        viewport_px: [u32; 2],
         model: [[f32; 4]; 4],
     ) {
         let uniforms = Uniforms {
             view_proj: camera.view_proj_f32(origin, aspect),
             overlay_color,
-            overlay_params: [overlay_mix, premul, 0.0, 0.0],
+            overlay_params: [
+                overlay_mix,
+                premul,
+                viewport_px[1].max(1) as f32,
+                viewport_px[0].max(1) as f32,
+            ],
             model,
         };
         queue.write_buffer(&self.buffer, 0, bytemuck::bytes_of(&uniforms));
     }
 }
 
-fn create_vertex_chunks(device: &wgpu::Device, caps: &[u32], label: &str) -> Vec<VertexChunk> {
+fn create_vertex_chunks(
+    device: &wgpu::Device,
+    caps: &[u32],
+    stride: u64,
+    label: &str,
+) -> Vec<VertexChunk> {
     caps.iter()
         .enumerate()
         .filter_map(|(index, &capacity)| {
@@ -905,35 +1101,45 @@ fn create_vertex_chunks(device: &wgpu::Device, caps: &[u32], label: &str) -> Vec
                 format!("{label}.{index}")
             };
             Some(VertexChunk {
-                buffer: create_vertex_buffer(device, capacity, &name)?,
+                buffer: create_vertex_buffer(device, capacity, stride, &name)?,
                 capacity,
             })
         })
         .collect()
 }
 
-fn create_vertex_buffer(device: &wgpu::Device, capacity: u32, label: &str) -> Option<wgpu::Buffer> {
+fn create_vertex_buffer(
+    device: &wgpu::Device,
+    capacity: u32,
+    stride: u64,
+    label: &str,
+) -> Option<wgpu::Buffer> {
     if capacity == 0 {
         return None;
     }
     Some(device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(label),
-        size: VERTEX_STRIDE * u64::from(capacity),
+        size: stride * u64::from(capacity),
         usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     }))
 }
 
-fn write_vertex_tail(queue: &wgpu::Queue, chunks: &[VertexChunk], start: u32, verts: &[GpuVertex]) {
+fn write_vertex_tail<T: bytemuck::NoUninit>(
+    queue: &wgpu::Queue,
+    chunks: &[VertexChunk],
+    start: u32,
+    verts: &[T],
+) {
     write_vertex_range(queue, chunks, start, verts);
 }
 
-fn write_upload_ranges(
+fn write_upload_ranges<T: bytemuck::NoUninit>(
     queue: &wgpu::Queue,
     chunks: &[VertexChunk],
     ranges: &[UploadRange; MAX_PATCH_RANGES],
     count: u8,
-    verts: &[GpuVertex],
+    verts: &[T],
 ) {
     let count = (count as usize).min(MAX_PATCH_RANGES);
     for range in &ranges[..count] {
@@ -945,12 +1151,13 @@ fn write_upload_ranges(
     }
 }
 
-fn write_vertex_range(
+fn write_vertex_range<T: bytemuck::NoUninit>(
     queue: &wgpu::Queue,
     chunks: &[VertexChunk],
     start: u32,
-    verts: &[GpuVertex],
+    verts: &[T],
 ) {
+    let stride = std::mem::size_of::<T>() as u64;
     let mut offset = start as usize;
     if offset >= verts.len() {
         return;
@@ -965,7 +1172,7 @@ fn write_vertex_range(
         let take = remaining.len().min(cap - offset);
         queue.write_buffer(
             &chunk.buffer,
-            VERTEX_STRIDE * offset as u64,
+            stride * offset as u64,
             bytemuck::cast_slice(&remaining[..take]),
         );
         remaining = &remaining[take..];
@@ -1010,6 +1217,47 @@ fn make_scene_pipelines(
                 shader_location: 1,
                 format: wgpu::VertexFormat::Float32x4,
             },
+            wgpu::VertexAttribute {
+                offset: 24,
+                shader_location: 2,
+                format: wgpu::VertexFormat::Float32,
+            },
+        ],
+    };
+    let weight_layout = &wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<WeightVertex>() as u64,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &[
+            wgpu::VertexAttribute {
+                offset: 0,
+                shader_location: 0,
+                format: wgpu::VertexFormat::Float32x2,
+            },
+            wgpu::VertexAttribute {
+                offset: 8,
+                shader_location: 1,
+                format: wgpu::VertexFormat::Float32x2,
+            },
+            wgpu::VertexAttribute {
+                offset: 16,
+                shader_location: 2,
+                format: wgpu::VertexFormat::Float32x4,
+            },
+            wgpu::VertexAttribute {
+                offset: 32,
+                shader_location: 3,
+                format: wgpu::VertexFormat::Float32,
+            },
+            wgpu::VertexAttribute {
+                offset: 36,
+                shader_location: 4,
+                format: wgpu::VertexFormat::Float32,
+            },
+            wgpu::VertexAttribute {
+                offset: 40,
+                shader_location: 5,
+                format: wgpu::VertexFormat::Float32,
+            },
         ],
     };
     let line = make_pipeline(
@@ -1018,6 +1266,7 @@ fn make_scene_pipelines(
         shader,
         format,
         vertex_layout,
+        "vs_main",
         wgpu::PrimitiveTopology::LineList,
         samples,
         Some(wgpu::BlendState::ALPHA_BLENDING),
@@ -1029,10 +1278,23 @@ fn make_scene_pipelines(
         shader,
         format,
         vertex_layout,
+        "vs_main",
         wgpu::PrimitiveTopology::TriangleList,
         samples,
         Some(wgpu::BlendState::ALPHA_BLENDING),
         "mycad.fill",
+    );
+    let weight = make_pipeline(
+        device,
+        layout,
+        shader,
+        format,
+        weight_layout,
+        "vs_weight",
+        wgpu::PrimitiveTopology::TriangleList,
+        samples,
+        Some(wgpu::BlendState::ALPHA_BLENDING),
+        "mycad.weights",
     );
     let line_premul = make_pipeline(
         device,
@@ -1040,6 +1302,7 @@ fn make_scene_pipelines(
         shader,
         format,
         vertex_layout,
+        "vs_main",
         wgpu::PrimitiveTopology::LineList,
         samples,
         Some(PREMUL_BLEND),
@@ -1051,17 +1314,32 @@ fn make_scene_pipelines(
         shader,
         format,
         vertex_layout,
+        "vs_main",
         wgpu::PrimitiveTopology::TriangleList,
         samples,
         Some(PREMUL_BLEND),
         "mycad.fill.premul",
     );
+    let weight_premul = make_pipeline(
+        device,
+        layout,
+        shader,
+        format,
+        weight_layout,
+        "vs_weight",
+        wgpu::PrimitiveTopology::TriangleList,
+        samples,
+        Some(PREMUL_BLEND),
+        "mycad.weights.premul",
+    );
     ScenePipelines {
         samples,
         line,
         fill,
+        weight,
         line_premul,
         fill_premul,
+        weight_premul,
     }
 }
 
@@ -1071,6 +1349,7 @@ fn make_pipeline(
     shader: &wgpu::ShaderModule,
     format: wgpu::TextureFormat,
     vertex_layout: &wgpu::VertexBufferLayout,
+    entry: &'static str,
     topology: wgpu::PrimitiveTopology,
     samples: u32,
     blend: Option<wgpu::BlendState>,
@@ -1081,7 +1360,7 @@ fn make_pipeline(
         layout: Some(layout),
         vertex: wgpu::VertexState {
             module: shader,
-            entry_point: Some("vs_main"),
+            entry_point: Some(entry),
             compilation_options: Default::default(),
             buffers: std::slice::from_ref(vertex_layout),
         },
@@ -1099,7 +1378,13 @@ fn make_pipeline(
             topology,
             ..Default::default()
         },
-        depth_stencil: None,
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: true,
+            depth_compare: wgpu::CompareFunction::LessEqual,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
         multisample: wgpu::MultisampleState {
             count: samples,
             ..Default::default()
@@ -1387,7 +1672,8 @@ impl egui_wgpu::CallbackTrait for CadFrame {
 fn draw_scene(gpu: &CadGpu, pipelines: &ScenePipelines, render_pass: &mut wgpu::RenderPass<'_>) {
     let has_fill = !gpu.fill_chunks.is_empty() && gpu.fill_count >= 3;
     let has_lines = !gpu.line_chunks.is_empty() && gpu.line_count >= 2;
-    if !has_fill && !has_lines {
+    let has_weights = !gpu.weight_chunks.is_empty() && gpu.weight_count >= 6;
+    if !has_fill && !has_lines && !has_weights {
         return;
     }
     render_pass.set_bind_group(0, &gpu.scene.bind_group, &[]);
@@ -1398,6 +1684,10 @@ fn draw_scene(gpu: &CadGpu, pipelines: &ScenePipelines, render_pass: &mut wgpu::
     if has_lines {
         render_pass.set_pipeline(&pipelines.line);
         draw_chunks(render_pass, &gpu.line_chunks, gpu.line_count, 2);
+    }
+    if has_weights {
+        render_pass.set_pipeline(&pipelines.weight);
+        draw_chunks(render_pass, &gpu.weight_chunks, gpu.weight_count, 6);
     }
 }
 
@@ -1444,6 +1734,12 @@ fn draw_overlay(
             draw_global_range(render_pass, &gpu.line_chunks, range.start, range.end, 2);
         }
     }
+    if !overlay.weights.is_empty() && !gpu.weight_chunks.is_empty() {
+        render_pass.set_pipeline(&pipelines.weight_premul);
+        for range in &overlay.weights {
+            draw_global_range(render_pass, &gpu.weight_chunks, range.start, range.end, 6);
+        }
+    }
 }
 
 fn draw_global_range(
@@ -1472,7 +1768,8 @@ fn draw_global_range(
 #[cfg(test)]
 mod tests {
     use super::{
-        chunk_capacities, max_vertices_for_buffer, motion_samples, next_vertex_capacity,
+        cached_pass, chunk_capacities, max_vertices_for_buffer, motion_samples,
+        next_vertex_capacity, CachedPass,
         picture_texture_size, plan_gpu_upload, scene_needs_redraw, viewport_pixel_size, GpuUpload,
         GpuUploadPlan, SceneKey, UploadRange, DEFAULT_MAX_BUFFER_SIZE, MAX_PATCH_RANGES,
         VERTEX_STRIDE,
@@ -1572,7 +1869,7 @@ mod tests {
         assert!(!super::overlay_has_content(&empty, &empty));
         let selected = crate::OverlayBatches {
             lines: vec![0..2],
-            fills: Vec::new(),
+            ..Default::default()
         };
         assert!(super::overlay_has_content(&selected, &empty));
         assert!(super::overlay_has_content(&empty, &selected));
@@ -1584,12 +1881,16 @@ mod tests {
         assert_eq!(motion_samples(false, 4), 4);
         assert_eq!(motion_samples(false, 2), 2);
         assert_eq!(motion_samples(false, 7), 4);
+        assert_eq!(cached_pass(4, 1), Some(CachedPass::Single));
+        assert_eq!(cached_pass(4, 4), Some(CachedPass::Multisample));
+        assert_eq!(cached_pass(1, 1), Some(CachedPass::Single));
+        assert_eq!(cached_pass(1, 4), None);
     }
 
     #[test]
     fn matching_generation_skips_upload() {
         assert_eq!(
-            plan_gpu_upload(4, 4, 10, 0, 16, 0, 12, 0, GpuUpload::Full),
+            plan_gpu_upload(4, 4, 10, 0, 0, 16, 0, 0, 12, 0, 0, GpuUpload::Full),
             GpuUploadPlan::Skip
         );
     }
@@ -1602,18 +1903,23 @@ mod tests {
                 2,
                 100,
                 0,
+                0,
                 1024,
+                0,
                 0,
                 102,
                 0,
+                0,
                 GpuUpload::Append {
                     line_start: 100,
-                    fill_start: 0
+                    fill_start: 0,
+                    weight_start: 0,
                 }
             ),
             GpuUploadPlan::Append {
                 line_start: 100,
-                fill_start: 0
+                fill_start: 0,
+                weight_start: 0,
             }
         );
     }
@@ -1626,13 +1932,17 @@ mod tests {
                 2,
                 100,
                 0,
+                0,
                 100,
+                0,
                 0,
                 102,
                 0,
+                0,
                 GpuUpload::Append {
                     line_start: 100,
-                    fill_start: 0
+                    fill_start: 0,
+                    weight_start: 0,
                 }
             ),
             GpuUploadPlan::GrowAndFull
@@ -1647,13 +1957,17 @@ mod tests {
                 3,
                 100,
                 0,
+                0,
                 1024,
+                0,
                 0,
                 104,
                 0,
+                0,
                 GpuUpload::Append {
                     line_start: 102,
-                    fill_start: 0
+                    fill_start: 0,
+                    weight_start: 0,
                 }
             ),
             GpuUploadPlan::Full
@@ -1671,15 +1985,20 @@ mod tests {
                 2,
                 40,
                 0,
+                0,
                 1024,
                 0,
+                0,
                 44,
+                0,
                 0,
                 GpuUpload::Patch {
                     lines,
                     line_count: 2,
                     fills: [UploadRange { start: 0, end: 0 }; MAX_PATCH_RANGES],
                     fill_count: 0,
+                    weights: [UploadRange { start: 0, end: 0 }; MAX_PATCH_RANGES],
+                    weight_count: 0,
                 }
             ),
             GpuUploadPlan::Patch {
@@ -1687,6 +2006,8 @@ mod tests {
                 line_count: 2,
                 fills: [UploadRange { start: 0, end: 0 }; MAX_PATCH_RANGES],
                 fill_count: 0,
+                weights: [UploadRange { start: 0, end: 0 }; MAX_PATCH_RANGES],
+                weight_count: 0,
             }
         );
     }
@@ -1704,15 +2025,20 @@ mod tests {
                 2,
                 100,
                 0,
+                0,
                 100,
                 0,
+                0,
                 110,
+                0,
                 0,
                 GpuUpload::Patch {
                     lines,
                     line_count: 1,
                     fills: [UploadRange { start: 0, end: 0 }; MAX_PATCH_RANGES],
                     fill_count: 0,
+                    weights: [UploadRange { start: 0, end: 0 }; MAX_PATCH_RANGES],
+                    weight_count: 0,
                 }
             ),
             GpuUploadPlan::GrowAndFull
@@ -1722,7 +2048,7 @@ mod tests {
     #[test]
     fn full_rebuild_reuses_capacity_when_it_fits() {
         assert_eq!(
-            plan_gpu_upload(8, 9, 50, 6, 1024, 64, 40, 3, GpuUpload::Full),
+            plan_gpu_upload(8, 9, 50, 6, 0, 1024, 64, 0, 40, 3, 0, GpuUpload::Full),
             GpuUploadPlan::Full
         );
     }

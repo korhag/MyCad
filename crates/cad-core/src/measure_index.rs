@@ -730,6 +730,7 @@ fn push_polyline(
                 vertex.bulge
             },
             vertex_id: Default::default(),
+            ..*vertex
         })
         .collect();
     let n = world.len();
@@ -939,6 +940,7 @@ mod tests {
             column_spacing: 0.0,
             row_spacing: 0.0,
             configuration: None,
+            clip: None,
         }));
         document.assign_missing_ids();
         let index = MeasureIndex::build(&document);
@@ -977,6 +979,7 @@ mod tests {
             column_spacing: 0.0,
             row_spacing: 0.0,
             configuration: None,
+            clip: None,
         }));
         document.assign_missing_ids();
         let index = MeasureIndex::build(&document);
@@ -1015,6 +1018,7 @@ mod tests {
             column_spacing: 0.0,
             row_spacing: 0.0,
             configuration: None,
+            clip: None,
         }));
         document.assign_missing_ids();
         let index = MeasureIndex::build(&document);

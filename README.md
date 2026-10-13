@@ -109,7 +109,10 @@ taskbar. It opens with no console window. DWG and DXF show EntoCAD under
 installed copy is `%LOCALAPPDATA%\Programs\EntoCAD\EntoCAD.exe`, so a later
 `cargo clean` does not remove it. Settings → Apps lists EntoCAD.
 
-Close EntoCAD before updating. If the compiler crashes, the script stops;
+The installed app compares its version with the workshop and offers to run
+this installer when the workshop is newer. Later hides that version until a
+newer one appears. Close EntoCAD before updating by hand. If the compiler
+crashes, the script stops;
 retry the build with `cargo build --release -p mycad -j 1`, then run the
 installer again.
 

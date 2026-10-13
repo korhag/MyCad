@@ -8,13 +8,14 @@ use cad_core::{
     BlockDefinition, BlockDefinitionId, BooleanParameter, CadColor, ChoiceOption, ChoiceParameter,
     CompatibilityRule, CompositionRule, Document, DrawingUnits, DynamicBehavior, DynamicDefinition,
     Entity, EntityId, FollowRole, Geometry, GeometryGroup, GeometryTarget, GradientStop, HatchData,
-    HatchEdge, HatchGradient, HatchPath, HatchPatternLine, InstanceConfiguration, Layer, LineType,
-    MTextData, MeasureMode, NestedInput, NestedMapping, NumericDomain, NumericParameter,
-    NumericQuantity, OccurrencePath, OptionId, ParameterCondition, ParameterDef, ParameterId,
-    ParameterKind, ParameterUnit, ParameterValue, PlacementBehavior, Point2, Point3, PolyVertex,
-    Preset, PresetId, ReflectionBehavior, Rgb, RotationBehavior, RotationSource, SizeAuthoring,
-    StepOrigin, StepPolicy, TextBinding, TextBindingMode, TextData, TextHAlign, TextParameter,
-    TextReflectPolicy, TextToken, TextVAlign, VertexId, VisibilityGroup, MAX_BLOCK_DEPTH,
+    HatchEdge, HatchGradient, HatchPath, HatchPatternLine, InstanceConfiguration, Layer,
+    LeaderContent, LeaderLine, LineType, MTextData, MeasureMode, NestedInput, NestedMapping,
+    NumericDomain, NumericParameter, NumericQuantity, OccurrencePath, OptionId, ParameterCondition,
+    ParameterDef, ParameterId, ParameterKind, ParameterUnit, ParameterValue, PlacementBehavior,
+    Point2, Point3, PolyVertex, Preset, PresetId, ReflectionBehavior, Rgb, RotationBehavior,
+    RotationSource, SizeAuthoring, SpatialClip, StepOrigin, StepPolicy, TextBinding,
+    TextBindingMode, TextData, TextHAlign, TextParameter, TextReflectPolicy, TextToken, TextVAlign,
+    VertexId, VisibilityGroup, MAX_BLOCK_DEPTH,
 };
 use serde::{Deserialize, Serialize};
 
@@ -65,6 +66,22 @@ struct WireDocument {
     text_styles: Vec<WireTextStyle>,
     blocks: Vec<WireBlock>,
     model_space: Vec<WireEntity>,
+    #[serde(default = "default_wipeout_frame")]
+    wipeout_frame: u8,
+    #[serde(default)]
+    xclip_frame: Option<u8>,
+    #[serde(default)]
+    lwdisplay: bool,
+    #[serde(default = "default_lwdefault")]
+    lwdefault: i16,
+}
+
+fn default_lwdefault() -> i16 {
+    cad_core::LWDEFAULT_HUNDREDTHS
+}
+
+fn default_wipeout_frame() -> u8 {
+    1
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -188,6 +205,8 @@ struct WireEntity {
     #[serde(default = "default_entity_lineweight")]
     lineweight: i16,
     visible: bool,
+    #[serde(default)]
+    draw_order: u32,
     geometry: WireGeometry,
 }
 
@@ -264,6 +283,8 @@ enum WireGeometry {
         column_spacing: f64,
         row_spacing: f64,
         configuration: Option<WireConfig>,
+        #[serde(default)]
+        clip: Option<WireSpatialClip>,
     },
     Text(WireText),
     MText {
@@ -329,7 +350,24 @@ enum WireGeometry {
     },
     MLine {
         vertices: Vec<[f64; 3]>,
+        #[serde(default)]
+        miters: Vec<[f64; 3]>,
         closed: bool,
+        #[serde(default = "default_mline_scale")]
+        scale: f64,
+        #[serde(default = "default_mline_justification")]
+        justification: u8,
+        #[serde(default)]
+        offsets: Vec<f64>,
+    },
+    MultiLeader {
+        lines: Vec<WireLeaderLine>,
+        content: WireLeaderContent,
+        #[serde(default)]
+        arrow_size: f64,
+    },
+    Region {
+        wires: Vec<Vec<[f64; 3]>>,
     },
     Image(WireRaster),
     Wipeout(WireRaster),
@@ -354,11 +392,62 @@ enum WireGeometry {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+struct WireLeaderLine {
+    points: Vec<[f64; 3]>,
+    #[serde(default)]
+    last_point: Option<[f64; 3]>,
+    #[serde(default)]
+    dogleg: Option<[f64; 3]>,
+    #[serde(default)]
+    dogleg_length: f64,
+    #[serde(default)]
+    arrow_size: Option<f64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+enum WireLeaderContent {
+    None,
+    Text {
+        value: String,
+        location: [f64; 3],
+        height: f64,
+        rotation: f64,
+        width: f64,
+        #[serde(default)]
+        frame: bool,
+    },
+    Block {
+        name: String,
+        location: [f64; 3],
+        scale: [f64; 3],
+        rotation: f64,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WireSpatialClip {
+    boundary: Vec<[f64; 2]>,
+    origin: [f64; 3],
+    extrusion: [f64; 3],
+    inverse_transform: [f64; 12],
+    transform: [f64; 12],
+    frame_on: bool,
+    #[serde(default)]
+    front_clip: Option<f64>,
+    #[serde(default)]
+    back_clip: Option<f64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 struct WireVertex {
     point: [f64; 3],
     bulge: f64,
     #[serde(default)]
     vertex_id: u64,
+    #[serde(default)]
+    start_width: f64,
+    #[serde(default)]
+    end_width: f64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -391,6 +480,14 @@ struct WireText {
 
 fn default_width_factor() -> f64 {
     1.0
+}
+
+fn default_mline_scale() -> f64 {
+    1.0
+}
+
+fn default_mline_justification() -> u8 {
+    1
 }
 
 fn default_line_spacing() -> f64 {
@@ -1125,6 +1222,10 @@ fn to_wire_document(document: &Document) -> WireDocument {
             .collect(),
         blocks: document.blocks.values().map(to_wire_block).collect(),
         model_space: document.model_space.iter().map(to_wire_entity).collect(),
+        wipeout_frame: document.wipeout_frame,
+        xclip_frame: document.xclip_frame,
+        lwdisplay: document.lwdisplay,
+        lwdefault: document.lwdefault,
     }
 }
 
@@ -1132,6 +1233,10 @@ fn from_wire_document(wire: WireDocument) -> Result<Document, ExportError> {
     let mut document = Document::default();
     document.units = DrawingUnits::from_insunits(wire.units);
     document.ltscale = wire.ltscale;
+    document.wipeout_frame = wire.wipeout_frame;
+    document.xclip_frame = wire.xclip_frame;
+    document.lwdisplay = wire.lwdisplay;
+    document.lwdefault = wire.lwdefault;
     document.current_layer = wire.current_layer;
     document.layers.clear();
     for layer in wire.layers {
@@ -1303,6 +1408,7 @@ fn to_wire_entity(entity: &Entity) -> WireEntity {
         linetype_scale: entity.linetype_scale,
         lineweight: entity.lineweight,
         visible: entity.visible,
+        draw_order: entity.draw_order,
         geometry: to_wire_geometry(&entity.geometry),
     }
 }
@@ -1316,6 +1422,7 @@ fn from_wire_entity(entity: WireEntity) -> Result<Entity, ExportError> {
         linetype_scale: entity.linetype_scale,
         lineweight: entity.lineweight,
         visible: entity.visible,
+        draw_order: entity.draw_order,
         geometry: from_wire_geometry(entity.geometry)?,
     })
 }
@@ -1413,6 +1520,7 @@ fn to_wire_geometry(geometry: &Geometry) -> WireGeometry {
             column_spacing,
             row_spacing,
             configuration,
+            clip,
         } => WireGeometry::Insert {
             block_name: block_name.clone(),
             insertion: pt(*insertion),
@@ -1425,6 +1533,7 @@ fn to_wire_geometry(geometry: &Geometry) -> WireGeometry {
             column_spacing: *column_spacing,
             row_spacing: *row_spacing,
             configuration: configuration.as_ref().map(to_config),
+            clip: clip.as_ref().map(to_spatial_clip),
         },
         Geometry::Text(data) => WireGeometry::Text(to_text(data)),
         Geometry::MText(data) => WireGeometry::MText {
@@ -1470,9 +1579,35 @@ fn to_wire_geometry(geometry: &Geometry) -> WireGeometry {
         Geometry::Leader { vertices } => WireGeometry::Leader {
             vertices: vertices.iter().copied().map(pt).collect(),
         },
-        Geometry::MLine { vertices, closed } => WireGeometry::MLine {
+        Geometry::MLine {
+            vertices,
+            miters,
+            closed,
+            scale,
+            justification,
+            offsets,
+        } => WireGeometry::MLine {
             vertices: vertices.iter().copied().map(pt).collect(),
+            miters: miters.iter().copied().map(pt).collect(),
             closed: *closed,
+            scale: *scale,
+            justification: *justification,
+            offsets: offsets.clone(),
+        },
+        Geometry::MultiLeader {
+            lines,
+            content,
+            arrow_size,
+        } => WireGeometry::MultiLeader {
+            lines: lines.iter().map(to_leader_line).collect(),
+            content: to_leader_content(content),
+            arrow_size: *arrow_size,
+        },
+        Geometry::Region { wires } => WireGeometry::Region {
+            wires: wires
+                .iter()
+                .map(|wire| wire.iter().copied().map(pt).collect())
+                .collect(),
         },
         Geometry::Image(frame) => WireGeometry::Image(to_raster(frame)),
         Geometry::Wipeout(frame) => WireGeometry::Wipeout(to_raster(frame)),
@@ -1590,6 +1725,7 @@ fn from_wire_geometry(geometry: WireGeometry) -> Result<Geometry, ExportError> {
             column_spacing,
             row_spacing,
             configuration,
+            clip,
         } => Geometry::Insert {
             block_name,
             insertion: from_pt(insertion),
@@ -1602,6 +1738,7 @@ fn from_wire_geometry(geometry: WireGeometry) -> Result<Geometry, ExportError> {
             column_spacing,
             row_spacing,
             configuration: configuration.map(from_config),
+            clip: clip.map(from_spatial_clip),
         },
         WireGeometry::Text(data) => Geometry::Text(from_text(data)),
         WireGeometry::MText {
@@ -1692,9 +1829,35 @@ fn from_wire_geometry(geometry: WireGeometry) -> Result<Geometry, ExportError> {
         WireGeometry::Leader { vertices } => Geometry::Leader {
             vertices: vertices.into_iter().map(from_pt).collect(),
         },
-        WireGeometry::MLine { vertices, closed } => Geometry::MLine {
-            vertices: vertices.into_iter().map(from_pt).collect(),
+        WireGeometry::MLine {
+            vertices,
+            miters,
             closed,
+            scale,
+            justification,
+            offsets,
+        } => Geometry::MLine {
+            vertices: vertices.into_iter().map(from_pt).collect(),
+            miters: miters.into_iter().map(from_pt).collect(),
+            closed,
+            scale: if scale.is_finite() { scale } else { 1.0 },
+            justification,
+            offsets,
+        },
+        WireGeometry::MultiLeader {
+            lines,
+            content,
+            arrow_size,
+        } => Geometry::MultiLeader {
+            lines: lines.into_iter().map(from_leader_line).collect(),
+            content: from_leader_content(content),
+            arrow_size,
+        },
+        WireGeometry::Region { wires } => Geometry::Region {
+            wires: wires
+                .into_iter()
+                .map(|wire| wire.into_iter().map(from_pt).collect())
+                .collect(),
         },
         WireGeometry::Image(frame) => Geometry::Image(from_raster(frame)),
         WireGeometry::Wipeout(frame) => Geometry::Wipeout(from_raster(frame)),
@@ -2766,6 +2929,8 @@ fn to_vertex(vertex: &PolyVertex) -> WireVertex {
         point: pt(vertex.point),
         bulge: vertex.bulge,
         vertex_id: vertex.vertex_id.raw(),
+        start_width: vertex.start_width,
+        end_width: vertex.end_width,
     }
 }
 
@@ -2774,6 +2939,8 @@ fn from_vertex(vertex: WireVertex) -> PolyVertex {
         point: from_pt(vertex.point),
         bulge: vertex.bulge,
         vertex_id: VertexId(vertex.vertex_id),
+        start_width: vertex.start_width,
+        end_width: vertex.end_width,
     }
 }
 
@@ -3032,12 +3199,130 @@ fn parse_step_origin(name: &str) -> Result<StepOrigin, ExportError> {
     }
 }
 
+fn to_leader_line(line: &LeaderLine) -> WireLeaderLine {
+    WireLeaderLine {
+        points: line.points.iter().copied().map(pt).collect(),
+        last_point: line.last_point.map(pt),
+        dogleg: line.dogleg.map(pt),
+        dogleg_length: line.dogleg_length,
+        arrow_size: line.arrow_size,
+    }
+}
+
+fn from_leader_line(line: WireLeaderLine) -> LeaderLine {
+    LeaderLine {
+        points: line.points.into_iter().map(from_pt).collect(),
+        last_point: line.last_point.map(from_pt),
+        dogleg: line.dogleg.map(from_pt),
+        dogleg_length: line.dogleg_length,
+        arrow_size: line.arrow_size,
+    }
+}
+
+fn to_leader_content(content: &LeaderContent) -> WireLeaderContent {
+    match content {
+        LeaderContent::None => WireLeaderContent::None,
+        LeaderContent::Text {
+            value,
+            location,
+            height,
+            rotation,
+            width,
+            frame,
+        } => WireLeaderContent::Text {
+            value: value.clone(),
+            location: pt(*location),
+            height: *height,
+            rotation: *rotation,
+            width: *width,
+            frame: *frame,
+        },
+        LeaderContent::Block {
+            name,
+            location,
+            scale,
+            rotation,
+        } => WireLeaderContent::Block {
+            name: name.clone(),
+            location: pt(*location),
+            scale: pt(*scale),
+            rotation: *rotation,
+        },
+    }
+}
+
+fn from_leader_content(content: WireLeaderContent) -> LeaderContent {
+    match content {
+        WireLeaderContent::None => LeaderContent::None,
+        WireLeaderContent::Text {
+            value,
+            location,
+            height,
+            rotation,
+            width,
+            frame,
+        } => LeaderContent::Text {
+            value,
+            location: from_pt(location),
+            height,
+            rotation,
+            width,
+            frame,
+        },
+        WireLeaderContent::Block {
+            name,
+            location,
+            scale,
+            rotation,
+        } => LeaderContent::Block {
+            name,
+            location: from_pt(location),
+            scale: from_pt(scale),
+            rotation,
+        },
+    }
+}
+
 fn pt(point: Point3) -> [f64; 3] {
     [point.x, point.y, point.z]
 }
 
 fn from_pt(point: [f64; 3]) -> Point3 {
     Point3::new(point[0], point[1], point[2])
+}
+
+fn to_spatial_clip(clip: &SpatialClip) -> WireSpatialClip {
+    WireSpatialClip {
+        boundary: clip
+            .boundary
+            .iter()
+            .map(|point| [point.x, point.y])
+            .collect(),
+        origin: pt(clip.origin),
+        extrusion: pt(clip.extrusion),
+        inverse_transform: clip.inverse_transform,
+        transform: clip.transform,
+        frame_on: clip.frame_on,
+        front_clip: clip.front_clip,
+        back_clip: clip.back_clip,
+    }
+}
+
+fn from_spatial_clip(clip: WireSpatialClip) -> SpatialClip {
+    SpatialClip {
+        boundary: clip
+            .boundary
+            .into_iter()
+            .map(|point| Point2::new(point[0], point[1]))
+            .collect(),
+        origin: from_pt(clip.origin),
+        extrusion: from_pt(clip.extrusion),
+        inverse_transform: clip.inverse_transform,
+        transform: clip.transform,
+        frame_on: clip.frame_on,
+        front_clip: clip.front_clip,
+        back_clip: clip.back_clip,
+    }
 }
 
 #[cfg(test)]
@@ -3370,11 +3655,15 @@ mod tests {
                     point: Point3::from_xy(0.0, 0.0),
                     bulge: 0.0,
                     vertex_id: vertex,
+                    start_width: 0.0,
+                    end_width: 0.0,
                 },
                 cad_core::PolyVertex {
                     point: Point3::from_xy(800.0, 0.0),
                     bulge: 0.0,
                     vertex_id: document.allocate_vertex_id(),
+                    start_width: 0.0,
+                    end_width: 0.0,
                 },
             ],
             closed: false,
@@ -3553,5 +3842,135 @@ mod tests {
         assert!(write_mycad(&document, &as_dir).is_err());
         assert!(as_dir.is_dir());
         let _ = std::fs::remove_dir(&as_dir);
+    }
+
+    #[test]
+    fn xclip_roundtrip_keeps_the_boundary_and_header() {
+        let mut document = Document::default();
+        document.ensure_layer_zero();
+        document.xclip_frame = Some(2);
+        document.blocks.insert(
+            "BAR".into(),
+            BlockDefinition {
+                name: "BAR".into(),
+                base_pt: Point3::default(),
+                entities: vec![Entity::new(Geometry::Line {
+                    start: Point3::from_xy(-10.0, 0.0),
+                    end: Point3::from_xy(10.0, 0.0),
+                })],
+                ..Default::default()
+            },
+        );
+        let boundary = vec![
+            Point2::new(-1.0, -1.0),
+            Point2::new(1.0, -1.0),
+            Point2::new(1.0, 1.0),
+            Point2::new(-1.0, 1.0),
+        ];
+        document.add_entity(Entity::new(Geometry::Insert {
+            block_name: "BAR".into(),
+            insertion: Point3::default(),
+            scale: Point3::new(1.0, 1.0, 1.0),
+            rotation: 0.0,
+            extrusion: Point3::new(0.0, 0.0, 1.0),
+            attribs: Vec::new(),
+            column_count: 1,
+            row_count: 1,
+            column_spacing: 0.0,
+            row_spacing: 0.0,
+            configuration: None,
+            clip: Some(SpatialClip::new(boundary.clone())),
+        }));
+        let path = temp("xclip.mycad");
+        write_mycad(&document, &path).expect("write");
+        let loaded = read_mycad(&path).expect("read");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(loaded.xclip_frame, Some(2));
+        let Geometry::Insert { clip, .. } = &loaded.model_space[0].geometry else {
+            panic!("insert");
+        };
+        let clip = clip.as_ref().expect("clip");
+        assert_eq!(clip.boundary.len(), boundary.len());
+        for (loaded_point, point) in clip.boundary.iter().zip(&boundary) {
+            assert!(loaded_point.distance(*point) < 1e-9);
+        }
+        assert!(clip.frame_on);
+        assert!(clip.front_clip.is_none());
+        assert_eq!(
+            clip.inverse_transform,
+            SpatialClip::new(Vec::new()).inverse_transform
+        );
+    }
+
+    #[test]
+    fn mline_and_multileader_roundtrip() {
+        let mut document = Document::default();
+        document.ensure_layer_zero();
+        document.add_entity(Entity::new(Geometry::MLine {
+            vertices: vec![Point3::from_xy(0.0, 0.0), Point3::from_xy(10.0, 0.0)],
+            miters: vec![Point3::from_xy(0.0, 1.0), Point3::from_xy(0.0, 1.0)],
+            closed: false,
+            scale: 200.0,
+            justification: 1,
+            offsets: vec![0.5, -0.5],
+        }));
+        document.add_entity(Entity::new(Geometry::MultiLeader {
+            lines: vec![LeaderLine {
+                points: vec![Point3::from_xy(0.0, 0.0)],
+                last_point: Some(Point3::from_xy(10.0, 0.0)),
+                dogleg: Some(Point3::from_xy(0.0, 1.0)),
+                dogleg_length: 4.0,
+                arrow_size: None,
+            }],
+            content: LeaderContent::Text {
+                value: "BUS".into(),
+                location: Point3::from_xy(10.0, 8.0),
+                height: 2.0,
+                rotation: 0.0,
+                width: 0.0,
+                frame: false,
+            },
+            arrow_size: 2.0,
+        }));
+        let path = temp("leaders.mycad");
+        write_mycad(&document, &path).expect("write");
+        let loaded = read_mycad(&path).expect("read");
+        let _ = std::fs::remove_file(&path);
+        let Geometry::MLine { scale, offsets, .. } = &loaded.model_space[0].geometry else {
+            panic!("mline");
+        };
+        assert!((*scale - 200.0).abs() < 1e-9);
+        assert_eq!(offsets, &vec![0.5, -0.5]);
+        let Geometry::MultiLeader {
+            content,
+            arrow_size,
+            ..
+        } = &loaded.model_space[1].geometry
+        else {
+            panic!("leader");
+        };
+        assert!((*arrow_size - 2.0).abs() < 1e-9);
+        let LeaderContent::Text { value, .. } = content else {
+            panic!("text");
+        };
+        assert_eq!(value, "BUS");
+    }
+
+    #[test]
+    fn lineweight_display_roundtrip_keeps_the_switch_and_default() {
+        let mut document = Document::default();
+        document.lwdisplay = true;
+        document.lwdefault = 50;
+        let path = temp("lwdisplay.mycad");
+        write_mycad(&document, &path).expect("write");
+        let loaded = read_mycad(&path).expect("read");
+        let _ = std::fs::remove_file(&path);
+        assert!(loaded.lwdisplay);
+        assert_eq!(loaded.lwdefault, 50);
+        let old = r#"{"units":0,"ltscale":1.0,"current_layer":"0","next_entity_id":1,"next_definition_id":1,"next_parameter_id":1,"next_option_id":1,"next_action_id":1,"content_generation":1,"saved_revision":0,"layers":[],"linetypes":[],"blocks":[],"model_space":[]}"#;
+        let wire: WireDocument = serde_json::from_str(old).expect("old document");
+        let loaded_old = from_wire_document(wire).expect("old document");
+        assert!(!loaded_old.lwdisplay);
+        assert_eq!(loaded_old.lwdefault, 25);
     }
 }

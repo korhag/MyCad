@@ -1,13 +1,55 @@
 use crate::{
-    box_select, hit_test, tessellate_document, tessellate_document_for_block_edit, BlockEditView,
-    BlockEditViewFrame, DisplayList, SelectBoxMode, DEFAULT_PICK_TOLERANCE_PX,
+    box_select, hit_test, tessellate_document, tessellate_document_for_block_edit,
+    tessellate_document_on, BlockEditView, BlockEditViewFrame, DisplayList, SelectBoxMode,
+    DEFAULT_PICK_TOLERANCE_PX, VIEWPORT_CLEAR, VIEWPORT_CLEAR_RGB,
 };
 use cad_core::Point2;
 use cad_core::{
     BlockDefinition, CadColor, Document, Entity, EntityId, Extents2, Geometry, Layer, Point3,
-    PolyVertex, Rgb, Transform2,
+    PolyVertex, Rgb, SpatialClip, Transform2,
 };
 use cad_viewport::Camera2;
+
+#[test]
+fn later_draw_order_covers_an_earlier_line() {
+    let mut document = Document::default();
+    layer0(&mut document);
+    let mut line = Entity::new(Geometry::Line {
+        start: Point3::from_xy(0.0, 0.0),
+        end: Point3::from_xy(10.0, 0.0),
+    });
+    line.draw_order = 0;
+    let mut wipeout = Entity::new(Geometry::Wipeout(cad_core::RasterFrame {
+        corner: Point3::from_xy(2.0, -1.0),
+        u_vector: Point3::from_xy(1.0, 0.0),
+        v_vector: Point3::from_xy(0.0, 1.0),
+        size: Point2::new(4.0, 2.0),
+        clip: Vec::new(),
+        path: String::new(),
+    }));
+    wipeout.draw_order = 1;
+    document.model_space.push(line);
+    document.model_space.push(wipeout);
+    let list = tessellate_document(&document);
+    let line_range = list.draw_ranges[0];
+    let wipe_range = list.draw_ranges[1];
+    let line_depth = list.line_vertices[line_range.line_start as usize].depth;
+    let fill_depth = list.triangle_vertices[wipe_range.fill_start as usize].depth;
+    assert!(
+        fill_depth < line_depth,
+        "wipeout depth {fill_depth} should be closer than line depth {line_depth}"
+    );
+    let color = list.triangle_vertices[wipe_range.fill_start as usize].color;
+    let clear = VIEWPORT_CLEAR;
+    assert_eq!(
+        VIEWPORT_CLEAR_RGB,
+        [33, 40, 48],
+        "model background is AutoCAD's dark theme"
+    );
+    assert!((color[0] - clear[0]).abs() < 0.02);
+    assert!((color[1] - clear[1]).abs() < 0.02);
+    assert!((color[2] - clear[2]).abs() < 0.02);
+}
 
 fn layer0(document: &mut Document) {
     document.layers.insert(
@@ -65,20 +107,152 @@ fn tessellates_line_into_two_vertices() {
 }
 
 #[test]
-fn black_line_draws_as_light_gray() {
+fn lineweight_display_off_keeps_a_hairline() {
+    let mut document = Document::default();
+    layer0(&mut document);
+    document.lwdisplay = false;
+    let mut line = Entity::new(Geometry::Line {
+        start: Point3::from_xy(0.0, 0.0),
+        end: Point3::from_xy(10.0, 0.0),
+    });
+    line.lineweight = 100;
+    document.model_space.push(line);
+    let list = tessellate_document(&document);
+    assert_eq!(list.line_count(), 1);
+    assert!(list.weight_vertices.is_empty());
+}
+
+#[test]
+fn lineweight_display_on_emits_a_ten_pixel_quad() {
+    let mut document = Document::default();
+    layer0(&mut document);
+    document.lwdisplay = true;
+    let mut line = Entity::new(Geometry::Line {
+        start: Point3::from_xy(0.0, 0.0),
+        end: Point3::from_xy(10.0, 0.0),
+    });
+    line.lineweight = 100;
+    document.model_space.push(line);
+    let first = tessellate_document(&document);
+    let second = tessellate_document(&document);
+    assert!(first.line_vertices.is_empty());
+    assert_eq!(first.weight_vertices.len(), 6);
+    assert!((first.weight_vertices[0].half_px - 5.0).abs() < 1e-6);
+    assert_eq!(first.weight_vertices.len(), second.weight_vertices.len());
+    assert!(
+        (first.weight_vertices[0].half_px - second.weight_vertices[0].half_px).abs() < 1e-6
+    );
+}
+
+#[test]
+fn a_wide_polyline_stays_a_filled_band_when_lineweight_display_is_on() {
+    let mut document = Document::default();
+    layer0(&mut document);
+    document.lwdisplay = true;
+    let wide = |x: f64| {
+        let mut vertex = PolyVertex::new(Point3::from_xy(x, 0.0), 0.0);
+        vertex.start_width = 2.0;
+        vertex.end_width = 2.0;
+        vertex
+    };
+    document.model_space.push(Entity::new(Geometry::LwPolyline {
+        vertices: vec![wide(0.0), wide(10.0)],
+        closed: false,
+        extrusion: Point3::new(0.0, 0.0, 1.0),
+        linetype_generation_continuous: true,
+    }));
+    let list = tessellate_document(&document);
+    assert!(!list.triangle_vertices.is_empty());
+    assert!(list.weight_vertices.is_empty());
+    assert!(list.line_vertices.is_empty());
+}
+
+#[test]
+fn black_and_aci_250_stay_their_stored_color() {
+    let mut document = Document::default();
+    layer0(&mut document);
+    let mut black = Entity::new(Geometry::Line {
+        start: Point3::from_xy(0.0, 0.0),
+        end: Point3::from_xy(10.0, 0.0),
+    });
+    black.color = CadColor::Rgb { r: 0, g: 0, b: 0 };
+    let mut gray = Entity::new(Geometry::Line {
+        start: Point3::from_xy(0.0, 1.0),
+        end: Point3::from_xy(10.0, 1.0),
+    });
+    gray.color = CadColor::Aci(250);
+    document.model_space.push(black);
+    document.model_space.push(gray);
+    let list = tessellate_document(&document);
+    let black_rgb = Rgb { r: 0, g: 0, b: 0 }.to_array();
+    let gray_rgb = cad_core::aci_rgb(250).to_array();
+    assert_eq!(list.line_vertices[0].color, black_rgb);
+    assert_eq!(list.line_vertices[1].color, black_rgb);
+    assert_eq!(list.line_vertices[2].color, gray_rgb);
+    assert_eq!(list.line_vertices[3].color, gray_rgb);
+}
+
+#[test]
+fn aci_7_stays_white_on_the_dark_sheet_and_turns_black_on_a_light_one() {
     let mut document = Document::default();
     layer0(&mut document);
     let mut line = Entity::new(Geometry::Line {
         start: Point3::from_xy(0.0, 0.0),
         end: Point3::from_xy(10.0, 0.0),
     });
-    line.color = CadColor::Rgb { r: 0, g: 0, b: 0 };
+    line.color = CadColor::Aci(7);
     document.model_space.push(line);
-    let list = tessellate_document(&document);
-    let expected = Rgb::DARK_BACKGROUND_SUBSTITUTE.to_array();
-    assert!(!list.line_vertices.is_empty());
-    for vertex in &list.line_vertices {
-        assert_eq!(vertex.color, expected);
+    let dark = tessellate_document(&document);
+    let white = Rgb {
+        r: 255,
+        g: 255,
+        b: 255,
+    }
+    .to_array();
+    assert_eq!(dark.line_vertices[0].color, white);
+    let light = tessellate_document_on(
+        &document,
+        Rgb {
+            r: 255,
+            g: 255,
+            b: 255,
+        },
+    );
+    let black = Rgb { r: 0, g: 0, b: 0 }.to_array();
+    assert_eq!(light.line_vertices[0].color, black);
+}
+
+#[test]
+fn a_wipeout_on_a_white_sheet_stays_white() {
+    let mut document = Document::default();
+    layer0(&mut document);
+    document
+        .model_space
+        .push(Entity::new(Geometry::Wipeout(cad_core::RasterFrame {
+            corner: Point3::from_xy(0.0, 0.0),
+            u_vector: Point3::from_xy(1.0, 0.0),
+            v_vector: Point3::from_xy(0.0, 1.0),
+            size: Point2::new(4.0, 2.0),
+            clip: Vec::new(),
+            path: String::new(),
+        })));
+    let list = tessellate_document_on(
+        &document,
+        Rgb {
+            r: 255,
+            g: 255,
+            b: 255,
+        },
+    );
+    assert!(!list.triangle_vertices.is_empty());
+    let white = Rgb {
+        r: 255,
+        g: 255,
+        b: 255,
+    }
+    .to_array();
+    for vertex in &list.triangle_vertices {
+        assert_eq!(vertex.color, white);
     }
 }
 
@@ -123,16 +297,22 @@ fn picks_a_polyline_along_a_segment() {
                 point: Point3::from_xy(0.0, 0.0),
                 bulge: 0.0,
                 vertex_id: Default::default(),
+                start_width: 0.0,
+                end_width: 0.0,
             },
             PolyVertex {
                 point: Point3::from_xy(8.0, 0.0),
                 bulge: 0.0,
                 vertex_id: Default::default(),
+                start_width: 0.0,
+                end_width: 0.0,
             },
             PolyVertex {
                 point: Point3::from_xy(8.0, 6.0),
                 bulge: 0.0,
                 vertex_id: Default::default(),
+                start_width: 0.0,
+                end_width: 0.0,
             },
         ],
         closed: false,
@@ -238,6 +418,7 @@ fn nested_block_picks_the_parent_insert() {
         column_spacing: 0.0,
         row_spacing: 0.0,
         configuration: None,
+        clip: None,
     }));
     assert_eq!(
         pick_world(&document, Point2::new(110.0, 50.0)),
@@ -349,6 +530,7 @@ fn nested_byblock_inherits_insert_linetype() {
         column_spacing: 0.0,
         row_spacing: 0.0,
         configuration: None,
+        clip: None,
     });
     insert.linetype = "DASHED".into();
     document.model_space.push(insert);
@@ -387,16 +569,22 @@ fn dashed_polyline_remains_pickable_in_gaps() {
                 point: Point3::from_xy(0.0, 0.0),
                 bulge: 0.0,
                 vertex_id: Default::default(),
+                start_width: 0.0,
+                end_width: 0.0,
             },
             PolyVertex {
                 point: Point3::from_xy(8.0, 0.0),
                 bulge: 0.0,
                 vertex_id: Default::default(),
+                start_width: 0.0,
+                end_width: 0.0,
             },
             PolyVertex {
                 point: Point3::from_xy(8.0, 6.0),
                 bulge: 0.0,
                 vertex_id: Default::default(),
+                start_width: 0.0,
+                end_width: 0.0,
             },
         ],
         closed: false,
@@ -467,6 +655,7 @@ fn insert_entity(name: &str, insertion: Point3, scale: Point3, rotation: f64) ->
         column_spacing: 0.0,
         row_spacing: 0.0,
         configuration: None,
+        clip: None,
     })
 }
 
@@ -908,6 +1097,8 @@ fn overlay_batches_merge_adjacent_ranges_not_edge_count() {
             point: Point3::from_xy(i as f64, 20.0),
             bulge: 0.0,
             vertex_id: Default::default(),
+            start_width: 0.0,
+            end_width: 0.0,
         })
         .collect();
     document.model_space.push(Entity::new(Geometry::LwPolyline {
@@ -1363,4 +1554,46 @@ fn spatial_hit_test_matches_the_linear_scan() {
         );
         assert_eq!(spatial, linear, "{world:?}");
     }
+}
+
+#[test]
+fn xclip_pick_hits_the_kept_segment_and_misses_outside() {
+    let mut document = Document::default();
+    layer0(&mut document);
+    document.blocks.insert(
+        "BAR".into(),
+        BlockDefinition {
+            name: "BAR".into(),
+            base_pt: Point3::default(),
+            entities: vec![Entity::new(Geometry::Line {
+                start: Point3::from_xy(-10.0, 0.0),
+                end: Point3::from_xy(10.0, 0.0),
+            })],
+            ..Default::default()
+        },
+    );
+    document.model_space.push(Entity::new(Geometry::Insert {
+        block_name: "BAR".into(),
+        insertion: Point3::default(),
+        scale: Point3::new(1.0, 1.0, 1.0),
+        rotation: 0.0,
+        extrusion: Point3::new(0.0, 0.0, 1.0),
+        attribs: Vec::new(),
+        column_count: 1,
+        row_count: 1,
+        column_spacing: 0.0,
+        row_spacing: 0.0,
+        configuration: None,
+        clip: Some(SpatialClip::new(vec![
+            Point2::new(-1.0, -1.0),
+            Point2::new(1.0, -1.0),
+            Point2::new(1.0, 1.0),
+            Point2::new(-1.0, 1.0),
+        ])),
+    }));
+    assert_eq!(
+        pick_world(&document, Point2::new(0.0, 0.0)),
+        Some(EntityId(0))
+    );
+    assert_eq!(pick_world(&document, Point2::new(5.0, 0.0)), None);
 }

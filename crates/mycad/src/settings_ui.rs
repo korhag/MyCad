@@ -317,6 +317,20 @@ fn display_tab(ui: &mut egui::Ui, app: &mut MyCadApp) {
     if ui.small_button("Reset crossing color").clicked() {
         app.settings_draft.display.reset_crossing();
     }
+    ui.add_space(16.0);
+    ui.separator();
+    ui.heading("Model");
+    ui.weak("The sheet color. AutoCAD's dark theme uses 33, 40, 48. Wipeouts use the same color.");
+    ui.add_space(8.0);
+    color_row(
+        ui,
+        "Model background",
+        "2D model space",
+        &mut app.settings_draft.display.model_background,
+    );
+    if ui.small_button("Reset model background").clicked() {
+        app.settings_draft.display.reset_model_background();
+    }
     ui.add_space(8.0);
     if ui.button("Reset display colors").clicked() {
         app.settings_draft.display.reset_all();

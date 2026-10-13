@@ -85,6 +85,8 @@ struct ChainSeg {
     bulge: f64,
     start_id: VertexId,
     end_id: VertexId,
+    start_width: f64,
+    end_width: f64,
 }
 
 // ------------------------------------------------------------
@@ -766,10 +768,12 @@ fn offset_vertices(
     let limit = MITER_LIMIT * distance;
     let mut out = Vec::new();
     if !closed {
-        out.push(poly_at(
+        out.push(poly_wide(
             shifted[0].0,
             vertices[0].point.z,
             vertices[0].vertex_id,
+            vertices[0].start_width,
+            vertices[0].end_width,
         ));
     }
     if closed {
@@ -777,28 +781,72 @@ fn offset_vertices(
             let prev = if index == 0 { count - 1 } else { index - 1 };
             let z = vertices[index].point.z;
             let id = vertices[index].vertex_id;
-            push_join(&mut out, shifted[prev], shifted[index], limit, z, id);
+            push_join(
+                &mut out,
+                shifted[prev],
+                shifted[index],
+                limit,
+                z,
+                id,
+                vertices[index].start_width,
+                vertices[index].end_width,
+            );
         }
     } else {
         for index in 1..count {
             let z = vertices[index].point.z;
             let id = vertices[index].vertex_id;
-            push_join(&mut out, shifted[index - 1], shifted[index], limit, z, id);
+            push_join(
+                &mut out,
+                shifted[index - 1],
+                shifted[index],
+                limit,
+                z,
+                id,
+                vertices[index].start_width,
+                vertices[index].end_width,
+            );
         }
     }
     if !closed {
         let last = vertices.len() - 1;
-        out.push(poly_at(
+        out.push(poly_wide(
             shifted[count - 1].1,
             vertices[last].point.z,
             vertices[last].vertex_id,
+            vertices[last].start_width,
+            vertices[last].end_width,
         ));
     }
+    copy_offset_widths(vertices, &mut out);
     compact_vertices(&mut out);
     if out.len() < 2 || (closed && out.len() < 3) {
         return Err(EditError::Degenerate);
     }
     Ok(out)
+}
+
+fn copy_offset_widths(source: &[PolyVertex], out: &mut [PolyVertex]) {
+    if source.len() == out.len() {
+        for (vertex, original) in out.iter_mut().zip(source) {
+            vertex.start_width = original.start_width;
+            vertex.end_width = original.end_width;
+        }
+        return;
+    }
+    let Some(first) = source.first() else {
+        return;
+    };
+    let constant = source.iter().all(|vertex| {
+        (vertex.start_width - first.start_width).abs() <= 1e-9
+            && (vertex.end_width - first.end_width).abs() <= 1e-9
+    });
+    if constant {
+        for vertex in out {
+            vertex.start_width = first.start_width;
+            vertex.end_width = first.end_width;
+        }
+    }
 }
 
 fn push_join(
@@ -808,15 +856,23 @@ fn push_join(
     limit: f64,
     z: f64,
     id: VertexId,
+    start_width: f64,
+    end_width: f64,
 ) {
     if let Some(point) = infinite_line_intersection(prev.0, prev.1, next.0, next.1) {
         if prev.1.distance(point) <= limit && next.0.distance(point) <= limit {
-            out.push(poly_at(point, z, id));
+            out.push(poly_wide(point, z, id, start_width, end_width));
             return;
         }
     }
-    out.push(poly_at(prev.1, z, id));
-    out.push(poly_at(next.0, z, VertexId::UNASSIGNED));
+    out.push(poly_wide(prev.1, z, id, start_width, end_width));
+    out.push(poly_wide(
+        next.0,
+        z,
+        VertexId::UNASSIGNED,
+        start_width,
+        end_width,
+    ));
 }
 
 fn pieces_from_span<F>(
@@ -907,6 +963,8 @@ fn chain_piece(
             point,
             bulge,
             vertex_id: id,
+            start_width: width_outgoing(segs, pair[0]),
+            end_width: width_incoming(segs, pair[1]),
         });
     }
     let Some(end_param) = params.last().copied() else {
@@ -921,6 +979,8 @@ fn chain_piece(
             point: end_point,
             bulge: 0.0,
             vertex_id: end_id,
+            start_width: width_incoming(segs, end_param),
+            end_width: width_incoming(segs, end_param),
         });
     }
     if vertices.len() < 2 {
@@ -1094,6 +1154,8 @@ fn chain_segments(vertices: &[PolyVertex], closed: bool) -> Vec<ChainSeg> {
                 bulge: vertices[index].bulge,
                 start_id: vertices[index].vertex_id,
                 end_id: vertices[next].vertex_id,
+                start_width: vertices[index].start_width,
+                end_width: vertices[index].end_width,
             }
         })
         .collect()
@@ -1376,11 +1438,59 @@ fn chain_side_sign(vertices: &[Point2], closed: bool, side: Point2) -> Option<f6
     Some(side_sign(normal, vertices[best], side))
 }
 
-fn poly_at(point: Point2, z: f64, vertex_id: VertexId) -> PolyVertex {
+fn poly_wide(
+    point: Point2,
+    z: f64,
+    vertex_id: VertexId,
+    start_width: f64,
+    end_width: f64,
+) -> PolyVertex {
     PolyVertex {
-        point: Point3::new(point.x, point.y, z),
-        bulge: 0.0,
         vertex_id,
+        start_width,
+        end_width,
+        ..PolyVertex::new(Point3::new(point.x, point.y, z), 0.0)
+    }
+}
+
+fn width_outgoing(segs: &[ChainSeg], param: f64) -> f64 {
+    if segs.is_empty() {
+        return 0.0;
+    }
+    let (index, t) = width_place(segs, param, false);
+    let seg = &segs[index];
+    seg.start_width + (seg.end_width - seg.start_width) * t
+}
+
+fn width_incoming(segs: &[ChainSeg], param: f64) -> f64 {
+    if segs.is_empty() {
+        return 0.0;
+    }
+    let (index, t) = width_place(segs, param, true);
+    let seg = &segs[index];
+    seg.start_width + (seg.end_width - seg.start_width) * t
+}
+
+fn width_place(segs: &[ChainSeg], param: f64, incoming: bool) -> (usize, f64) {
+    let count = segs.len();
+    if count == 0 {
+        return (0, 0.0);
+    }
+    let end = count as f64;
+    if incoming {
+        if param >= end - 1e-9 {
+            return (count - 1, 1.0);
+        }
+        if param <= 1e-9 {
+            return (0, 0.0);
+        }
+        let index = ((param - 1e-9).floor() as usize).min(count - 1);
+        (index, (param - index as f64).clamp(0.0, 1.0))
+    } else if param >= end - 1e-9 {
+        (count - 1, 1.0)
+    } else {
+        let index = (param.max(0.0).floor() as usize).min(count - 1);
+        (index, (param - index as f64).clamp(0.0, 1.0))
     }
 }
 
@@ -1542,6 +1652,33 @@ mod tests {
     }
 
     #[test]
+    fn trim_keeps_polyline_width() {
+        let wide = |x: f64, y: f64| PolyVertex {
+            start_width: 2.0,
+            end_width: 4.0,
+            ..PolyVertex::new(Point3::new(x, y, 0.0), 0.0)
+        };
+        let poly = Geometry::LwPolyline {
+            vertices: vec![wide(0.0, 0.0), wide(10.0, 0.0), wide(10.0, 4.0)],
+            closed: false,
+            extrusion: default_extrusion(),
+            linetype_generation_continuous: false,
+        };
+        let trimmed =
+            trim_geometry(&poly, Point2::new(6.0, 0.0), &[fence(4.0), fence(8.0)]).unwrap();
+        for piece in &trimmed.pieces {
+            let Geometry::LwPolyline { vertices, .. } = piece else {
+                panic!("expected a polyline");
+            };
+            assert!(
+                vertices[0].start_width > 1.0,
+                "trimmed start width {}",
+                vertices[0].start_width
+            );
+        }
+    }
+
+    #[test]
     fn extend_line_to_a_line_and_an_arc() {
         let target = line(0.0, 0.0, 1.0, 0.0);
         let extended = extend_geometry(&target, Point2::new(1.0, 0.0), &[fence(4.0)]).unwrap();
@@ -1609,6 +1746,57 @@ mod tests {
         assert!(closed);
         let has = |x, y| vertices.iter().any(|vertex| near(vertex.point.xy(), x, y));
         assert!(has(11.0, -1.0) && has(11.0, 6.0) && has(-1.0, 6.0) && has(-1.0, -1.0));
+
+        let mut wide = rect;
+        if let Geometry::LwPolyline { vertices, .. } = &mut wide {
+            for vertex in vertices {
+                vertex.start_width = 2.0;
+                vertex.end_width = 2.0;
+            }
+        }
+        let offset = offset_geometry(&wide, 1.0, Point2::new(5.0, -1.0)).unwrap();
+        let Geometry::LwPolyline { vertices, .. } = offset else {
+            panic!("expected a polyline");
+        };
+        assert!(vertices.iter().all(|vertex| {
+            (vertex.start_width - 2.0).abs() < 1e-9 && (vertex.end_width - 2.0).abs() < 1e-9
+        }));
+    }
+
+    #[test]
+    fn offset_keeps_width_when_a_corner_splits() {
+        let back = Geometry::LwPolyline {
+            vertices: vec![
+                PolyVertex {
+                    start_width: 2.0,
+                    end_width: 2.0,
+                    ..PolyVertex::new(Point3::new(0.0, 0.0, 0.0), 0.0)
+                },
+                PolyVertex {
+                    start_width: 4.0,
+                    end_width: 6.0,
+                    ..PolyVertex::new(Point3::new(10.0, 0.0, 0.0), 0.0)
+                },
+                PolyVertex {
+                    start_width: 8.0,
+                    end_width: 8.0,
+                    ..PolyVertex::new(Point3::new(0.0, 0.0, 0.0), 0.0)
+                },
+            ],
+            closed: false,
+            extrusion: default_extrusion(),
+            linetype_generation_continuous: false,
+        };
+        let Geometry::LwPolyline { vertices, .. } =
+            offset_geometry(&back, 1.0, Point2::new(5.0, 1.0)).unwrap()
+        else {
+            panic!("expected a polyline");
+        };
+        assert!(vertices.len() > 3);
+        assert!(vertices.iter().any(|vertex| {
+            (vertex.start_width - 4.0).abs() < 1e-9 && (vertex.end_width - 6.0).abs() < 1e-9
+        }));
+        assert!(vertices.iter().all(|vertex| vertex.start_width > 1.0));
     }
 
     #[test]

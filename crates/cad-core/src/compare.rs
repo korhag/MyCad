@@ -725,19 +725,103 @@ fn compare_geometry(
         (
             Geometry::MLine {
                 vertices: a,
+                miters: miters_a,
                 closed: closed_a,
+                scale: scale_a,
+                justification: just_a,
+                offsets: offsets_a,
             },
             Geometry::MLine {
                 vertices: b,
+                miters: miters_b,
                 closed: closed_b,
+                scale: scale_b,
+                justification: just_b,
+                offsets: offsets_b,
             },
         ) => {
             points_field(&format!("{path}.vertices"), a, b, tol, out);
+            points_field(&format!("{path}.miters"), miters_a, miters_b, tol, out);
             if closed_a != closed_b {
                 out.push(Mismatch {
                     path: format!("{path}.closed"),
                     message: format!("expected {closed_a} got {closed_b}"),
                 });
+            }
+            scalar_field(&format!("{path}.scale"), *scale_a, *scale_b, tol.coord, out);
+            if just_a != just_b {
+                out.push(Mismatch {
+                    path: format!("{path}.justification"),
+                    message: format!("expected {just_a} got {just_b}"),
+                });
+            }
+            if offsets_a.len() != offsets_b.len() {
+                out.push(Mismatch {
+                    path: format!("{path}.offsets"),
+                    message: format!("expected {offsets_a:?} got {offsets_b:?}"),
+                });
+            } else {
+                for (index, (left, right)) in offsets_a.iter().zip(offsets_b).enumerate() {
+                    scalar_field(
+                        &format!("{path}.offsets[{index}]"),
+                        *left,
+                        *right,
+                        tol.coord,
+                        out,
+                    );
+                }
+            }
+        }
+        (
+            Geometry::MultiLeader {
+                lines: lines_a,
+                content: content_a,
+                arrow_size: arrow_a,
+            },
+            Geometry::MultiLeader {
+                lines: lines_b,
+                content: content_b,
+                arrow_size: arrow_b,
+            },
+        ) => {
+            scalar_field(
+                &format!("{path}.arrow_size"),
+                *arrow_a,
+                *arrow_b,
+                tol.coord,
+                out,
+            );
+            if lines_a.len() != lines_b.len() {
+                out.push(Mismatch {
+                    path: format!("{path}.lines"),
+                    message: format!("expected {} got {}", lines_a.len(), lines_b.len()),
+                });
+            }
+            for (index, (left, right)) in lines_a.iter().zip(lines_b).enumerate() {
+                points_field(
+                    &format!("{path}.lines[{index}]"),
+                    &left.polyline(),
+                    &right.polyline(),
+                    tol,
+                    out,
+                );
+            }
+            if content_a != content_b {
+                out.push(Mismatch {
+                    path: format!("{path}.content"),
+                    message: format!("expected {content_a:?} got {content_b:?}"),
+                });
+            }
+        }
+        (Geometry::Region { wires: a }, Geometry::Region { wires: b }) => {
+            if a.len() != b.len() {
+                out.push(Mismatch {
+                    path: format!("{path}.wires"),
+                    message: format!("expected {} got {}", a.len(), b.len()),
+                });
+            }
+            for (index, (left, right)) in a.iter().zip(b).enumerate() {
+                points_field(&format!("{path}.wires[{index}]"), left, right, tol, out);
             }
         }
         (Geometry::Viewport(a), Geometry::Viewport(b)) => compare_viewport(path, a, b, tol, out),
@@ -1337,6 +1421,18 @@ fn vertices_field(
                 message: format!("expected {} got {}", a.bulge, b.bulge),
             });
         }
+        if !close(a.start_width, b.start_width, tol.coord) {
+            out.push(Mismatch {
+                path: format!("{path}[{index}].start_width"),
+                message: format!("expected {} got {}", a.start_width, b.start_width),
+            });
+        }
+        if !close(a.end_width, b.end_width, tol.coord) {
+            out.push(Mismatch {
+                path: format!("{path}[{index}].end_width"),
+                message: format!("expected {} got {}", a.end_width, b.end_width),
+            });
+        }
     }
 }
 
@@ -1483,11 +1579,15 @@ mod tests {
                     point: Point3::new(0.0, 0.0, 1.0),
                     bulge: 0.0,
                     vertex_id: Default::default(),
+                    start_width: 0.0,
+                    end_width: 0.0,
                 },
                 crate::entity::PolyVertex {
                     point: Point3::new(2.0, 0.0, 4.0),
                     bulge: 0.0,
                     vertex_id: Default::default(),
+                    start_width: 0.0,
+                    end_width: 0.0,
                 },
             ],
             closed: false,

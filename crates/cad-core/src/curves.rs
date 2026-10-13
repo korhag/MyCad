@@ -707,11 +707,15 @@ mod tests {
                 point: Point3::from_xy(a.x, a.y),
                 bulge,
                 vertex_id: Default::default(),
+                start_width: 0.0,
+                end_width: 0.0,
             },
             PolyVertex {
                 point: Point3::from_xy(b.x, b.y),
                 bulge: 0.0,
                 vertex_id: Default::default(),
+                start_width: 0.0,
+                end_width: 0.0,
             },
         ]
     }
@@ -863,16 +867,22 @@ mod tests {
                 point: Point3::from_xy(0.0, 0.0),
                 bulge: 0.0,
                 vertex_id: Default::default(),
+                start_width: 0.0,
+                end_width: 0.0,
             },
             PolyVertex {
                 point: Point3::from_xy(1.0, 0.0),
                 bulge: 0.0,
                 vertex_id: Default::default(),
+                start_width: 0.0,
+                end_width: 0.0,
             },
             PolyVertex {
                 point: Point3::from_xy(1.0, 1.0),
                 bulge: 0.0,
                 vertex_id: Default::default(),
+                start_width: 0.0,
+                end_width: 0.0,
             },
         ];
         let pts = polyline_points(&verts, true, Point3::new(0.0, 0.0, 1.0));

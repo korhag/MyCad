@@ -5,9 +5,89 @@ All notable changes to EntoCAD are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project versions with [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Workspace version is `0.46.1` (`Cargo.toml`).
+Workspace version is `0.54.1` (`Cargo.toml`).
 
 ## [Unreleased]
+
+## [0.54.1] - 2026-10-13
+
+### Fixed
+- The window opens again. A moving view draws at one sample without pairing that color target with the four-sample depth buffer.
+
+## [0.54.0] - 2026-10-13
+
+### Added
+- The installed app compares itself with the workshop and offers to run the installer when that copy is newer. Later hides the prompt until a newer version appears.
+
+## [0.53.0] - 2026-10-13
+
+### Added
+- The model viewport opens on AutoCAD's dark blue-gray (33, 40, 48). Settings → Display → Model background changes that color, and wipeouts stay the same color as the sheet.
+
+### Changed
+- Dark colors draw as stored. Near-white ink turns black only when the model background is light, so color 7 stays visible.
+
+## [0.52.0] - 2026-10-13
+
+### Added
+- Lineweights draw at a constant pixel width when Display Lineweight is on. View → Display lineweight follows the file, and turning it on does not change the picture until the new one is ready.
+
+### Changed
+- Plot and PDF use the real millimetre weight, including Default (0.25 mm) and a ByBlock line that inherits its insert. A native save and a DXF save keep the display switch.
+
+## [0.51.0] - 2026-10-13
+
+### Added
+- A MULTILEADER draws its leader, arrow, and text or block. An MLINE draws one line per style offset, so a scaled multiline has its real width.
+- A REGION with a wire cache is stroked. A region with no wires stays unsupported.
+
+### Changed
+- Native save keeps multiline offsets and multileaders. DXF export writes the offset lines, and a multileader as leader geometry plus text.
+
+## [0.50.1] - 2026-10-13
+
+### Fixed
+- A closed MLINE draws the edge back to the first vertex.
+
+## [0.50.0] - 2026-10-13
+
+### Added
+- An XCLIP on a block insert draws only the geometry inside the boundary, including nested inserts and array cells. The frame follows XCLIPFRAME, including a frame that shows on screen and stays off the plot.
+
+### Changed
+- The clip is kept through a native save and a DXF/DWG save.
+
+## [0.49.0] - 2026-10-13
+
+### Added
+- Draw order comes from each block's SORTENTSTABLE, and a WIPEOUT fills with the background so it covers geometry behind it. Frames follow WIPEOUTFRAME, including frames that show on screen and stay off the plot.
+
+### Changed
+- Fills and lines of the same drawing share one depth order, so a later fill can cover an earlier line.
+
+### Fixed
+- A rectangular WIPEOUT whose clip is two opposite corners fills that rectangle.
+- Offset of a wide polyline keeps its width, including a corner that splits into two points.
+- `--import-only` reports how many draw-order tables were applied, and the largest table size.
+
+## [0.48.0] - 2026-10-13
+
+### Added
+- AutoCAD dynamic blocks with visibility, linear stretch or move, flip, and rotation open as editable dynamic blocks. Arrays, lookups, scale, and point parameters stay as drawn and are named in Diagnostics.
+
+## [0.47.0] - 2026-10-13
+
+### Added
+- Wide LWPOLYLINE and POLYLINE draw as filled bands, including constant width, per-vertex start and end width, bulges, and mitered corners, so walls match AutoCAD when lineweight display is off.
+
+### Changed
+- `--import-only` always prints `SPATIAL_FILTER`, `SORTENTSTABLE`, `WIDE_LWPOLYLINE`, and `WIDE_POLYLINE_2D`, including a count of zero.
+- Polyline width is kept through a DXF, DWG, and native save, and it scales when a block is exploded.
+
+## [0.46.2] - 2026-10-13
+
+### Changed
+- `--import-only` lists the AutoCAD display features a drawing uses, including wide polylines, clip filters, draw order, and whether lineweight display is on.
 
 ## [0.46.1] - 2026-10-12
 

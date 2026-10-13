@@ -146,9 +146,29 @@ fn emit_plot(
     out: &mut String,
     report: &mut SaveReport,
 ) {
+    let mut order: Vec<(bool, usize)> = Vec::new();
+    order.extend((0..plot.strokes.len()).map(|index| (false, index)));
+    order.extend((0..plot.fills.len()).map(|index| (true, index)));
+    order.sort_by(|left, right| {
+        let left_key = plot_order_key(plot, left.0, left.1);
+        let right_key = plot_order_key(plot, right.0, right.1);
+        left_key.cmp(&right_key)
+    });
     let mut last_stroke: Option<Rgb> = None;
     let mut last_width = options.stroke_pt.max(0.05);
-    for stroke in &plot.strokes {
+    for (is_fill, index) in order {
+        if is_fill {
+            let fill = &plot.fills[index];
+            set_stroke_color(out, options.style, fill.rgb);
+            set_fill_color(out, options.style, fill.rgb);
+            if !emit_fill(mapper, out, fill) {
+                report
+                    .warnings
+                    .push("Skipped non-finite plot coordinates".into());
+            }
+            continue;
+        }
+        let stroke = &plot.strokes[index];
         let width = if stroke.width_mm > 0.0 {
             (stroke.width_mm * 72.0 / 25.4).max(0.05)
         } else {
@@ -168,15 +188,22 @@ fn emit_plot(
                 .push("Skipped non-finite plot coordinates".into());
         }
     }
-    for fill in &plot.fills {
-        set_stroke_color(out, options.style, fill.rgb);
-        set_fill_color(out, options.style, fill.rgb);
-        if !emit_fill(mapper, out, fill) {
-            report
-                .warnings
-                .push("Skipped non-finite plot coordinates".into());
-        }
-    }
+}
+
+fn plot_order_key(plot: &PlotGeometry, is_fill: bool, index: usize) -> (i32, u32) {
+    let depth = if is_fill {
+        plot.fills[index].depth
+    } else {
+        plot.strokes[index].depth
+    };
+    let seq = if is_fill {
+        plot.fills[index].seq
+    } else {
+        plot.strokes[index].seq
+    };
+    // Farther (larger) depth is painted first. Sequence keeps one entity's
+    // fill behind its own frame.
+    ((-depth * 1_000_000.0).round() as i32, seq)
 }
 
 fn emit_path(mapper: &PageMap, out: &mut String, points: &[Point2], closed: bool) -> bool {
@@ -370,6 +397,7 @@ mod tests {
             column_spacing: 0.0,
             row_spacing: 0.0,
             configuration: None,
+            clip: None,
         })
     }
 
@@ -654,11 +682,15 @@ mod tests {
                     point: Point3::from_xy(0.0, 0.0),
                     bulge: 1.0,
                     vertex_id: Default::default(),
+                    start_width: 0.0,
+                    end_width: 0.0,
                 },
                 PolyVertex {
                     point: Point3::from_xy(2.0, 0.0),
                     bulge: 0.0,
                     vertex_id: Default::default(),
+                    start_width: 0.0,
+                    end_width: 0.0,
                 },
             ],
             closed: false,
@@ -682,11 +714,15 @@ mod tests {
                     point: Point3::from_xy(0.0, 0.0),
                     bulge: 1.0,
                     vertex_id: Default::default(),
+                    start_width: 0.0,
+                    end_width: 0.0,
                 },
                 PolyVertex {
                     point: Point3::from_xy(2.0, 0.0),
                     bulge: 0.0,
                     vertex_id: Default::default(),
+                    start_width: 0.0,
+                    end_width: 0.0,
                 },
             ],
             closed: false,
@@ -786,21 +822,29 @@ mod tests {
                             point: Point3::from_xy(0.0, 0.0),
                             bulge: 0.0,
                             vertex_id: Default::default(),
+                            start_width: 0.0,
+                            end_width: 0.0,
                         },
                         PolyVertex {
                             point: Point3::from_xy(10.0, 0.0),
                             bulge: 0.0,
                             vertex_id: Default::default(),
+                            start_width: 0.0,
+                            end_width: 0.0,
                         },
                         PolyVertex {
                             point: Point3::from_xy(10.0, 10.0),
                             bulge: 0.0,
                             vertex_id: Default::default(),
+                            start_width: 0.0,
+                            end_width: 0.0,
                         },
                         PolyVertex {
                             point: Point3::from_xy(0.0, 10.0),
                             bulge: 0.0,
                             vertex_id: Default::default(),
+                            start_width: 0.0,
+                            end_width: 0.0,
                         },
                     ],
                     closed: true,
@@ -811,21 +855,29 @@ mod tests {
                             point: Point3::from_xy(3.0, 3.0),
                             bulge: 0.0,
                             vertex_id: Default::default(),
+                            start_width: 0.0,
+                            end_width: 0.0,
                         },
                         PolyVertex {
                             point: Point3::from_xy(7.0, 3.0),
                             bulge: 0.0,
                             vertex_id: Default::default(),
+                            start_width: 0.0,
+                            end_width: 0.0,
                         },
                         PolyVertex {
                             point: Point3::from_xy(7.0, 7.0),
                             bulge: 0.0,
                             vertex_id: Default::default(),
+                            start_width: 0.0,
+                            end_width: 0.0,
                         },
                         PolyVertex {
                             point: Point3::from_xy(3.0, 7.0),
                             bulge: 0.0,
                             vertex_id: Default::default(),
+                            start_width: 0.0,
+                            end_width: 0.0,
                         },
                     ],
                     closed: true,
@@ -984,6 +1036,23 @@ mod tests {
         options.stroke_pt = PDF_STROKE_HEAVY_PT;
         let (_, text) = write_pdf(&line_document(), &options);
         assert!(text.contains("1.0000 w"));
+    }
+
+    #[test]
+    fn default_lineweight_plots_in_millimetres_while_display_is_off() {
+        let mut document = line_document();
+        document.lwdisplay = false;
+        document.model_space[0].lineweight = cad_core::LINEWEIGHT_DEFAULT;
+        let mut options = PdfExportOptions::default();
+        options.stroke_pt = 0.5;
+        let (_, text) = write_pdf(&document, &options);
+        let points = 0.25 * 72.0 / 25.4;
+        assert!(text.contains(&format!("{points:.4} w")), "{text}");
+
+        document.model_space[0].lineweight = 0;
+        let (_, hairline) = write_pdf(&document, &options);
+        assert!(hairline.contains("0.5000 w"));
+        assert!(!hairline.contains(&format!("{points:.4} w")));
     }
 
     #[test]

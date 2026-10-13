@@ -6,6 +6,25 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+fn sample_dwgs() -> Vec<PathBuf> {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../samples");
+    let Ok(entries) = fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(ext) = path.extension() else {
+            continue;
+        };
+        if ext.eq_ignore_ascii_case("dwg") {
+            found.push(path);
+        }
+    }
+    found.sort();
+    found
+}
+
 fn reference_dwg() -> PathBuf {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let samples = root.join("samples/KD-1413-260825 Assir Poultry Internal Logistics.dwg");
@@ -13,6 +32,32 @@ fn reference_dwg() -> PathBuf {
         return samples;
     }
     root.join("test-data/KD-1413-260825 Assir Poultry Internal Logistics.dwg")
+}
+
+#[test]
+fn sample_dwgs_report_dynamic_blocks() {
+    let samples = sample_dwgs();
+    assert!(
+        !samples.is_empty(),
+        "expected DWG files in samples/ or test-data/"
+    );
+    for path in samples {
+        let doc = dwg_import::import_dwg(&path).expect("import");
+        assert!(
+            !doc.diagnostics.dynamic_lines.is_empty(),
+            "{} produced no dynamic report",
+            path.display()
+        );
+        assert!(
+            doc.diagnostics.extents.is_some() || doc.model_space.is_empty(),
+            "{} lost its extents",
+            path.display()
+        );
+        println!("=== {}", path.display());
+        for line in &doc.diagnostics.dynamic_lines {
+            println!("{line}");
+        }
+    }
 }
 
 #[test]
@@ -103,6 +148,28 @@ fn reference_dwg_imports_without_panic() {
         non_continuous_layers > 0,
         "layer linetype handles were not resolved (all layers CONTINUOUS)"
     );
+    assert!(
+        !doc.diagnostics.dynamic_lines.is_empty(),
+        "dynamic import should always report what it found"
+    );
+    if doc.diagnostics.dynamic_definitions == 0 {
+        assert!(
+            doc.diagnostics.dynamic_lines.iter().any(|line| {
+                line.contains("no AutoCAD dynamic blocks") || line.contains("were not linked")
+            }),
+            "a drawing with no graphs should say so: {:?}",
+            doc.diagnostics.dynamic_lines
+        );
+    } else {
+        assert!(
+            doc.diagnostics
+                .dynamic_lines
+                .iter()
+                .any(|line| line.contains("verified") || line.contains("kept static")),
+            "every dynamic reference should be verified or kept static: {:?}",
+            doc.diagnostics.dynamic_lines
+        );
+    }
 }
 
 #[test]

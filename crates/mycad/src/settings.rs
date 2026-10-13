@@ -73,6 +73,14 @@ impl RgbColor {
     pub const CROSSING: Self = Self::new(64, 200, 96);
 }
 
+fn default_model_background() -> RgbColor {
+    RgbColor::new(
+        cad_render::VIEWPORT_CLEAR_RGB[0],
+        cad_render::VIEWPORT_CLEAR_RGB[1],
+        cad_render::VIEWPORT_CLEAR_RGB[2],
+    )
+}
+
 // ------------------------------------------------------------
 // Type: DisplaySettings
 // Purpose: Viewport display prefs, including box-selection chrome.
@@ -82,6 +90,8 @@ impl RgbColor {
 pub struct DisplaySettings {
     pub window_selection: RgbColor,
     pub crossing_selection: RgbColor,
+    #[serde(default = "default_model_background")]
+    pub model_background: RgbColor,
 }
 
 impl Default for DisplaySettings {
@@ -89,6 +99,7 @@ impl Default for DisplaySettings {
         Self {
             window_selection: RgbColor::WINDOW,
             crossing_selection: RgbColor::CROSSING,
+            model_background: default_model_background(),
         }
     }
 }
@@ -100,6 +111,10 @@ impl DisplaySettings {
 
     pub fn reset_crossing(&mut self) {
         self.crossing_selection = RgbColor::CROSSING;
+    }
+
+    pub fn reset_model_background(&mut self) {
+        self.model_background = default_model_background();
     }
 
     pub fn reset_all(&mut self) {
@@ -211,6 +226,9 @@ pub struct AppSettings {
     /// Ease each wheel click instead of jumping to the new zoom.
     #[serde(default = "default_smooth_zoom")]
     pub smooth_zoom: bool,
+    /// Workshop version the user chose Later for. A newer one still prompts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dismissed_update: Option<String>,
 }
 
 fn default_viewport_msaa() -> u32 {
@@ -246,6 +264,7 @@ impl Default for AppSettings {
             wheel_acceleration: WheelAccelerationSettings::default(),
             viewport_msaa: DEFAULT_VIEWPORT_MSAA,
             smooth_zoom: default_smooth_zoom(),
+            dismissed_update: None,
         }
     }
 }
@@ -436,6 +455,26 @@ mod tests {
             .bindings
             .bindings_for(InputAction::ContextMenu)
             .is_empty());
+        assert_eq!(
+            decoded.display.model_background,
+            default_model_background()
+        );
+    }
+
+    #[test]
+    fn reset_model_background_restores_the_autocad_sheet() {
+        let mut display = DisplaySettings::default();
+        display.model_background = RgbColor::new(1, 2, 3);
+        display.reset_model_background();
+        assert_eq!(display.model_background, default_model_background());
+        assert_eq!(
+            (
+                display.model_background.r,
+                display.model_background.g,
+                display.model_background.b
+            ),
+            (33, 40, 48)
+        );
     }
 
     #[test]

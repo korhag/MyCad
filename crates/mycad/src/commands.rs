@@ -1491,6 +1491,8 @@ pub fn lwpolyline_geometry(points: &[Point2], closed: bool) -> Geometry {
                 point: Point3::from_xy(point.x, point.y),
                 bulge: 0.0,
                 vertex_id: Default::default(),
+                start_width: 0.0,
+                end_width: 0.0,
             })
             .collect(),
         closed,

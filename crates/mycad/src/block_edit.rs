@@ -644,6 +644,7 @@ mod tests {
             column_spacing: 0.0,
             row_spacing: 0.0,
             configuration: None,
+            clip: None,
         });
         assert!(!insert_is_editable(&entity));
     }

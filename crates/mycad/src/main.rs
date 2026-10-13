@@ -31,6 +31,7 @@ mod selection;
 mod settings;
 mod settings_ui;
 mod theme;
+mod update_check;
 mod view_motion;
 mod wheel_zoom;
 mod workspace;
@@ -252,6 +253,48 @@ fn run_import_only(path: Option<PathBuf>) -> ExitCode {
             }
             for (name, count) in &d.unsupported_counts {
                 println!("unsupported {name} {count}");
+            }
+            for name in [
+                "SPATIAL_FILTER",
+                "SORTENTSTABLE",
+                "WIDE_LWPOLYLINE",
+                "WIDE_POLYLINE_2D",
+            ] {
+                let count = d.feature_counts.get(name).copied().unwrap_or(0);
+                println!("feature {name} {count}");
+            }
+            for (name, count) in &d.feature_counts {
+                if matches!(
+                    name.as_str(),
+                    "SPATIAL_FILTER" | "SORTENTSTABLE" | "WIDE_LWPOLYLINE" | "WIDE_POLYLINE_2D"
+                ) {
+                    continue;
+                }
+                println!("feature {name} {count}");
+            }
+            for name in ["WIPEOUT", "MULTILEADER", "REGION"] {
+                let count = d
+                    .entity_counts
+                    .get(name)
+                    .copied()
+                    .or_else(|| d.unsupported_counts.get(name).copied())
+                    .unwrap_or(0);
+                println!("feature {name} {count}");
+            }
+            println!("polyline_width_max: {:.3}", d.max_polyline_width);
+            println!("sort_ents_max: {}", d.max_sort_ents);
+            let lwdisplay = match d.lwdisplay {
+                Some(true) => "on",
+                Some(false) => "off",
+                None => "unknown",
+            };
+            println!("lwdisplay {lwdisplay}");
+            println!(
+                "dynamic definitions: {} editable: {} kept static: {}",
+                d.dynamic_definitions, d.dynamic_editable, d.dynamic_kept_static
+            );
+            for line in &d.dynamic_lines {
+                println!("{line}");
             }
             for warning in &d.warnings {
                 println!("warning: {warning}");

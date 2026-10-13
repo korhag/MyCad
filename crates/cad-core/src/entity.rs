@@ -60,6 +60,20 @@ impl Default for DimensionData {
 pub const LINEWEIGHT_BYLAYER: i16 = -1;
 pub const LINEWEIGHT_BYBLOCK: i16 = -2;
 pub const LINEWEIGHT_DEFAULT: i16 = -3;
+/// AutoCAD's usual `$LWDEFAULT`, in hundredths of a millimetre (0.25 mm).
+pub const LWDEFAULT_HUNDREDTHS: i16 = 25;
+
+/// On-screen width in pixels for a resolved lineweight.
+///
+/// `hundredths / 10`, rounded, and at least 1. Zero stays one pixel, which
+/// the viewport draws with the hairline line list.
+pub fn lineweight_pixels(hundredths: i16) -> i32 {
+    if hundredths <= 0 {
+        1
+    } else {
+        ((f64::from(hundredths) / 10.0).round() as i32).max(1)
+    }
+}
 
 // ------------------------------------------------------------
 // Type: EntityId
@@ -94,6 +108,9 @@ pub struct Entity {
     pub linetype_scale: f64,
     pub lineweight: i16,
     pub visible: bool,
+    /// Painter's order in this entity's space. A higher value is drawn later,
+    /// in front. Equal values keep file order.
+    pub draw_order: u32,
     pub geometry: Geometry,
 }
 
@@ -107,9 +124,40 @@ impl Entity {
             linetype_scale: 1.0,
             lineweight: LINEWEIGHT_BYLAYER,
             visible: true,
+            draw_order: 0,
             geometry,
         }
     }
+}
+
+/// One MULTILEADER leg. `arrow_size` is `None` when the leg uses the entity size.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LeaderLine {
+    pub points: Vec<Point3>,
+    pub last_point: Option<Point3>,
+    pub dogleg: Option<Point3>,
+    pub dogleg_length: f64,
+    pub arrow_size: Option<f64>,
+}
+
+/// Text or block at the end of a multileader.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LeaderContent {
+    None,
+    Text {
+        value: String,
+        location: Point3,
+        height: f64,
+        rotation: f64,
+        width: f64,
+        frame: bool,
+    },
+    Block {
+        name: String,
+        location: Point3,
+        scale: Point3,
+        rotation: f64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -173,6 +221,8 @@ pub enum Geometry {
         row_spacing: f64,
         /// Instance parameter values for this reference. Absent for static blocks.
         configuration: Option<InstanceConfiguration>,
+        /// AutoCAD XCLIP boundary. Absent when the insert is not clipped.
+        clip: Option<SpatialClip>,
     },
     Text(TextData),
     MText(MTextData),
@@ -187,7 +237,23 @@ pub enum Geometry {
     },
     MLine {
         vertices: Vec<Point3>,
+        /// Unit miter at each vertex. A zero or missing miter uses the left normal.
+        miters: Vec<Point3>,
         closed: bool,
+        /// Multiplies style offsets. Empty offsets draw the centerline.
+        scale: f64,
+        /// 0 top, 1 zero, 2 bottom.
+        justification: u8,
+        offsets: Vec<f64>,
+    },
+    MultiLeader {
+        lines: Vec<LeaderLine>,
+        content: LeaderContent,
+        arrow_size: f64,
+    },
+    /// Display wires of a REGION. An empty list draws nothing.
+    Region {
+        wires: Vec<Vec<Point3>>,
     },
     /// A paper-space viewport. The rectangle lives on the sheet; the view
     /// fields describe the model-space window it shows.
@@ -196,11 +262,220 @@ pub enum Geometry {
     Wipeout(RasterFrame),
 }
 
+impl LeaderLine {
+    /// Stored points, then the landing, then the dogleg.
+    pub fn polyline(&self) -> Vec<Point3> {
+        let mut points = self.points.clone();
+        if let Some(last) = self.last_point {
+            push_distinct(&mut points, last);
+        }
+        if let Some(dir) = self.dogleg {
+            if let Some(&end) = points.last() {
+                push_distinct(&mut points, end + dogleg_step(dir, self.dogleg_length));
+            }
+        }
+        points
+    }
+
+    pub fn arrow_size(&self, entity_size: f64) -> f64 {
+        self.arrow_size.unwrap_or(entity_size)
+    }
+}
+
+impl LeaderContent {
+    pub fn location(&self) -> Option<Point3> {
+        match self {
+            Self::Text { location, .. } | Self::Block { location, .. } => Some(*location),
+            Self::None => None,
+        }
+    }
+}
+
+/// One polyline per style offset. An empty offset list is the centerline.
+pub fn mline_offset_polylines(
+    vertices: &[Point3],
+    miters: &[Point3],
+    closed: bool,
+    scale: f64,
+    justification: u8,
+    offsets: &[f64],
+) -> Vec<Vec<Point3>> {
+    if vertices.len() < 2 {
+        return Vec::new();
+    }
+    let scale = if scale.is_finite() { scale } else { 1.0 };
+    let close = closed && vertices.len() >= 3;
+    let used: Vec<f64> = if offsets.is_empty() {
+        vec![0.0]
+    } else {
+        offsets
+            .iter()
+            .copied()
+            .filter(|value| value.is_finite())
+            .collect()
+    };
+    if used.is_empty() {
+        return Vec::new();
+    }
+    let adjust = if offsets.is_empty() {
+        0.0
+    } else {
+        match justification {
+            0 => -used.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+            2 => -used.iter().copied().fold(f64::INFINITY, f64::min),
+            _ => 0.0,
+        }
+    };
+    let adjust = if adjust.is_finite() { adjust } else { 0.0 };
+    let directions: Vec<Point2> = (0..vertices.len())
+        .map(|index| mline_miter(vertices, miters, index, close))
+        .collect();
+    used.into_iter()
+        .map(|offset| {
+            let distance = (offset + adjust) * scale;
+            vertices
+                .iter()
+                .enumerate()
+                .map(|(index, vertex)| {
+                    let miter = directions[index];
+                    Point3::new(
+                        vertex.x + miter.x * distance,
+                        vertex.y + miter.y * distance,
+                        vertex.z,
+                    )
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn dogleg_step(dir: Point3, length: f64) -> Point3 {
+    let len = dir.length();
+    if len < 1e-15 || !length.is_finite() {
+        Point3::default()
+    } else {
+        dir * (length / len)
+    }
+}
+
+fn push_distinct(points: &mut Vec<Point3>, point: Point3) {
+    if !point.is_finite() {
+        return;
+    }
+    if points
+        .last()
+        .is_some_and(|prev| (*prev - point).length() <= 1e-9)
+    {
+        return;
+    }
+    points.push(point);
+}
+
+fn unit_xy(vector: Point2) -> Option<Point2> {
+    let len = (vector.x * vector.x + vector.y * vector.y).sqrt();
+    if len < 1e-12 {
+        None
+    } else {
+        Some(Point2::new(vector.x / len, vector.y / len))
+    }
+}
+
+fn left_normal(dir: Point2) -> Point2 {
+    unit_xy(Point2::new(-dir.y, dir.x)).unwrap_or(Point2::new(0.0, 1.0))
+}
+
+fn mline_miter(vertices: &[Point3], miters: &[Point3], index: usize, closed: bool) -> Point2 {
+    if let Some(miter) = miters.get(index) {
+        if let Some(unit) = unit_xy(miter.xy()) {
+            return unit;
+        }
+    }
+    let here = vertices[index].xy();
+    let next = if index + 1 < vertices.len() {
+        index + 1
+    } else if closed {
+        0
+    } else {
+        index
+    };
+    let prev = if index > 0 {
+        index - 1
+    } else if closed {
+        vertices.len() - 1
+    } else {
+        index
+    };
+    let dir = if next != index {
+        vertices[next].xy() - here
+    } else if prev != index {
+        here - vertices[prev].xy()
+    } else {
+        Point2::new(1.0, 0.0)
+    };
+    left_normal(dir)
+}
+
 // ------------------------------------------------------------
 // Type: ViewportData
 // Purpose: One VIEWPORT entity. Paper size and sheet name live on
 //          `PaperLayout`, not here.
 // ------------------------------------------------------------
+/// Row-major 4×3. `x' = m[0]*x + m[1]*y + m[2]*z + m[3]`, then the next row for y.
+pub const IDENTITY_4X3: [f64; 12] = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+
+// ------------------------------------------------------------
+// Type: SpatialClip
+// Purpose: XCLIP boundary stored on an INSERT. Points are in clip
+//          space. `inverse_transform` maps them into the block.
+// ------------------------------------------------------------
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpatialClip {
+    pub boundary: Vec<Point2>,
+    pub origin: Point3,
+    pub extrusion: Point3,
+    pub inverse_transform: [f64; 12],
+    pub transform: [f64; 12],
+    /// The filter's own frame flag, used when the drawing has no XCLIPFRAME.
+    pub frame_on: bool,
+    pub front_clip: Option<f64>,
+    pub back_clip: Option<f64>,
+}
+
+impl SpatialClip {
+    pub fn new(boundary: Vec<Point2>) -> Self {
+        Self {
+            boundary,
+            origin: Point3::default(),
+            extrusion: Point3::new(0.0, 0.0, 1.0),
+            inverse_transform: IDENTITY_4X3,
+            transform: IDENTITY_4X3,
+            frame_on: true,
+            front_clip: None,
+            back_clip: None,
+        }
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.boundary.len() >= 3 && self.boundary.iter().all(|point| point.is_finite())
+    }
+
+    /// Boundary in the block's coordinate system.
+    pub fn block_boundary(&self) -> Vec<Point2> {
+        self.boundary
+            .iter()
+            .map(|point| apply_4x3(&self.inverse_transform, point.x, point.y))
+            .filter(|point| point.is_finite())
+            .collect()
+    }
+}
+
+fn apply_4x3(matrix: &[f64; 12], x: f64, y: f64) -> Point2 {
+    Point2::new(
+        matrix[0] * x + matrix[1] * y + matrix[3],
+        matrix[4] * x + matrix[5] * y + matrix[7],
+    )
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RasterFrame {
     pub corner: Point3,
@@ -337,6 +612,8 @@ impl Geometry {
             Self::Solid { .. } => "Solid",
             Self::Leader { .. } => "Leader",
             Self::MLine { .. } => "MLine",
+            Self::MultiLeader { .. } => "MultiLeader",
+            Self::Region { .. } => "Region",
             Self::Viewport(_) => "Viewport",
             Self::Image(_) => "Image",
             Self::Wipeout(_) => "Wipeout",
@@ -398,11 +675,18 @@ impl Geometry {
     }
 }
 
+/// Widths at or below this are drawn as a centerline.
+pub const POLYLINE_WIDTH_MIN: f64 = 1e-9;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PolyVertex {
     pub point: Point3,
     pub bulge: f64,
     pub vertex_id: VertexId,
+    /// Width at the start of the segment that leaves this vertex (DXF group 40).
+    pub start_width: f64,
+    /// Width at the end of that segment (DXF group 41).
+    pub end_width: f64,
 }
 
 impl PolyVertex {
@@ -411,8 +695,18 @@ impl PolyVertex {
             point,
             bulge,
             vertex_id: VertexId::UNASSIGNED,
+            start_width: 0.0,
+            end_width: 0.0,
         }
     }
+
+    pub fn is_wide(self) -> bool {
+        self.start_width > POLYLINE_WIDTH_MIN || self.end_width > POLYLINE_WIDTH_MIN
+    }
+}
+
+pub fn polyline_is_wide(vertices: &[PolyVertex]) -> bool {
+    vertices.iter().any(|vertex| vertex.is_wide())
 }
 
 // ------------------------------------------------------------

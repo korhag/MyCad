@@ -10,9 +10,9 @@ use cad_core::{
     default_extrusion, is_paper_layout_block, normalize_linetype_name, sorted_paper_layout_blocks,
     AttributeInfo, BlockDefinition, CadColor, DimensionData, DimensionKind, Document, DrawingUnits,
     Entity, EntityId, Extents2, Geometry, HatchData, HatchEdge, HatchPath, HatchPatternLine,
-    ImportDiagnostics, Layer, LineType, LineTypeShape, MTextData, PaperLayout, Point2, Point3,
-    PolyVertex, RasterFrame, TextData, TextHAlign, TextStyle, TextVAlign, ViewportData,
-    MAX_INSERT_ARRAY_CELLS,
+    ImportDiagnostics, Layer, LeaderContent, LeaderLine, LineType, LineTypeShape, MTextData,
+    PaperLayout, Point2, Point3, PolyVertex, RasterFrame, SpatialClip, TextData, TextHAlign,
+    TextStyle, TextVAlign, ViewportData, MAX_INSERT_ARRAY_CELLS,
 };
 
 use crate::dynapi::{
@@ -57,7 +57,9 @@ pub unsafe fn convert_document(
     let mut linetypes = BTreeMap::new();
     let mut text_styles = BTreeMap::new();
     let mut blocks = BTreeMap::new();
+    let mut block_handles: BTreeMap<String, Vec<u64>> = BTreeMap::new();
     let mut model_space = Vec::new();
+    let mut wipeout_frame = 1u8;
 
     let num_objects = unsafe { libredwg_sys::dwg_get_num_objects(dwg) };
     for i in 0..num_objects {
@@ -81,6 +83,15 @@ pub unsafe fn convert_document(
             if let Some(lt) = convert_ltype(dwg, ptr, &mut diagnostics) {
                 linetypes.insert(lt.name.clone(), lt);
             }
+        } else if fixedtype == libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_SPATIAL_FILTER {
+            diagnostics.bump_feature("SPATIAL_FILTER");
+        } else if fixedtype == libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_SORTENTSTABLE {
+            diagnostics.bump_feature("SORTENTSTABLE");
+        } else if fixedtype == libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_WIPEOUTVARIABLES {
+            let ptr = unsafe { libredwg_sys::uncad_object_object_ptr(obj) };
+            if let Some(frame) = get_field::<u16>(ptr, "WIPEOUTVARIABLES", "display_frame") {
+                wipeout_frame = u8::try_from(frame).unwrap_or(1).min(2);
+            }
         }
     }
 
@@ -99,17 +110,18 @@ pub unsafe fn convert_document(
         let Some(name) = block_record_name(object_ptr) else {
             continue;
         };
-        let entities = unsafe { owned_entities(dwg, obj, &mut diagnostics, r2004_colors) };
+        let owned = unsafe { owned_entities(dwg, obj, &mut diagnostics, r2004_colors) };
         let base_pt = pt_field(object_ptr, "BLOCK_HEADER", "base_pt").unwrap_or(Point3::default());
         if is_model_space(&name) {
-            model_space.extend(entities.clone());
+            model_space.extend(owned.entities.clone());
         }
+        block_handles.insert(name.clone(), owned.handles);
         blocks.insert(
             name.clone(),
             BlockDefinition {
                 name,
                 base_pt,
-                entities,
+                entities: owned.entities,
                 xref_path: get_utf8_field(object_ptr, "BLOCK_HEADER", "xref_pname")
                     .unwrap_or_default(),
                 xref_overlay: get_field::<u8>(object_ptr, "BLOCK_HEADER", "xrefoverlaid")
@@ -121,7 +133,13 @@ pub unsafe fn convert_document(
     }
 
     unsafe {
-        fill_named_blocks_from_sequences(dwg, &mut blocks, &mut diagnostics, r2004_colors);
+        fill_named_blocks_from_sequences(
+            dwg,
+            &mut blocks,
+            &mut block_handles,
+            &mut diagnostics,
+            r2004_colors,
+        );
     }
 
     diagnostics.layer_count = layers.len();
@@ -150,6 +168,7 @@ pub unsafe fn convert_document(
     let ltscale = get_header_field::<f64>(dwg, "LTSCALE")
         .filter(|v| v.is_finite() && *v > 0.0)
         .unwrap_or(1.0);
+    diagnostics.lwdisplay = get_header_field::<u8>(dwg, "LWDISPLAY").map(|value| value != 0);
     let units = get_header_field::<u16>(dwg, "INSUNITS")
         .map(DrawingUnits::from_insunits)
         .unwrap_or(DrawingUnits::Unspecified);
@@ -166,11 +185,32 @@ pub unsafe fn convert_document(
     document.layouts = unsafe { import_paper_layouts(dwg) };
     ensure_layouts_for_paper_blocks(&mut document);
     document.model_space = model_space;
+    document.lwdisplay = diagnostics.lwdisplay.unwrap_or(false);
+    document.lwdefault = cad_core::LWDEFAULT_HUNDREDTHS;
     document.diagnostics = diagnostics;
     document.ltscale = ltscale;
+    document.wipeout_frame = wipeout_frame;
+    // XCLIPFRAME is stored from R2004. An earlier file leaves the struct at 0,
+    // which is not a request to hide every frame.
+    document.xclip_frame = if dwg_magic_is_r2004(&document.diagnostics.dwg_version) {
+        get_header_field::<u8>(dwg, "XCLIPFRAME")
+            .or_else(|| {
+                get_header_field::<i16>(dwg, "XCLIPFRAME")
+                    .and_then(|value| u8::try_from(value).ok())
+            })
+            .map(|value| value.min(2))
+    } else {
+        None
+    };
+    unsafe {
+        apply_sort_tables(dwg, &mut document, &block_handles);
+    }
     document.units = units;
     document.ensure_layer_zero();
     document.apply_current_layer(clayer.as_deref());
+    unsafe {
+        crate::acad_dynamic::import_acad_dynamic(dwg, &mut document, &block_handles);
+    }
     document.assign_missing_ids();
     document.diagnostics.extents = document.compute_extents();
     document
@@ -344,12 +384,14 @@ fn viewport_from(entity_ptr: *mut c_void) -> ViewportData {
 unsafe fn fill_named_blocks_from_sequences(
     dwg: *mut libredwg_sys::Dwg_Data,
     blocks: &mut BTreeMap<String, BlockDefinition>,
+    block_handles: &mut BTreeMap<String, Vec<u64>>,
     diagnostics: &mut ImportDiagnostics,
     r2004_colors: bool,
 ) {
     let num_objects = unsafe { libredwg_sys::dwg_get_num_objects(dwg) };
     let mut current_name: Option<String> = None;
     let mut collected = Vec::new();
+    let mut collected_handles = Vec::new();
     let mut base_pt = Point3::default();
     for i in 0..num_objects {
         let obj = unsafe { libredwg_sys::dwg_get_object(dwg, i) };
@@ -359,26 +401,38 @@ unsafe fn fill_named_blocks_from_sequences(
         let fixedtype = object_fixedtype(obj);
         if fixedtype == libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_BLOCK {
             collected.clear();
+            collected_handles.clear();
             let entity_ptr = unsafe { libredwg_sys::uncad_object_entity_ptr(obj) };
             current_name = get_utf8_field(entity_ptr, "BLOCK", "name");
             base_pt = pt_field(entity_ptr, "BLOCK", "base_pt").unwrap_or_default();
         } else if fixedtype == libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_ENDBLK {
             if let Some(name) = current_name.take() {
                 if !is_model_space(&name) {
+                    let handle_key = name.clone();
                     match blocks.get_mut(&name) {
                         Some(block) if block.entities.is_empty() => {
                             block.entities = std::mem::take(&mut collected);
+                            block_handles
+                                .insert(handle_key, std::mem::take(&mut collected_handles));
                         }
-                        Some(_) => collected.clear(),
+                        Some(_) => {
+                            collected.clear();
+                            collected_handles.clear();
+                        }
                         None => {
                             let key = find_block_key(blocks, &name).unwrap_or_else(|| name.clone());
                             if let Some(block) = blocks.get_mut(&key) {
                                 if block.entities.is_empty() {
                                     block.entities = std::mem::take(&mut collected);
+                                    block_handles
+                                        .insert(key, std::mem::take(&mut collected_handles));
                                 } else {
                                     collected.clear();
+                                    collected_handles.clear();
                                 }
                             } else {
+                                block_handles
+                                    .insert(name.clone(), std::mem::take(&mut collected_handles));
                                 blocks.insert(
                                     name.clone(),
                                     BlockDefinition {
@@ -393,6 +447,7 @@ unsafe fn fill_named_blocks_from_sequences(
                     }
                 } else {
                     collected.clear();
+                    collected_handles.clear();
                 }
             }
         } else if current_name
@@ -407,6 +462,7 @@ unsafe fn fill_named_blocks_from_sequences(
                 .unwrap_or(true);
             if needs_fill {
                 if let Some(entity) = unsafe { convert_one(dwg, obj, diagnostics, r2004_colors) } {
+                    collected_handles.push(object_handle(obj));
                     collected.push(entity);
                 }
             }
@@ -664,7 +720,7 @@ fn finite_or(value: f64, fallback: f64) -> f64 {
     }
 }
 
-fn block_record_name(block_header_object_ptr: *mut c_void) -> Option<String> {
+pub(crate) fn block_record_name(block_header_object_ptr: *mut c_void) -> Option<String> {
     let abbreviated = get_utf8_field(block_header_object_ptr, "BLOCK_HEADER", "name");
     if let Some(block_ref) = get_field::<*mut libredwg_sys::Dwg_Object_Ref>(
         block_header_object_ptr,
@@ -706,12 +762,144 @@ pub(crate) fn resolve_block_name(
 // LibreDWG `Dwg_Version_Type` enumerator. Same value as `DwgOutputVersion::R2000`.
 const LIBREDWG_R_2000: i32 = 25;
 
+struct OwnedGeometry {
+    entities: Vec<Entity>,
+    handles: Vec<u64>,
+}
+
+fn ref_handle(reference: *mut libredwg_sys::Dwg_Object_Ref) -> u64 {
+    if reference.is_null() {
+        return 0;
+    }
+    let object = unsafe { (*reference).obj };
+    if object.is_null() {
+        return 0;
+    }
+    object_handle(object.cast())
+}
+
+unsafe fn apply_sort_tables(
+    dwg: *mut libredwg_sys::Dwg_Data,
+    document: &mut Document,
+    block_handles: &BTreeMap<String, Vec<u64>>,
+) {
+    let num_objects = unsafe { libredwg_sys::dwg_get_num_objects(dwg) };
+    for index in 0..num_objects {
+        let obj = unsafe { libredwg_sys::dwg_get_object(dwg, index) };
+        if obj.is_null()
+            || object_fixedtype(obj) != libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_SORTENTSTABLE
+        {
+            continue;
+        }
+        let ptr = unsafe { libredwg_sys::uncad_object_object_ptr(obj) };
+        if ptr.is_null() {
+            continue;
+        }
+        let Some(owner) =
+            get_field::<*mut libredwg_sys::Dwg_Object_Ref>(ptr, "SORTENTSTABLE", "block_owner")
+        else {
+            document.diagnostics.bump_feature("SORT_NO_OWNER");
+            continue;
+        };
+        let Some(name) = resolve_block_name(owner) else {
+            document.diagnostics.bump_feature("SORT_NO_OWNER");
+            continue;
+        };
+        let Some(handles) = block_handles.get(&name) else {
+            document.diagnostics.bump_feature("SORT_NO_BLOCK");
+            continue;
+        };
+        let entities = get_array_field::<u32, *mut libredwg_sys::Dwg_Object_Ref>(
+            ptr,
+            "SORTENTSTABLE",
+            "num_ents",
+            "ents",
+        );
+        let sort_handles = get_array_field::<u32, *mut libredwg_sys::Dwg_Object_Ref>(
+            ptr,
+            "SORTENTSTABLE",
+            "num_ents",
+            "sort_ents",
+        );
+        let num_ents = get_field::<u32>(ptr, "SORTENTSTABLE", "num_ents").unwrap_or(0);
+        document.diagnostics.note_sort_ents(num_ents);
+        let mut keys = std::collections::HashMap::new();
+        for (entity_ref, sort_ref) in entities.iter().zip(sort_handles.iter()) {
+            let entity = ref_handle(*entity_ref);
+            let sort = ref_handle(*sort_ref);
+            if entity != 0 {
+                keys.insert(entity, if sort == 0 { entity } else { sort });
+            }
+        }
+        if keys.is_empty() {
+            document.diagnostics.bump_feature(if num_ents == 0 {
+                "SORT_EMPTY"
+            } else {
+                "SORT_UNRESOLVED"
+            });
+            continue;
+        }
+        let matched = handles
+            .iter()
+            .filter(|handle| keys.contains_key(handle))
+            .count();
+        if matched == 0 {
+            document.diagnostics.bump_feature("SORT_UNMATCHED");
+            continue;
+        }
+        let mut applied = false;
+        if let Some(block) = document.blocks.get_mut(&name) {
+            applied = assign_draw_orders(&mut block.entities, handles, &keys);
+        }
+        if is_model_space(&name) {
+            applied = assign_draw_orders(&mut document.model_space, handles, &keys) || applied;
+        }
+        document.diagnostics.bump_feature(if applied {
+            "SORT_APPLIED"
+        } else {
+            "SORT_MISMATCH"
+        });
+    }
+}
+
+fn assign_draw_orders(
+    entities: &mut [Entity],
+    handles: &[u64],
+    keys: &std::collections::HashMap<u64, u64>,
+) -> bool {
+    if entities.len() != handles.len() || entities.is_empty() {
+        return false;
+    }
+    let mut order: Vec<(u64, usize)> = handles
+        .iter()
+        .enumerate()
+        .map(|(index, handle)| (keys.get(handle).copied().unwrap_or(*handle), index))
+        .collect();
+    order.sort_by_key(|(key, index)| (*key, *index));
+    for (rank, (_, index)) in order.into_iter().enumerate() {
+        entities[index].draw_order = rank as u32;
+    }
+    true
+}
+
+fn object_handle(obj: *mut libredwg_sys::Dwg_Object) -> u64 {
+    if obj.is_null() {
+        return 0;
+    }
+    let mut error = 0;
+    let handle = unsafe { libredwg_sys::dwg_object_get_handle(obj, &mut error) };
+    if handle.is_null() {
+        return 0;
+    }
+    unsafe { (*handle).value }
+}
+
 unsafe fn owned_entities(
     dwg: *mut libredwg_sys::Dwg_Data,
     block_obj: *mut libredwg_sys::Dwg_Object,
     diagnostics: &mut ImportDiagnostics,
     r2004_colors: bool,
-) -> Vec<Entity> {
+) -> OwnedGeometry {
     // R2000 `get_next_owned_entity` skips ATTDEF. After a DXF read the owned
     // vector still lists every definition, and it contains the iterator's
     // entities. A DWG read is the other way around, so the vector is used only
@@ -724,14 +912,16 @@ unsafe fn owned_entities(
         return convert_owned_objects(dwg, &objects, diagnostics, r2004_colors);
     }
     let mut entities = Vec::new();
+    let mut handles = Vec::new();
     let mut owned = unsafe { libredwg_sys::get_first_owned_entity(block_obj) };
     while !owned.is_null() {
         if let Some(entity) = unsafe { convert_one(dwg, owned, diagnostics, r2004_colors) } {
+            handles.push(object_handle(owned));
             entities.push(entity);
         }
         owned = unsafe { libredwg_sys::get_next_owned_entity(block_obj, owned) };
     }
-    entities
+    OwnedGeometry { entities, handles }
 }
 
 fn block_header_entities(
@@ -830,14 +1020,16 @@ fn convert_owned_objects(
     objects: &[*mut libredwg_sys::Dwg_Object],
     diagnostics: &mut ImportDiagnostics,
     r2004_colors: bool,
-) -> Vec<Entity> {
+) -> OwnedGeometry {
     let mut entities = Vec::new();
+    let mut handles = Vec::new();
     for object in objects {
         if let Some(entity) = unsafe { convert_one(dwg, *object, diagnostics, r2004_colors) } {
+            handles.push(object_handle(*object));
             entities.push(entity);
         }
     }
-    entities
+    OwnedGeometry { entities, handles }
 }
 
 unsafe fn convert_one(
@@ -895,6 +1087,7 @@ unsafe fn convert_one(
         linetype_scale,
         lineweight: entity_lineweight(entity_ptr),
         visible: !invisible,
+        draw_order: 0,
         geometry,
     })
 }
@@ -975,16 +1168,22 @@ unsafe fn convert_geometry(
                 get_array_field::<u32, Point2D>(entity_ptr, "LWPOLYLINE", "num_points", "points");
             let bulges: Vec<f64> =
                 get_array_field::<u32, f64>(entity_ptr, "LWPOLYLINE", "num_bulges", "bulges");
+            let widths = lwpolyline_widths(entity_ptr, points.len(), diagnostics);
             let flag = get_field::<u16>(entity_ptr, "LWPOLYLINE", "flag").unwrap_or(0);
             let closed = lwpolyline_is_closed(flag);
             Geometry::LwPolyline {
                 vertices: points
                     .iter()
                     .enumerate()
-                    .map(|(i, p)| PolyVertex {
-                        point: Point3::from_xy(p.x, p.y),
-                        bulge: bulges.get(i).copied().unwrap_or(0.0),
-                        vertex_id: Default::default(),
+                    .map(|(i, p)| {
+                        let (start_width, end_width) = widths.get(i).copied().unwrap_or((0.0, 0.0));
+                        PolyVertex {
+                            point: Point3::from_xy(p.x, p.y),
+                            bulge: bulges.get(i).copied().unwrap_or(0.0),
+                            vertex_id: Default::default(),
+                            start_width,
+                            end_width,
+                        }
                     })
                     .collect(),
                 closed,
@@ -993,7 +1192,7 @@ unsafe fn convert_geometry(
             }
         }
         libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_POLYLINE_2D => {
-            let vertices = unsafe { polyline_2d_vertices(obj, entity_ptr) };
+            let vertices = unsafe { polyline_2d_vertices(obj, entity_ptr, diagnostics) };
             let flag = get_field::<u16>(entity_ptr, "POLYLINE_2D", "flag").unwrap_or(0);
             Geometry::Polyline {
                 vertices,
@@ -1097,6 +1296,7 @@ unsafe fn convert_geometry(
                 column_spacing: get_field::<f64>(entity_ptr, dxf, "col_spacing").unwrap_or(0.0),
                 row_spacing: get_field::<f64>(entity_ptr, dxf, "row_spacing").unwrap_or(0.0),
                 configuration: None,
+                clip: spatial_clip(dwg, entity_ptr),
             }
         }
         libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_TEXT => {
@@ -1212,14 +1412,32 @@ unsafe fn convert_geometry(
             let flags = get_field::<u32>(entity_ptr, "MLINE", "flags")
                 .or_else(|| get_field::<u16>(entity_ptr, "MLINE", "flags").map(|f| f as u32))
                 .unwrap_or(0);
+            let offsets = mline_style_offsets(dwg, entity_ptr);
             Geometry::MLine {
                 vertices: verts
                     .iter()
                     .map(|v| Point3::new(v.vertex.x, v.vertex.y, v.vertex.z))
                     .collect(),
+                miters: verts
+                    .iter()
+                    .map(|v| {
+                        Point3::new(
+                            v.miter_direction.x,
+                            v.miter_direction.y,
+                            v.miter_direction.z,
+                        )
+                    })
+                    .collect(),
                 closed: flags & 2 != 0,
+                scale: get_field::<f64>(entity_ptr, "MLINE", "scale").unwrap_or(1.0),
+                justification: get_field::<u8>(entity_ptr, "MLINE", "justification").unwrap_or(1),
+                offsets,
             }
         }
+        libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_MULTILEADER => {
+            multileader_geometry(dwg, entity_ptr)?
+        }
+        libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_REGION => region_geometry(entity_ptr)?,
         libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_RAY => Geometry::Line {
             start: pt3(get_field::<Point3D>(entity_ptr, "RAY", "point")?),
             end: {
@@ -1246,11 +1464,7 @@ unsafe fn convert_geometry(
             Geometry::Polyline {
                 vertices: corners
                     .into_iter()
-                    .map(|point| PolyVertex {
-                        point,
-                        bulge: 0.0,
-                        vertex_id: Default::default(),
-                    })
+                    .map(|point| PolyVertex::new(point, 0.0))
                     .collect(),
                 closed: true,
                 linetype_generation_continuous: false,
@@ -1273,14 +1487,182 @@ fn raster_frame(
 ) -> RasterFrame {
     let size =
         get_field::<Point2D>(entity_ptr, dxf, "image_size").unwrap_or(Point2D { x: 1.0, y: 1.0 });
+    let clipping = get_field::<u8>(entity_ptr, dxf, "clipping").unwrap_or(1) != 0;
+    let clip = if clipping {
+        get_array_field::<u32, Point2D>(entity_ptr, dxf, "num_clip_verts", "clip_verts")
+            .into_iter()
+            .map(|point| Point2::new(point.x, point.y))
+            .filter(|point| point.is_finite())
+            .collect()
+    } else {
+        Vec::new()
+    };
     RasterFrame {
         corner: pt_field(entity_ptr, dxf, "pt0").unwrap_or_default(),
         u_vector: pt_field(entity_ptr, dxf, "uvec").unwrap_or(Point3::from_xy(1.0, 0.0)),
         v_vector: pt_field(entity_ptr, dxf, "vvec").unwrap_or(Point3::from_xy(0.0, 1.0)),
         size: Point2::new(size.x, size.y),
-        clip: Vec::new(),
+        clip,
         path: image_def_path(dwg, entity_ptr, dxf),
     }
+}
+
+fn c_text(ptr: *mut c_char) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
+    unsafe { CStr::from_ptr(ptr) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn point_list(points: *mut f64, count: u32) -> Vec<Point3> {
+    if count == 0 || points.is_null() {
+        return Vec::new();
+    }
+    let coords = unsafe { std::slice::from_raw_parts(points, count as usize * 3) };
+    coords
+        .chunks(3)
+        .map(|chunk| Point3::new(chunk[0], chunk[1], chunk[2]))
+        .collect()
+}
+
+fn multileader_geometry(
+    dwg: *mut libredwg_sys::Dwg_Data,
+    entity_ptr: *mut c_void,
+) -> Option<Geometry> {
+    let mut raw = std::ptr::null_mut();
+    let count = unsafe { libredwg_sys::uncad_multileader_get_lines(entity_ptr, &mut raw) };
+    let mut lines = Vec::new();
+    if count > 0 && !raw.is_null() {
+        let slice = unsafe { std::slice::from_raw_parts(raw, count as usize) };
+        for line in slice {
+            lines.push(LeaderLine {
+                points: point_list(line.points, line.num_points),
+                last_point: (line.has_last_point != 0).then(|| {
+                    Point3::new(line.last_point[0], line.last_point[1], line.last_point[2])
+                }),
+                dogleg: (line.has_dogleg != 0).then(|| {
+                    Point3::new(
+                        line.dogleg_vector[0],
+                        line.dogleg_vector[1],
+                        line.dogleg_vector[2],
+                    )
+                }),
+                dogleg_length: line.dogleg_length,
+                arrow_size: (line.arrow_override != 0).then_some(line.arrow_size),
+            });
+        }
+    }
+    if !raw.is_null() {
+        unsafe { libredwg_sys::uncad_multileader_free_lines(raw, count) };
+    }
+
+    let mut raw_content = unsafe { std::mem::zeroed() };
+    let content = if unsafe {
+        libredwg_sys::uncad_multileader_get_content(dwg, entity_ptr, &mut raw_content)
+    } == 0
+    {
+        let content = match raw_content.kind {
+            2 => LeaderContent::Text {
+                value: c_text(raw_content.text),
+                location: Point3::new(
+                    raw_content.location[0],
+                    raw_content.location[1],
+                    raw_content.location[2],
+                ),
+                height: raw_content.height,
+                rotation: raw_content.rotation,
+                width: raw_content.width,
+                frame: raw_content.frame != 0,
+            },
+            1 => LeaderContent::Block {
+                name: c_text(raw_content.block_name),
+                location: Point3::new(
+                    raw_content.location[0],
+                    raw_content.location[1],
+                    raw_content.location[2],
+                ),
+                scale: Point3::new(
+                    raw_content.block_scale[0],
+                    raw_content.block_scale[1],
+                    raw_content.block_scale[2],
+                ),
+                rotation: raw_content.block_rotation,
+            },
+            _ => LeaderContent::None,
+        };
+        unsafe { libredwg_sys::uncad_multileader_free_content(&mut raw_content) };
+        content
+    } else {
+        LeaderContent::None
+    };
+
+    if let Some(location) = content.location() {
+        for line in &mut lines {
+            if line.polyline().len() < 2 && line.last_point.is_none() {
+                line.last_point = Some(location);
+            }
+        }
+    }
+    if lines.is_empty() && matches!(content, LeaderContent::None) {
+        return None;
+    }
+    let arrow_size = get_field::<f64>(entity_ptr, "MULTILEADER", "arrow_size").unwrap_or(0.0);
+    Some(Geometry::MultiLeader {
+        lines,
+        content,
+        arrow_size,
+    })
+}
+
+fn region_geometry(entity_ptr: *mut c_void) -> Option<Geometry> {
+    let mut raw = std::ptr::null_mut();
+    let count = unsafe { libredwg_sys::uncad_region_get_wires(entity_ptr, &mut raw) };
+    let mut wires = Vec::new();
+    if count > 0 && !raw.is_null() {
+        let slice = unsafe { std::slice::from_raw_parts(raw, count as usize) };
+        for wire in slice {
+            let points = point_list(wire.points, wire.num_points);
+            if points.len() >= 2 {
+                wires.push(points);
+            }
+        }
+    }
+    if !raw.is_null() {
+        unsafe { libredwg_sys::uncad_region_free_wires(raw, count) };
+    }
+    if wires.is_empty() {
+        None
+    } else {
+        Some(Geometry::Region { wires })
+    }
+}
+
+fn mline_style_offsets(dwg: *mut libredwg_sys::Dwg_Data, entity_ptr: *mut c_void) -> Vec<f64> {
+    let Some(handle) =
+        get_field::<*mut libredwg_sys::Dwg_Object_Ref>(entity_ptr, "MLINE", "mlinestyle")
+    else {
+        return Vec::new();
+    };
+    if handle.is_null() {
+        return Vec::new();
+    }
+    let object = unsafe { libredwg_sys::dwg_ref_object(dwg, handle) };
+    if object.is_null() {
+        return Vec::new();
+    }
+    let payload = unsafe { libredwg_sys::uncad_object_object_ptr(object) };
+    get_array_field::<u8, libredwg_sys::Dwg_MLINESTYLE_line>(
+        payload,
+        "MLINESTYLE",
+        "num_lines",
+        "lines",
+    )
+    .into_iter()
+    .map(|line| line.offset)
+    .filter(|offset| offset.is_finite())
+    .collect()
 }
 
 fn image_def_path(dwg: *mut libredwg_sys::Dwg_Data, entity_ptr: *mut c_void, dxf: &str) -> String {
@@ -1317,6 +1699,58 @@ fn attrib_text(dwg: *mut libredwg_sys::Dwg_Data, entity_ptr: *mut c_void) -> Opt
         style: resolved_style(dwg, entity_ptr, "ATTRIB"),
         ..Default::default()
     })
+}
+
+fn spatial_clip(dwg: *mut libredwg_sys::Dwg_Data, entity_ptr: *mut c_void) -> Option<SpatialClip> {
+    let dictionary = crate::acad_dynamic::extension_dictionary(dwg, entity_ptr)?;
+    let spatial = crate::acad_dynamic::find_named(dwg, dictionary, "SPATIAL_FILTER")?;
+    let payload = unsafe { libredwg_sys::uncad_object_object_ptr(spatial) };
+    if payload.is_null() {
+        return None;
+    }
+    let mut boundary =
+        get_array_field::<u16, Point2D>(payload, "SPATIAL_FILTER", "num_clip_verts", "clip_verts")
+            .into_iter()
+            .map(|point| Point2::new(point.x, point.y))
+            .filter(|point| point.is_finite())
+            .collect::<Vec<_>>();
+    if boundary.len() >= 2 && boundary[boundary.len() - 1].distance(boundary[0]) <= 1e-9 {
+        boundary.pop();
+    }
+    if boundary.len() < 3 {
+        return None;
+    }
+    let mut clip = SpatialClip::new(boundary);
+    clip.origin = pt_field(payload, "SPATIAL_FILTER", "origin").unwrap_or_default();
+    clip.extrusion = extrusion_of(payload, "SPATIAL_FILTER");
+    clip.inverse_transform = matrix12(payload, "inverse_transform");
+    clip.transform = matrix12(payload, "transform");
+    clip.frame_on =
+        get_field::<u16>(payload, "SPATIAL_FILTER", "display_boundary_on").unwrap_or(1) != 0;
+    if get_field::<u16>(payload, "SPATIAL_FILTER", "front_clip_on").unwrap_or(0) != 0 {
+        clip.front_clip = get_field::<f64>(payload, "SPATIAL_FILTER", "front_clip_z");
+    }
+    if get_field::<u16>(payload, "SPATIAL_FILTER", "back_clip_on").unwrap_or(0) != 0 {
+        clip.back_clip = get_field::<f64>(payload, "SPATIAL_FILTER", "back_clip_z");
+    }
+    Some(clip)
+}
+
+fn matrix12(entity_ptr: *mut c_void, field: &str) -> [f64; 12] {
+    let mut matrix = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+    let Some(pointer) = get_field::<*const f64>(entity_ptr, "SPATIAL_FILTER", field) else {
+        return matrix;
+    };
+    if pointer.is_null() {
+        return matrix;
+    }
+    let values = unsafe { std::slice::from_raw_parts(pointer, 12) };
+    for (slot, value) in matrix.iter_mut().zip(values) {
+        if value.is_finite() {
+            *slot = *value;
+        }
+    }
+    matrix
 }
 
 fn insert_attribs(
@@ -1486,11 +1920,7 @@ fn convert_hatch_path(path: &libredwg_sys::Dwg_HATCH_Path) -> HatchPath {
         HatchPath::Polyline {
             vertices: vertices
                 .iter()
-                .map(|v| PolyVertex {
-                    point: Point3::from_xy(v.point.x, v.point.y),
-                    bulge: v.bulge,
-                    vertex_id: Default::default(),
-                })
+                .map(|v| PolyVertex::new(Point3::from_xy(v.point.x, v.point.y), v.bulge))
                 .collect(),
             closed: path.closed != 0,
         }
@@ -1663,6 +2093,57 @@ pub(crate) fn lwpolyline_is_closed(flag: u16) -> bool {
     flag & LWPOLYLINE_CLOSED_BIT != 0
 }
 
+// One LWPOLYLINE per-vertex width pair (DXF groups 40 and 41).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LwPolylineWidth {
+    start: f64,
+    end: f64,
+}
+
+fn record_wide_polyline(diagnostics: &mut ImportDiagnostics, kind: &str, max_width: f64) {
+    if max_width <= 1e-9 {
+        return;
+    }
+    diagnostics.bump_feature(kind);
+    diagnostics.note_polyline_width(max_width);
+}
+
+fn positive_width(value: f64) -> f64 {
+    if value.is_finite() && value > 0.0 {
+        value
+    } else {
+        0.0
+    }
+}
+
+fn lwpolyline_widths(
+    entity_ptr: *mut c_void,
+    count: usize,
+    diagnostics: &mut ImportDiagnostics,
+) -> Vec<(f64, f64)> {
+    let const_width =
+        positive_width(get_field::<f64>(entity_ptr, "LWPOLYLINE", "const_width").unwrap_or(0.0));
+    let stored: Vec<LwPolylineWidth> =
+        get_array_field::<u32, LwPolylineWidth>(entity_ptr, "LWPOLYLINE", "num_widths", "widths");
+    let mut widths = Vec::with_capacity(count);
+    let mut max_width: f64 = 0.0;
+    for index in 0..count {
+        let (mut start, mut end) = stored
+            .get(index)
+            .map(|width| (positive_width(width.start), positive_width(width.end)))
+            .unwrap_or((0.0, 0.0));
+        if start <= 0.0 && end <= 0.0 {
+            start = const_width;
+            end = const_width;
+        }
+        max_width = max_width.max(start).max(end);
+        widths.push((start, end));
+    }
+    record_wide_polyline(diagnostics, "WIDE_LWPOLYLINE", max_width);
+    widths
+}
+
 // LibreDWG leaves the extrusion at (0, 0, 0) when the entity did not store one.
 // A zero normal is the world Z axis. Writing it out makes DXF readers flip the entity.
 pub(crate) fn extrusion_or_world(extrusion: Point3) -> Point3 {
@@ -1687,7 +2168,12 @@ fn pt3(p: Point3D) -> Point3 {
 unsafe fn polyline_2d_vertices(
     obj: *mut libredwg_sys::Dwg_Object,
     entity_ptr: *mut c_void,
+    diagnostics: &mut ImportDiagnostics,
 ) -> Vec<PolyVertex> {
+    let default_start =
+        positive_width(get_field::<f64>(entity_ptr, "POLYLINE_2D", "start_width").unwrap_or(0.0));
+    let default_end =
+        positive_width(get_field::<f64>(entity_ptr, "POLYLINE_2D", "end_width").unwrap_or(0.0));
     let mut verts = Vec::new();
     let mut sub = unsafe { libredwg_sys::get_first_owned_subentity(obj) };
     while !sub.is_null() {
@@ -1698,33 +2184,45 @@ unsafe fn polyline_2d_vertices(
                 verts.push(PolyVertex {
                     point: pt3(p),
                     bulge,
-                    vertex_id: Default::default(),
+                    start_width: positive_width(
+                        get_field::<f64>(vp, "VERTEX_2D", "start_width").unwrap_or(0.0),
+                    ),
+                    end_width: positive_width(
+                        get_field::<f64>(vp, "VERTEX_2D", "end_width").unwrap_or(0.0),
+                    ),
+                    ..PolyVertex::new(Point3::default(), 0.0)
                 });
             }
         }
         sub = unsafe { libredwg_sys::get_next_owned_subentity(obj, sub) };
     }
-    if !verts.is_empty() {
-        return verts;
+    if verts.is_empty() {
+        let mut error = 0i32;
+        let points_ptr =
+            unsafe { libredwg_sys::dwg_object_polyline_2d_get_points(obj, &mut error) };
+        let num_points =
+            unsafe { libredwg_sys::dwg_object_polyline_2d_get_numpoints(obj, &mut error) };
+        if !points_ptr.is_null() && num_points > 0 {
+            let slice = unsafe {
+                std::slice::from_raw_parts(points_ptr.cast::<Point2D>(), num_points as usize)
+            };
+            verts = slice
+                .iter()
+                .map(|p| PolyVertex::new(Point3::from_xy(p.x, p.y), 0.0))
+                .collect();
+            unsafe { libc::free(points_ptr.cast()) };
+        }
     }
-    let mut error = 0i32;
-    let points_ptr = unsafe { libredwg_sys::dwg_object_polyline_2d_get_points(obj, &mut error) };
-    let num_points = unsafe { libredwg_sys::dwg_object_polyline_2d_get_numpoints(obj, &mut error) };
-    if !points_ptr.is_null() && num_points > 0 {
-        let slice = unsafe {
-            std::slice::from_raw_parts(points_ptr.cast::<Point2D>(), num_points as usize)
-        };
-        verts = slice
-            .iter()
-            .map(|p| PolyVertex {
-                point: Point3::from_xy(p.x, p.y),
-                bulge: 0.0,
-                vertex_id: Default::default(),
-            })
-            .collect();
-        unsafe { libc::free(points_ptr.cast()) };
+    if verts.iter().all(|vertex| !vertex.is_wide()) && (default_start > 0.0 || default_end > 0.0) {
+        for vertex in &mut verts {
+            vertex.start_width = default_start;
+            vertex.end_width = default_end;
+        }
     }
-    let _ = entity_ptr;
+    let max_width = verts.iter().fold(0.0_f64, |max_width, vertex| {
+        max_width.max(vertex.start_width).max(vertex.end_width)
+    });
+    record_wide_polyline(diagnostics, "WIDE_POLYLINE_2D", max_width);
     verts
 }
 
@@ -1737,11 +2235,7 @@ unsafe fn polyline_3d_vertices(obj: *mut libredwg_sys::Dwg_Object) -> Vec<PolyVe
         if object_fixedtype(sub) == libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_VERTEX_3D {
             let vertex = unsafe { libredwg_sys::uncad_object_entity_ptr(sub) };
             if let Some(point) = get_field::<Point3D>(vertex, "VERTEX_3D", "point") {
-                verts.push(PolyVertex {
-                    point: pt3(point),
-                    bulge: 0.0,
-                    vertex_id: Default::default(),
-                });
+                verts.push(PolyVertex::new(pt3(point), 0.0));
             }
         }
         sub = unsafe { libredwg_sys::get_next_owned_subentity(obj, sub) };
@@ -1759,11 +2253,7 @@ unsafe fn polyline_3d_vertices(obj: *mut libredwg_sys::Dwg_Object) -> Vec<PolyVe
         unsafe { std::slice::from_raw_parts(points_ptr.cast::<Point3D>(), num_points as usize) };
     let verts = slice
         .iter()
-        .map(|p| PolyVertex {
-            point: pt3(*p),
-            bulge: 0.0,
-            vertex_id: Default::default(),
-        })
+        .map(|p| PolyVertex::new(pt3(*p), 0.0))
         .collect();
     unsafe { libc::free(points_ptr.cast()) };
     verts
@@ -1772,6 +2262,24 @@ unsafe fn polyline_3d_vertices(obj: *mut libredwg_sys::Dwg_Object) -> Vec<PolyVe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sort_handles_put_the_smaller_key_behind() {
+        let first = Entity::new(Geometry::Point {
+            position: Point3::default(),
+        });
+        let second = Entity::new(Geometry::Point {
+            position: Point3::from_xy(1.0, 0.0),
+        });
+        let handles = vec![10, 20];
+        let mut keys = std::collections::HashMap::new();
+        keys.insert(10, 50);
+        keys.insert(20, 5);
+        let mut entities = vec![first, second];
+        assign_draw_orders(&mut entities, &handles, &keys);
+        assert_eq!(entities[1].draw_order, 0);
+        assert_eq!(entities[0].draw_order, 1);
+    }
 
     #[test]
     fn model_space_name_is_case_insensitive() {

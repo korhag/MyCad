@@ -12,6 +12,7 @@ use std::time::Instant;
 use cad_core::{Document, ImportDiagnostics};
 use thiserror::Error;
 
+mod acad_dynamic;
 mod classes;
 mod convert;
 mod dynapi;
@@ -103,6 +104,17 @@ fn import_cad_file(path: &Path, kind: CadReadKind) -> Result<Document, ImportErr
         )
     };
     unsafe { libredwg_sys::dwg_free(dwg.as_mut()) };
+    if matches!(kind, CadReadKind::Dxf) {
+        if let Ok(header) = cad_io::read_dxf_lineweight_header_file(path) {
+            if let Some(shown) = header.lwdisplay {
+                document.lwdisplay = shown;
+                document.diagnostics.lwdisplay = Some(shown);
+            }
+            if let Some(default_weight) = header.lwdefault {
+                document.lwdefault = default_weight;
+            }
+        }
+    }
     document.diagnostics.import_time = started.elapsed();
     cad_core::warm_document_fonts(&mut document);
     Ok(document)

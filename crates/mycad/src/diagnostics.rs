@@ -26,6 +26,10 @@ pub fn show(ui: &mut Ui, app: &MyCadApp) {
     ui.monospace(format!("Layers: {}", d.layer_count));
     ui.monospace(format!("Blocks: {}", d.block_count));
     ui.monospace(format!("Objects: {}", d.object_count));
+    ui.monospace(format!(
+        "Dynamic: {} definitions, {} editable, {} kept static",
+        d.dynamic_definitions, d.dynamic_editable, d.dynamic_kept_static
+    ));
     ui.monospace(format!("Imported entities: {}", d.entity_total()));
     ui.monospace(format!("Unsupported entities: {}", d.unsupported_total()));
     let paper_entities = doc.paper_space_entity_count();
@@ -68,6 +72,13 @@ pub fn show(ui: &mut Ui, app: &MyCadApp) {
         ui.label("Not carried over on save");
         for (name, count) in &d.unhandled_classes {
             ui.monospace(format!("{name:>24}  {count}"));
+        }
+    }
+    if !d.dynamic_lines.is_empty() {
+        ui.add_space(8.0);
+        ui.label("Dynamic blocks");
+        for line in &d.dynamic_lines {
+            ui.monospace(line);
         }
     }
     if !d.warnings.is_empty() {

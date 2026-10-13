@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use cad_core::{
-    BlockDefinition, Document, DynamicExportLink, Entity, Geometry, HatchEdge, HatchPath,
+    fingerprint_block, BlockDefinition, BlockFingerprint, Document, DynamicExportLink, Entity,
     InstanceConfiguration, ParameterKind,
 };
 use serde::{Deserialize, Serialize};
@@ -21,8 +21,6 @@ use crate::options::SaveReport;
 
 pub const COMPANION_FORMAT: &str = "mycad-companion";
 pub const COMPANION_SCHEMA: u32 = 1;
-
-const FINGERPRINT_SCALE: f64 = 10_000.0;
 
 // ------------------------------------------------------------
 // Type: Companion
@@ -85,13 +83,6 @@ impl CompanionReport {
             Some(parts.join(" • "))
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-struct BlockFingerprint {
-    entities: u64,
-    min: Option<[f64; 2]>,
-    max: Option<[f64; 2]>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -657,194 +648,6 @@ fn lookup_fingerprint<'a>(
         .map(|(_, fingerprint)| fingerprint)
 }
 
-fn fingerprint_block(block: &BlockDefinition) -> BlockFingerprint {
-    let mut min_x = f64::INFINITY;
-    let mut min_y = f64::INFINITY;
-    let mut max_x = f64::NEG_INFINITY;
-    let mut max_y = f64::NEG_INFINITY;
-    let mut any = false;
-    for entity in &block.entities {
-        for (x, y) in entity_points(&entity.geometry) {
-            if !x.is_finite() || !y.is_finite() {
-                continue;
-            }
-            any = true;
-            min_x = min_x.min(x);
-            min_y = min_y.min(y);
-            max_x = max_x.max(x);
-            max_y = max_y.max(y);
-        }
-    }
-    BlockFingerprint {
-        entities: block.entities.len() as u64,
-        min: any.then(|| [quantize(min_x), quantize(min_y)]),
-        max: any.then(|| [quantize(max_x), quantize(max_y)]),
-    }
-}
-
-fn entity_points(geometry: &Geometry) -> Vec<(f64, f64)> {
-    let mut points = Vec::new();
-    macro_rules! add {
-        ($point:expr) => {
-            points.push(($point.x, $point.y))
-        };
-    }
-    macro_rules! add_xy {
-        ($x:expr, $y:expr $(,)?) => {
-            points.push(($x, $y))
-        };
-    }
-    match geometry {
-        Geometry::Line { start, end } => {
-            add!(*start);
-            add!(*end);
-        }
-        Geometry::Point { position } => add!(*position),
-        Geometry::Circle { center, radius, .. } => {
-            add!(*center);
-            add_xy!(center.x + radius, center.y);
-            add_xy!(center.x - radius, center.y);
-            add_xy!(center.x, center.y + radius);
-            add_xy!(center.x, center.y - radius);
-        }
-        Geometry::Arc {
-            center,
-            radius,
-            start_angle,
-            end_angle,
-            ..
-        } => {
-            add!(*center);
-            add_xy!(
-                center.x + radius * start_angle.cos(),
-                center.y + radius * start_angle.sin(),
-            );
-            add_xy!(
-                center.x + radius * end_angle.cos(),
-                center.y + radius * end_angle.sin(),
-            );
-        }
-        Geometry::Ellipse {
-            center, major_axis, ..
-        } => {
-            add!(*center);
-            add_xy!(center.x + major_axis.x, center.y + major_axis.y);
-        }
-        Geometry::LwPolyline { vertices, .. } | Geometry::Polyline { vertices, .. } => {
-            for vertex in vertices {
-                add!(vertex.point);
-            }
-        }
-        Geometry::Spline {
-            control_points,
-            fit_points,
-            ..
-        } => {
-            for point in control_points.iter().chain(fit_points.iter()) {
-                add!(*point);
-            }
-        }
-        Geometry::Insert {
-            insertion,
-            scale,
-            rotation,
-            attribs,
-            ..
-        } => {
-            add!(*insertion);
-            add_xy!(
-                insertion.x + rotation.cos() * scale.x,
-                insertion.y + rotation.sin() * scale.y,
-            );
-            for attrib in attribs {
-                add!(attrib.insertion);
-            }
-        }
-        Geometry::Text(data) => {
-            add!(data.insertion);
-            add_xy!(
-                data.insertion.x + data.height,
-                data.insertion.y + data.height
-            );
-        }
-        Geometry::MText(data) => {
-            add!(data.insertion);
-            add_xy!(
-                data.insertion.x + data.width,
-                data.insertion.y + data.height
-            );
-        }
-        Geometry::Hatch(hatch) => {
-            for path in &hatch.paths {
-                match path {
-                    HatchPath::Polyline { vertices, .. } => {
-                        for vertex in vertices {
-                            add!(vertex.point);
-                        }
-                    }
-                    HatchPath::Edges(edges) => {
-                        for edge in edges {
-                            match edge {
-                                HatchEdge::Line { start, end } => {
-                                    add!(*start);
-                                    add!(*end);
-                                }
-                                HatchEdge::Arc { center, radius, .. } => {
-                                    add!(*center);
-                                    add_xy!(center.x + radius, center.y);
-                                }
-                                HatchEdge::Ellipse {
-                                    center,
-                                    major_endpoint,
-                                    ..
-                                } => {
-                                    add!(*center);
-                                    add!(*major_endpoint);
-                                }
-                                HatchEdge::Spline {
-                                    control_points,
-                                    fit_points,
-                                    ..
-                                } => {
-                                    for point in control_points.iter().chain(fit_points.iter()) {
-                                        add!(*point);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        Geometry::Dimension(_) => {}
-        Geometry::Image(frame) | Geometry::Wipeout(frame) => {
-            for corner in frame.corners() {
-                add!(corner);
-            }
-        }
-        Geometry::Solid { corners, .. } => {
-            for corner in corners {
-                add!(*corner);
-            }
-        }
-        Geometry::Leader { vertices } | Geometry::MLine { vertices, .. } => {
-            for vertex in vertices {
-                add!(*vertex);
-            }
-        }
-        Geometry::Viewport(viewport) => {
-            for corner in viewport.corners() {
-                add!(corner);
-            }
-        }
-    }
-    points
-}
-
-fn quantize(value: f64) -> f64 {
-    (value * FINGERPRINT_SCALE).round() / FINGERPRINT_SCALE
-}
-
 fn to_wire_fingerprint(fingerprint: &BlockFingerprint) -> WireFingerprint {
     WireFingerprint {
         entities: fingerprint.entities,
@@ -866,8 +669,8 @@ mod tests {
     use super::*;
     use cad_core::{
         export_materialized, identity_insert, BehaviorKind, CompositionRule, DynamicBehavior,
-        DynamicDefinition, EvaluationCache, EvaluationRequest, FollowRole, GeometryTarget,
-        NumericParameter, ParameterDef, ParameterValue, Point2, Point3,
+        DynamicDefinition, EvaluationCache, EvaluationRequest, FollowRole, Geometry,
+        GeometryTarget, NumericParameter, ParameterDef, ParameterValue, Point2, Point3,
     };
     use std::time::{SystemTime, UNIX_EPOCH};
 

@@ -243,6 +243,8 @@ fn point_vertex(point: Point2) -> PolyVertex {
         point: crate::geom::Point3::from_xy(point.x, point.y),
         bulge: 0.0,
         vertex_id: Default::default(),
+        start_width: 0.0,
+        end_width: 0.0,
     }
 }
 
@@ -583,6 +585,8 @@ fn circle_as_loop(center: Point2, radius: f64) -> Vec<PolyVertex> {
                 ),
                 bulge: 0.0,
                 vertex_id: Default::default(),
+                start_width: 0.0,
+                end_width: 0.0,
             }
         })
         .collect()
@@ -682,6 +686,8 @@ mod tests {
             point: Point3::from_xy(x, y),
             bulge,
             vertex_id: Default::default(),
+            start_width: 0.0,
+            end_width: 0.0,
         }
     }
 

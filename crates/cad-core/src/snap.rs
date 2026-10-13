@@ -715,6 +715,7 @@ mod tests {
             column_spacing: 0.0,
             row_spacing: 0.0,
             configuration: None,
+            clip: None,
         }));
         let index = SnapIndex::build(&document);
         let mut found = Vec::new();
@@ -734,11 +735,15 @@ mod tests {
                 point: Point3::from_xy(0.0, 0.0),
                 bulge: 1.0,
                 vertex_id: Default::default(),
+                start_width: 0.0,
+                end_width: 0.0,
             },
             PolyVertex {
                 point: Point3::from_xy(10.0, 0.0),
                 bulge: 0.0,
                 vertex_id: Default::default(),
+                start_width: 0.0,
+                end_width: 0.0,
             },
         ];
         let mut features = Vec::new();
@@ -885,6 +890,7 @@ mod tests {
             column_spacing: 0.0,
             row_spacing: 0.0,
             configuration: None,
+            clip: None,
         }));
         let index = SnapIndex::build(&document);
         let mut found = Vec::new();
@@ -947,6 +953,7 @@ mod tests {
             column_spacing: 2.0,
             row_spacing: 2.0,
             configuration: None,
+            clip: None,
         }));
         let index = SnapIndex::build(&document);
         assert!(index.len() <= crate::MAX_INSERT_ARRAY_CELLS as usize * 4);

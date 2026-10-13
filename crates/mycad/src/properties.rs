@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use cad_core::{
     arc_length, arc_sweep, circle_area, format_angle_deg, format_area, format_length,
-    polyline_length, AreaMeasurement, CadColor, Document, Entity, Geometry, Point3,
+    polyline_length, AreaMeasurement, CadColor, Document, Entity, Geometry, LeaderContent, Point3,
 };
 use eframe::egui::{self, RichText, Ui};
 
@@ -346,10 +346,23 @@ fn geometry_rows(ui: &mut Ui, document: &Document, geometry: &Geometry, referenc
                 format_length(viewport.view_height, units),
             );
         }
-        Geometry::MLine { vertices, closed } => {
+        Geometry::MLine {
+            vertices,
+            closed,
+            offsets,
+            ..
+        } => {
             kv(ui, "Vertices", vertices.len().to_string());
             kv(ui, "Closed", yes_no(*closed));
+            kv(ui, "Lines", offsets.len().max(1).to_string());
         }
+        Geometry::MultiLeader { lines, content, .. } => {
+            kv(ui, "Leaders", lines.len().to_string());
+            if let LeaderContent::Text { value, .. } = content {
+                kv(ui, "Text", value.clone());
+            }
+        }
+        Geometry::Region { wires } => kv(ui, "Wires", wires.len().to_string()),
         Geometry::Dimension(data) => {
             kv(ui, "Block", data.block_name.clone());
             kv(ui, "Style", data.dimstyle.clone());

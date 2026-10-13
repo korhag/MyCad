@@ -16,6 +16,7 @@ pub mod entity;
 pub mod entity_transform;
 pub mod evaluate;
 pub mod extents;
+pub mod fingerprint;
 pub mod fixtures;
 pub mod geom;
 pub mod hatch;
@@ -34,6 +35,7 @@ pub mod thumbnail;
 pub mod transform;
 pub mod ttf_font;
 pub mod vectorize;
+pub mod wide_poly;
 
 pub use block::{
     block_depends_on, clamped_array_counts, count_block_references, create_block_from_entities,
@@ -85,12 +87,14 @@ pub use dynamic_model::{
     TextReflectPolicy, TextToken, TransformKind, VisibilityGroup,
 };
 pub use entity::{
-    default_extrusion, AttributeInfo, DimensionData, DimensionKind, Entity, EntityId, Geometry,
-    GradientStop, HatchData, HatchEdge, HatchGradient, HatchPath, HatchPatternLine, MTextData,
-    PolyVertex, RasterFrame, TextData, TextHAlign, TextVAlign, ViewportData, ATTRIB_CONSTANT,
-    ATTRIB_INVISIBLE, ATTRIB_PRESET, ATTRIB_VERIFY, HATCH_MAX_LINES, LINEWEIGHT_BYBLOCK,
-    LINEWEIGHT_BYLAYER, LINEWEIGHT_DEFAULT, MAX_HATCH_DASHES_PER_SPAN, MAX_HATCH_PATTERN_LINES,
-    MAX_HATCH_PATTERN_SEGMENTS,
+    default_extrusion, mline_offset_polylines, polyline_is_wide, AttributeInfo, DimensionData,
+    DimensionKind, Entity, EntityId, Geometry, GradientStop, HatchData, HatchEdge, HatchGradient,
+    HatchPath, HatchPatternLine, LeaderContent, LeaderLine, MTextData, PolyVertex, RasterFrame,
+    SpatialClip, TextData, TextHAlign, TextVAlign, ViewportData, ATTRIB_CONSTANT, ATTRIB_INVISIBLE,
+    ATTRIB_PRESET, ATTRIB_VERIFY, HATCH_MAX_LINES, LINEWEIGHT_BYBLOCK, LINEWEIGHT_BYLAYER,
+    LINEWEIGHT_DEFAULT, LWDEFAULT_HUNDREDTHS, MAX_HATCH_DASHES_PER_SPAN, MAX_HATCH_PATTERN_LINES,
+    lineweight_pixels,
+    MAX_HATCH_PATTERN_SEGMENTS, POLYLINE_WIDTH_MIN,
 };
 pub use entity_transform::{
     reference_radius, transform_entity, transform_entity_matrix, transform_geometry,
@@ -103,6 +107,9 @@ pub use evaluate::{
     EvaluationRequest, MaterializedExport, GENERATED_BLOCK_PREFIX,
 };
 pub use extents::Extents2;
+pub use fingerprint::{
+    fingerprint_block, fingerprint_visible_entities, visible_geometry_key, BlockFingerprint,
+};
 pub use fixtures::{autocad_features_document, primitives_document};
 pub use geom::{
     arc_from_three_points, ocs_to_wcs, ArcFromPointsError, Point2, Point3, ThreePointArc,
@@ -127,7 +134,10 @@ pub use measure_index::{
     area_from_primitive, radius_from_primitive, straight_of, MeasureGeom, MeasureIndex,
     MeasurePrimitive, MeasureRole, MEASURE_APERTURE_PX,
 };
-pub use polygon::{contour_contains, contour_depths, point_in_polygon, signed_area};
+pub use polygon::{
+    clip_open_polyline, clip_polygon, contour_contains, contour_depths, intersect_polygons,
+    point_in_polygon, signed_area,
+};
 pub use snap::{SnapFeature, SnapIndex, SnapKind, MAX_SNAP_CANDIDATES};
 pub use snap_edges::edge_snaps;
 pub use stroke_font::{
@@ -142,6 +152,7 @@ pub use thumbnail::{
 pub use transform::Transform2;
 pub use ttf_font::{describe_text_style_font, warm_document_fonts, FontAvailability};
 pub use vectorize::{
-    plot_geometry, vectorize_entity, PlotFill, PlotGeometry, PlotStroke, VectorSink,
-    VectorVisibility,
+    plot_geometry, vectorize_entity, DrawBand, PaintList, PlotFill, PlotGeometry, PlotStroke,
+    VectorSink, VectorVisibility,
 };
+pub use wide_poly::wide_polyline_quads;
