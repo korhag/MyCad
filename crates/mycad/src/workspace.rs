@@ -1,7 +1,9 @@
 //! Persistent dockable workspace: Home, Properties, Viewport, Diagnostics, Blocks, Dynamic Block.
 
-use eframe::egui::{self, Color32, Margin, Pos2, Rect, Stroke, StrokeKind, Ui};
-use egui_dock::{DockArea, DockState, Node, NodeIndex, Split, Style, TabStyle, TabViewer};
+use eframe::egui::{self, Color32, Margin, Pos2, Rect, Stroke, StrokeKind, Ui, Vec2};
+use egui_dock::{
+    DockArea, DockState, Node, NodeIndex, Split, Style, Surface, TabStyle, TabViewer, Tree,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::app::MyCadApp;
@@ -43,6 +45,10 @@ pub const HOME_DEFAULT_HEIGHT_PX: f32 = 50.0;
 /// Smallest Home leaf the splitter will allow. Matches a ~40–45 px ribbon.
 pub const HOME_MIN_LEAF_PX: f32 = 42.0;
 pub const HOME_TAB_BAR_HEIGHT: f32 = 20.0;
+/// Smallest expanded leaf: tab bar plus one ribbon row.
+pub const MIN_LEAF_HEIGHT_PX: f32 = HOME_MIN_LEAF_PX;
+/// Smallest leaf width that still fits a tab title and a side-panel heading.
+pub const MIN_LEAF_WIDTH_PX: f32 = 160.0;
 const ASSUMED_WORKSPACE_HEIGHT: f32 = 800.0;
 const LEGACY_HOME_SPLIT_FRACTION: f32 = 0.08;
 
@@ -139,6 +145,37 @@ pub fn migrate_command_line_tab(
     if already_migrated || state.find_tab(&WorkspaceTab::CommandLine).is_some() {
         return true;
     }
+    if let Some((surface, node, _)) = state.find_tab(&WorkspaceTab::Viewport) {
+        let _ = state.split(
+            (surface, node),
+            Split::Below,
+            0.88,
+            Node::leaf(WorkspaceTab::CommandLine),
+        );
+    } else {
+        state.push_to_focused_leaf(WorkspaceTab::CommandLine);
+    }
+    true
+}
+
+/// Move Command out of the Viewport leaf once. A later re-dock is left alone.
+pub fn split_command_from_viewport_once(
+    state: &mut DockState<WorkspaceTab>,
+    already_repaired: bool,
+) -> bool {
+    if already_repaired {
+        return true;
+    }
+    let Some((surface, node, command)) = state.find_tab(&WorkspaceTab::CommandLine) else {
+        return true;
+    };
+    let Some((viewport_surface, viewport_node, _)) = state.find_tab(&WorkspaceTab::Viewport) else {
+        return true;
+    };
+    if surface != viewport_surface || node != viewport_node {
+        return true;
+    }
+    state.remove_tab((surface, node, command));
     if let Some((surface, node, _)) = state.find_tab(&WorkspaceTab::Viewport) {
         let _ = state.split(
             (surface, node),
@@ -326,16 +363,172 @@ pub fn show_workspace(ui: &mut Ui, app: &mut MyCadApp) {
         ui.available_height(),
         app.settings.compact_home_height_applied,
     );
+    // egui_dock 0.17 asserts when a tab strip is exactly the 24px collapse
+    // button. A restored 0×0 window, or a split dragged onto that width,
+    // panics every frame and leaves `cargo run` stuck in the terminal.
+    // The same pass keeps every leaf at a usable size. Split fractions are
+    // ratios, so a strip saved for a tall window would otherwise shrink
+    // until the next tab bar paints over it.
+    let show_collapse = guard_collapse_buttons(&mut dock_state, ui.available_size());
     let style = dock_style(ui);
     {
         let mut viewer = WorkspaceViewer { app };
         DockArea::new(&mut dock_state)
             .id(egui::Id::new("mycad-workspace"))
             .style(style)
-            .show_leaf_collapse_buttons(true)
+            .show_leaf_collapse_buttons(show_collapse)
+            .show_leaf_close_all_buttons(false)
             .show_inside(ui, &mut viewer);
     }
     app.dock_state = dock_state;
+}
+
+/// egui_dock `Style::TAB_COLLAPSE_BUTTON_SIZE`. A tab strip of this width
+/// subtracts down to zero and trips `assert_ne!(available_width, 0.0)`.
+const COLLAPSE_BUTTON_PX: f32 = 24.0;
+
+/// Keep every tab strip wider than the collapse button, and keep every leaf
+/// at least [`MIN_LEAF_WIDTH_PX`] by [`MIN_LEAF_HEIGHT_PX`].
+fn guard_collapse_buttons(state: &mut DockState<WorkspaceTab>, main_size: Vec2) -> bool {
+    let mut allowed = true;
+    for surface in state.iter_surfaces_mut() {
+        let safe = match surface {
+            Surface::Empty => true,
+            Surface::Main(tree) => guard_tree(tree, main_size),
+            Surface::Window(tree, _) => {
+                let size = tree[NodeIndex::root()]
+                    .rect()
+                    .map(|rect| rect.size())
+                    .unwrap_or(Vec2::ZERO);
+                guard_tree(tree, size)
+            }
+        };
+        allowed &= safe;
+    }
+    allowed
+}
+
+fn guard_tree(tree: &mut Tree<WorkspaceTab>, size: Vec2) -> bool {
+    if !size.x.is_finite() || size.x <= 0.0 {
+        return true;
+    }
+    enforce_min_leaf_sizes(tree, NodeIndex::root(), size);
+    if size.x <= COLLAPSE_BUTTON_PX + 0.5 {
+        return false;
+    }
+    !tab_strip_hits_collapse_button(tree, NodeIndex::root(), size.x)
+}
+
+fn subtree_min_size(tree: &Tree<WorkspaceTab>, index: NodeIndex) -> Vec2 {
+    if index.0 >= tree.len() {
+        return Vec2::new(MIN_LEAF_WIDTH_PX, MIN_LEAF_HEIGHT_PX);
+    }
+    match &tree[index] {
+        Node::Empty => Vec2::ZERO,
+        Node::Leaf(leaf) => {
+            let height = if leaf.collapsed {
+                HOME_TAB_BAR_HEIGHT
+            } else {
+                MIN_LEAF_HEIGHT_PX
+            };
+            Vec2::new(MIN_LEAF_WIDTH_PX, height)
+        }
+        Node::Horizontal(_) => {
+            let left = subtree_min_size(tree, index.left());
+            let right = subtree_min_size(tree, index.right());
+            Vec2::new(left.x + right.x, left.y.max(right.y))
+        }
+        Node::Vertical(_) => {
+            let left = subtree_min_size(tree, index.left());
+            let right = subtree_min_size(tree, index.right());
+            Vec2::new(left.x.max(right.x), left.y + right.y)
+        }
+    }
+}
+
+fn enforce_min_leaf_sizes(tree: &mut Tree<WorkspaceTab>, index: NodeIndex, size: Vec2) {
+    if index.0 >= tree.len() {
+        return;
+    }
+    let orientation = match &tree[index] {
+        Node::Horizontal(split) => Some((true, split.fraction)),
+        Node::Vertical(split) => Some((false, split.fraction)),
+        Node::Leaf(_) | Node::Empty => None,
+    };
+    let Some((horizontal, current)) = orientation else {
+        return;
+    };
+    let left_min = subtree_min_size(tree, index.left());
+    let right_min = subtree_min_size(tree, index.right());
+    let (span, first_min, second_min) = if horizontal {
+        (size.x, left_min.x, right_min.x)
+    } else {
+        (size.y, left_min.y, right_min.y)
+    };
+    let fraction = if span.is_finite() && span > 0.0 {
+        clamp_split_fraction(current, span, first_min, second_min)
+    } else {
+        current
+    };
+    match &mut tree[index] {
+        Node::Horizontal(split) | Node::Vertical(split) => split.fraction = fraction,
+        Node::Leaf(_) | Node::Empty => return,
+    }
+    let (left_size, right_size) = if horizontal {
+        (
+            Vec2::new(size.x * fraction, size.y),
+            Vec2::new(size.x * (1.0 - fraction), size.y),
+        )
+    } else {
+        (
+            Vec2::new(size.x, size.y * fraction),
+            Vec2::new(size.x, size.y * (1.0 - fraction)),
+        )
+    };
+    enforce_min_leaf_sizes(tree, index.left(), left_size);
+    enforce_min_leaf_sizes(tree, index.right(), right_size);
+}
+
+fn clamp_split_fraction(fraction: f32, span: f32, first_min: f32, second_min: f32) -> f32 {
+    let fraction = if fraction.is_finite() {
+        fraction.clamp(0.0, 1.0)
+    } else {
+        0.5
+    };
+    if !span.is_finite() || span <= 0.0 {
+        return fraction.clamp(0.05, 0.95);
+    }
+    let first_min = first_min.max(0.0);
+    let second_min = second_min.max(0.0);
+    let need = first_min + second_min;
+    if need <= 0.0 || span + 0.5 < need {
+        return fraction.clamp(0.05, 0.95);
+    }
+    let min_frac = (first_min / span).clamp(0.0, 1.0);
+    let max_frac = (1.0 - second_min / span).clamp(0.0, 1.0);
+    if min_frac > max_frac {
+        return fraction.clamp(0.05, 0.95);
+    }
+    fraction.clamp(min_frac, max_frac)
+}
+
+fn tab_strip_hits_collapse_button(tree: &Tree<WorkspaceTab>, index: NodeIndex, width: f32) -> bool {
+    if index.0 >= tree.len() || !width.is_finite() {
+        return false;
+    }
+    match &tree[index] {
+        Node::Leaf(_) => width > 0.5 && (width - COLLAPSE_BUTTON_PX).abs() <= 0.5,
+        Node::Horizontal(split) => {
+            let fraction = split.fraction.clamp(0.0, 1.0);
+            tab_strip_hits_collapse_button(tree, index.left(), width * fraction)
+                || tab_strip_hits_collapse_button(tree, index.right(), width * (1.0 - fraction))
+        }
+        Node::Vertical(_) => {
+            tab_strip_hits_collapse_button(tree, index.left(), width)
+                || tab_strip_hits_collapse_button(tree, index.right(), width)
+        }
+        Node::Empty => false,
+    }
 }
 
 // ------------------------------------------------------------
@@ -656,6 +849,157 @@ mod layout_tests {
             state.find_tab(&WorkspaceTab::Home).is_none(),
             "closing Home after migration must be preserved"
         );
+    }
+
+    #[test]
+    fn a_split_as_wide_as_the_collapse_button_is_widened() {
+        let mut state = default_dock_state();
+        let width = 1400.0;
+        let (surface, props, _) = state
+            .find_tab(&WorkspaceTab::Properties)
+            .expect("Properties");
+        let parent = props.parent().expect("properties split");
+        let Node::Horizontal(split) = &mut state[surface][parent] else {
+            panic!("Properties should sit in a horizontal split");
+        };
+        split.fraction = COLLAPSE_BUTTON_PX / width;
+        assert!(guard_collapse_buttons(&mut state, egui::vec2(width, 800.0)));
+        let Node::Horizontal(split) = &state[surface][parent] else {
+            unreachable!();
+        };
+        assert!(split.fraction * width >= MIN_LEAF_WIDTH_PX - 0.1);
+        assert!(!tab_strip_hits_collapse_button(
+            state.main_surface(),
+            NodeIndex::root(),
+            width
+        ));
+    }
+
+    #[test]
+    fn a_button_width_workspace_hides_collapse_buttons() {
+        let mut state = default_dock_state();
+        assert!(!guard_collapse_buttons(
+            &mut state,
+            egui::vec2(COLLAPSE_BUTTON_PX, 800.0)
+        ));
+    }
+
+    #[test]
+    fn short_home_strip_is_raised_to_the_leaf_minimum() {
+        let mut state = default_dock_state();
+        let height = 826.0;
+        let (surface, home, _) = state.find_tab(&WorkspaceTab::Home).expect("Home");
+        let parent = home.parent().expect("Home split");
+        let Node::Vertical(split) = &mut state[surface][parent] else {
+            panic!("Home should be above the viewport");
+        };
+        split.fraction = 0.0417;
+        assert!(guard_collapse_buttons(
+            &mut state,
+            egui::vec2(1424.0, height)
+        ));
+        let Node::Vertical(split) = &state[surface][parent] else {
+            unreachable!();
+        };
+        assert!(
+            split.fraction * height >= MIN_LEAF_HEIGHT_PX - 0.1,
+            "home height {}px",
+            split.fraction * height
+        );
+    }
+
+    #[test]
+    fn narrow_side_panels_keep_subtree_minimums() {
+        let mut state = default_dock_state();
+        let width = 1424.0;
+        let (surface, props, _) = state
+            .find_tab(&WorkspaceTab::Properties)
+            .expect("Properties");
+        let props_parent = props.parent().expect("properties split");
+        let Node::Horizontal(split) = &mut state[surface][props_parent] else {
+            panic!("Properties should sit in a horizontal split");
+        };
+        split.fraction = 0.061;
+
+        let (surface, viewport, _) = state.find_tab(&WorkspaceTab::Viewport).expect("Viewport");
+        let column = viewport.parent().expect("viewport column");
+        let diag_parent = column.parent().expect("diagnostics split");
+        let Node::Horizontal(split) = &mut state[surface][diag_parent] else {
+            panic!("Viewport column should sit beside Diagnostics");
+        };
+        split.fraction = 0.05;
+
+        assert!(guard_collapse_buttons(&mut state, egui::vec2(width, 826.0)));
+
+        let Node::Horizontal(split) = &state[surface][props_parent] else {
+            unreachable!();
+        };
+        let props_width = split.fraction * width;
+        assert!(
+            props_width >= MIN_LEAF_WIDTH_PX - 0.1,
+            "properties width {props_width}px"
+        );
+
+        let Node::Horizontal(split) = &state[surface][diag_parent] else {
+            unreachable!();
+        };
+        let column_width = split.fraction * (width - props_width);
+        assert!(
+            column_width >= MIN_LEAF_WIDTH_PX - 0.1,
+            "viewport column width {column_width}px"
+        );
+    }
+
+    #[test]
+    fn a_workspace_smaller_than_the_minimums_keeps_sane_fractions() {
+        for size in [egui::vec2(24.0, 24.0), egui::vec2(60.0, 60.0)] {
+            let mut state = default_dock_state();
+            let _ = guard_collapse_buttons(&mut state, size);
+            for node in state.main_surface().iter() {
+                let fraction = match node {
+                    Node::Horizontal(split) | Node::Vertical(split) => split.fraction,
+                    Node::Leaf(_) | Node::Empty => continue,
+                };
+                assert!(
+                    fraction.is_finite() && fraction > 0.0 && fraction < 1.0,
+                    "fraction {fraction} for size {size:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn command_stacked_on_viewport_is_split_out_once() {
+        let mut state = default_dock_state();
+        let command = state.find_tab(&WorkspaceTab::CommandLine).expect("Command");
+        state.remove_tab(command);
+        let (surface, node, _) = state.find_tab(&WorkspaceTab::Viewport).expect("Viewport");
+        state[surface][node].append_tab(WorkspaceTab::CommandLine);
+
+        assert!(split_command_from_viewport_once(&mut state, true));
+        let (viewport_surface, viewport_node, _) =
+            state.find_tab(&WorkspaceTab::Viewport).expect("Viewport");
+        let (command_surface, command_node, _) =
+            state.find_tab(&WorkspaceTab::CommandLine).expect("Command");
+        assert_eq!(
+            (viewport_surface, viewport_node),
+            (command_surface, command_node),
+            "a repaired layout must keep a later re-dock"
+        );
+
+        assert!(split_command_from_viewport_once(&mut state, false));
+        let (viewport_surface, viewport_node, _) =
+            state.find_tab(&WorkspaceTab::Viewport).expect("Viewport");
+        let (command_surface, command_node, _) =
+            state.find_tab(&WorkspaceTab::CommandLine).expect("Command");
+        assert_ne!(
+            (viewport_surface, viewport_node),
+            (command_surface, command_node)
+        );
+        let parent = command_node.parent().expect("command split");
+        assert!(matches!(state[command_surface][parent], Node::Vertical(_)));
+        assert_eq!(parent.left(), viewport_node);
+        assert_eq!(parent.right(), command_node);
     }
 }
 

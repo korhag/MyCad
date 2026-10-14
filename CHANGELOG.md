@@ -5,9 +5,37 @@ All notable changes to EntoCAD are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project versions with [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Workspace version is `0.54.1` (`Cargo.toml`).
+Workspace version is `0.56.0` (`Cargo.toml`).
 
 ## [Unreleased]
+
+## [0.56.0] - 2026-10-14
+
+### Added
+- Dynamic blocks that use a point parameter can be edited. Position X and Position Y drive move and stretch on both axes, so a block such as Vertical Bends is no longer kept static just because it contains BLOCKPOINTPARAMETER.
+
+### Fixed
+- A move or stretch whose selection is empty no longer keeps the rest of that dynamic block static.
+
+## [0.55.2] - 2026-10-14
+
+### Fixed
+- Dock panels keep a usable size when the window gets shorter or narrower. The Home ribbon is no longer cut off, side panels stay wide enough to read, Command returns to its own strip under the viewport, and the extra close button on each tab strip is gone.
+
+## [0.55.1] - 2026-10-14
+
+### Fixed
+- The window opens on screen again. A saved 0×0 position off the desktop no longer comes back on the next launch, and a dock tab exactly as wide as the collapse button no longer panics and leaves the terminal stuck.
+
+## [0.55.0] - 2026-10-14
+
+### Added
+- File → Open Recent lists the last ten drawings you opened or saved. A file that has moved is removed from the list when you pick it.
+
+## [0.54.2] - 2026-10-13
+
+### Fixed
+- A SORTENTSTABLE whose block owner does not resolve now uses the block that owns the table's dictionary, so that draw order is not dropped.
 
 ## [0.54.1] - 2026-10-13
 

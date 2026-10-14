@@ -795,13 +795,12 @@ unsafe fn apply_sort_tables(
         if ptr.is_null() {
             continue;
         }
-        let Some(owner) =
-            get_field::<*mut libredwg_sys::Dwg_Object_Ref>(ptr, "SORTENTSTABLE", "block_owner")
+        let owner =
+            get_field::<*mut libredwg_sys::Dwg_Object_Ref>(ptr, "SORTENTSTABLE", "block_owner");
+        let Some(name) = owner
+            .and_then(resolve_block_name)
+            .or_else(|| sort_table_block_from_owner(ptr))
         else {
-            document.diagnostics.bump_feature("SORT_NO_OWNER");
-            continue;
-        };
-        let Some(name) = resolve_block_name(owner) else {
             document.diagnostics.bump_feature("SORT_NO_OWNER");
             continue;
         };
@@ -860,6 +859,26 @@ unsafe fn apply_sort_tables(
             "SORT_MISMATCH"
         });
     }
+}
+
+/// `block_owner` is sometimes unset or not a block header. AutoCAD stores the
+/// table in the block record's `ACAD_SORTENTS` dictionary, so the table's
+/// owner is that dictionary and the dictionary's owner is the block record.
+fn sort_table_block_from_owner(ptr: *mut c_void) -> Option<String> {
+    let owner = get_common_field::<*mut libredwg_sys::Dwg_Object_Ref>(ptr, "ownerhandle")?;
+    if owner.is_null() {
+        return None;
+    }
+    let object = unsafe { (*owner).obj };
+    if object.is_null() || object_dxfname(object.cast()) != "DICTIONARY" {
+        return None;
+    }
+    let body = unsafe { libredwg_sys::uncad_object_object_ptr(object.cast()) };
+    if body.is_null() {
+        return None;
+    }
+    let grand = get_common_field::<*mut libredwg_sys::Dwg_Object_Ref>(body, "ownerhandle")?;
+    resolve_block_name(grand)
 }
 
 fn assign_draw_orders(

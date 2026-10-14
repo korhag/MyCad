@@ -86,6 +86,14 @@ pub(crate) enum AcadParam {
         current_deg: f64,
         value_set: AcadValueSet,
     },
+    /// AutoCAD point parameter. EntoCAD stores it as two distances, Position X
+    /// and Position Y, so the existing move and stretch math can follow both axes.
+    Point {
+        name: String,
+        show: bool,
+        base: Point2,
+        current: Point2,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -142,7 +150,8 @@ impl AcadParam {
             Self::Visibility { name, .. }
             | Self::Linear { name, .. }
             | Self::Flip { name, .. }
-            | Self::Rotation { name, .. } => name,
+            | Self::Rotation { name, .. }
+            | Self::Point { name, .. } => name,
         }
     }
 
@@ -151,7 +160,8 @@ impl AcadParam {
             Self::Visibility { show, .. }
             | Self::Linear { show, .. }
             | Self::Flip { show, .. }
-            | Self::Rotation { show, .. } => *show,
+            | Self::Rotation { show, .. }
+            | Self::Point { show, .. } => *show,
         }
     }
 }
@@ -185,6 +195,7 @@ pub(crate) fn materialize_definition(
     assign_entity_ids(document, entities);
     let mut dynamic = DynamicDefinition::default();
     let mut names = BTreeMap::new();
+    let mut point_axes: BTreeMap<String, PointAxes> = BTreeMap::new();
     for (index, parameter) in graph.parameters.iter().enumerate() {
         if !parameter.show()
             && !graph
@@ -192,6 +203,31 @@ pub(crate) fn materialize_definition(
                 .iter()
                 .any(|action| action.parameter().eq_ignore_ascii_case(parameter.name()))
         {
+            continue;
+        }
+        if let AcadParam::Point { base, .. } = parameter {
+            let raw = parameter_key(parameter.name());
+            let x_label = unique_name(&names, &format!("{raw} X"));
+            let x_id = document.allocate_parameter_id();
+            names.insert(x_label.to_ascii_lowercase(), (x_id, x_label.clone()));
+            let y_label = unique_name(&names, &format!("{raw} Y"));
+            let y_id = document.allocate_parameter_id();
+            names.insert(y_label.to_ascii_lowercase(), (y_id, y_label.clone()));
+            names.insert(raw.to_ascii_lowercase(), (x_id, x_label.clone()));
+            point_axes.insert(
+                raw.to_ascii_lowercase(),
+                PointAxes {
+                    x: x_id,
+                    y: y_id,
+                    base: *base,
+                },
+            );
+            dynamic
+                .parameters
+                .push(axis_parameter(x_id, x_label, base.x, index as i32));
+            dynamic
+                .parameters
+                .push(axis_parameter(y_id, y_label, base.y, index as i32));
             continue;
         }
         let name = unique_name(&names, parameter.name());
@@ -219,7 +255,10 @@ pub(crate) fn materialize_definition(
             .any(|action| action.parameter().eq_ignore_ascii_case(parameter.name()));
         let needs_action = matches!(
             parameter,
-            AcadParam::Linear { .. } | AcadParam::Flip { .. } | AcadParam::Rotation { .. }
+            AcadParam::Linear { .. }
+                | AcadParam::Flip { .. }
+                | AcadParam::Rotation { .. }
+                | AcadParam::Point { .. }
         );
         if needs_action && !linked {
             return Err(format!("{} has no action", parameter.name()));
@@ -236,6 +275,53 @@ pub(crate) fn materialize_definition(
                 action_label(action)
             ));
         };
+        if let Some(axes) = point_axes
+            .get(&action.parameter().trim().to_ascii_lowercase())
+            .copied()
+        {
+            match action {
+                AcadAction::Stretch {
+                    offset_x,
+                    offset_y,
+                    connection,
+                    targets,
+                    ..
+                } => {
+                    push_point_stretch(
+                        document,
+                        entities,
+                        &mut dynamic,
+                        &axes,
+                        *offset_x,
+                        *offset_y,
+                        connection,
+                        targets,
+                    )?;
+                }
+                AcadAction::Move {
+                    offset_x,
+                    offset_y,
+                    connection,
+                    entities: members,
+                    ..
+                } => {
+                    push_point_move(
+                        document,
+                        entities,
+                        &mut dynamic,
+                        &axes,
+                        *offset_x,
+                        *offset_y,
+                        connection,
+                        members,
+                    )?;
+                }
+                AcadAction::Flip { .. } | AcadAction::Rotate { .. } => {
+                    return Err("a point parameter cannot drive this action".into());
+                }
+            }
+            continue;
+        }
         match action {
             AcadAction::Stretch {
                 offset_x,
@@ -376,6 +462,9 @@ fn parameter_def(
             apply_value_set(&mut numeric, value_set, *angle_deg)?;
             ParameterKind::Number(numeric)
         }
+        AcadParam::Point { .. } => {
+            return Err("a point parameter is stored as Position X and Position Y".into());
+        }
     };
     Ok(ParameterDef {
         id,
@@ -449,6 +538,172 @@ fn apply_value_set(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct PointAxes {
+    x: ParameterId,
+    y: ParameterId,
+    base: Point2,
+}
+
+struct AxisDrive {
+    parameter: ParameterId,
+    direction: Point2,
+    reference: f64,
+    multiplier: f64,
+}
+
+fn parameter_key(name: &str) -> String {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        "Position".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn axis_parameter(id: ParameterId, name: String, reference: f64, order: i32) -> ParameterDef {
+    let mut numeric = NumericParameter::length(reference);
+    numeric.display_order = order;
+    ParameterDef {
+        id,
+        name,
+        description: None,
+        display_order: order,
+        kind: ParameterKind::Number(numeric),
+    }
+}
+
+fn point_drives(axes: &PointAxes, offset_x: f64, offset_y: f64, connection: &str) -> Vec<AxisDrive> {
+    let sign = connection_sign(connection);
+    [
+        AxisDrive {
+            parameter: axes.x,
+            direction: Point2::new(1.0, 0.0),
+            reference: axes.base.x,
+            multiplier: offset_x * sign,
+        },
+        AxisDrive {
+            parameter: axes.y,
+            direction: Point2::new(0.0, 1.0),
+            reference: axes.base.y,
+            multiplier: offset_y * sign,
+        },
+    ]
+    .into_iter()
+    .filter(|drive| drive.multiplier.abs() > 1e-12)
+    .collect()
+}
+
+fn push_point_stretch(
+    document: &mut Document,
+    entities: &[Entity],
+    dynamic: &mut DynamicDefinition,
+    axes: &PointAxes,
+    offset_x: f64,
+    offset_y: f64,
+    connection: &str,
+    targets: &[AcadStretchTarget],
+) -> Result<(), String> {
+    if targets.is_empty() {
+        return Ok(());
+    }
+    let drives = point_drives(axes, offset_x, offset_y, connection);
+    if drives.is_empty() {
+        return Err("stretch has no effect".into());
+    }
+    let mut points = Vec::new();
+    let mut whole = Vec::new();
+    for target in targets {
+        let entity = entities
+            .get(target.entity)
+            .ok_or("stretch target is missing")?;
+        match classify_stretch(entity, &target.indexes)? {
+            StretchUse::Whole => whole.push(GeometryTarget::Entity(entity.id)),
+            StretchUse::Points(found) => points.extend(found),
+        }
+    }
+    if points.is_empty() && whole.is_empty() {
+        return Err("stretch has no effect".into());
+    }
+    for drive in &drives {
+        if !points.is_empty() {
+            merge_behavior(
+                dynamic,
+                behavior(
+                    document.allocate_action_id(),
+                    BehaviorKind::Stretch,
+                    drive.parameter,
+                    cad_core::dedupe_targets(points.clone()),
+                    drive.direction,
+                    drive.reference,
+                    drive.multiplier,
+                    FollowRole::Second,
+                )?,
+            );
+        }
+        if !whole.is_empty() {
+            merge_behavior(
+                dynamic,
+                behavior(
+                    document.allocate_action_id(),
+                    BehaviorKind::Move,
+                    drive.parameter,
+                    cad_core::dedupe_targets(whole.clone()),
+                    drive.direction,
+                    drive.reference,
+                    drive.multiplier,
+                    FollowRole::Custom,
+                )?,
+            );
+        }
+    }
+    Ok(())
+}
+
+fn push_point_move(
+    document: &mut Document,
+    entities: &[Entity],
+    dynamic: &mut DynamicDefinition,
+    axes: &PointAxes,
+    offset_x: f64,
+    offset_y: f64,
+    connection: &str,
+    members: &[usize],
+) -> Result<(), String> {
+    if members.is_empty() {
+        return Ok(());
+    }
+    let drives = point_drives(axes, offset_x, offset_y, connection);
+    if drives.is_empty() {
+        return Err("move has no effect".into());
+    }
+    let mut targets = Vec::new();
+    for index in members {
+        let entity = entities.get(*index).ok_or("move target is missing")?;
+        let target = GeometryTarget::Entity(entity.id);
+        cad_core::capability_for(BehaviorKind::Move, &entity.geometry, target)
+            .map_err(|reason| reason.to_string())?;
+        targets.push(target);
+    }
+    let targets = cad_core::dedupe_targets(targets);
+    for drive in &drives {
+        merge_behavior(
+            dynamic,
+            behavior(
+                document.allocate_action_id(),
+                BehaviorKind::Move,
+                drive.parameter,
+                targets.clone(),
+                drive.direction,
+                drive.reference,
+                drive.multiplier,
+                FollowRole::Custom,
+            )?,
+        );
+    }
+    Ok(())
+}
+
 fn push_stretch(
     document: &mut Document,
     entities: &[Entity],
@@ -459,9 +714,12 @@ fn push_stretch(
     targets: &[AcadStretchTarget],
     graph: &AcadGraph,
 ) -> Result<(), String> {
+    if targets.is_empty() {
+        return Ok(());
+    }
     let (direction, reference) = linear_direction(dynamic, parameter, graph)?;
     let multiplier = offset_x * connection_sign(connection);
-    if multiplier.abs() <= 1e-12 || targets.is_empty() {
+    if multiplier.abs() <= 1e-12 {
         return Err("stretch has no effect".into());
     }
     let mut points = Vec::new();
@@ -518,9 +776,12 @@ fn push_move(
     members: &[usize],
     graph: &AcadGraph,
 ) -> Result<(), String> {
+    if members.is_empty() {
+        return Ok(());
+    }
     let (direction, reference) = linear_direction(dynamic, parameter, graph)?;
     let multiplier = offset_x * connection_sign(connection);
-    if multiplier.abs() <= 1e-12 || members.is_empty() {
+    if multiplier.abs() <= 1e-12 {
         return Err("move has no effect".into());
     }
     let mut targets = Vec::new();
@@ -1211,14 +1472,7 @@ fn instance_hint(
                 let current = anonymous
                     .parameters
                     .iter()
-                    .find(|item| item.name().eq_ignore_ascii_case(&parameter.name))
-                    .map(|item| match item {
-                        AcadParam::Linear {
-                            current_distance, ..
-                        } => *current_distance,
-                        AcadParam::Rotation { current_deg, .. } => *current_deg,
-                        _ => numeric.default,
-                    })
+                    .find_map(|item| hinted_number(item, &parameter.name))
                     .unwrap_or(numeric.default);
                 numbers.insert(parameter.id, current);
             }
@@ -1232,6 +1486,35 @@ fn instance_hint(
         choices,
         flags,
     })
+}
+
+fn hinted_number(parameter: &AcadParam, name: &str) -> Option<f64> {
+    match parameter {
+        AcadParam::Linear {
+            name: parameter_name,
+            current_distance,
+            ..
+        } if parameter_name.eq_ignore_ascii_case(name) => Some(*current_distance),
+        AcadParam::Rotation {
+            name: parameter_name,
+            current_deg,
+            ..
+        } if parameter_name.eq_ignore_ascii_case(name) => Some(*current_deg),
+        AcadParam::Point {
+            name: parameter_name,
+            current,
+            ..
+        } => {
+            if name.eq_ignore_ascii_case(&format!("{parameter_name} X")) {
+                Some(current.x)
+            } else if name.eq_ignore_ascii_case(&format!("{parameter_name} Y")) {
+                Some(current.y)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 fn trial_configs(
@@ -1439,6 +1722,7 @@ fn describe_graph(graph: &AcadGraph) -> String {
             AcadParam::Linear { .. } => "linear",
             AcadParam::Flip { .. } => "flip",
             AcadParam::Rotation { .. } => "rotation",
+            AcadParam::Point { .. } => "point",
         };
         parts.push(format!("{kind} {}", parameter.name()));
     }
@@ -1489,10 +1773,7 @@ unsafe fn read_dynamic(
             *kinds.entry(dxf.clone()).or_default() += 1;
             if matches!(
                 classify_node(&dxf),
-                NodeClass::Parameter
-                    | NodeClass::Action
-                    | NodeClass::Unsupported
-                    | NodeClass::Point
+                NodeClass::Parameter | NodeClass::Action | NodeClass::Unsupported
             ) {
                 if let Some(name) = owning_block_name(dwg, object) {
                     if !is_layout_block(&name) {
@@ -1683,7 +1964,6 @@ unsafe fn assemble_graph(
     let mut raw_params = Vec::new();
     let mut raw_actions = Vec::new();
     let mut param_names: Vec<(i64, String)> = Vec::new();
-    let mut point_ids = Vec::new();
     for node in nodes {
         match classify_node(&node.dxf) {
             NodeClass::Unsupported => {
@@ -1693,11 +1973,6 @@ unsafe fn assemble_graph(
             }
             NodeClass::Parameter => raw_params.push(node),
             NodeClass::Action => raw_actions.push(node),
-            NodeClass::Point => {
-                if node.id >= 0 {
-                    point_ids.push(node.id);
-                }
-            }
             NodeClass::Ignore => {}
         }
     }
@@ -1718,16 +1993,6 @@ unsafe fn assemble_graph(
     }
     let mut links: Vec<(&RawNode, String)> = Vec::new();
     for node in &raw_actions {
-        if node.parent >= 0 && point_ids.contains(&node.parent) {
-            if !result
-                .unsupported
-                .iter()
-                .any(|item| item == "BLOCKPOINTPARAMETER")
-            {
-                result.unsupported.push("BLOCKPOINTPARAMETER".into());
-            }
-            continue;
-        }
         if raw_actions
             .iter()
             .any(|other| other.id == node.parent && node.parent >= 0)
@@ -1748,14 +2013,6 @@ unsafe fn assemble_graph(
             .or_else(|| parameter_from_deps(node, &raw_params, &param_names))
         {
             links.push((node, parameter_name));
-        } else if connects_point_parameter(node, &point_ids) {
-            if !result
-                .unsupported
-                .iter()
-                .any(|item| item == "BLOCKPOINTPARAMETER")
-            {
-                result.unsupported.push("BLOCKPOINTPARAMETER".into());
-            }
         } else if !result
             .unsupported
             .iter()
@@ -1785,7 +2042,6 @@ enum NodeClass {
     Parameter,
     Action,
     Unsupported,
-    Point,
     Ignore,
 }
 
@@ -1794,7 +2050,8 @@ fn classify_node(dxf: &str) -> NodeClass {
         "BLOCKVISIBILITYPARAMETER"
         | "BLOCKLINEARPARAMETER"
         | "BLOCKROTATIONPARAMETER"
-        | "BLOCKFLIPPARAMETER" => NodeClass::Parameter,
+        | "BLOCKFLIPPARAMETER"
+        | "BLOCKPOINTPARAMETER" => NodeClass::Parameter,
         "BLOCKSTRETCHACTION" | "BLOCKMOVEACTION" | "BLOCKFLIPACTION" | "BLOCKROTATEACTION" => {
             NodeClass::Action
         }
@@ -1806,7 +2063,6 @@ fn classify_node(dxf: &str) -> NodeClass {
         | "BLOCKPOLARPARAMETER"
         | "BLOCKXYPARAMETER"
         | "BLOCKALIGNMENTPARAMETER" => NodeClass::Unsupported,
-        "BLOCKPOINTPARAMETER" => NodeClass::Point,
         _ if dxf.ends_with("GRIP")
             || dxf.contains("CONSTRAINT")
             || dxf == "BLOCKBASEPOINTPARAMETER"
@@ -1849,7 +2105,7 @@ fn parameter_for_action(
     let matches: Vec<&AcadParam> = built
         .iter()
         .filter(|parameter| match (want, parameter) {
-            ("linear", AcadParam::Linear { .. })
+            ("linear", AcadParam::Linear { .. } | AcadParam::Point { .. })
             | ("flip", AcadParam::Flip { .. })
             | ("rotation", AcadParam::Rotation { .. }) => true,
             _ => false,
@@ -1899,15 +2155,6 @@ fn parameter_from_connection_codes(action: &RawNode, names: &[(i64, String)]) ->
         connection_codes(action.payload, &action.dxf).into_iter(),
         names,
     )
-}
-
-fn connects_point_parameter(action: &RawNode, points: &[i64]) -> bool {
-    if points.is_empty() {
-        return false;
-    }
-    connection_codes(action.payload, &action.dxf)
-        .into_iter()
-        .any(|code| points.contains(&code))
 }
 
 fn one_named_id(ids: impl IntoIterator<Item = i64>, names: &[(i64, String)]) -> Option<String> {
@@ -2090,6 +2337,19 @@ unsafe fn read_parameter(node: &RawNode, handles: &HashMap<u64, usize>) -> Optio
                 value_set: read_value_set(payload, dxf, "angle_value_set", true),
             }
         }
+        "BLOCKPOINTPARAMETER" => {
+            let base = point_field(payload, dxf, "def_pt").unwrap_or(Point2::new(0.0, 0.0));
+            AcadParam::Point {
+                name: named(
+                    &get_utf8_field(payload, dxf, "position_name").unwrap_or_default(),
+                    &element_name,
+                    "Position",
+                ),
+                show,
+                current: current_point(payload, dxf, base),
+                base,
+            }
+        }
         _ => return None,
     })
 }
@@ -2125,14 +2385,14 @@ unsafe fn read_action(
         "BLOCKSTRETCHACTION" => AcadAction::Stretch {
             parameter: parameter.to_string(),
             offset_x,
-            offset_y: get_field::<f64>(payload, dxf, "action_offset_y").unwrap_or(0.0),
+            offset_y: get_field::<f64>(payload, dxf, "action_offset_y").unwrap_or(1.0),
             connection,
             targets: stretch_targets,
         },
         "BLOCKMOVEACTION" => AcadAction::Move {
             parameter: parameter.to_string(),
             offset_x,
-            offset_y: get_field::<f64>(payload, dxf, "action_offset_y").unwrap_or(0.0),
+            offset_y: get_field::<f64>(payload, dxf, "action_offset_y").unwrap_or(1.0),
             connection,
             entities: resolve_deps(dwg, payload, dxf, handles, unresolved),
         },
@@ -2158,6 +2418,18 @@ fn named(primary: &str, secondary: &str, fallback: &str) -> String {
         }
     }
     fallback.to_string()
+}
+
+unsafe fn current_point(payload: *mut c_void, dxf: &str, base: Point2) -> Point2 {
+    for field in ["pt", "upd_pt", "updated_pt"] {
+        let Some(point) = point_field(payload, dxf, field) else {
+            continue;
+        };
+        if point.x.is_finite() && point.y.is_finite() {
+            return point;
+        }
+    }
+    base
 }
 
 fn point_distance(base: Point2, end: Point2) -> f64 {
@@ -2858,6 +3130,71 @@ mod tests {
             Geometry::Line { start, end } => {
                 assert!((start.x).abs() < 1e-6);
                 assert!((end.x - 20.0).abs() < 1e-6);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn point_parameter_moves_in_x_and_y() {
+        let mut document = Document::default();
+        let mut entities = vec![line(0.0, 0.0, 10.0, 0.0), line(0.0, 0.0, 0.0, 4.0)];
+        let mut graph = empty_graph("Bend");
+        graph.parameters.push(AcadParam::Point {
+            name: "Position".into(),
+            show: true,
+            base: Point2::new(0.0, 0.0),
+            current: Point2::new(0.0, 0.0),
+        });
+        graph.actions.push(AcadAction::Move {
+            parameter: "Position".into(),
+            offset_x: 1.0,
+            offset_y: 1.0,
+            connection: String::new(),
+            entities: vec![0],
+        });
+        graph.actions.push(AcadAction::Stretch {
+            parameter: "Position".into(),
+            offset_x: 1.0,
+            offset_y: 1.0,
+            connection: String::new(),
+            targets: vec![AcadStretchTarget {
+                entity: 1,
+                indexes: vec![1],
+            }],
+        });
+        let dynamic = materialize_definition(&mut document, &mut entities, &graph).expect("map");
+        assert_eq!(dynamic.parameters[0].name, "Position X");
+        assert_eq!(dynamic.parameters[1].name, "Position Y");
+        let x_id = dynamic.parameters[0].id;
+        let y_id = dynamic.parameters[1].id;
+        install(&mut document, "Bend", entities, dynamic);
+        let drawn = evaluate(&document, "Bend", None);
+        match &drawn[0].geometry {
+            Geometry::Line { start, end } => {
+                assert!(start.x.abs() < 1e-6 && start.y.abs() < 1e-6);
+                assert!((end.x - 10.0).abs() < 1e-6 && end.y.abs() < 1e-6);
+            }
+            other => panic!("{other:?}"),
+        }
+        let mut configuration = InstanceConfiguration::default();
+        configuration.set(x_id, ParameterValue::Number(5.0));
+        configuration.set(y_id, ParameterValue::Number(-3.0));
+        let moved = evaluate(&document, "Bend", Some(&configuration));
+        match &moved[0].geometry {
+            Geometry::Line { start, end } => {
+                assert!((start.x - 5.0).abs() < 1e-6);
+                assert!((start.y + 3.0).abs() < 1e-6);
+                assert!((end.x - 15.0).abs() < 1e-6);
+                assert!((end.y + 3.0).abs() < 1e-6);
+            }
+            other => panic!("{other:?}"),
+        }
+        match &moved[1].geometry {
+            Geometry::Line { start, end } => {
+                assert!(start.x.abs() < 1e-6 && start.y.abs() < 1e-6);
+                assert!((end.x - 5.0).abs() < 1e-6);
+                assert!((end.y - 1.0).abs() < 1e-6);
             }
             other => panic!("{other:?}"),
         }

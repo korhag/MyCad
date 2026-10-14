@@ -57,6 +57,19 @@ fn sample_dwgs_report_dynamic_blocks() {
         for line in &doc.diagnostics.dynamic_lines {
             println!("{line}");
         }
+        let file_name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+        if file_name.contains("LYO-410546") {
+            let bends = doc
+                .diagnostics
+                .dynamic_lines
+                .iter()
+                .find(|line| line.contains("101781 Vertical Bends"))
+                .expect("Vertical Bends dynamic report");
+            assert!(
+                bends.contains("point ") && !bends.contains("kept static"),
+                "{bends}"
+            );
+        }
     }
 }
 

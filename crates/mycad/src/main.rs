@@ -26,6 +26,7 @@ mod measurement;
 mod perf_baseline;
 mod preview;
 mod properties;
+mod recent_files;
 mod ribbon;
 mod selection;
 mod settings;
@@ -37,8 +38,9 @@ mod wheel_zoom;
 mod workspace;
 
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // Printed when the window fails to open so a graphics problem is actionable
 // on any machine, including a VM or a Remote Desktop session.
@@ -70,6 +72,7 @@ fn main() -> ExitCode {
 
     install_panic_hook();
     brand::migrate_legacy_storage();
+    repair_persisted_window();
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1440.0, 900.0])
@@ -180,9 +183,17 @@ fn attach_parent_console() {
 #[cfg(not(all(windows, not(debug_assertions))))]
 fn attach_parent_console() {}
 
+static PANIC_REPORTED: AtomicBool = AtomicBool::new(false);
+
 fn install_panic_hook() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        // winit keeps the frame loop alive after a panic. Reporting every
+        // frame floods the console `cargo run` is attached to and locks it
+        // behind a modal dialog.
+        if PANIC_REPORTED.swap(true, Ordering::Relaxed) {
+            return;
+        }
         let message = panic_message(info);
         let location = info
             .location()
@@ -195,19 +206,62 @@ fn install_panic_hook() {
             env!("CARGO_PKG_VERSION")
         );
         let path = crash_log_path();
-        let _ = std::fs::create_dir_all(path.parent().unwrap_or(std::path::Path::new(".")));
-        let _ = std::fs::write(&path, body);
-        let _ = rfd::MessageDialog::new()
-            .set_title(format!("{} stopped unexpectedly", brand::APP_NAME))
-            .set_level(rfd::MessageLevel::Error)
-            .set_description(format!(
-                "{} hit an unexpected error.\n\nA report was saved to:\n{}",
-                brand::APP_NAME,
-                path.display()
-            ))
-            .show();
+        let _ = std::fs::create_dir_all(path.parent().unwrap_or(Path::new(".")));
+        let _ = std::fs::write(&path, &body);
+        let dialog_path = path.clone();
+        std::thread::spawn(move || {
+            let _ = rfd::MessageDialog::new()
+                .set_title(format!("{} stopped unexpectedly", brand::APP_NAME))
+                .set_level(rfd::MessageLevel::Error)
+                .set_description(format!(
+                    "{} hit an unexpected error.\n\nA report was saved to:\n{}",
+                    brand::APP_NAME,
+                    dialog_path.display()
+                ))
+                .show();
+        });
         previous(info);
     }));
+}
+
+/// Last session stored the minimized Windows sentinel (-32000, -32000) and a
+/// 0×0 client area. Restoring that hides the window and can size a dock tab
+/// to exactly the collapse button, which panics.
+const SANE_WINDOW: &str = "(inner_position_pixels:None,outer_position_pixels:None,fullscreen:false,maximized:false,inner_size_points:Some((x:1440.0,y:900.0)))";
+
+fn repair_persisted_window() {
+    let Some(dir) = eframe::storage_dir(brand::APP_ID) else {
+        return;
+    };
+    let path = dir.join("app.ron");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Some(repaired) = repair_window_storage(&text) else {
+        return;
+    };
+    let _ = std::fs::write(path, repaired);
+}
+
+fn repair_window_storage(text: &str) -> Option<String> {
+    let key = "\"window\": \"";
+    let start = text.find(key)? + key.len();
+    let end = start + text[start..].find('"')?;
+    if !persisted_window_is_unusable(&text[start..end]) {
+        return None;
+    }
+    let mut repaired = String::with_capacity(text.len());
+    repaired.push_str(&text[..start]);
+    repaired.push_str(SANE_WINDOW);
+    repaired.push_str(&text[end..]);
+    Some(repaired)
+}
+
+fn persisted_window_is_unusable(value: &str) -> bool {
+    value.contains("x:-32000")
+        || value.contains("y:-32000")
+        || value.contains("inner_size_points:Some((x:0.0,y:0.0))")
+        || value.contains("inner_size_points:Some((x:0,y:0))")
 }
 
 fn panic_message(info: &std::panic::PanicHookInfo<'_>) -> String {
@@ -329,5 +383,26 @@ fn run_import_only(path: Option<PathBuf>) -> ExitCode {
             eprintln!("import failed: {err}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::{persisted_window_is_unusable, repair_window_storage, SANE_WINDOW};
+
+    #[test]
+    fn a_hidden_zero_window_is_replaced() {
+        let stored = r#"{
+    "window": "(inner_position_pixels:Some((x:-32000.0,y:-32000.0)),outer_position_pixels:Some((x:-32000.0,y:-32000.0)),fullscreen:false,maximized:false,inner_size_points:Some((x:0.0,y:0.0)))",
+    "mycad_settings": "kept"
+}"#;
+        assert!(persisted_window_is_unusable(
+            "(inner_position_pixels:Some((x:-32000.0,y:-32000.0)),inner_size_points:Some((x:0.0,y:0.0)))"
+        ));
+        let repaired = repair_window_storage(stored).expect("bad window is rewritten");
+        assert!(repaired.contains(SANE_WINDOW));
+        assert!(repaired.contains("\"mycad_settings\": \"kept\""));
+        assert!(!repaired.contains("-32000"));
+        assert!(repair_window_storage(&repaired).is_none());
     }
 }

@@ -7,7 +7,7 @@ use crate::input::InputMap;
 use crate::workspace::{
     decode_dock_layout, default_dock_state, encode_dock_layout, migrate_blocks_tab,
     migrate_command_line_tab, migrate_home_tab, recover_home_split_once, sanitize_dock_state,
-    WorkspaceTab,
+    split_command_from_viewport_once, WorkspaceTab,
 };
 
 pub const STORAGE_KEY: &str = "mycad_settings";
@@ -213,6 +213,8 @@ pub struct AppSettings {
     #[serde(default)]
     pub command_line_migrated: bool,
     #[serde(default)]
+    pub command_line_split_repaired: bool,
+    #[serde(default)]
     pub responsive_ribbon_recovered: bool,
     #[serde(default)]
     pub compact_home_height_applied: bool,
@@ -258,6 +260,7 @@ impl Default for AppSettings {
             home_layout_migrated: false,
             blocks_tab_migrated: false,
             command_line_migrated: false,
+            command_line_split_repaired: false,
             responsive_ribbon_recovered: false,
             compact_home_height_applied: false,
             library_preview: LibraryPreviewSettings::default(),
@@ -294,6 +297,8 @@ impl AppSettings {
         self.blocks_tab_migrated = migrate_blocks_tab(&mut state, self.blocks_tab_migrated);
         self.command_line_migrated =
             migrate_command_line_tab(&mut state, self.command_line_migrated);
+        self.command_line_split_repaired =
+            split_command_from_viewport_once(&mut state, self.command_line_split_repaired);
         self.responsive_ribbon_recovered =
             recover_home_split_once(&mut state, self.responsive_ribbon_recovered);
         self.dock_layout = Some(encode_dock_layout(&state));
@@ -455,10 +460,7 @@ mod tests {
             .bindings
             .bindings_for(InputAction::ContextMenu)
             .is_empty());
-        assert_eq!(
-            decoded.display.model_background,
-            default_model_background()
-        );
+        assert_eq!(decoded.display.model_background, default_model_background());
     }
 
     #[test]

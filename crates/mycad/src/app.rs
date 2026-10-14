@@ -411,6 +411,11 @@ enum PendingDiscard {
     Quit,
 }
 
+enum RecentMenuAction {
+    Open(PathBuf),
+    Clear,
+}
+
 struct KeyChord {
     f3: bool,
     f8: bool,
@@ -575,6 +580,8 @@ pub struct MyCadApp {
     brand: Option<crate::brand::BrandTextures>,
     splash: Option<crate::brand::SplashState>,
     update_offer: Option<crate::update_check::UpdateOffer>,
+    recent_files: crate::recent_files::RecentFiles,
+    recent_files_changed: bool,
 }
 
 impl MyCadApp {
@@ -589,6 +596,7 @@ impl MyCadApp {
         }
         let settings = AppSettings::load(cc.storage);
         let mut app = Self::from_settings(settings, initial_path);
+        app.recent_files = crate::recent_files::RecentFiles::load(cc.storage);
         app.brand = crate::brand::BrandTextures::load(&cc.egui_ctx);
         app.splash = Some(crate::brand::SplashState::start());
         workspace::sanitize_dock_state(&mut app.dock_state);
@@ -699,6 +707,8 @@ impl MyCadApp {
             brand: None,
             splash: None,
             update_offer,
+            recent_files: crate::recent_files::RecentFiles::default(),
+            recent_files_changed: false,
         }
     }
 
@@ -839,6 +849,13 @@ impl MyCadApp {
                 self.displayed_key = None;
                 self.geometry_generation = None;
                 self.tree_generation = None;
+                if let Some(path) = document
+                    .source_path
+                    .clone()
+                    .or_else(|| self.loading_path.clone())
+                {
+                    self.remember_recent(&path);
+                }
                 self.document = Some(Arc::new(document));
                 self.rebuild_block_tree();
                 self.display = Arc::new(display);
@@ -1089,7 +1106,26 @@ impl MyCadApp {
             .map(|document| document.diagnostics.unhandled_classes.len())
             .unwrap_or(0);
         self.status = format_save_status(path, &report, omitted_classes);
+        self.remember_recent(path);
         true
+    }
+
+    fn remember_recent(&mut self, path: &Path) {
+        if self.recent_files.touch(path) {
+            self.recent_files_changed = true;
+        }
+    }
+
+    fn open_recent(&mut self, path: PathBuf) {
+        if !path.is_file() {
+            let name = file_name(&path);
+            if self.recent_files.remove(&path) {
+                self.recent_files_changed = true;
+            }
+            self.status = format!("{name} was not found");
+            return;
+        }
+        self.start_load(path);
     }
 
     fn export_pdf_dialog(&mut self) {
@@ -6228,6 +6264,45 @@ impl eframe::App for MyCadApp {
                         ui.close();
                         self.open_dialog();
                     }
+                    let mut recent_action = None;
+                    ui.menu_button("Open Recent", |ui| {
+                        if self.recent_files.entries().is_empty() {
+                            ui.add_enabled(false, egui::Button::new("No recent files"));
+                        } else {
+                            let entries: Vec<(String, PathBuf)> = self
+                                .recent_files
+                                .entries()
+                                .iter()
+                                .enumerate()
+                                .map(|(index, path)| {
+                                    (self.recent_files.label(index), path.clone())
+                                })
+                                .collect();
+                            for (label, path) in entries {
+                                if ui
+                                    .button(label)
+                                    .on_hover_text(path.display().to_string())
+                                    .clicked()
+                                {
+                                    ui.close();
+                                    recent_action = Some(RecentMenuAction::Open(path));
+                                }
+                            }
+                            ui.separator();
+                            if ui.button("Clear list").clicked() {
+                                ui.close();
+                                recent_action = Some(RecentMenuAction::Clear);
+                            }
+                        }
+                    });
+                    match recent_action {
+                        Some(RecentMenuAction::Open(path)) => self.open_recent(path),
+                        Some(RecentMenuAction::Clear) => {
+                            self.recent_files.clear();
+                            self.recent_files_changed = true;
+                        }
+                        None => {}
+                    }
                     if ui
                         .add_enabled(can_save, egui::Button::new("Save    Ctrl+S"))
                         .clicked()
@@ -6582,6 +6657,12 @@ impl eframe::App for MyCadApp {
                 self.settings.save(storage);
             }
         }
+        if self.recent_files_changed {
+            if let Some(storage) = frame.storage_mut() {
+                self.recent_files.save(storage);
+            }
+            self.recent_files_changed = false;
+        }
         self.show_block_ui(ctx);
 
         match settings_ui::show(ctx, self) {
@@ -6596,6 +6677,8 @@ impl eframe::App for MyCadApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         self.settings.set_dock_state(&self.dock_state);
         self.settings.save(storage);
+        self.recent_files.save(storage);
+        self.recent_files_changed = false;
     }
 }
 
