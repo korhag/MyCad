@@ -5,6 +5,7 @@
 //! instance. Opening the DWG without the companion still shows the geometry.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use cad_core::{
@@ -12,6 +13,7 @@ use cad_core::{
     InstanceConfiguration, ParameterKind,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::error::ExportError;
 use crate::native::{
@@ -20,7 +22,7 @@ use crate::native::{
 use crate::options::SaveReport;
 
 pub const COMPANION_FORMAT: &str = "mycad-companion";
-pub const COMPANION_SCHEMA: u32 = 1;
+pub const COMPANION_SCHEMA: u32 = 2;
 
 // ------------------------------------------------------------
 // Type: Companion
@@ -28,6 +30,7 @@ pub const COMPANION_SCHEMA: u32 = 1;
 // ------------------------------------------------------------
 #[derive(Debug, Clone)]
 pub struct Companion {
+    drawing_sha256: Option<String>,
     blocks: Vec<BlockDefinition>,
     instances: Vec<CompanionInstance>,
     fingerprints: BTreeMap<String, BlockFingerprint>,
@@ -89,6 +92,8 @@ impl CompanionReport {
 struct WireCompanion {
     format: String,
     schema: u32,
+    #[serde(default)]
+    drawing_sha256: Option<String>,
     blocks: Vec<WireBlock>,
     instances: Vec<WireInstance>,
     #[serde(default)]
@@ -166,11 +171,16 @@ pub fn drawing_for_companion(path: &Path) -> Option<PathBuf> {
 // ------------------------------------------------------------
 pub fn write_companion(
     path: &Path,
+    drawing_path: &Path,
     source: &Document,
     exported: &Document,
     links: &[DynamicExportLink],
     generated_blocks: &[String],
 ) -> Result<SaveReport, ExportError> {
+    // Bind to the bytes that were actually written, including any conversion
+    // performed by the DWG writer. A helper left behind after a failed update
+    // must never replace newer drawing geometry on the next open.
+    let drawing_sha256 = Some(hash_drawing(drawing_path)?);
     let blocks = source_blocks(source);
     let mut fingerprints = BTreeMap::new();
     for name in generated_blocks {
@@ -201,6 +211,7 @@ pub fn write_companion(
     let wire = WireCompanion {
         format: COMPANION_FORMAT.into(),
         schema: COMPANION_SCHEMA,
+        drawing_sha256,
         blocks: blocks.iter().map(to_wire_block).collect(),
         instances,
         block_fingerprints: fingerprints
@@ -247,12 +258,29 @@ fn parse_companion_bytes(bytes: &[u8]) -> Result<Companion, ExportError> {
             wire.format
         )));
     }
-    if wire.schema != COMPANION_SCHEMA {
+    if wire.schema != 1 && wire.schema != COMPANION_SCHEMA {
         return Err(ExportError::Unsupported(format!(
             "unsupported EntoCAD companion schema {} (this build reads {COMPANION_SCHEMA})",
             wire.schema
         )));
     }
+    let drawing_sha256 = if wire.schema == COMPANION_SCHEMA {
+        match wire.drawing_sha256 {
+            Some(digest) if digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()) => {
+                Some(digest.to_ascii_lowercase())
+            }
+            Some(_) => {
+                return Err(ExportError::Validation(
+                    "invalid companion drawing SHA-256 digest".into(),
+                ));
+            }
+            None => None,
+        }
+    } else {
+        // Schema 1 has no drawing binding. Even an unexpected digest field
+        // cannot upgrade its guarantees; the verified entry point rejects it.
+        None
+    };
     let mut blocks = Vec::with_capacity(wire.blocks.len());
     for block in wire.blocks {
         blocks.push(from_wire_block(block)?);
@@ -267,6 +295,7 @@ fn parse_companion_bytes(bytes: &[u8]) -> Result<Companion, ExportError> {
         });
     }
     Ok(Companion {
+        drawing_sha256,
         blocks,
         instances,
         fingerprints: wire
@@ -278,13 +307,61 @@ fn parse_companion_bytes(bytes: &[u8]) -> Result<Companion, ExportError> {
     })
 }
 
+fn hash_drawing(path: &Path) -> Result<String, ExportError> {
+    let mut file = std::fs::File::open(path).map_err(|source| ExportError::io(path, source))?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|source| ExportError::io(path, source))?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+/// Restore app-specific behavior only when the helper belongs to these exact
+/// drawing bytes. AutoCAD saves, including changes that preserve entity counts
+/// and bounds, invalidate the helper. Verification happens before any document
+/// mutation; the drawing remains authoritative on every failure.
+pub fn apply_companion_for_drawing(
+    drawing_path: &Path,
+    document: &mut Document,
+    companion: Companion,
+) -> Result<CompanionReport, ExportError> {
+    let warning = match &companion.drawing_sha256 {
+        None => Some(
+            "Legacy or unbound companion was not applied; the drawing was opened without helper features"
+                .to_string(),
+        ),
+        Some(expected) if hash_drawing(drawing_path)? != *expected => Some(
+            "Drawing changed since its companion was saved; the drawing was opened without helper features"
+                .to_string(),
+        ),
+        Some(_) => None,
+    };
+    if let Some(warning) = warning {
+        return Ok(CompanionReport {
+            restored: 0,
+            skipped: 0,
+            warning: Some(warning),
+        });
+    }
+    Ok(apply_companion(document, companion))
+}
+
 // ------------------------------------------------------------
 // Function: apply_companion
 // Purpose: Put dynamic definitions back and point flattened
 //          inserts at them. A block whose geometry no longer
 //          matches the fingerprint stays as AutoCAD left it.
 // ------------------------------------------------------------
-pub fn apply_companion(document: &mut Document, companion: Companion) -> CompanionReport {
+// Keep unchecked reconstruction private: file-opening callers must verify the
+// drawing binding before restoring any behavior.
+fn apply_companion(document: &mut Document, companion: Companion) -> CompanionReport {
     let mut blocked = fingerprint_conflicts(document, &companion);
     expand_blocked(&companion.blocks, &mut blocked);
     let install: Vec<BlockDefinition> = companion
@@ -734,8 +811,11 @@ mod tests {
 
     fn write_and_read(source: &Document, exported: &cad_core::MaterializedExport) -> Companion {
         let path = temp_path("plant.dwg.mycad");
+        let drawing = drawing_for_companion(&path).unwrap();
+        std::fs::write(&drawing, b"companion unit-test drawing").unwrap();
         write_companion(
             &path,
+            &drawing,
             source,
             &exported.document,
             &exported.links,
@@ -744,6 +824,7 @@ mod tests {
         .unwrap();
         let companion = read_companion(&path).unwrap();
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&drawing);
         companion
     }
 
@@ -907,6 +988,132 @@ mod tests {
         let path = temp_path("absent.dwg.mycad");
         let _ = std::fs::remove_file(&path);
         assert!(read_companion_optional(&path).unwrap().is_none());
+    }
+
+    fn write_bound_fixture() -> (PathBuf, Document) {
+        let (mut source, _) = span_document();
+        source
+            .block_by_name_mut("AdjustableFrame")
+            .unwrap()
+            .entities[0]
+            .color = cad_core::CadColor::Aci(1);
+        let exported = materialize(&source);
+        let drawing = temp_path("bound.dxf");
+        crate::write_dxf(
+            &exported.document,
+            &drawing,
+            &crate::DxfExportOptions::default(),
+        )
+        .unwrap();
+        write_companion(
+            &companion_path(&drawing),
+            &drawing,
+            &source,
+            &exported.document,
+            &exported.links,
+            &exported.generated_blocks,
+        )
+        .unwrap();
+        let mut imported = exported.document;
+        simulate_import(&mut imported);
+        (drawing, imported)
+    }
+
+    fn remove_bound_fixture(drawing: &Path) {
+        std::fs::remove_file(companion_path(drawing)).unwrap();
+        std::fs::remove_file(drawing).unwrap();
+    }
+
+    #[test]
+    fn verified_companion_restores_unchanged_drawing() {
+        let (drawing, mut imported) = write_bound_fixture();
+        let companion = read_companion(&companion_path(&drawing)).unwrap();
+        let report = apply_companion_for_drawing(&drawing, &mut imported, companion).unwrap();
+        assert_eq!(report.restored, 1);
+        assert!(report.warning.is_none());
+        assert!((span_of(&imported) - 1200.0).abs() < 1e-9);
+        remove_bound_fixture(&drawing);
+    }
+
+    #[test]
+    fn changed_color_with_same_size_and_bounds_rejects_stale_companion() {
+        let (drawing, mut imported) = write_bound_fixture();
+        let export_name = insert_name(&imported);
+        let original_fingerprint = fingerprint_block(imported.block_by_name(&export_name).unwrap());
+        let original_size = std::fs::metadata(&drawing).unwrap().len();
+        imported.block_by_name_mut(&export_name).unwrap().entities[0].color =
+            cad_core::CadColor::Aci(2);
+        crate::write_dxf(&imported, &drawing, &crate::DxfExportOptions::default()).unwrap();
+        assert_eq!(std::fs::metadata(&drawing).unwrap().len(), original_size);
+        assert_eq!(
+            fingerprint_block(imported.block_by_name(&export_name).unwrap()),
+            original_fingerprint
+        );
+        let before = format!("{imported:?}");
+        let companion = read_companion(&companion_path(&drawing)).unwrap();
+        let report = apply_companion_for_drawing(&drawing, &mut imported, companion).unwrap();
+        assert_eq!(report.restored, 0);
+        assert!(report.warning.unwrap().contains("Drawing changed"));
+        assert_eq!(format!("{imported:?}"), before);
+        remove_bound_fixture(&drawing);
+    }
+
+    #[test]
+    fn legacy_and_unbound_companions_leave_document_unchanged() {
+        for schema in [1, COMPANION_SCHEMA] {
+            let (drawing, mut imported) = write_bound_fixture();
+            let helper = companion_path(&drawing);
+            let mut wire: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&helper).unwrap()).unwrap();
+            wire["schema"] = schema.into();
+            wire.as_object_mut().unwrap().remove("drawing_sha256");
+            std::fs::write(&helper, serde_json::to_vec(&wire).unwrap()).unwrap();
+            let before = format!("{imported:?}");
+            let report = apply_companion_for_drawing(
+                &drawing,
+                &mut imported,
+                read_companion(&helper).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(report.restored, 0);
+            assert!(report.warning.unwrap().contains("unbound"));
+            assert_eq!(format!("{imported:?}"), before);
+            remove_bound_fixture(&drawing);
+        }
+    }
+
+    #[test]
+    fn corrupt_companion_is_rejected_without_mutating_drawing() {
+        let (drawing, imported) = write_bound_fixture();
+        let original_drawing = std::fs::read(&drawing).unwrap();
+        let before = format!("{imported:?}");
+        let helper = companion_path(&drawing);
+        std::fs::write(&helper, b"{broken helper").unwrap();
+        assert!(read_companion_optional(&helper).is_err());
+        assert_eq!(std::fs::read(&drawing).unwrap(), original_drawing);
+        assert_eq!(format!("{imported:?}"), before);
+        remove_bound_fixture(&drawing);
+    }
+
+    #[test]
+    fn missing_drawing_cannot_replace_existing_companion() {
+        let (drawing, _) = write_bound_fixture();
+        let helper = companion_path(&drawing);
+        let original_helper = std::fs::read(&helper).unwrap();
+        std::fs::remove_file(&drawing).unwrap();
+        let (source, _) = span_document();
+        let exported = materialize(&source);
+        assert!(write_companion(
+            &helper,
+            &drawing,
+            &source,
+            &exported.document,
+            &exported.links,
+            &exported.generated_blocks,
+        )
+        .is_err());
+        assert_eq!(std::fs::read(&helper).unwrap(), original_helper);
+        std::fs::remove_file(&helper).unwrap();
     }
 
     #[test]

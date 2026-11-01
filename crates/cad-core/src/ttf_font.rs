@@ -641,8 +641,12 @@ fn load_request(lib: &mut Library, request: &FontRequest) -> Option<String> {
         FontRequest::Family { name, bold, italic } => (name.as_str(), true, *bold, *italic),
     };
     let key = request_key(label);
-    if key.is_empty() || lib.missing.contains(&key) {
+    if key.is_empty() {
         return None;
+    }
+    if lib.missing.contains(&key) {
+        // A previous document's missing face still needs a warning in this one.
+        return Some(format!("text font '{label}' not found; using stroke font"));
     }
     if request_is_loaded(lib, label, from_inline, bold, italic) {
         return None;
@@ -788,44 +792,89 @@ fn ensure_index() -> Option<()> {
 
 fn scan_fonts() -> Vec<FaceRecord> {
     let mut records = Vec::new();
-    for dir in font_dirs() {
-        let entries = match fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(_) => continue,
+    for path in font_paths(font_dirs()) {
+        let Ok(bytes) = fs::read(&path) else {
+            continue;
         };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !is_font_file(&path) {
-                continue;
-            }
-            let Ok(bytes) = fs::read(&path) else {
+        let count = ttf_parser::fonts_in_collection(&bytes)
+            .unwrap_or(1)
+            .clamp(1, MAX_COLLECTION_FACES);
+        for index in 0..count {
+            let Ok(face) = Face::parse(&bytes, index) else {
                 continue;
             };
-            let count = ttf_parser::fonts_in_collection(&bytes).unwrap_or(1).max(1);
-            for index in 0..count {
-                let Ok(face) = Face::parse(&bytes, index) else {
-                    continue;
-                };
-                let families = family_names(&face);
-                if families.is_empty() {
-                    continue;
-                }
-                records.push(FaceRecord {
-                    file_key: path
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .map(file_key)
-                        .unwrap_or_default(),
-                    path: path.clone(),
-                    collection_index: index,
-                    families,
-                    bold: face.is_bold(),
-                    italic: face.is_italic(),
-                });
+            let families = family_names(&face);
+            if families.is_empty() {
+                continue;
             }
+            records.push(FaceRecord {
+                file_key: path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(file_key)
+                    .unwrap_or_default(),
+                path: path.clone(),
+                collection_index: index,
+                families,
+                bold: face.is_bold(),
+                italic: face.is_italic(),
+            });
         }
     }
     records
+}
+
+const MAX_FONT_ENTRIES: usize = 65_536;
+const MAX_FONT_FILES: usize = 4_096;
+const MAX_FONT_FILE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_COLLECTION_FACES: u32 = 256;
+
+// Linux font packages install faces in nested family directories. Canonical
+// paths prevent duplicate indexing and cycles through symlinked directories.
+fn font_paths(dirs: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut pending: Vec<_> = dirs.into_iter().rev().collect();
+    let mut seen = HashSet::new();
+    let mut paths = Vec::new();
+    let mut entries_seen = 0;
+    while let Some(dir) = pending.pop() {
+        if entries_seen >= MAX_FONT_ENTRIES || paths.len() >= MAX_FONT_FILES {
+            break;
+        }
+        let Ok(canonical) = dir.canonicalize() else {
+            continue;
+        };
+        if !seen.insert(canonical) {
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            entries_seen += 1;
+            if entries_seen > MAX_FONT_ENTRIES || paths.len() >= MAX_FONT_FILES {
+                break;
+            }
+            let path = entry.path();
+            let Ok(metadata) = fs::metadata(&path) else {
+                continue;
+            };
+            if metadata.is_dir() {
+                pending.push(path);
+            } else if metadata.is_file()
+                && metadata.len() <= MAX_FONT_FILE_BYTES
+                && is_font_file(&path)
+            {
+                let Ok(canonical) = path.canonicalize() else {
+                    continue;
+                };
+                if seen.insert(canonical.clone()) {
+                    paths.push(canonical);
+                }
+            }
+        }
+    }
+    paths.sort();
+    paths
 }
 
 fn font_dirs() -> Vec<PathBuf> {
@@ -841,6 +890,39 @@ fn font_dirs() -> Vec<PathBuf> {
                 .join("Fonts"),
         );
     }
+    #[cfg(target_os = "linux")]
+    dirs.extend(linux_font_dirs(
+        std::env::var_os("HOME").map(PathBuf::from),
+        std::env::var_os("XDG_DATA_HOME").map(PathBuf::from),
+        std::env::var_os("XDG_DATA_DIRS"),
+    ));
+    dirs
+}
+
+#[cfg(target_os = "linux")]
+fn linux_font_dirs(
+    home: Option<PathBuf>,
+    data_home: Option<PathBuf>,
+    data_dirs: Option<std::ffi::OsString>,
+) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let data_home = data_home
+        .filter(|path| path.is_absolute())
+        .or_else(|| home.as_ref().map(|path| path.join(".local/share")));
+    if let Some(data_home) = data_home {
+        dirs.push(data_home.join("fonts"));
+    }
+    if let Some(home) = home {
+        dirs.push(home.join(".fonts"));
+    }
+    let data_dirs = data_dirs
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "/usr/local/share:/usr/share".into());
+    dirs.extend(
+        std::env::split_paths(&data_dirs)
+            .filter(|path| path.is_absolute())
+            .map(|path| path.join("fonts")),
+    );
     dirs
 }
 
@@ -988,6 +1070,99 @@ fn request_key(label: &str) -> String {
 mod tests {
     use super::*;
     use crate::stroke_font::measure_styled_width;
+
+    #[test]
+    fn nested_font_directories_are_scanned_without_duplicate_symlink_targets() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("mycad-font-scan-{stamp}"));
+        let family = root.join("truetype/family");
+        fs::create_dir_all(&family).unwrap();
+        let face = family.join("Example.TTF");
+        fs::write(&face, b"font discovery fixture").unwrap();
+        fs::write(family.join("README"), b"not a font").unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&root, family.join("cycle")).unwrap();
+            std::os::unix::fs::symlink(&face, root.join("alias.ttf")).unwrap();
+        }
+        let found = font_paths(vec![root.clone(), family]);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].canonicalize().unwrap(),
+            face.canonicalize().unwrap()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_discovers_user_and_system_font_locations() {
+        let defaults = linux_font_dirs(Some("/home/example".into()), None, None);
+        assert!(defaults.contains(&PathBuf::from("/home/example/.local/share/fonts")));
+        assert!(defaults.contains(&PathBuf::from("/home/example/.fonts")));
+        assert!(defaults.contains(&PathBuf::from("/usr/share/fonts")));
+        assert!(defaults.contains(&PathBuf::from("/usr/local/share/fonts")));
+        let configured = linux_font_dirs(
+            Some("/home/example".into()),
+            Some("/data/user".into()),
+            Some("/data/shared:relative:/opt/data".into()),
+        );
+        assert!(configured.contains(&PathBuf::from("/data/user/fonts")));
+        assert!(configured.contains(&PathBuf::from("/data/shared/fonts")));
+        assert!(configured.contains(&PathBuf::from("/opt/data/fonts")));
+        assert!(configured.iter().all(|path| path.is_absolute()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_installed_linux_font_is_used_for_text_geometry() {
+        // Availability is checked independently of our scanner, so the former
+        // Windows-only scanner fails this regression on Linux with these fonts.
+        let candidates = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        ];
+        let Some(path) = candidates.iter().map(Path::new).find(|path| path.is_file()) else {
+            eprintln!("DejaVu/Liberation fonts are not installed; system-font integration unrun");
+            return;
+        };
+        let name = path.file_name().unwrap().to_str().unwrap();
+        assert!(
+            warm_font_file(name),
+            "installed font was not indexed: {path:?}"
+        );
+        let font = TextFont::cached_file(name);
+        assert!(matches!(font, TextFont::TrueType(_)));
+        let width = font.measure("AlMarai 123", 10.0, 1.0, true);
+        assert!(width.is_finite() && width > 0.0);
+        let drawn = font.draw(Point2::new(0.0, 0.0), 10.0, 0.0, 1.0, 0.0, "O", true);
+        assert!(!drawn.glyphs.is_empty());
+        assert!(drawn.strokes.is_empty());
+    }
+
+    #[test]
+    fn cached_missing_fonts_warn_in_every_document() {
+        let style = TextStyle {
+            font_file: "mycad-uninstalled-regression-font.ttf".into(),
+            ..TextStyle::standard()
+        };
+        for _ in 0..2 {
+            let mut document = Document::default();
+            document
+                .text_styles
+                .insert(style.name.clone(), style.clone());
+            warm_document_fonts(&mut document);
+            assert!(describe_text_style_font(&style).ends_with("missing"));
+            assert!(document.diagnostics.warnings.iter().any(|warning| {
+                warning.contains(&style.font_file) && warning.contains("using stroke font")
+            }));
+            warm_document_fonts(&mut document);
+            assert_eq!(document.diagnostics.warnings.len(), 1);
+        }
+    }
 
     #[test]
     fn missing_truetype_font_measures_like_the_stroke_font() {

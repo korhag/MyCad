@@ -57,7 +57,10 @@ fn sample_dwgs_report_dynamic_blocks() {
         for line in &doc.diagnostics.dynamic_lines {
             println!("{line}");
         }
-        let file_name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
         if file_name.contains("LYO-410546") {
             let bends = doc
                 .diagnostics
@@ -134,9 +137,9 @@ fn reference_dwg_imports_without_panic() {
         "status 68 should name the bounds bit: {status}"
     );
     assert!(
-        !doc.diagnostics.has_save_loss(),
-        "class notes must not open the save dialog: {:?}",
-        doc.diagnostics.lossy_notes
+        doc.diagnostics.has_save_loss(),
+        "unread native objects must require a copy-save warning: {:?}",
+        doc.diagnostics.unhandled_classes
     );
     assert!(
         !doc.diagnostics.unhandled_classes.is_empty(),
@@ -813,23 +816,64 @@ fn almarai_title_block_fonts_resolve() {
         return;
     };
     let document = dwg_import::import_dwg(&path).expect("AlMarai DWG imports");
-    let mut truetype = 0;
+    let mut truetype_styles = 0;
     for style in document.text_styles.values() {
         let line = cad_core::describe_text_style_font(style);
         let lower = style.font_file.to_ascii_lowercase();
         if lower.ends_with(".ttf") || lower.ends_with(".otf") {
+            truetype_styles += 1;
             assert!(
                 line.ends_with("truetype") || line.ends_with("missing"),
                 "{line}"
             );
-            if line.ends_with("truetype") {
-                truetype += 1;
+            if line.ends_with("missing") {
+                assert!(
+                    document.diagnostics.warnings.iter().any(|warning| {
+                        warning.contains(&format!("text font '{}'", style.font_file))
+                            && warning.contains("using stroke font")
+                    }),
+                    "missing font must be reported: {line}"
+                );
             }
+            // The sample requests proprietary fonts which need not be installed.
+            // Both exact installed faces and explicitly reported stroke fallback
+            // must produce finite, visible text rather than silently dropping it.
+            let mut probe = cad_core::Document::default();
+            probe.text_styles.insert(style.name.clone(), style.clone());
+            probe.add_entity(cad_core::Entity::new(cad_core::Geometry::Text(
+                cad_core::TextData {
+                    value: "AlMarai 123".into(),
+                    height: 10.0,
+                    style: style.name.clone(),
+                    ..Default::default()
+                },
+            )));
+            let plotted = cad_core::plot_geometry(&probe);
+            assert!(
+                !plotted.strokes.is_empty() || !plotted.fills.is_empty(),
+                "{line}"
+            );
+            assert!(
+                plotted.warnings.is_empty(),
+                "{line}: {:?}",
+                plotted.warnings
+            );
+            assert!(plotted
+                .strokes
+                .iter()
+                .flat_map(|stroke| &stroke.points)
+                .all(|p| p.is_finite()));
+            assert!(plotted
+                .fills
+                .iter()
+                .flat_map(|fill| &fill.contours)
+                .flatten()
+                .all(|p| p.is_finite()));
         }
     }
     assert!(
-        truetype > 0,
-        "expected at least one installed TrueType style"
+        truetype_styles > 0,
+        "sample should exercise TrueType styles and their resolution or fallback"
     );
     let mut seen = BTreeMap::<String, u32>::new();
     let mut visit = |value: &str, height: f64| {

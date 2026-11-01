@@ -193,7 +193,7 @@ pub struct ImportDiagnostics {
     pub render_prepare_time: Duration,
     pub warnings: Vec<String>,
     /// Classes LibreDWG could not read, with how many objects used each one.
-    /// These stay in Diagnostics and do not open the save dialog.
+    /// Saving cannot preserve these objects; include them in the loss warning.
     pub unhandled_classes: BTreeMap<String, u64>,
     /// Content a save still cannot keep, besides unsupported entity counts.
     pub lossy_notes: Vec<String>,
@@ -255,10 +255,17 @@ impl ImportDiagnostics {
 
     /// True when Save should offer Save a Copy.
     ///
-    /// Unsupported entities and content that could not be stored count.
-    /// Skipped classes and header extent notes stay in Diagnostics.
+    /// The exchange writer drops unsupported objects and native AutoCAD
+    /// dynamic controls even when their visible geometry was imported.
     pub fn has_save_loss(&self) -> bool {
-        self.unsupported_total() > 0 || !self.lossy_notes.is_empty()
+        self.unsupported_total() > 0
+            || !self.lossy_notes.is_empty()
+            || !self.unhandled_classes.is_empty()
+            || self.has_native_dynamic_content()
+    }
+
+    pub fn has_native_dynamic_content(&self) -> bool {
+        self.dynamic_definitions > 0 || self.dynamic_editable > 0 || self.dynamic_kept_static > 0
     }
 
     pub fn note_lossy(&mut self, message: impl Into<String>) {
@@ -1733,7 +1740,7 @@ mod tests {
     }
 
     #[test]
-    fn unhandled_class_names_are_not_a_save_loss() {
+    fn unhandled_class_names_require_a_save_loss_warning() {
         let mut diagnostics = ImportDiagnostics::default();
         diagnostics.record_unhandled_class("ACDB_DYNAMICBLOCKPURGEPREVENTER");
         diagnostics.record_unhandled_class("ACDB_DYNAMICBLOCKPURGEPREVENTER");
@@ -1745,7 +1752,7 @@ mod tests {
             2
         );
         assert!(!diagnostics.unhandled_classes.contains_key("UNKNOWN_ENT"));
-        assert!(!diagnostics.has_save_loss());
+        assert!(diagnostics.has_save_loss());
         assert!(diagnostics.lossy_notes.is_empty());
         assert!(diagnostics
             .warnings

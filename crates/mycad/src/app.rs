@@ -20,14 +20,15 @@ use cad_core::{
     Transform2, TransformError, GEOM_TOLERANCE,
 };
 use cad_io::{
-    apply_companion, companion_path, drawing_for_companion, export_pdf, read_companion_optional,
-    read_mycad, write_companion, write_dxf, CadFileFormat, DxfExportOptions, PdfExportOptions,
-    PdfOrientation, PdfPaperSize, PdfPlotArea, PdfPlotStyle, SaveReport, PDF_MARGIN_MM,
-    PDF_STROKE_WEIGHTS,
+    apply_companion_for_drawing, companion_path, drawing_for_companion, export_pdf,
+    read_companion_optional, read_mycad, write_companion, write_dxf, CadFileFormat,
+    DxfExportOptions, PdfExportOptions, PdfOrientation, PdfPaperSize, PdfPlotArea, PdfPlotStyle,
+    SaveReport, PDF_MARGIN_MM, PDF_STROKE_WEIGHTS,
 };
 use cad_render::{
-    tessellate_document_for_block_edit_on, tessellate_document_on, upload_for_ranges, BlockEditView,
-    BlockEditViewFrame, CadFrame, CadGpu, DisplayList, GpuUpload, OverlayBatches, SelectBoxMode,
+    tessellate_document_for_block_edit_on, tessellate_document_on, upload_for_ranges,
+    BlockEditView, BlockEditViewFrame, CadFrame, CadGpu, DisplayList, GpuUpload, OverlayBatches,
+    SelectBoxMode,
 };
 use cad_viewport::Camera2;
 use dwg_import::{write_dwg, DwgWriteError, ExportError as DwgExportError, ImportError};
@@ -1084,19 +1085,15 @@ impl MyCadApp {
     }
 
     fn finish_cad_save(&mut self, path: &Path, report: SaveReport) -> bool {
-        let dynamic = self
-            .document
-            .as_deref()
-            .is_some_and(document_has_dynamic_content);
         let companion_failed = companion_update_failed(&report);
         if let Some(document) = self.document.as_mut().map(Arc::make_mut) {
             document.source_path = Some(path.to_path_buf());
-            if !dynamic || !companion_failed {
+            if !companion_failed {
                 document.mark_saved_revision();
             }
         }
         self.source_written_by_mycad = true;
-        if !dynamic || !companion_failed {
+        if !companion_failed {
             self.history.mark_clean();
         }
         self.error = None;
@@ -1107,7 +1104,7 @@ impl MyCadApp {
             .unwrap_or(0);
         self.status = format_save_status(path, &report, omitted_classes);
         self.remember_recent(path);
-        true
+        !companion_failed
     }
 
     fn remember_recent(&mut self, path: &Path) {
@@ -1828,9 +1825,14 @@ impl MyCadApp {
                 // thread can mark the drawing saved without copying it.
                 let finished = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
                     let dest = path;
+                    if kind.is_save() {
+                        protect_lossy_source(&snapshot, &dest)?;
+                    }
                     let prepared = {
                         let _span = cad_core::perf::span("export_snapshot");
-                        export_snapshot(&snapshot)
+                        export_snapshot(&snapshot).map_err(|err| {
+                            format_save_failed(format!("could not evaluate dynamic blocks: {err}"))
+                        })?
                     };
                     let document = prepared
                         .as_ref()
@@ -1895,8 +1897,8 @@ impl MyCadApp {
                 self.io_kind = None;
                 ctx.request_repaint();
                 if kind.is_save() {
-                    self.finish_cad_save(&path, report);
-                    if self.pending_discard.is_some() {
+                    let complete = self.finish_cad_save(&path, report);
+                    if complete && self.pending_discard.is_some() {
                         self.continue_pending_discard(ctx);
                     }
                 } else {
@@ -6274,9 +6276,7 @@ impl eframe::App for MyCadApp {
                                 .entries()
                                 .iter()
                                 .enumerate()
-                                .map(|(index, path)| {
-                                    (self.recent_files.label(index), path.clone())
-                                })
+                                .map(|(index, path)| (self.recent_files.label(index), path.clone()))
                                 .collect();
                             for (label, path) in entries {
                                 if ui
@@ -7431,22 +7431,69 @@ fn add_save_filters(dialog: rfd::FileDialog, prefer_dwg: bool) -> rfd::FileDialo
     }
 }
 
-fn export_snapshot(document: &Document) -> Option<MaterializedExport> {
+fn export_snapshot(
+    document: &Document,
+) -> Result<Option<MaterializedExport>, cad_core::DynamicError> {
     if !document_has_dynamic_content(document) {
-        return None;
+        return Ok(None);
     }
     let request = EvaluationRequest {
         generation: document.content_generation(),
     };
-    Some(
-        export_materialized(document, &mut EvaluationCache::default(), request).unwrap_or_else(
-            |_| MaterializedExport {
-                document: document.clone(),
-                links: Vec::new(),
-                generated_blocks: Vec::new(),
-            },
-        ),
-    )
+    export_materialized(document, &mut EvaluationCache::default(), request).map(Some)
+}
+
+// A Save a Copy dialog is not sufficient protection: its destination can still
+// be the original drawing, including a symlink or hardlink alias of that file.
+fn protect_lossy_source(document: &Document, destination: &Path) -> Result<(), String> {
+    if !document.diagnostics.has_save_loss() {
+        return Ok(());
+    }
+    let Some(source) = document.source_path.as_deref() else {
+        return Ok(());
+    };
+    let source = resolved_save_path(source).map_err(|err| {
+        format_save_failed(format!("could not verify the original drawing path: {err}"))
+    })?;
+    let destination = resolved_save_path(destination).map_err(|err| {
+        format_save_failed(format!("could not verify the copy destination: {err}"))
+    })?;
+    let same_file = if source == destination {
+        true
+    } else {
+        match same_file::is_same_file(&source, &destination) {
+            Ok(same) => same,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+            Err(err) => {
+                return Err(format_save_failed(format!(
+                    "could not verify that the copy preserves the original drawing: {err}"
+                )));
+            }
+        }
+    };
+    if same_file {
+        return Err(format_save_failed(
+            "this drawing contains data that cannot be preserved; choose a different file for Save a Copy",
+        ));
+    }
+    Ok(())
+}
+
+fn resolved_save_path(path: &Path) -> std::io::Result<PathBuf> {
+    match path.canonicalize() {
+        Ok(resolved) => Ok(resolved),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let parent = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            let name = path.file_name().ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing drawing filename")
+            })?;
+            Ok(parent.canonicalize()?.join(name))
+        }
+        Err(err) => Err(err),
+    }
 }
 
 fn sync_companion(
@@ -7465,6 +7512,7 @@ fn sync_companion(
         };
         if let Err(err) = write_companion(
             &path,
+            dest,
             source,
             &prepared.document,
             &prepared.links,
@@ -7500,9 +7548,27 @@ fn apply_open_companion(path: &Path, document: &mut Document) -> Option<String> 
         return None;
     }
     match read_companion_optional(&companion_path(path)) {
-        Ok(Some(companion)) => apply_companion(document, companion).status_line(),
+        Ok(Some(companion)) => match apply_companion_for_drawing(path, document, companion) {
+            Ok(report) => {
+                if let Some(warning) = &report.warning {
+                    document
+                        .diagnostics
+                        .note_lossy(format!("Companion file was not fully applied: {warning}"));
+                }
+                report.status_line()
+            }
+            Err(err) => {
+                let warning = format!("Companion file was not applied: {err}");
+                document.diagnostics.note_lossy(warning.clone());
+                Some(warning)
+            }
+        },
         Ok(None) => None,
-        Err(err) => Some(format!("Companion file was not applied: {err}")),
+        Err(err) => {
+            let warning = format!("Companion file was not applied: {err}");
+            document.diagnostics.note_lossy(warning.clone());
+            Some(warning)
+        }
     }
 }
 
@@ -7531,6 +7597,20 @@ fn blank_drawing() -> Document {
 
 fn lossy_save_message(diagnostics: &cad_core::ImportDiagnostics) -> String {
     let mut lines = Vec::new();
+    if diagnostics.has_native_dynamic_content() {
+        lines.push("AutoCAD dynamic-block controls will not be preserved in this copy. Blocks are saved as static geometry. The companion file restores EntoCAD controls only; it does not restore AutoCAD controls.".into());
+    }
+    if !diagnostics.unhandled_classes.is_empty() {
+        let classes = diagnostics
+            .unhandled_classes
+            .iter()
+            .map(|(name, count)| format!("{count} {name}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(format!(
+            "Drawing objects that could not be read will not be preserved: {classes}."
+        ));
+    }
     let unsupported = diagnostics.unsupported_total();
     if unsupported > 0 {
         let noun = if unsupported == 1 {
@@ -8016,7 +8096,7 @@ mod save_as_tests {
     }
 
     #[test]
-    fn unhandled_classes_do_not_open_the_save_dialog() {
+    fn unhandled_classes_open_the_save_dialog() {
         let mut document = Document::default();
         document.diagnostics.warnings.push(
             "LibreDWG read reported unhandled class and value out of bounds (status 68)".into(),
@@ -8025,7 +8105,8 @@ mod save_as_tests {
             .diagnostics
             .record_unhandled_class("ACDB_BLOCKREPRESENTATION");
         document.diagnostics.finish_unhandled_classes();
-        assert!(!needs_lossy_save_warning(&document));
+        assert!(needs_lossy_save_warning(&document));
+        assert!(lossy_save_message(&document.diagnostics).contains("ACDB_BLOCKREPRESENTATION"));
         assert!(document
             .diagnostics
             .warnings
@@ -8043,6 +8124,32 @@ mod save_as_tests {
         assert!(status.contains("1 drawing class"));
         assert!(status.contains("see Diagnostics"));
         assert!(status.starts_with("Saved Plant.dwg"));
+    }
+
+    #[test]
+    fn native_dynamic_controls_warn_even_when_geometry_imports_completely() {
+        for diagnostics in [
+            cad_core::ImportDiagnostics {
+                dynamic_definitions: 1,
+                ..Default::default()
+            },
+            cad_core::ImportDiagnostics {
+                dynamic_editable: 1,
+                ..Default::default()
+            },
+            cad_core::ImportDiagnostics {
+                dynamic_kept_static: 1,
+                ..Default::default()
+            },
+        ] {
+            let mut document = Document::default();
+            document.diagnostics = diagnostics;
+            assert_eq!(document.diagnostics.unsupported_total(), 0);
+            assert!(needs_lossy_save_warning(&document));
+            let message = lossy_save_message(&document.diagnostics);
+            assert!(message.contains("AutoCAD dynamic-block controls will not be preserved"));
+            assert!(message.contains("does not restore AutoCAD controls"));
+        }
     }
 
     #[test]
@@ -8790,6 +8897,291 @@ mod io_job_tests {
     use super::*;
     use cad_core::{Geometry, Point3};
     use cad_io::PdfExportOptions;
+
+    fn lossy_save_fixture(extension: &str) -> (MyCadApp, PathBuf) {
+        let directory = std::env::temp_dir().join(format!(
+            "mycad-io-lossy-{}-{}-{extension}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let source = directory.join(format!("original.{extension}"));
+        std::fs::write(&source, b"original drawing bytes").unwrap();
+        std::fs::write(companion_path(&source), b"original helper bytes").unwrap();
+        let mut document = blank_drawing();
+        document.source_path = Some(source.clone());
+        document.add_entity(Entity::new(Geometry::Line {
+            start: Point3::from_xy(0.0, 0.0),
+            end: Point3::from_xy(10.0, 0.0),
+        }));
+        document
+            .diagnostics
+            .note_lossy("Unsupported native data would be omitted");
+        let mut app = MyCadApp::for_test();
+        app.document = Some(Arc::new(document));
+        app.history.mark_dirty();
+        (app, source)
+    }
+
+    fn assert_lossy_save_preserves_original(
+        kind: IoKind,
+        extension: &str,
+        destination: impl FnOnce(&Path) -> PathBuf,
+    ) {
+        let (mut app, source) = lossy_save_fixture(extension);
+        let destination = destination(&source);
+        assert!(app.start_io_job(kind, destination.clone(), None));
+        app.wait_for_io();
+        assert!(app
+            .status
+            .contains("choose a different file for Save a Copy"));
+        assert!(app.is_dirty());
+        assert!(!app.source_written_by_mycad);
+        assert_eq!(
+            app.document.as_ref().unwrap().source_path.as_ref(),
+            Some(&source)
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), b"original drawing bytes");
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            b"original drawing bytes"
+        );
+        assert_eq!(
+            std::fs::read(companion_path(&source)).unwrap(),
+            b"original helper bytes"
+        );
+        std::fs::remove_dir_all(source.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn lossy_save_cannot_overwrite_the_original() {
+        for (kind, extension) in [(IoKind::SavingDxf, "dxf"), (IoKind::SavingDwg, "dwg")] {
+            assert_lossy_save_preserves_original(kind, extension, Path::to_path_buf);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lossy_save_cannot_overwrite_a_symlink_to_the_original() {
+        assert_lossy_save_preserves_original(IoKind::SavingDxf, "dxf", |source| {
+            let alias = source.with_file_name("alias.dxf");
+            std::os::unix::fs::symlink(source, &alias).unwrap();
+            alias
+        });
+    }
+
+    #[test]
+    fn lossy_save_cannot_overwrite_a_hardlink_to_the_original() {
+        assert_lossy_save_preserves_original(IoKind::SavingDxf, "dxf", |source| {
+            let alias = source.with_file_name("alias.dxf");
+            std::fs::hard_link(source, &alias).unwrap();
+            alias
+        });
+    }
+
+    #[test]
+    fn lossy_save_can_write_a_separate_copy() {
+        let (mut app, source) = lossy_save_fixture("dxf");
+        let destination = source.with_file_name("copy.dxf");
+        assert!(app.start_io_job(IoKind::SavingDxf, destination.clone(), None));
+        app.wait_for_io();
+        assert!(app.status.starts_with("Saved "), "{}", app.status);
+        assert!(!app.is_dirty());
+        assert_eq!(std::fs::read(&source).unwrap(), b"original drawing bytes");
+        assert_eq!(
+            std::fs::read(companion_path(&source)).unwrap(),
+            b"original helper bytes"
+        );
+        assert!(std::fs::read_to_string(&destination)
+            .unwrap()
+            .contains("ENTITIES"));
+        std::fs::remove_dir_all(source.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn helper_removal_failure_keeps_static_drawing_dirty_and_pending_discard() {
+        let (mut app, source) = lossy_save_fixture("dxf");
+        let document = Arc::get_mut(app.document.as_mut().unwrap()).unwrap();
+        document.diagnostics.lossy_notes.clear();
+        let original_entities = document.model_space.clone();
+        let saved_revision = document.saved_revision();
+        assert!(!document_has_dynamic_content(document));
+        assert!(!needs_lossy_save_warning(document));
+
+        let helper = companion_path(&source);
+        std::fs::remove_file(&helper).unwrap();
+        std::fs::create_dir(&helper).unwrap();
+        let retained_file = helper.join("keep.txt");
+        std::fs::write(&retained_file, b"must remain untouched").unwrap();
+        app.pending_discard = Some(PendingDiscard::NewDrawing);
+        assert!(app.start_io_job(IoKind::SavingDxf, source.clone(), None));
+
+        let context = egui::Context::default();
+        let start = Instant::now();
+        while app.io_busy() {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(10),
+                "save timed out"
+            );
+            app.poll_io(&context);
+            if app.io_busy() {
+                thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+
+        assert!(
+            app.status.contains("companion file was not updated"),
+            "{}",
+            app.status
+        );
+        assert!(
+            app.is_dirty(),
+            "an incomplete save must not clear unsaved changes"
+        );
+        assert!(matches!(
+            app.pending_discard,
+            Some(PendingDiscard::NewDrawing)
+        ));
+        let retained = app.document.as_ref().unwrap();
+        assert_eq!(retained.model_space, original_entities);
+        assert_eq!(retained.saved_revision(), saved_revision);
+        assert_eq!(retained.source_path.as_ref(), Some(&source));
+        assert!(std::fs::read_to_string(&source)
+            .unwrap()
+            .contains("ENTITIES"));
+        assert_eq!(
+            std::fs::read(&retained_file).unwrap(),
+            b"must remain untouched"
+        );
+        std::fs::remove_dir_all(source.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn unapplied_helpers_force_copy_save_and_survive_it() {
+        for helper in [
+            "corrupt helper".to_string(),
+            serde_json::json!({
+                "format": "mycad-companion", "schema": 1,
+                "blocks": [], "instances": []
+            })
+            .to_string(),
+            serde_json::json!({
+                "format": "mycad-companion", "schema": 2,
+                "drawing_sha256": "0".repeat(64),
+                "blocks": [], "instances": []
+            })
+            .to_string(),
+        ] {
+            let (mut app, source) = lossy_save_fixture("dxf");
+            let helper_path = companion_path(&source);
+            std::fs::write(&helper_path, &helper).unwrap();
+            let document = Arc::get_mut(app.document.as_mut().unwrap()).unwrap();
+            document.diagnostics.lossy_notes.clear();
+            assert!(!needs_lossy_save_warning(document));
+            let note = apply_open_companion(&source, document);
+            assert!(note.is_some());
+            assert!(needs_lossy_save_warning(document));
+            assert!(document
+                .diagnostics
+                .lossy_notes
+                .iter()
+                .any(|note| note.contains("Companion file")));
+            assert!(app.start_io_job(IoKind::SavingDxf, source.clone(), None));
+            app.wait_for_io();
+            assert!(app
+                .status
+                .contains("choose a different file for Save a Copy"));
+            assert!(app.is_dirty());
+            assert_eq!(std::fs::read(&source).unwrap(), b"original drawing bytes");
+            assert_eq!(std::fs::read_to_string(&helper_path).unwrap(), helper);
+            std::fs::remove_dir_all(source.parent().unwrap()).unwrap();
+        }
+    }
+
+    fn assert_failed_evaluation_preserves_files(kind: IoKind, extension: &str) {
+        let mut document = Document::default();
+        document.source_path = Some(PathBuf::from("original.dwg"));
+        let parameter = cad_core::ParameterDef::number(
+            document.allocate_parameter_id(),
+            "Length",
+            cad_core::NumericParameter::length(10.0),
+        );
+        let mut block = cad_core::BlockDefinition::plain(
+            "Broken",
+            Point3::from_xy(0.0, 0.0),
+            vec![Entity::new(Geometry::Line {
+                start: Point3::from_xy(0.0, 0.0),
+                end: Point3::from_xy(10.0, 0.0),
+            })],
+        );
+        block.dynamic = Some(cad_core::DynamicDefinition {
+            parameters: vec![parameter.clone(), parameter],
+            ..Default::default()
+        });
+        document.replace_block_definition(block);
+        document.add_entity(Entity::new(identity_insert(
+            "Broken".into(),
+            Point3::from_xy(0.0, 0.0),
+        )));
+        let snapshot = Arc::new(document);
+        let mut app = MyCadApp::for_test();
+        app.document = Some(Arc::clone(&snapshot));
+        app.history.mark_dirty();
+
+        let directory = std::env::temp_dir().join(format!(
+            "mycad-io-evaluation-failure-{}-{}-{extension}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join(format!("drawing.{extension}"));
+        let helper = companion_path(&path);
+        std::fs::write(&path, b"existing drawing bytes").unwrap();
+        std::fs::write(&helper, b"existing companion bytes").unwrap();
+
+        assert!(app.start_io_job(kind, path.clone(), Some(PdfExportOptions::default())));
+        app.wait_for_io();
+
+        assert!(app
+            .status
+            .starts_with("Save failed: could not evaluate dynamic blocks:"));
+        assert!(
+            app.is_dirty(),
+            "failed evaluation must not mark the drawing saved"
+        );
+        assert!(!app.source_written_by_mycad);
+        let retained = app.document.as_ref().unwrap();
+        assert!(Arc::ptr_eq(retained, &snapshot));
+        assert_eq!(
+            retained.source_path.as_deref(),
+            Some(Path::new("original.dwg"))
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"existing drawing bytes");
+        assert_eq!(std::fs::read(&helper).unwrap(), b"existing companion bytes");
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 2);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn dxf_save_aborts_when_dynamic_evaluation_fails() {
+        assert_failed_evaluation_preserves_files(IoKind::SavingDxf, "dxf");
+    }
+
+    #[test]
+    fn dwg_save_aborts_when_dynamic_evaluation_fails() {
+        assert_failed_evaluation_preserves_files(IoKind::SavingDwg, "dwg");
+    }
+
+    #[test]
+    fn pdf_export_aborts_when_dynamic_evaluation_fails() {
+        assert_failed_evaluation_preserves_files(IoKind::ExportingPdf, "pdf");
+    }
 
     #[test]
     fn dxf_save_keeps_the_ui_document_and_does_not_block() {

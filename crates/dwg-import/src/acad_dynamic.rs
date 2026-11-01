@@ -573,7 +573,12 @@ fn axis_parameter(id: ParameterId, name: String, reference: f64, order: i32) -> 
     }
 }
 
-fn point_drives(axes: &PointAxes, offset_x: f64, offset_y: f64, connection: &str) -> Vec<AxisDrive> {
+fn point_drives(
+    axes: &PointAxes,
+    offset_x: f64,
+    offset_y: f64,
+    connection: &str,
+) -> Vec<AxisDrive> {
     let sign = connection_sign(connection);
     [
         AxisDrive {
@@ -3349,7 +3354,9 @@ mod tests {
     #[test]
     fn mapped_block_round_trips_through_the_companion() {
         use cad_core::{export_materialized, identity_insert};
-        use cad_io::{apply_companion, companion_path, read_companion, write_companion};
+        use cad_io::{
+            apply_companion_for_drawing, companion_path, read_companion, write_companion,
+        };
 
         let mut document = Document::default();
         let mut entities = vec![line(0.0, 0.0, 10.0, 0.0)];
@@ -3400,6 +3407,7 @@ mod tests {
             Ok(_) => {
                 write_companion(
                     &sidecar,
+                    &dest,
                     &document,
                     &exported.document,
                     &exported.links,
@@ -3408,7 +3416,8 @@ mod tests {
                 .expect("companion");
                 let mut loaded = crate::import_dwg(&dest).expect("import");
                 let companion = read_companion(&sidecar).expect("read companion");
-                let report = apply_companion(&mut loaded, companion);
+                let report = apply_companion_for_drawing(&dest, &mut loaded, companion)
+                    .expect("verify companion");
                 let _ = std::fs::remove_file(&dest);
                 let _ = std::fs::remove_file(&sidecar);
                 assert_eq!(report.skipped, 0, "{report:?}");

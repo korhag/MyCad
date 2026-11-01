@@ -17,7 +17,7 @@ pub use atomic::{
     replace_atomic, sibling_temp_in_dir, sibling_temp_path, sibling_temp_with_extension,
 };
 pub use companion::{
-    apply_companion, companion_path, drawing_for_companion, read_companion,
+    apply_companion_for_drawing, companion_path, drawing_for_companion, read_companion,
     read_companion_optional, write_companion, Companion, CompanionReport, COMPANION_FORMAT,
     COMPANION_SCHEMA,
 };

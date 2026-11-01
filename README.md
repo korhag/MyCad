@@ -7,6 +7,19 @@ reliably.
 LibreDWG is used only inside `dwg-import`. The rest of the application talks to
 `cad-core`, so later DXF import and editing will not depend on LibreDWG types.
 
+Development follows a fully open-source path. AutoCAD fidelity is the target,
+but the current DXF-interchange writer does **not** preserve native AutoCAD
+dynamic-block controls or every DWG object. Saving offers a separate copy when
+these losses are known; it must not overwrite the source drawing. See the
+[compatibility contract and implementation plan](docs/autocad-compatibility.md).
+
+New companion files are bound to the exact saved DWG/DXF bytes. If AutoCAD or
+another application changes the drawing, or a legacy helper has no binding,
+EntoCAD opens the drawing without applying that helper and reports the reason.
+This deliberately includes edits that keep the same block bounds. Keep legacy
+helpers with their original drawings; they are not silently migrated. Missing
+helpers leave the normal drawing geometry usable.
+
 ## Layout
 
 | Crate | Role |
@@ -198,7 +211,7 @@ The test is skipped when that variable is unset. It converts the written DXF and
 - **File → New** (`Ctrl+N`) starts an empty drawing in millimetres on layer 0. If the current drawing has unsaved edits, EntoCAD asks before replacing it. The first save uses Save As.
 - **File → Open** (`Ctrl+O`) to pick a DWG. If `Plant.dwg.mycad` sits beside it, EntoCAD loads the dynamic blocks stored there. Opening the companion file itself opens the DWG.
 - **File → Save** (`Ctrl+S`) overwrites a previously saved DXF in place. An opened DWG always goes through Save As with a `*-EntoCAD.dwg` copy name so the original file is not overwritten. A compact Save icon on the menu bar (tooltip **Save** / **Ctrl+S**) runs the same command. Successful saves report in the status bar (`Saved Plant.dxf`, `Saved Plant.dwg`, or `DWG saved with 3 compatibility warnings`) without a dialog. When the original drawing had classes that were not carried over, the status bar also names how many and points at Diagnostics.
-- **File → Save As…** (`Ctrl+Shift+S`) writes AutoCAD 2000 DXF or **DWG AutoCAD 2000**. DWG save goes through the DXF writer, then LibreDWG. The DWG stays a normal drawing: dynamic blocks are written as ordinary static blocks, so AutoCAD opens them without EntoCAD. EntoCAD also writes `Plant.dwg.mycad` next to the drawing and uses it to restore those dynamic blocks on the next open. A block edited outside EntoCAD stays static. Older `.mycad` drawings still open; new drawings are not saved in that format. Paper space and extra sheets are written as layouts, including VIEWPORT entities and the sheet size. Block attributes, text styles, layer lock/plot/lineweight, hatch pattern names, dimensions, external-reference paths, and complex linetype shapes are written with the drawing. TrueType font names are saved; the viewport still draws the stroke font. An external reference is not loaded. An image or wipeout is drawn as its frame and saved as a closed polyline, because a real IMAGE object does not survive the DWG writer. If the drawing has entities EntoCAD cannot fully keep, or a complex linetype that could not be stored, a prompt lists them and asks to **Save a Copy**. Classes that were not carried over are listed in Diagnostics instead of that prompt. The original file is never overwritten. The copy is named `*-EntoCAD`.
+- **File → Save As…** (`Ctrl+Shift+S`) writes AutoCAD 2000 DXF or **DWG AutoCAD 2000**. DWG save goes through the DXF writer, then LibreDWG. The DWG stays a normal drawing: dynamic blocks are written as ordinary static blocks, so AutoCAD opens them without EntoCAD. EntoCAD also writes `Plant.dwg.mycad` next to the drawing and uses it to restore those dynamic blocks on the next open. If the drawing changes outside EntoCAD, its previous companion is not applied. Older `.mycad` drawings still open; new drawings are not saved in that format. Paper space and extra sheets are written as layouts, including VIEWPORT entities and the sheet size. Block attributes, text styles, layer lock/plot/lineweight, hatch pattern names, dimensions, external-reference paths, and complex linetype shapes are written with the drawing. TrueType font names are saved; the viewport still draws the stroke font. An external reference is not loaded. An image or wipeout is drawn as its frame and saved as a closed polyline, because a real IMAGE object does not survive the DWG writer. If the drawing has entities EntoCAD cannot fully keep, or a complex linetype that could not be stored, a prompt lists them and asks to **Save a Copy**. Unreadable classes and lost AutoCAD dynamic controls are also listed in the save warning. The original file is never overwritten. The copy is named `*-EntoCAD`.
 - **File → Export → PDF…** opens a plot dialog, then writes a vector PDF of plottable model-space geometry (not a viewport screenshot). Paper A4–A0, portrait or landscape, extents, fit to page, color or monochrome, and 5/10/15 mm margins. The drawing path and dirty state are unchanged. A finished export reports `Exported Plant.pdf` in the status bar.
 - Pass a path on the command line for repeatable testing.
 - **Left-click** an entity to select it (line, circle, polyline, block insert, and other drawable types). Nested block geometry selects the parent block.
@@ -223,7 +236,7 @@ A saved file is a normal AutoCAD 2000 drawing. These parts of an opened AutoCAD 
 - TABLE
 - MULTILEADER
 
-Non-graphical data LibreDWG cannot read, such as associative arrays and dynamic-block parameters, is listed in Diagnostics and is not written to the copy.
+Non-graphical data LibreDWG cannot read, such as associative arrays and dynamic-block parameters, is listed in Diagnostics and the save warning and is not written to the copy.
 
 Model-space lines, polylines, arcs, circles, text, hatches, blocks, attributes, dimensions, and layout sheets are written and can be edited. Text styles are saved; TrueType faces are not drawn. External references keep their path and draw nothing until the file is present. An opened image or wipeout is shown as its frame; the save writes that frame as a closed polyline rather than an IMAGE or WIPEOUT entity.
 

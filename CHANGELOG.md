@@ -5,9 +5,17 @@ All notable changes to EntoCAD are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project versions with [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Workspace version is `0.56.0` (`Cargo.toml`).
+Workspace version is `0.56.1` (`Cargo.toml`).
 
 ## [Unreleased]
+
+## [0.56.1] - 2026-11-01
+
+### Fixed
+- Bind companion metadata to the saved drawing's SHA-256 digest so stale or unverified legacy helpers cannot override edits made in AutoCAD.
+- Stop DWG, DXF and PDF export before replacing files when dynamic-block evaluation fails.
+- Warn before exporting native AutoCAD dynamic controls or unreadable drawing objects, and protect the source drawing when saving a lossy copy.
+- Compile Windows icon resources only on Windows, and discover Linux fonts without substituting unavailable proprietary faces silently.
 
 ## [0.56.0] - 2026-10-14
 

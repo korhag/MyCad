@@ -441,16 +441,12 @@ mod tests {
         assert_eq!(lines, 3, "line count after DWG save");
     }
 
-    #[test]
-    fn dwg_roundtrip_restores_dynamic_blocks_from_the_companion() {
+    fn companion_test_document() -> Document {
         use cad_core::{
-            export_materialized, identity_insert, BehaviorKind, BlockDefinition, CompositionRule,
-            DynamicBehavior, DynamicDefinition, Entity, EvaluationCache, EvaluationRequest,
-            FollowRole, Geometry, GeometryTarget, InstanceConfiguration, NumericParameter,
-            ParameterDef, ParameterValue, Point2, Point3,
+            identity_insert, BehaviorKind, BlockDefinition, CompositionRule, DynamicBehavior,
+            DynamicDefinition, Entity, FollowRole, Geometry, GeometryTarget, InstanceConfiguration,
+            NumericParameter, ParameterDef, ParameterValue, Point2, Point3,
         };
-        use cad_io::{apply_companion, companion_path, read_companion, write_companion};
-
         let mut source = Document::default();
         let param = source.allocate_parameter_id();
         let mut line = Entity::new(Geometry::Line {
@@ -490,6 +486,89 @@ mod tests {
         config.set(param, ParameterValue::Number(1200.0));
         insert.geometry.set_insert_configuration(Some(config));
         source.add_entity(insert);
+        source
+    }
+
+    #[test]
+    fn stale_companion_preserves_reimported_dxf_edits_with_unchanged_bounds() {
+        use cad_core::{
+            export_materialized, fingerprint_block, CadColor, EvaluationCache, EvaluationRequest,
+        };
+        use cad_io::{
+            apply_companion_for_drawing, companion_path, read_companion, write_companion, write_dxf,
+        };
+
+        let mut source = companion_test_document();
+        source
+            .block_by_name_mut("AdjustableFrame")
+            .unwrap()
+            .entities[0]
+            .color = CadColor::Aci(1);
+        let mut exported = export_materialized(
+            &source,
+            &mut EvaluationCache::default(),
+            EvaluationRequest {
+                generation: source.content_generation(),
+            },
+        )
+        .unwrap();
+        let dest =
+            std::env::temp_dir().join(format!("mycad-companion-external-edit-{}.dxf", stamp()));
+        let sidecar = companion_path(&dest);
+        write_dxf(&exported.document, &dest, &DxfExportOptions::default()).unwrap();
+        write_companion(
+            &sidecar,
+            &dest,
+            &source,
+            &exported.document,
+            &exported.links,
+            &exported.generated_blocks,
+        )
+        .unwrap();
+        let before = crate::import_dxf(&dest).expect("original DXF imports");
+        let original_size = fs::metadata(&dest).unwrap().len();
+        let export_name = exported.links[0].export_block.clone();
+        exported
+            .document
+            .block_by_name_mut(&export_name)
+            .unwrap()
+            .entities[0]
+            .color = CadColor::Aci(2);
+        write_dxf(&exported.document, &dest, &DxfExportOptions::default()).unwrap();
+        assert_eq!(fs::metadata(&dest).unwrap().len(), original_size);
+
+        let mut changed = crate::import_dxf(&dest).expect("edited DXF imports");
+        assert_eq!(
+            fingerprint_block(before.block_by_name(&export_name).unwrap()),
+            fingerprint_block(changed.block_by_name(&export_name).unwrap())
+        );
+        assert_eq!(
+            changed.block_by_name(&export_name).unwrap().entities[0].color,
+            CadColor::Aci(2)
+        );
+        let snapshot = format!("{changed:?}");
+        let report =
+            apply_companion_for_drawing(&dest, &mut changed, read_companion(&sidecar).unwrap())
+                .unwrap();
+        assert_eq!(report.restored, 0);
+        assert!(report.warning.unwrap().contains("Drawing changed"));
+        assert_eq!(
+            format!("{changed:?}"),
+            snapshot,
+            "helper must not undo the external edit"
+        );
+        fs::remove_file(dest).unwrap();
+        fs::remove_file(sidecar).unwrap();
+    }
+
+    #[test]
+    fn dwg_roundtrip_restores_dynamic_blocks_from_the_companion() {
+        use cad_core::{export_materialized, EvaluationCache, EvaluationRequest, Geometry};
+        use cad_io::{
+            apply_companion_for_drawing, companion_path, read_companion, write_companion,
+        };
+
+        let source = companion_test_document();
         let request = EvaluationRequest {
             generation: source.content_generation(),
         };
@@ -501,6 +580,7 @@ mod tests {
             Ok(_) => {
                 write_companion(
                     &sidecar,
+                    &dest,
                     &source,
                     &exported.document,
                     &exported.links,
@@ -509,7 +589,8 @@ mod tests {
                 .expect("companion");
                 let mut loaded = crate::import_dwg(&dest).expect("import");
                 let companion = read_companion(&sidecar).expect("read companion");
-                let report = apply_companion(&mut loaded, companion);
+                let report = apply_companion_for_drawing(&dest, &mut loaded, companion)
+                    .expect("verify companion");
                 let _ = fs::remove_file(&dest);
                 let _ = fs::remove_file(&sidecar);
                 assert_eq!(report.skipped, 0, "{report:?}");

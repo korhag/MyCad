@@ -1,12 +1,18 @@
 //! Embeds the EntoCAD icon in the Windows executable.
 
-use std::env;
-use std::path::PathBuf;
-
 fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+    #[cfg(windows)]
+    embed_windows_icon();
+}
+
+#[cfg(windows)]
+fn embed_windows_icon() {
+    use std::env;
+    use std::path::PathBuf;
+
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
     let icon = PathBuf::from(&manifest_dir).join("../../resources/icons/entocad.ico");
-    println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed={}", icon.display());
 
     if env::var("CARGO_CFG_TARGET_OS").ok().as_deref() != Some("windows") {
