@@ -1754,12 +1754,22 @@ fn validate_phase3(
         if !anchor.id.is_assigned() || !anchor_ids.insert(anchor.id) {
             return Err(DynamicError::DuplicateAction(ActionId(anchor.id.raw())));
         }
+        if !anchor.position.is_finite()
+            || anchor.orientation.is_some_and(|angle| !angle.is_finite())
+        {
+            return Err(DynamicError::UnsupportedCombination {
+                details: format!(
+                    "Anchor '{}' has non-finite coordinates or orientation",
+                    anchor.name
+                ),
+            });
+        }
         if let Some(crate::dynamic_model::AnchorFollow::Size { parameter, .. }) = &anchor.follow {
-            if dynamic.parameter(*parameter).is_none() {
-                return Err(DynamicError::UnknownParameter {
-                    action: ActionId::UNASSIGNED,
-                    parameter: *parameter,
-                });
+            validate_numeric_source(dynamic, ActionId::UNASSIGNED, *parameter)?;
+        }
+        if let Some(crate::dynamic_model::AnchorFollow::Geometry(target)) = &anchor.follow {
+            if !entity_ids.contains(&target.entity_id()) {
+                return Err(DynamicError::MissingEntity { target: *target });
             }
         }
     }
@@ -1779,6 +1789,11 @@ fn validate_phase3(
                 });
             }
         }
+        if !behavior.axis_a.is_finite() || !behavior.axis_b.is_finite() {
+            return Err(DynamicError::UnsupportedCombination {
+                details: format!("Flip action {} has a non-finite axis", behavior.id),
+            });
+        }
         if behavior.axis_a.distance(behavior.axis_b) <= 1e-12 {
             return Err(DynamicError::ZeroDirection {
                 action: behavior.id,
@@ -1789,15 +1804,19 @@ fn validate_phase3(
         if !behavior.id.is_assigned() || !action_ids.insert(behavior.id) {
             return Err(DynamicError::DuplicateAction(behavior.id));
         }
+        if !behavior.pivot.is_finite() {
+            return Err(DynamicError::UnsupportedCombination {
+                details: format!("Rotate action {} has a non-finite pivot", behavior.id),
+            });
+        }
         match &behavior.source {
-            RotationSource::AngleParameter(parameter)
-            | RotationSource::OptionMap { parameter, .. } => {
-                if dynamic.parameter(*parameter).is_none() {
-                    return Err(DynamicError::UnknownParameter {
-                        action: behavior.id,
-                        parameter: *parameter,
-                    });
-                }
+            RotationSource::AngleParameter(parameter) => {
+                // Older native definitions use untyped numeric parameters as
+                // radians; keep those valid while rejecting nonnumeric inputs.
+                validate_numeric_source(dynamic, behavior.id, *parameter)?;
+            }
+            RotationSource::OptionMap { parameter, angles } => {
+                validate_choice_mapping(dynamic, behavior.id, *parameter, angles)?;
             }
         }
         if let RotationSource::OptionMap { angles, .. } = &behavior.source {
@@ -1823,10 +1842,45 @@ fn validate_phase3(
         if !behavior.id.is_assigned() || !action_ids.insert(behavior.id) {
             return Err(DynamicError::DuplicateAction(behavior.id));
         }
-        if dynamic.parameter(behavior.parameter).is_none() {
-            return Err(DynamicError::UnknownParameter {
-                action: behavior.id,
-                parameter: behavior.parameter,
+        let parameter =
+            dynamic
+                .parameter(behavior.parameter)
+                .ok_or(DynamicError::UnknownParameter {
+                    action: behavior.id,
+                    parameter: behavior.parameter,
+                })?;
+        match &parameter.kind {
+            ParameterKind::Choice(_) => {
+                validate_choice_mapping(
+                    dynamic,
+                    behavior.id,
+                    behavior.parameter,
+                    &behavior.destinations,
+                )?;
+            }
+            ParameterKind::Boolean(_) => {
+                if behavior.boolean_destinations.is_none() {
+                    return Err(DynamicError::IncompleteMapping {
+                        action: behavior.id,
+                        parameter: behavior.parameter,
+                        option: OptionId::UNASSIGNED,
+                    });
+                }
+            }
+            other => {
+                return Err(DynamicError::ValueType {
+                    parameter: behavior.parameter,
+                    expected: "choice or boolean",
+                    actual: other.type_name(),
+                })
+            }
+        }
+        if !behavior.attachment.is_finite() || !behavior.attachment_angle.is_finite() {
+            return Err(DynamicError::UnsupportedCombination {
+                details: format!(
+                    "Position action {} has a non-finite attachment",
+                    behavior.id
+                ),
             });
         }
         for member in &behavior.members {
@@ -1842,8 +1896,17 @@ fn validate_phase3(
                 });
             }
         }
-        for anchor in behavior.destinations.values() {
-            if dynamic.anchor(*anchor).is_none() {
+        let boolean_anchors = behavior
+            .boolean_destinations
+            .into_iter()
+            .flat_map(|(off, on)| [off, on]);
+        for anchor in behavior
+            .destinations
+            .values()
+            .copied()
+            .chain(boolean_anchors)
+        {
+            if dynamic.anchor(anchor).is_none() {
                 return Err(DynamicError::MissingEntity {
                     target: GeometryTarget::Entity(EntityId::UNASSIGNED),
                 });
@@ -1861,6 +1924,20 @@ fn validate_phase3(
                 action: input.id,
                 parameter: input.source,
             });
+        }
+        match &input.mapping {
+            crate::dynamic_model::NestedMapping::NumericScale { factor } => {
+                validate_numeric_source(dynamic, input.id, input.source)?;
+                if !factor.is_finite() {
+                    return Err(DynamicError::NonFinite {
+                        parameter: input.source,
+                    });
+                }
+            }
+            crate::dynamic_model::NestedMapping::OptionMap(mapping) => {
+                validate_choice_mapping(dynamic, input.id, input.source, mapping)?;
+            }
+            crate::dynamic_model::NestedMapping::Direct => {}
         }
         if input.target_occurrence.inserts.is_empty() {
             return Err(DynamicError::NestedCycle {
@@ -1887,6 +1964,52 @@ fn validate_phase3(
                 });
             };
             validate_parameter_value(parameter, value)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_numeric_source(
+    dynamic: &DynamicDefinition,
+    action: ActionId,
+    parameter: ParameterId,
+) -> Result<(), DynamicError> {
+    let def = dynamic
+        .parameter(parameter)
+        .ok_or(DynamicError::UnknownParameter { action, parameter })?;
+    if !matches!(def.kind, ParameterKind::Number(_)) {
+        return Err(DynamicError::ValueType {
+            parameter,
+            expected: "number",
+            actual: def.kind.type_name(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_choice_mapping<T>(
+    dynamic: &DynamicDefinition,
+    action: ActionId,
+    parameter: ParameterId,
+    mapping: &BTreeMap<OptionId, T>,
+) -> Result<(), DynamicError> {
+    let def = dynamic
+        .parameter(parameter)
+        .ok_or(DynamicError::UnknownParameter { action, parameter })?;
+    let ParameterKind::Choice(choice) = &def.kind else {
+        return Err(DynamicError::ValueType {
+            parameter,
+            expected: "choice",
+            actual: def.kind.type_name(),
+        });
+    };
+    for option in &choice.options {
+        if !mapping.contains_key(&option.id) {
+            return Err(DynamicError::IncompleteMapping {
+                action,
+                parameter,
+                option: option.id,
+            });
         }
     }
     Ok(())
@@ -2018,7 +2141,10 @@ fn validate_anchor_cycles(dynamic: &DynamicDefinition) -> Result<(), DynamicErro
             for anchor in &dynamic.anchors {
                 if let Some(crate::dynamic_model::AnchorFollow::Geometry(target)) = &anchor.follow {
                     if target.entity_id() == *member
-                        && placement.destinations.values().any(|id| *id == anchor.id)
+                        && (placement.destinations.values().any(|id| *id == anchor.id)
+                            || placement
+                                .boolean_destinations
+                                .is_some_and(|(off, on)| off == anchor.id || on == anchor.id))
                     {
                         return Err(DynamicError::DependencyCycle {
                             details: format!(
@@ -2318,7 +2444,10 @@ fn validate_numeric_def(id: ParameterId, numeric: &NumericParameter) -> Result<(
         }
     }
     if let (Some(min), Some(max)) = (numeric.min, numeric.max) {
-        if !min.is_finite() || !max.is_finite() || min > max {
+        if !min.is_finite() || !max.is_finite() {
+            return Err(DynamicError::NonFinite { parameter: id });
+        }
+        if min > max {
             return Err(DynamicError::Range {
                 parameter: id,
                 value: numeric.default,
@@ -2388,7 +2517,10 @@ pub fn validate_numeric_value(
     numeric: &NumericParameter,
     value: f64,
 ) -> Result<(), DynamicError> {
-    if !value.is_finite() {
+    if !value.is_finite()
+        || numeric.min.is_some_and(|bound| !bound.is_finite())
+        || numeric.max.is_some_and(|bound| !bound.is_finite())
+    {
         return Err(DynamicError::NonFinite { parameter: id });
     }
     if let Some(min) = numeric.min {
@@ -2754,6 +2886,33 @@ mod tests {
         });
         entity.id = EntityId(id);
         entity
+    }
+
+    #[test]
+    fn one_sided_numeric_bounds_must_be_finite() {
+        for bound in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for minimum in [true, false] {
+                let mut numeric = NumericParameter::length(100.0);
+                if minimum {
+                    numeric.min = Some(bound);
+                } else {
+                    numeric.max = Some(bound);
+                }
+                let parameter = ParameterDef::number(ParameterId(1), "Width", numeric);
+                assert!(matches!(
+                    validate_parameter_def(&parameter),
+                    Err(DynamicError::NonFinite { .. })
+                ));
+                assert!(matches!(
+                    validate_parameter_value(&parameter, &ParameterValue::Number(100.0)),
+                    Err(DynamicError::NonFinite { .. })
+                ));
+            }
+        }
+        let parameter =
+            ParameterDef::number(ParameterId(1), "Width", NumericParameter::length(100.0));
+        validate_parameter_def(&parameter).unwrap();
+        validate_parameter_value(&parameter, &ParameterValue::Number(-10.0)).unwrap();
     }
 
     #[test]

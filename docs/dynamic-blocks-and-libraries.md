@@ -4,6 +4,41 @@ EntoCAD keeps dynamic behavior in its native files and in a companion beside a
 saved DWG/DXF. The exchange drawing contains the evaluated block geometry, so it
 can be opened without that companion. Development remains fully open source.
 
+## Choose what a parameter controls
+
+A native dynamic block can combine geometry changes, visibility, labels, and
+inputs to nested blocks. The authoring dock exposes these existing actions:
+
+| Action | Typical input | Result |
+| --- | --- | --- |
+| Stretch | Size or numeric offset | Moves selected endpoints or vertices |
+| Move | Size or numeric offset | Moves complete selected objects |
+| Rotate | Angle or Choice | Rotates selected geometry about a picked pivot |
+| Flip / mirror | On/Off or Choice | Reflects selected geometry across a picked axis |
+| Visibility | On/Off or Choice | Shows or hides selected parts |
+| Placement | Choice | Places a selected group at named anchors |
+| Linked text | Text, number, Choice, or On/Off | Updates a label from parameter values |
+| Nested inputs | Parent parameter | Drives a parameter on a specific nested block |
+
+Select geometry and use **Rotate…**, **Flip / mirror…**, **Position by option…**,
+**Show / hide…**, or **Link text…** in the dock. Position destinations use block
+coordinates in the drawing's units.
+
+Use **Add angle parameter** for a rotation angle. Its value is stored in degrees,
+and its minimum and maximum can be left unrestricted or set in the parameter
+editor. Pick the geometry first, start the action, then supply its pivot, axis,
+or anchors. Missing or invalid settings keep the setup open with an explanation.
+
+Named presets store useful combinations of values. Compatibility rules constrain
+which options can be combined. Test the complete configuration before saving a
+block, especially when several actions affect the same geometry.
+Test values are temporary previews for the edited occurrence. Change a parameter's
+default or a placed instance's configuration to retain a value outside Test mode.
+
+The current nested-input shortcut maps to the child's first parameter. The
+compatibility-rule shortcut starts from the first Choice/numeric pair; it is
+not a general rule editor. Native scale and array actions are not implemented.
+
 ## Create a size that changes geometry
 
 1. Create a block from selected geometry, or select an existing block reference.

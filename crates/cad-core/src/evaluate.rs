@@ -4,7 +4,7 @@
 //! evaluated result is never used as the next input. Output is disposable
 //! derived state and must not replace the source definition.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::document::{BlockDefinition, Document};
@@ -15,8 +15,8 @@ use crate::dynamic::{
     ParameterKind, ParameterValue, EVALUATOR_VERSION,
 };
 use crate::dynamic_model::{
-    effective_visibility, evaluate_text_binding, AnchorFollow, NestedMapping, PlacementBehavior,
-    ReflectionBehavior, RotationBehavior, RotationSource, TextReflectPolicy,
+    evaluate_text_binding, AnchorFollow, NestedMapping, PlacementBehavior, ReflectionBehavior,
+    RotationBehavior, RotationSource, TextReflectPolicy,
 };
 use crate::entity::{Entity, EntityId, Geometry};
 use crate::entity_transform::transform_entity_matrix;
@@ -198,7 +198,7 @@ fn eval_key(
         .map(|(id, value)| (id.raw(), value.normalize()))
         .collect();
     normalized.sort_by_key(|(id, _)| *id);
-    let nested = nested_dependency_revisions(document, definition, &mut Vec::new());
+    let nested = nested_dependency_revisions(document, definition);
     Ok(EvalKey {
         definition_id: definition.id.raw(),
         content_revision: definition.content_revision,
@@ -211,17 +211,34 @@ fn eval_key(
 fn nested_dependency_revisions(
     document: &Document,
     definition: &BlockDefinition,
-    stack: &mut Vec<String>,
 ) -> Vec<(u64, u64)> {
-    let mut revisions = Vec::new();
-    if crate::nesting_too_deep(stack)
-        || stack
-            .iter()
-            .any(|name| name.eq_ignore_ascii_case(&definition.name))
-    {
-        return revisions;
+    let mut revisions = BTreeSet::new();
+    let mut shallowest = BTreeMap::new();
+    collect_dependency_revisions(document, definition, 0, &mut shallowest, &mut revisions);
+    revisions.into_iter().collect()
+}
+
+fn collect_dependency_revisions(
+    document: &Document,
+    definition: &BlockDefinition,
+    depth: usize,
+    shallowest: &mut BTreeMap<String, usize>,
+    revisions: &mut BTreeSet<(u64, u64)>,
+) {
+    if depth >= crate::MAX_BLOCK_DEPTH {
+        return;
     }
-    stack.push(definition.name.clone());
+    let name = definition.name.to_ascii_uppercase();
+    // Shared sub-blocks can represent exponentially many occurrences. Their
+    // revisions only need visiting once, unless a later path reaches the same
+    // definition at a shallower depth and exposes additional descendants.
+    if shallowest
+        .get(&name)
+        .is_some_and(|previous| *previous <= depth)
+    {
+        return;
+    }
+    shallowest.insert(name, depth);
     for entity in &definition.entities {
         let Some(name) = entity.geometry.insert_block_name() else {
             continue;
@@ -229,13 +246,9 @@ fn nested_dependency_revisions(
         let Some(child) = document.block_by_name(name) else {
             continue;
         };
-        revisions.push((child.id.raw(), child.content_revision));
-        revisions.extend(nested_dependency_revisions(document, child, stack));
+        revisions.insert((child.id.raw(), child.content_revision));
+        collect_dependency_revisions(document, child, depth + 1, shallowest, revisions);
     }
-    stack.pop();
-    revisions.sort_unstable();
-    revisions.dedup();
-    revisions
 }
 
 fn apply_evaluation_plan(
@@ -289,7 +302,15 @@ fn map_nested_value(
     match &input.mapping {
         NestedMapping::Direct => Ok(source.clone()),
         NestedMapping::NumericScale { factor } => match source {
-            ParameterValue::Number(number) => Ok(ParameterValue::Number(*number * *factor)),
+            ParameterValue::Number(number) => {
+                let scaled = *number * *factor;
+                if !scaled.is_finite() {
+                    return Err(DynamicError::NonFinite {
+                        parameter: input.source,
+                    });
+                }
+                Ok(ParameterValue::Number(scaled))
+            }
             other => Err(DynamicError::ValueType {
                 parameter: input.source,
                 expected: "number",
@@ -713,6 +734,7 @@ fn transform_members(
     matrix: Transform2,
     text_policy: Option<TextReflectPolicy>,
 ) -> Result<(), DynamicError> {
+    let members: BTreeSet<_> = members.iter().copied().collect();
     for entity in entities.iter_mut() {
         if !members.contains(&entity.id) {
             continue;
@@ -792,8 +814,16 @@ fn apply_visibility(
     dynamic: &DynamicDefinition,
     values: &BTreeMap<ParameterId, ParameterValue>,
 ) {
+    // Membership in any inactive group hides an entity. Evaluate each group's
+    // condition once and avoid scanning every member list for every entity.
+    let hidden: BTreeSet<_> = dynamic
+        .visibility
+        .iter()
+        .filter(|group| !group.is_active(values))
+        .flat_map(|group| group.members.iter().copied())
+        .collect();
     for entity in entities.iter_mut() {
-        if !effective_visibility(&dynamic.visibility, entity.id, values) {
+        if hidden.contains(&entity.id) {
             entity.visible = false;
         }
     }
@@ -950,6 +980,128 @@ pub fn apply_definition_preview(
     if let Some(block) = evaluated.block_by_name_mut(block_name) {
         block.entities = entities;
     }
+    Ok(())
+}
+
+/// Preview one edited occurrence, preserving other instances of the same block.
+/// Ancestors along a nested edit path are copied only in the temporary evaluated
+/// drawing, so rendering, snapping and measurement all follow the preview.
+pub fn apply_definition_preview_at_path(
+    source: &Document,
+    evaluated: &mut Document,
+    block_name: &str,
+    config: &InstanceConfiguration,
+    cache: &mut EvaluationCache,
+    request: EvaluationRequest,
+    path: &[EntityId],
+) -> Result<(), DynamicError> {
+    validate_preview_path(source, block_name, path)?;
+    if evaluated.block_by_name(block_name).is_none() {
+        return Err(DynamicError::MissingDefinition);
+    }
+    apply_definition_preview(source, evaluated, block_name, config, cache, request)?;
+    let mut model = std::mem::take(&mut evaluated.model_space);
+    let result = retarget_preview_path(evaluated, &mut model, block_name, path);
+    evaluated.model_space = model;
+    result
+}
+
+fn validate_preview_path(
+    source: &Document,
+    block_name: &str,
+    path: &[EntityId],
+) -> Result<(), DynamicError> {
+    if path.is_empty() || path.len() > crate::MAX_BLOCK_DEPTH {
+        return Err(DynamicError::NestedCycle {
+            details: "The preview edit path is empty or exceeds the nesting limit".into(),
+        });
+    }
+    let mut entities = source.model_space.as_slice();
+    let mut visited = BTreeSet::new();
+    for (depth, id) in path.iter().enumerate() {
+        let entity =
+            entities
+                .iter()
+                .find(|entity| entity.id == *id)
+                .ok_or(DynamicError::MissingEntity {
+                    target: GeometryTarget::Entity(*id),
+                })?;
+        let Geometry::Insert {
+            block_name: referenced,
+            ..
+        } = &entity.geometry
+        else {
+            return Err(DynamicError::NestedEditUnsupported);
+        };
+        if !visited.insert(referenced.to_ascii_uppercase()) {
+            return Err(DynamicError::NestedCycle {
+                details: "The preview edit path contains a circular block reference".into(),
+            });
+        }
+        if depth + 1 == path.len() && !referenced.eq_ignore_ascii_case(block_name) {
+            return Err(DynamicError::UnsupportedCombination {
+                details: format!(
+                    "The edited occurrence refers to '{referenced}', not '{block_name}'"
+                ),
+            });
+        }
+        entities = &source
+            .block_by_name(referenced)
+            .ok_or(DynamicError::MissingDefinition)?
+            .entities;
+    }
+    Ok(())
+}
+
+fn retarget_preview_path(
+    evaluated: &mut Document,
+    entities: &mut [Entity],
+    block_name: &str,
+    path: &[EntityId],
+) -> Result<(), DynamicError> {
+    let Some((id, rest)) = path.split_first() else {
+        return Err(DynamicError::NestedEditUnsupported);
+    };
+    let entity =
+        entities
+            .iter_mut()
+            .find(|entity| entity.id == *id)
+            .ok_or(DynamicError::MissingEntity {
+                target: GeometryTarget::Entity(*id),
+            })?;
+    let Geometry::Insert {
+        block_name: referenced,
+        configuration,
+        ..
+    } = &mut entity.geometry
+    else {
+        return Err(DynamicError::NestedEditUnsupported);
+    };
+    if rest.is_empty() {
+        *referenced = block_name.to_string();
+        *configuration = None;
+        return Ok(());
+    }
+    let mut ancestor = evaluated
+        .block_by_name(referenced)
+        .ok_or(DynamicError::MissingDefinition)?
+        .clone();
+    retarget_preview_path(evaluated, &mut ancestor.entities, block_name, rest)?;
+    // At most blocks.len() names can be occupied. The bounded extra candidate
+    // guarantees a free name, including files that already use this prefix.
+    let name = (0..=evaluated.blocks.len())
+        .map(|index| format!("{GENERATED_BLOCK_PREFIX}PREVIEW_{index}"))
+        .find(|name| evaluated.block_key(name).is_none())
+        .ok_or_else(|| DynamicError::UnsupportedCombination {
+            details: "No temporary block name is available for this preview".into(),
+        })?;
+    ancestor.name = name.clone();
+    ancestor.dynamic = None;
+    // Keep entity IDs: the edit path, picking and snap ownership refer to the
+    // source members. This transient copy must not allocate persistent IDs.
+    evaluated.blocks.insert(name.clone(), ancestor);
+    *referenced = name;
+    *configuration = None;
     Ok(())
 }
 
@@ -1332,6 +1484,290 @@ mod tests {
         config.set(param, ParameterValue::Number(span));
         entity.geometry.set_insert_configuration(Some(config));
         document.add_entity(entity)
+    }
+
+    fn preview_path_block<'a>(document: &'a Document, path: &[EntityId]) -> &'a BlockDefinition {
+        let mut entities = document.model_space.as_slice();
+        let mut result = None;
+        for id in path {
+            let entity = entities.iter().find(|entity| entity.id == *id).unwrap();
+            let name = entity.geometry.insert_block_name().unwrap();
+            let block = document.block_by_name(name).unwrap();
+            result = Some(block);
+            entities = &block.entities;
+        }
+        result.unwrap()
+    }
+
+    fn preview_path_span(document: &Document, path: &[EntityId]) -> f64 {
+        let block = preview_path_block(document, path);
+        let Geometry::Line { start, end } = block.entities[2].geometry else {
+            panic!("top line");
+        };
+        end.x - start.x
+    }
+
+    #[test]
+    fn preview_at_path_changes_only_the_edited_occurrence() {
+        let (mut document, _, parameter) = span_frame();
+        let edited = insert_with_span(&mut document, 0.0, 800.0, parameter);
+        let other = insert_with_span(&mut document, 2000.0, 1200.0, parameter);
+        let source_before = format!("{document:?}");
+        let request = EvaluationRequest {
+            generation: document.content_generation(),
+        };
+        let mut cache = EvaluationCache::default();
+        let mut evaluated = materialize_evaluated(&document, &mut cache, request).unwrap();
+        let mut config = InstanceConfiguration::default();
+        config.set(parameter, ParameterValue::Number(1000.0));
+        apply_definition_preview_at_path(
+            &document,
+            &mut evaluated,
+            "AdjustableFrame",
+            &config,
+            &mut cache,
+            request,
+            &[edited.id],
+        )
+        .unwrap();
+        assert_eq!(preview_path_span(&evaluated, &[edited.id]), 1000.0);
+        assert_eq!(preview_path_span(&evaluated, &[other.id]), 1200.0);
+        assert_eq!(format!("{document:?}"), source_before);
+        assert_eq!(document.identity_counters(), evaluated.identity_counters());
+    }
+
+    #[test]
+    fn preview_at_path_isolates_nested_shared_ancestors_and_avoids_name_collisions() {
+        let (mut document, _, parameter) = span_frame();
+        let child = |document: &mut Document, width| {
+            let mut entity =
+                Entity::new(identity_insert("AdjustableFrame".into(), Point3::default()));
+            entity.id = document.allocate_id();
+            let mut config = InstanceConfiguration::default();
+            config.set(parameter, ParameterValue::Number(width));
+            entity.geometry.set_insert_configuration(Some(config));
+            entity
+        };
+        let edited = child(&mut document, 800.0);
+        let sibling = child(&mut document, 1200.0);
+        let flag = document.allocate_parameter_id();
+        let mut inner = BlockDefinition::plain(
+            "Inner",
+            Point3::default(),
+            vec![edited.clone(), sibling.clone()],
+        );
+        inner.dynamic = Some(DynamicDefinition {
+            parameters: vec![ParameterDef::boolean(
+                flag,
+                "Enabled",
+                crate::BooleanParameter::default(),
+            )],
+            ..Default::default()
+        });
+        document.replace_block_definition(inner);
+        let mut selected_inner = Entity::new(identity_insert("Inner".into(), Point3::default()));
+        selected_inner.id = document.allocate_id();
+        let mut other_inner = Entity::new(identity_insert(
+            "Inner".into(),
+            Point3::from_xy(5000.0, 0.0),
+        ));
+        other_inner.id = document.allocate_id();
+        document.replace_block_definition(BlockDefinition::plain(
+            "Outer",
+            Point3::default(),
+            vec![selected_inner.clone(), other_inner.clone()],
+        ));
+        let selected_outer = document.add_entity(Entity::new(identity_insert(
+            "Outer".into(),
+            Point3::default(),
+        )));
+        let other_outer = document.add_entity(Entity::new(identity_insert(
+            "Outer".into(),
+            Point3::from_xy(10000.0, 0.0),
+        )));
+        let occupied_name = format!("{GENERATED_BLOCK_PREFIX}PREVIEW_0");
+        document.replace_block_definition(BlockDefinition::plain(
+            &occupied_name,
+            Point3::default(),
+            vec![Entity::new(Geometry::Point {
+                position: Point3::from_xy(42.0, 99.0),
+            })],
+        ));
+        let occupied = document.block_by_name(&occupied_name).unwrap().clone();
+        let source_before = format!("{document:?}");
+        let request = EvaluationRequest {
+            generation: document.content_generation(),
+        };
+        let mut cache = EvaluationCache::default();
+        let mut evaluated = materialize_evaluated(&document, &mut cache, request).unwrap();
+        let mut config = InstanceConfiguration::default();
+        config.set(parameter, ParameterValue::Number(1000.0));
+        apply_definition_preview_at_path(
+            &document,
+            &mut evaluated,
+            "AdjustableFrame",
+            &config,
+            &mut cache,
+            request,
+            &[selected_outer.id, selected_inner.id, edited.id],
+        )
+        .unwrap();
+        assert_eq!(
+            preview_path_span(
+                &evaluated,
+                &[selected_outer.id, selected_inner.id, edited.id]
+            ),
+            1000.0
+        );
+        assert_eq!(
+            preview_path_span(
+                &evaluated,
+                &[selected_outer.id, selected_inner.id, sibling.id]
+            ),
+            1200.0
+        );
+        assert_eq!(
+            preview_path_span(&evaluated, &[selected_outer.id, other_inner.id, edited.id]),
+            800.0
+        );
+        assert_eq!(
+            preview_path_span(&evaluated, &[other_outer.id, selected_inner.id, edited.id]),
+            800.0
+        );
+        assert_eq!(evaluated.block_by_name(&occupied_name).unwrap(), &occupied);
+        assert_eq!(format!("{document:?}"), source_before);
+        assert_eq!(document.identity_counters(), evaluated.identity_counters());
+    }
+
+    #[test]
+    fn preview_at_path_rejects_missing_mismatched_and_excessive_paths() {
+        let (mut document, _, parameter) = span_frame();
+        let edited = insert_with_span(&mut document, 0.0, 800.0, parameter);
+        document.replace_block_definition(BlockDefinition::plain(
+            "Other",
+            Point3::default(),
+            vec![],
+        ));
+        let request = EvaluationRequest {
+            generation: document.content_generation(),
+        };
+        let mut cache = EvaluationCache::default();
+        let mut evaluated = materialize_evaluated(&document, &mut cache, request).unwrap();
+        let before = format!("{evaluated:?}");
+        for (name, path) in [
+            ("AdjustableFrame", vec![]),
+            ("AdjustableFrame", vec![EntityId(u64::MAX)]),
+            (
+                "AdjustableFrame",
+                vec![edited.id; crate::MAX_BLOCK_DEPTH + 1],
+            ),
+            ("Other", vec![edited.id]),
+        ] {
+            assert!(apply_definition_preview_at_path(
+                &document,
+                &mut evaluated,
+                name,
+                &InstanceConfiguration::default(),
+                &mut cache,
+                request,
+                &path
+            )
+            .is_err());
+            assert_eq!(format!("{evaluated:?}"), before);
+        }
+    }
+
+    #[test]
+    fn shared_dependency_revisions_track_edits_without_expanding_occurrences() {
+        let mut document = Document::default();
+        for index in (0..12).rev() {
+            let members = if index == 11 {
+                vec![Entity::new(Geometry::Point {
+                    position: Point3::default(),
+                })]
+            } else {
+                (0..3)
+                    .map(|_| {
+                        Entity::new(crate::identity_insert(
+                            format!("Shared{}", index + 1),
+                            Point3::default(),
+                        ))
+                    })
+                    .collect()
+            };
+            let mut block =
+                BlockDefinition::plain(format!("Shared{index}"), Point3::default(), members);
+            if index == 0 {
+                block.dynamic = Some(DynamicDefinition::default());
+            }
+            document.replace_block_definition(block);
+        }
+        document.assign_missing_ids();
+        let mut cache = EvaluationCache::default();
+        let evaluate = |document: &Document, cache: &mut EvaluationCache| {
+            evaluate_definition(
+                document,
+                document.block_by_name("Shared0").unwrap(),
+                None,
+                cache,
+                EvaluationRequest {
+                    generation: document.content_generation(),
+                },
+            )
+            .unwrap()
+        };
+        let before = evaluate(&document, &mut cache);
+        assert_eq!(before.key.nested_revisions.len(), 11);
+        let mut leaf = document.block_by_name("Shared11").unwrap().clone();
+        leaf.entities[0].geometry = Geometry::Point {
+            position: Point3::from_xy(2.0, 3.0),
+        };
+        document.replace_block_definition(leaf);
+        let after = evaluate(&document, &mut cache);
+        assert_eq!(after.key.nested_revisions.len(), 11);
+        assert_ne!(before.key, after.key);
+        assert!(!Arc::ptr_eq(&before, &after));
+    }
+
+    #[test]
+    fn dependency_scan_revisits_shallower_paths_and_stops_cycles() {
+        let mut document = Document::default();
+        let insert =
+            |name: &str| Entity::new(crate::identity_insert(name.into(), Point3::default()));
+        for index in 0..crate::MAX_BLOCK_DEPTH - 2 {
+            let next = if index + 1 == crate::MAX_BLOCK_DEPTH - 2 {
+                "Shared".into()
+            } else {
+                format!("Deep{}", index + 1)
+            };
+            document.replace_block_definition(BlockDefinition::plain(
+                format!("Deep{index}"),
+                Point3::default(),
+                vec![insert(&next)],
+            ));
+        }
+        for (name, members) in [
+            ("Root", vec![insert("Deep0"), insert("Shared")]),
+            ("Shared", vec![insert("Leaf")]),
+            ("Leaf", vec![insert("Grandchild")]),
+            ("Grandchild", vec![insert("Root")]),
+        ] {
+            document.replace_block_definition(BlockDefinition::plain(
+                name,
+                Point3::default(),
+                members,
+            ));
+        }
+        let root = document.block_by_name("Root").unwrap();
+        let revisions = nested_dependency_revisions(&document, root);
+        for block in document.blocks.values() {
+            assert!(
+                revisions.contains(&(block.id.raw(), block.content_revision)),
+                "{} missing",
+                block.name
+            );
+        }
+        assert_eq!(revisions.len(), document.blocks.len());
     }
 
     #[test]
@@ -2385,6 +2821,46 @@ mod tests {
     }
 
     #[test]
+    fn overlapping_visibility_groups_require_all_conditions() {
+        let (mut document, _, _, _, boolean, _, _, _, _, _) = phase3_assembly();
+        let block = document.block_by_name_mut("Assembly").unwrap();
+        let dynamic = block.dynamic.as_mut().unwrap();
+        let member = dynamic.visibility[0].members[0];
+        dynamic.visibility[2].members = vec![member, member];
+        // The default choice is active, but the overlapping Boolean group is not.
+        let hidden = eval_assembly(&document, &InstanceConfiguration::default());
+        assert!(
+            !hidden
+                .entities
+                .iter()
+                .find(|entity| entity.id == member)
+                .unwrap()
+                .visible
+        );
+        let mut enabled = InstanceConfiguration::default();
+        enabled.set(boolean, ParameterValue::Boolean(true));
+        let visible = eval_assembly(&document, &enabled);
+        assert!(
+            visible
+                .entities
+                .iter()
+                .find(|entity| entity.id == member)
+                .unwrap()
+                .visible
+        );
+        assert!(
+            document
+                .block_by_name("Assembly")
+                .unwrap()
+                .entities
+                .iter()
+                .find(|entity| entity.id == member)
+                .unwrap()
+                .visible
+        );
+    }
+
+    #[test]
     fn formatted_text_substitutes_ids_not_names() {
         let (document, span, depth, _, _, _, _, _, _, _) = phase3_assembly();
         let mut config = InstanceConfiguration::default();
@@ -2589,6 +3065,108 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(config.get(style), Some(ParameterValue::Choice(option)) if *option == id));
+    }
+
+    #[test]
+    fn phase3_validation_rejects_inactive_invalid_actions_and_incomplete_mappings() {
+        use crate::dynamic_model::{AnchorDef, RotationBehavior, RotationSource};
+        let (mut document, span, _, style, boolean, _, _, _, _, _) = phase3_assembly();
+        let rotate_id = document.allocate_action_id();
+        let block = document.block_by_name("Assembly").unwrap();
+        let mut valid = block.dynamic.clone().unwrap();
+        valid.rotations.push(RotationBehavior {
+            id: rotate_id,
+            name: None,
+            members: vec![block.entities[0].id],
+            pivot: Point2::new(0.0, 0.0),
+            source: RotationSource::AngleParameter(span),
+        });
+        // Legacy Number/Length rotation sources remain valid as radians.
+        validate_definition(&valid, &block.entities).unwrap();
+        for case in 0..12 {
+            let mut dynamic = valid.clone();
+            match case {
+                0 => dynamic.reflections[0].axis_a.x = f64::NAN,
+                1 => dynamic.rotations[0].pivot.y = f64::INFINITY,
+                2 => dynamic.anchors[0].orientation = Some(f64::NAN),
+                3 => dynamic.placements[0].attachment.x = f64::INFINITY,
+                4 => dynamic.placements[0].parameter = span,
+                5 => dynamic.placements[0].parameter = boolean,
+                6 => {
+                    dynamic.placements[0].parameter = boolean;
+                    dynamic.placements[0].boolean_destinations =
+                        Some((dynamic.anchors[0].id, crate::ids::AnchorId(u64::MAX)));
+                }
+                7 => {
+                    dynamic.placements[0].destinations.pop_first();
+                }
+                8 => dynamic.rotations[0].source = RotationSource::AngleParameter(style),
+                9 => {
+                    dynamic.rotations[0].source = RotationSource::OptionMap {
+                        parameter: span,
+                        angles: BTreeMap::new(),
+                    }
+                }
+                10 => {
+                    dynamic.rotations[0].source = RotationSource::OptionMap {
+                        parameter: style,
+                        angles: BTreeMap::new(),
+                    }
+                }
+                11 => {
+                    dynamic.nested_inputs[0].mapping = NestedMapping::NumericScale {
+                        factor: f64::INFINITY,
+                    }
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                validate_definition(&dynamic, &block.entities).is_err(),
+                "invalid case {case} was accepted"
+            );
+        }
+        // A Boolean placement can target both valid anchors without a Choice map.
+        let mut boolean_placement = valid.clone();
+        boolean_placement.placements[0].parameter = boolean;
+        boolean_placement.placements[0].destinations.clear();
+        boolean_placement.placements[0].boolean_destinations = Some((
+            boolean_placement.anchors[0].id,
+            boolean_placement.anchors[1].id,
+        ));
+        validate_definition(&boolean_placement, &block.entities).unwrap();
+        let bound = boolean_placement.placements[0].members[0];
+        let AnchorDef { follow, .. } = &mut boolean_placement.anchors[0];
+        *follow = Some(AnchorFollow::Geometry(GeometryTarget::Entity(bound)));
+        assert!(matches!(
+            validate_definition(&boolean_placement, &block.entities),
+            Err(DynamicError::DependencyCycle { .. })
+        ));
+    }
+
+    #[test]
+    fn nested_numeric_mapping_overflow_never_enters_the_cache() {
+        let (mut document, _, _, _, _, _, _, _, _, _) = phase3_assembly();
+        document
+            .block_by_name_mut("Assembly")
+            .unwrap()
+            .dynamic
+            .as_mut()
+            .unwrap()
+            .nested_inputs[0]
+            .mapping = NestedMapping::NumericScale { factor: f64::MAX };
+        let mut cache = EvaluationCache::default();
+        let error = evaluate_definition(
+            &document,
+            document.block_by_name("Assembly").unwrap(),
+            None,
+            &mut cache,
+            EvaluationRequest {
+                generation: document.content_generation(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, DynamicError::NonFinite { .. }));
+        assert_eq!(cache.len(), 0);
     }
 
     #[test]

@@ -8,7 +8,7 @@ use std::thread;
 use std::time::Instant;
 
 use cad_core::{
-    apply_definition_preview, create_block_from_entities, document_has_dynamic_content,
+    apply_definition_preview_at_path, create_block_from_entities, document_has_dynamic_content,
     duplicate_block_definition, export_materialized, identity_insert, insert_instance_ids,
     insert_instance_ids_in_space, make_unique_block, materialize_evaluated,
     materialize_evaluated_with, membership_matrix, purge_unused_user_blocks, reference_radius,
@@ -359,6 +359,8 @@ enum IoMsg {
         kind: IoKind,
         path: PathBuf,
         report: SaveReport,
+        source: std::sync::Weak<Document>,
+        generation: u64,
     },
     Failure {
         message: String,
@@ -488,6 +490,7 @@ pub struct MyCadApp {
     gpu_upload: GpuUpload,
     load_rx: Option<Receiver<LoadMsg>>,
     io_rx: Option<Receiver<IoMsg>>,
+    io_ready: Option<IoMsg>,
     io_kind: Option<IoKind>,
     pub(crate) loading_path: Option<PathBuf>,
     pub(crate) error: Option<String>,
@@ -626,6 +629,7 @@ impl MyCadApp {
             gpu_upload: GpuUpload::Full,
             load_rx: None,
             io_rx: None,
+            io_ready: None,
             io_kind: None,
             loading_path: None,
             error: None,
@@ -1642,6 +1646,12 @@ impl MyCadApp {
         self.dynamic_input.set_layout(DynamicLayout::Hidden);
         self.context_menu = None;
         self.drafting.clear_acquisition();
+        if !self.history.can_undo()
+            || (self.block_edit.is_active()
+                && self.history.undo_len() <= self.block_edit.undo_mark())
+        {
+            return;
+        }
         let (undone, rename_only, rename_edits, transaction) = {
             let Some(document) = self.document.as_mut().map(Arc::make_mut) else {
                 return;
@@ -1683,6 +1693,9 @@ impl MyCadApp {
         self.dynamic_input.set_layout(DynamicLayout::Hidden);
         self.context_menu = None;
         self.drafting.clear_acquisition();
+        if !self.history.can_redo() {
+            return;
+        }
         let (redone, rename_only, rename_edits, transaction) = {
             let Some(document) = self.document.as_mut().map(Arc::make_mut) else {
                 return;
@@ -1741,12 +1754,12 @@ impl MyCadApp {
     }
 
     pub(crate) fn io_busy(&self) -> bool {
-        self.io_rx.is_some()
+        self.io_rx.is_some() || self.io_ready.is_some()
     }
 
     fn is_busy(&self) -> bool {
         self.load_rx.is_some()
-            || self.io_rx.is_some()
+            || self.io_busy()
             || self.preview_rx.is_some()
             || self.view_rx.is_some()
             || self.view_pending
@@ -1784,34 +1797,14 @@ impl MyCadApp {
     #[cfg(test)]
     pub(crate) fn wait_for_io(&mut self) {
         let start = Instant::now();
+        let context = egui::Context::default();
         while self.io_busy() {
             if start.elapsed() > std::time::Duration::from_secs(10) {
                 panic!("io job timed out: {}", self.status);
             }
-            match self.io_rx.as_ref().map(|rx| rx.try_recv()) {
-                Some(Ok(IoMsg::Success { kind, path, report })) => {
-                    self.io_rx = None;
-                    self.io_kind = None;
-                    if kind.is_save() {
-                        self.finish_cad_save(&path, report);
-                    } else {
-                        self.error = None;
-                        self.status = format_pdf_export_status(&path, &report);
-                    }
-                }
-                Some(Ok(IoMsg::Failure { message, .. })) => {
-                    self.io_rx = None;
-                    self.io_kind = None;
-                    self.status = message;
-                }
-                Some(Err(TryRecvError::Disconnected)) => {
-                    self.io_rx = None;
-                    self.io_kind = None;
-                    panic!("io thread ended unexpectedly");
-                }
-                Some(Err(TryRecvError::Empty)) | None => {
-                    thread::sleep(std::time::Duration::from_millis(2));
-                }
+            self.poll_io(&context);
+            if self.io_busy() {
+                thread::sleep(std::time::Duration::from_millis(2));
             }
         }
     }
@@ -1830,6 +1823,10 @@ impl MyCadApp {
             self.status = "No drawing is open".into();
             return false;
         };
+        // The freshness token must not retain the snapshot after the worker
+        // releases it, otherwise merely marking a save clean could clone it.
+        let source = Arc::downgrade(&snapshot);
+        let generation = snapshot.content_generation();
         let (tx, rx) = mpsc::channel();
         self.io_rx = Some(rx);
         self.io_kind = Some(kind);
@@ -1892,6 +1889,8 @@ impl MyCadApp {
                         kind,
                         path: dest,
                         report,
+                        source,
+                        generation,
                     },
                     Ok(Err(message)) => IoMsg::Failure { message },
                     Err(_) => IoMsg::Failure {
@@ -1910,15 +1909,61 @@ impl MyCadApp {
     }
 
     fn poll_io(&mut self, ctx: &egui::Context) {
-        let Some(rx) = self.io_rx.as_ref() else {
+        let reply = if let Some(message) = self.io_ready.take() {
+            Ok(message)
+        } else if let Some(rx) = self.io_rx.as_ref() {
+            rx.try_recv()
+        } else {
             return;
         };
-        match rx.try_recv() {
-            Ok(IoMsg::Success { kind, path, report }) => {
+        match reply {
+            Ok(IoMsg::Success {
+                kind,
+                path,
+                report,
+                source,
+                generation,
+            }) => {
                 self.io_rx = None;
+                let current = self.document.as_ref().is_some_and(|document| {
+                    source.ptr_eq(&Arc::downgrade(document))
+                        && generation == document.content_generation()
+                });
+                if kind.is_save()
+                    && current
+                    && self
+                        .document
+                        .as_ref()
+                        .is_some_and(|document| Arc::strong_count(document) > 1)
+                {
+                    // A preview may still own the same snapshot. Keep the
+                    // completion until its reader releases it, rather than
+                    // cloning the drawing on the UI thread to mark it saved.
+                    self.io_ready = Some(IoMsg::Success {
+                        kind,
+                        path,
+                        report,
+                        source,
+                        generation,
+                    });
+                    ctx.request_repaint_after(std::time::Duration::from_millis(16));
+                    return;
+                }
                 self.io_kind = None;
+                drop(source);
                 ctx.request_repaint();
                 if kind.is_save() {
+                    if !current {
+                        // Saving an older snapshot must never mark newer edits
+                        // (or a replacement drawing) clean or close them.
+                        self.status = format!("Saved an earlier snapshot to {}. The current drawing has not been marked saved.", path.display());
+                        if !report.warnings.is_empty() {
+                            self.status
+                                .push_str(&format!(" {}", report.warnings.join("; ")));
+                        }
+                        self.remember_recent(&path);
+                        return;
+                    }
                     let complete = self.finish_cad_save(&path, report);
                     if complete && self.pending_discard.is_some() {
                         self.continue_pending_discard(ctx);
@@ -1950,6 +1995,12 @@ impl MyCadApp {
         self.rebuild_block_tree_if_stale();
         let mut cache = std::mem::take(&mut self.eval_cache);
         let tess_view = self.block_edit.tess_view();
+        let preview_path: Vec<_> = self
+            .block_edit
+            .stack
+            .iter()
+            .map(|frame| frame.instance_id)
+            .collect();
         let reuse_geometry = self.can_reuse_static_geometry();
         if self.document.is_none() {
             self.eval_cache = cache;
@@ -1994,13 +2045,14 @@ impl MyCadApp {
                         let mut apply_display = true;
                         if let Some(authoring) = authoring.as_ref() {
                             if let Some(test) = authoring.test_config(document) {
-                                if let Err(err) = apply_definition_preview(
+                                if let Err(err) = apply_definition_preview_at_path(
                                     document,
                                     &mut evaluated,
                                     &authoring.block_name,
                                     &test,
                                     &mut cache,
                                     request,
+                                    &preview_path,
                                 ) {
                                     status = Some(err.to_string());
                                     apply_display = !self.last_eval_ok;
@@ -2008,7 +2060,8 @@ impl MyCadApp {
                             }
                         }
                         if apply_display {
-                            document.diagnostics.extents = evaluated.compute_extents();
+                            evaluated.recompute_cached_extents();
+                            document.diagnostics.extents = evaluated.diagnostics.extents;
                             self.display =
                                 Arc::new(tessellate_live(&evaluated, tess_view.as_ref(), mask));
                             let mut snaps = SnapIndex::build(&evaluated);
@@ -2238,10 +2291,14 @@ impl MyCadApp {
     }
 
     fn spawn_view_tessellation(&mut self) {
-        if self
-            .document
-            .as_ref()
-            .is_some_and(|document| Arc::strong_count(document) == 1)
+        // Even after the IO worker releases its Arc, a queued save reply
+        // still owns a Weak freshness token. Do not detach it for cache-only
+        // changes before poll_io has accepted the completed save.
+        if !self.io_busy()
+            && self
+                .document
+                .as_ref()
+                .is_some_and(|document| Arc::strong_count(document) == 1)
         {
             if let Some(document) = self.document.as_mut().map(Arc::make_mut) {
                 document.ensure_cached_extents();
@@ -2822,12 +2879,6 @@ impl MyCadApp {
                     drop(document);
                     let dynamic = source.as_ref().is_some_and(document_has_dynamic_content);
                     let keep_source = dynamic || authoring.is_some();
-                    if let Some(source) = source.as_mut() {
-                        source.recompute_cached_extents();
-                    }
-                    let cached_extents = source
-                        .as_ref()
-                        .and_then(|source| source.diagnostics.extents);
                     let request = EvaluationRequest {
                         generation: document_generation,
                     };
@@ -2852,13 +2903,14 @@ impl MyCadApp {
                             if let Some(authoring) = authoring.as_ref() {
                                 let source = source.as_ref().expect("authoring keeps the source");
                                 if let Some(test) = authoring.test_config(source) {
-                                    if let Err(err) = apply_definition_preview(
+                                    if let Err(err) = apply_definition_preview_at_path(
                                         source,
                                         &mut evaluated,
                                         &authoring.block_name,
                                         &test,
                                         &mut cache,
                                         request,
+                                        &view_frames,
                                     ) {
                                         let _ = tx.send(PreviewMsg::Failed {
                                             document_generation,
@@ -2871,6 +2923,11 @@ impl MyCadApp {
                                     }
                                 }
                             }
+                            // Bounds must describe this evaluated configuration.
+                            // Compute them once, before tessellation uses them to
+                            // choose a stable drawing origin.
+                            evaluated.recompute_cached_extents();
+                            let extents = evaluated.diagnostics.extents;
                             let display = tessellate_live(&evaluated, tess_view.as_ref(), mask);
                             let mut snaps = SnapIndex::build(&evaluated);
                             let mut measures = MeasureIndex::build(&evaluated);
@@ -2881,11 +2938,6 @@ impl MyCadApp {
                                         measures.into_block_edit(&evaluated, id, world_from_local);
                                 }
                             }
-                            let extents = if keep_source {
-                                evaluated.compute_extents()
-                            } else {
-                                cached_extents
-                            };
                             let _ = tx.send(PreviewMsg::Ready {
                                 document_generation,
                                 session_generation,
@@ -2988,10 +3040,14 @@ impl MyCadApp {
                             extents,
                             ..
                         } => {
-                            if self
-                                .document
-                                .as_ref()
-                                .is_some_and(|document| Arc::strong_count(document) == 1)
+                            // A metadata-only refresh must not detach the
+                            // Weak token of a save that just finished in this
+                            // frame, before its reply reaches poll_io.
+                            if !self.io_busy()
+                                && self
+                                    .document
+                                    .as_ref()
+                                    .is_some_and(|document| Arc::strong_count(document) == 1)
                             {
                                 if let Some(document) = self.document.as_mut().map(Arc::make_mut) {
                                     document.diagnostics.extents = extents;
@@ -5418,7 +5474,8 @@ impl MyCadApp {
             .and_then(|document| document.diagnostics.extents)
             .filter(|extents| extents.is_valid());
         if let Some(extents) = extents {
-            self.camera.zoom_extents(extents, width.max(1.0), height.max(1.0));
+            self.camera
+                .zoom_extents(extents, width.max(1.0), height.max(1.0));
         }
     }
 
@@ -5430,7 +5487,8 @@ impl MyCadApp {
             }
         }
         if extents.is_valid() {
-            self.camera.zoom_extents(extents, width.max(1.0), height.max(1.0));
+            self.camera
+                .zoom_extents(extents, width.max(1.0), height.max(1.0));
             self.status = "Zoomed to selection".into();
         } else {
             self.status = "Select visible geometry to zoom to".into();
@@ -6503,7 +6561,10 @@ impl eframe::App for MyCadApp {
                         self.zoom_extents(size.width() as f64, size.height() as f64);
                     }
                     if ui
-                        .add_enabled(!self.selection.is_empty(), egui::Button::new("Zoom Selection    ZS"))
+                        .add_enabled(
+                            !self.selection.is_empty(),
+                            egui::Button::new("Zoom Selection    ZS"),
+                        )
                         .clicked()
                     {
                         ui.close();
@@ -7570,7 +7631,9 @@ fn sync_companion(
         // Keep the older helper intact, but supersede it so removing dynamic
         // behavior cannot accidentally restore old controls on the next open.
         if let Err(err) = write_companion(&path, dest, source, source, &[], &[]) {
-            report.warnings.push(format!("companion file was not written: {err}"));
+            report
+                .warnings
+                .push(format!("companion file was not written: {err}"));
         }
     } else if let Err(err) = remove_drawing_companion(dest) {
         report
@@ -8006,7 +8069,14 @@ mod save_as_tests {
 
     #[test]
     fn static_save_supersedes_legacy_helper_without_deleting_it() {
-        let directory = std::env::temp_dir().join(format!("mycad-static-companion-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let directory = std::env::temp_dir().join(format!(
+            "mycad-static-companion-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         std::fs::create_dir(&directory).unwrap();
         let drawing = directory.join("Plant.dxf");
         std::fs::write(&drawing, b"saved static drawing").unwrap();
@@ -8023,8 +8093,14 @@ mod save_as_tests {
 
     #[test]
     fn companion_open_path_uses_the_drawing() {
-        assert_eq!(resolve_open_path(PathBuf::from(".Plant.dwg.mycad")), PathBuf::from("Plant.dwg"));
-        assert_eq!(resolve_open_path(PathBuf::from("..Plant.dxf.mycad")), PathBuf::from(".Plant.dxf"));
+        assert_eq!(
+            resolve_open_path(PathBuf::from(".Plant.dwg.mycad")),
+            PathBuf::from("Plant.dwg")
+        );
+        assert_eq!(
+            resolve_open_path(PathBuf::from("..Plant.dxf.mycad")),
+            PathBuf::from(".Plant.dxf")
+        );
         assert_eq!(
             resolve_open_path(PathBuf::from("Plant.dwg.mycad")),
             PathBuf::from("Plant.dwg")
@@ -8281,7 +8357,8 @@ mod navigation_command_tests {
     fn zoom_extents_preserves_shared_document_and_last_drawing_command() {
         let mut document = Document::default();
         document.diagnostics.extents = Some(Extents2::from_corners(
-            Point2::new(20.0, 30.0), Point2::new(120.0, 90.0),
+            Point2::new(20.0, 30.0),
+            Point2::new(120.0, 90.0),
         ));
         let document = Arc::new(document);
         let mut app = MyCadApp::for_test();
@@ -8299,14 +8376,18 @@ mod navigation_command_tests {
     fn zoom_selection_fits_transformed_block_without_unselected_geometry() {
         let mut document = Document::default();
         document.replace_block_definition(cad_core::BlockDefinition::plain(
-            "Widget", Point3::default(),
+            "Widget",
+            Point3::default(),
             vec![Entity::new(Geometry::Line {
                 start: Point3::from_xy(0.0, 0.0),
                 end: Point3::from_xy(10.0, 0.0),
             })],
         ));
         let mut insert = identity_insert("Widget".into(), Point3::from_xy(100.0, 200.0));
-        if let Geometry::Insert { scale, rotation, .. } = &mut insert {
+        if let Geometry::Insert {
+            scale, rotation, ..
+        } = &mut insert
+        {
             *scale = Point3::new(2.0, 2.0, 1.0);
             *rotation = std::f64::consts::FRAC_PI_2;
         }
@@ -8583,6 +8664,231 @@ mod interaction_tests {
         app.redo();
         assert_eq!(model_count(&app), 4);
         assert_eq!(app.full_refresh_count, 0, "redo must patch");
+    }
+
+    #[test]
+    fn empty_undo_and_redo_do_not_clone_a_shared_document() {
+        let mut app = MyCadApp::for_test();
+        let snapshot = Arc::new(Document::default());
+        app.document = Some(Arc::clone(&snapshot));
+        let generation = snapshot.content_generation();
+        app.undo();
+        assert!(Arc::ptr_eq(app.document.as_ref().unwrap(), &snapshot));
+        app.redo();
+        assert!(Arc::ptr_eq(app.document.as_ref().unwrap(), &snapshot));
+        assert_eq!(
+            app.document.as_ref().unwrap().content_generation(),
+            generation
+        );
+        assert!(!app.history.is_dirty());
+    }
+
+    #[test]
+    fn preview_tessellation_origin_uses_the_evaluated_configuration_bounds() {
+        use cad_core::{
+            BehaviorKind, BlockDefinition, CompositionRule, DynamicBehavior, DynamicDefinition,
+            FollowRole, GeometryTarget, NumericParameter, ParameterDef, ParameterValue,
+        };
+        let mut document = Document::default();
+        let parameter = document.allocate_parameter_id();
+        let mut entity = document.new_entity(Geometry::Line {
+            start: Point3::from_xy(0.0, 0.0),
+            end: Point3::from_xy(10.0, 0.0),
+        });
+        entity.id = document.allocate_id();
+        let target = entity.id;
+        let mut block = BlockDefinition::plain("Shift", Point3::default(), vec![entity]);
+        block.dynamic = Some(DynamicDefinition {
+            parameters: vec![ParameterDef::number(
+                parameter,
+                "Offset",
+                NumericParameter::length(0.0),
+            )],
+            behaviors: vec![DynamicBehavior {
+                id: document.allocate_action_id(),
+                kind: BehaviorKind::Move,
+                parameter,
+                targets: vec![GeometryTarget::Entity(target)],
+                local_direction: Point2::new(1.0, 0.0),
+                reference_value: 0.0,
+                multiplier: 1.0,
+                composition: CompositionRule::Additive,
+                follow: FollowRole::Second,
+                name: None,
+            }],
+            ..Default::default()
+        });
+        document.replace_block_definition(block);
+        let mut insert = identity_insert("Shift".into(), Point3::default());
+        let mut configuration = InstanceConfiguration::default();
+        configuration.set(parameter, ParameterValue::Number(10_000.0));
+        insert.set_insert_configuration(Some(configuration));
+        document.add_entity(Entity::new(insert));
+        document.recompute_cached_extents();
+        assert_eq!(document.diagnostics.extents.unwrap().center().x, 5.0);
+        let mut app = MyCadApp::for_test();
+        app.document = Some(Arc::new(document));
+        app.spawn_preview();
+        let message = app
+            .preview_rx
+            .take()
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let (display, extents) = match message {
+            PreviewMsg::Ready {
+                display, extents, ..
+            } => (display, extents),
+            PreviewMsg::Failed { message, .. } => panic!("preview failed: {message}"),
+        };
+        assert_eq!(extents.unwrap().center().x, 10_005.0);
+        assert_eq!(
+            display.origin.x, 10_005.0,
+            "renderer must not use the raw block bounds"
+        );
+    }
+
+    #[test]
+    fn authoring_rotation_test_updates_picture_snaps_and_measurements_only_for_the_edited_insert() {
+        use cad_core::{
+            BlockDefinition, DynamicDefinition, NumericParameter, NumericQuantity, ParameterDef,
+            ParameterUnit, ParameterValue, RotationBehavior, RotationSource,
+        };
+        fn assert_picture(
+            display: &DisplayList,
+            snaps: &SnapIndex,
+            measures: &MeasureIndex,
+            member: EntityId,
+            edited: EntityId,
+            other: EntityId,
+        ) {
+            assert!(display.origin.distance(Point2::new(55.0, 5.0)) < 1e-6);
+            let selected = display.pick_for(member).expect("edited member is visible");
+            assert!(selected.bounds.min.x.abs() < 1e-6);
+            assert!(selected.bounds.max.x.abs() < 1e-6);
+            assert!((selected.bounds.max.y - 10.0).abs() < 1e-6);
+            let context = display
+                .pick_for(other)
+                .expect("other occurrence is visible");
+            assert!((context.bounds.min.x - 100.0).abs() < 1e-6);
+            assert!((context.bounds.max.x - 110.0).abs() < 1e-6);
+            assert!(context.bounds.max.y.abs() < 1e-6);
+            let mut candidates = Vec::new();
+            snaps.query(
+                Extents2::from_corners(Point2::new(-0.01, 9.99), Point2::new(0.01, 10.01)),
+                &mut candidates,
+            );
+            assert!(candidates
+                .iter()
+                .any(|feature| feature.point.distance(Point2::new(0.0, 10.0)) < 1e-6));
+            snaps.query(
+                Extents2::from_corners(Point2::new(9.99, -0.01), Point2::new(10.01, 0.01)),
+                &mut candidates,
+            );
+            assert!(
+                candidates.is_empty(),
+                "old unrotated endpoint must not remain snappable"
+            );
+            let selected: Vec<_> = measures.primitives_for_owner(edited).collect();
+            assert_eq!(selected.len(), 1);
+            let cad_core::MeasureGeom::Straight { start, end } = selected[0].geom else {
+                panic!("line")
+            };
+            assert!(start.distance(Point2::new(0.0, 0.0)) < 1e-6);
+            assert!(end.distance(Point2::new(0.0, 10.0)) < 1e-6);
+            let context: Vec<_> = measures.primitives_for_owner(other).collect();
+            assert_eq!(context.len(), 1);
+            let cad_core::MeasureGeom::Straight { start, end } = context[0].geom else {
+                panic!("line")
+            };
+            assert!(start.distance(Point2::new(100.0, 0.0)) < 1e-6);
+            assert!(end.distance(Point2::new(110.0, 0.0)) < 1e-6);
+        }
+        for worker in [false, true] {
+            let mut document = Document::default();
+            let angle = document.allocate_parameter_id();
+            let rotation = document.allocate_action_id();
+            let mut numeric = NumericParameter::length(0.0);
+            numeric.quantity = NumericQuantity::Angle;
+            numeric.unit = ParameterUnit::Degrees;
+            let mut line = Entity::new(Geometry::Line {
+                start: Point3::default(),
+                end: Point3::from_xy(10.0, 0.0),
+            });
+            line.id = document.allocate_id();
+            let member = line.id;
+            let mut block = BlockDefinition::plain("Swing", Point3::default(), vec![line]);
+            block.dynamic = Some(DynamicDefinition {
+                parameters: vec![ParameterDef::number(angle, "Angle", numeric)],
+                rotations: vec![RotationBehavior {
+                    id: rotation,
+                    name: None,
+                    members: vec![member],
+                    pivot: Point2::new(0.0, 0.0),
+                    source: RotationSource::AngleParameter(angle),
+                }],
+                transform_order: vec![rotation],
+                ..Default::default()
+            });
+            document.replace_block_definition(block);
+            let edited = document
+                .add_entity(Entity::new(identity_insert(
+                    "Swing".into(),
+                    Point3::default(),
+                )))
+                .id;
+            let other = document
+                .add_entity(Entity::new(identity_insert(
+                    "Swing".into(),
+                    Point3::from_xy(100.0, 0.0),
+                )))
+                .id;
+            let original_block = document.block_by_name("Swing").unwrap().clone();
+            let original_model = document.model_space.clone();
+            let mut app = MyCadApp::for_test();
+            app.block_edit
+                .enter(&document, &app.history, edited)
+                .unwrap();
+            let mut authoring = AuthoringState::new("Swing".into(), edited, false, None);
+            authoring.enter_test(&document);
+            authoring
+                .test_values
+                .insert(angle, ParameterValue::Number(90.0));
+            app.dynamic_authoring = Some(authoring);
+            app.document = Some(Arc::new(document));
+            if worker {
+                app.spawn_preview();
+                let message = app
+                    .preview_rx
+                    .take()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap();
+                match message {
+                    PreviewMsg::Ready {
+                        display,
+                        snaps,
+                        measures,
+                        ..
+                    } => assert_picture(&display, &snaps, &measures, member, edited, other),
+                    PreviewMsg::Failed { message, .. } => panic!("{message}"),
+                }
+            } else {
+                app.refresh_derived();
+                assert_picture(
+                    &app.display,
+                    &app.snaps,
+                    &app.measures,
+                    member,
+                    edited,
+                    other,
+                );
+            }
+            let source = app.document.as_ref().unwrap();
+            assert_eq!(source.block_by_name("Swing").unwrap(), &original_block);
+            assert_eq!(source.model_space, original_model);
+            assert!(!app.history.is_dirty(), "Test must not edit the drawing");
+        }
     }
 
     #[test]
@@ -9357,6 +9663,236 @@ mod io_job_tests {
         assert!(path.is_file(), "expected {}", path.display());
         assert!(app.status.starts_with("Saved "));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn editing_during_save_keeps_newer_content_dirty_and_pending_discard() {
+        let mut app = MyCadApp::for_test();
+        app.ensure_document()
+            .unwrap()
+            .add_entity(Entity::new(Geometry::Line {
+                start: Point3::from_xy(0.0, 0.0),
+                end: Point3::from_xy(10.0, 0.0),
+            }));
+        let path = std::env::temp_dir().join(format!(
+            "mycad-save-edit-{}-{}.dxf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        assert!(app.write_dxf_to(&path));
+        let entity = app
+            .ensure_document()
+            .unwrap()
+            .add_entity(Entity::new(Geometry::Point {
+                position: Point3::from_xy(20.0, 5.0),
+            }));
+        app.history.record(Edit::InsertEntity {
+            space: EntitySpace::ModelSpace,
+            index: 1,
+            entity,
+        });
+        app.pending_discard = Some(PendingDiscard::NewDrawing);
+        app.wait_for_io();
+
+        let saved = dwg_import::import_dxf(&path).unwrap();
+        assert_eq!(
+            saved.model_space.len(),
+            1,
+            "only the captured snapshot was saved"
+        );
+        let current = app.document.as_ref().unwrap();
+        assert_eq!(current.model_space.len(), 2);
+        assert!(current.source_path.is_none());
+        assert!(app.is_dirty());
+        assert_eq!(app.history.undo_len(), 1);
+        assert!(matches!(
+            app.pending_discard,
+            Some(PendingDiscard::NewDrawing)
+        ));
+        assert!(app.status.contains("earlier snapshot"), "{}", app.status);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn save_completion_cannot_mark_a_replacement_document_clean() {
+        let mut app = MyCadApp::for_test();
+        let original = Arc::new(Document::default());
+        let source = Arc::downgrade(&original);
+        let generation = original.content_generation();
+        let mut replacement = Document::default();
+        replacement.source_path = Some(PathBuf::from("replacement.dwg"));
+        assert_eq!(replacement.content_generation(), generation);
+        app.document = Some(Arc::new(replacement));
+        app.history.mark_dirty();
+        app.pending_discard = Some(PendingDiscard::NewDrawing);
+        let (sender, receiver) = mpsc::channel();
+        app.io_rx = Some(receiver);
+        sender
+            .send(IoMsg::Success {
+                kind: IoKind::SavingDxf,
+                path: PathBuf::from("original-copy.dxf"),
+                report: SaveReport::default(),
+                source,
+                generation,
+            })
+            .unwrap();
+        drop(original);
+        app.poll_io(&egui::Context::default());
+
+        assert!(app.is_dirty());
+        assert_eq!(
+            app.document.as_ref().unwrap().source_path.as_deref(),
+            Some(Path::new("replacement.dwg"))
+        );
+        assert!(matches!(
+            app.pending_discard,
+            Some(PendingDiscard::NewDrawing)
+        ));
+        assert!(!app.source_written_by_mycad);
+        assert!(!app.io_busy());
+    }
+
+    #[test]
+    fn preview_metadata_after_worker_release_does_not_invalidate_a_save() {
+        let mut app = MyCadApp::for_test();
+        app.document = Some(Arc::new(Document::default()));
+        app.history.mark_dirty();
+        let pointer = Arc::as_ptr(app.document.as_ref().unwrap());
+        let generation = app.document.as_ref().unwrap().content_generation();
+        let source = Arc::downgrade(app.document.as_ref().unwrap());
+        let (io_sender, io_receiver) = mpsc::channel();
+        app.io_rx = Some(io_receiver);
+        app.io_kind = Some(IoKind::SavingDxf);
+        let context = egui::Context::default();
+        // Reproduce a worker completing after this frame has already checked IO.
+        app.poll_io(&context);
+        io_sender
+            .send(IoMsg::Success {
+                kind: IoKind::SavingDxf,
+                path: PathBuf::from("preview-completed.dxf"),
+                report: SaveReport::default(),
+                source,
+                generation,
+            })
+            .unwrap();
+        assert_eq!(Arc::strong_count(app.document.as_ref().unwrap()), 1);
+        let extents = Some(Extents2::from_corners(
+            Point2::new(10.0, 0.0),
+            Point2::new(20.0, 5.0),
+        ));
+        let (sender, receiver) = mpsc::channel();
+        app.preview_rx = Some(receiver);
+        sender
+            .send(PreviewMsg::Ready {
+                document_generation: generation,
+                session_generation: 0,
+                preview_generation: 0,
+                view_frames: Vec::new(),
+                display: Box::new(DisplayList::default()),
+                snaps: Box::new(SnapIndex::default()),
+                measures: Box::new(MeasureIndex::default()),
+                extents,
+            })
+            .unwrap();
+        app.poll_preview(&context);
+        assert_eq!(Arc::as_ptr(app.document.as_ref().unwrap()), pointer);
+        assert!(app.is_dirty());
+        app.poll_io(&context);
+        assert!(!app.io_busy());
+        assert!(!app.is_dirty(), "{}", app.status);
+        assert!(app.status.starts_with("Saved "), "{}", app.status);
+        assert_eq!(
+            app.document.as_ref().unwrap().source_path.as_deref(),
+            Some(Path::new("preview-completed.dxf"))
+        );
+    }
+
+    #[test]
+    fn view_cache_refresh_after_worker_release_does_not_invalidate_a_save() {
+        let mut document = Document::default();
+        document.add_entity(Entity::new(Geometry::Line {
+            start: Point3::from_xy(0.0, 0.0),
+            end: Point3::from_xy(10.0, 0.0),
+        }));
+        document.mark_extents_stale();
+        let mut app = MyCadApp::for_test();
+        app.document = Some(Arc::new(document));
+        app.history.mark_dirty();
+        let pointer = Arc::as_ptr(app.document.as_ref().unwrap());
+        let source = Arc::downgrade(app.document.as_ref().unwrap());
+        let generation = app.document.as_ref().unwrap().content_generation();
+        let (sender, receiver) = mpsc::channel();
+        app.io_rx = Some(receiver);
+        app.io_kind = Some(IoKind::SavingDxf);
+        sender
+            .send(IoMsg::Success {
+                kind: IoKind::SavingDxf,
+                path: PathBuf::from("view-completed.dxf"),
+                report: SaveReport::default(),
+                source,
+                generation,
+            })
+            .unwrap();
+        app.spawn_view_tessellation();
+        assert_eq!(Arc::as_ptr(app.document.as_ref().unwrap()), pointer);
+        let message = app
+            .view_rx
+            .take()
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        app.apply_ready_view(message);
+        app.poll_io(&egui::Context::default());
+        assert!(!app.io_busy());
+        assert!(!app.is_dirty(), "{}", app.status);
+        assert!(app.status.starts_with("Saved "), "{}", app.status);
+    }
+
+    #[test]
+    fn save_completion_waits_for_other_readers_without_cloning_the_drawing() {
+        let mut app = MyCadApp::for_test();
+        app.document = Some(Arc::new(Document::default()));
+        app.history.mark_dirty();
+        let reader = Arc::clone(app.document.as_ref().unwrap());
+        let pointer = Arc::as_ptr(&reader);
+        let (sender, receiver) = mpsc::channel();
+        app.io_rx = Some(receiver);
+        app.io_kind = Some(IoKind::SavingDxf);
+        sender
+            .send(IoMsg::Success {
+                kind: IoKind::SavingDxf,
+                path: PathBuf::from("completed.dxf"),
+                report: SaveReport::default(),
+                source: Arc::downgrade(&reader),
+                generation: reader.content_generation(),
+            })
+            .unwrap();
+        let context = egui::Context::default();
+        app.poll_io(&context);
+        assert!(app.io_busy());
+        assert!(app.io_ready.is_some());
+        assert!(app.is_dirty());
+        assert_eq!(Arc::as_ptr(app.document.as_ref().unwrap()), pointer);
+        assert_eq!(
+            Arc::strong_count(&reader),
+            2,
+            "the pending token must be weak"
+        );
+        assert!(!app.start_io_job(IoKind::SavingDxf, PathBuf::from("other.dxf"), None));
+
+        drop(reader);
+        app.poll_io(&context);
+        assert!(!app.io_busy());
+        assert!(!app.is_dirty());
+        assert_eq!(Arc::as_ptr(app.document.as_ref().unwrap()), pointer);
+        assert_eq!(
+            app.document.as_ref().unwrap().source_path.as_deref(),
+            Some(Path::new("completed.dxf"))
+        );
     }
 
     #[test]

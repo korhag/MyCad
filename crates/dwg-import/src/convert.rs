@@ -913,73 +913,194 @@ fn object_handle(obj: *mut libredwg_sys::Dwg_Object) -> u64 {
     unsafe { (*handle).value }
 }
 
+// These single-step functions are exported by the vendored library but omitted
+// from its bindgen allowlist. Unlike the owned iterators, neither hides an
+// unbounded linked-subentity walk or indexes an unvalidated ownership array.
+extern "C" {
+    fn dwg_next_object(object: *const libredwg_sys::Dwg_Object) -> *mut libredwg_sys::Dwg_Object;
+    fn dwg_resolve_jump(object: *const libredwg_sys::Dwg_Object) -> *mut libredwg_sys::Dwg_Object;
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ChainFailure {
+    Cycle,
+    ObjectLimit,
+}
+
+fn bounded_chain<T: Copy + Eq + std::hash::Hash>(
+    first: Option<T>,
+    limit: usize,
+    mut next: impl FnMut(T) -> Option<T>,
+) -> (Vec<T>, Option<ChainFailure>) {
+    let mut objects = Vec::new();
+    let mut seen = HashSet::new();
+    let mut current = first;
+    while let Some(object) = current {
+        if seen.contains(&object) {
+            return (objects, Some(ChainFailure::Cycle));
+        }
+        if objects.len() >= limit {
+            return (objects, Some(ChainFailure::ObjectLimit));
+        }
+        seen.insert(object);
+        objects.push(object);
+        current = next(object);
+    }
+    (objects, None)
+}
+
+fn report_chain_failure(
+    failure: Option<ChainFailure>,
+    kind: &str,
+    diagnostics: &mut ImportDiagnostics,
+) {
+    if let Some(failure) = failure {
+        let reason = match failure {
+            ChainFailure::Cycle => "contains a cycle",
+            ChainFailure::ObjectLimit => "exceeds the drawing object count",
+        };
+        diagnostics.note_lossy(format!(
+            "{kind} ownership chain {reason}; only unique reachable objects were imported"
+        ));
+    }
+}
+
+fn native_version(dwg: *mut libredwg_sys::Dwg_Data) -> i32 {
+    // Dwg_Data begins with Dwg_Header.version (the same stable prefix used by
+    // export::set_header_version). It is not a HEADER-variable dynapi field.
+    unsafe { dwg.cast::<i32>().read() }
+}
+
+fn reference_object(
+    dwg: *mut libredwg_sys::Dwg_Data,
+    reference: *mut libredwg_sys::Dwg_Object_Ref,
+) -> *mut libredwg_sys::Dwg_Object {
+    if reference.is_null() {
+        std::ptr::null_mut()
+    } else {
+        unsafe { libredwg_sys::dwg_ref_object(dwg, reference) }
+    }
+}
+
+fn resolve_owned_endpoint(
+    dwg: *mut libredwg_sys::Dwg_Data,
+    payload: *mut c_void,
+    kind: &str,
+    field: &str,
+    diagnostics: &mut ImportDiagnostics,
+) -> *mut libredwg_sys::Dwg_Object {
+    let reference = get_field::<*mut libredwg_sys::Dwg_Object_Ref>(payload, kind, field)
+        .unwrap_or(std::ptr::null_mut());
+    let object = reference_object(dwg, reference);
+    if !reference.is_null() && object.is_null() {
+        let declared = unsafe { &*reference };
+        // Empty blocks have zero-valued absolute handles. Relative +1/-1
+        // handles still name an object even though their stored value is zero.
+        if declared.absolute_ref != 0
+            || declared.handleref.value != 0
+            || matches!(declared.handleref.code, 6 | 8)
+        {
+            diagnostics.note_lossy(format!("{kind} has an unresolved ownership endpoint"));
+        }
+    }
+    object
+}
+
+fn owned_reference_objects(
+    dwg: *mut libredwg_sys::Dwg_Data,
+    payload: *mut c_void,
+    kind: &str,
+    array: &str,
+    diagnostics: &mut ImportDiagnostics,
+) -> Option<Vec<*mut libredwg_sys::Dwg_Object>> {
+    let count = get_field::<u32>(payload, kind, "num_owned")? as usize;
+    if count == 0 {
+        return None;
+    }
+    let limit = unsafe { libredwg_sys::dwg_get_num_objects(dwg) } as usize;
+    if count > limit {
+        diagnostics.note_lossy(format!(
+            "{kind} ownership array exceeds the drawing object count; the array was skipped"
+        ));
+        return Some(Vec::new());
+    }
+    let references = get_field::<*const *mut libredwg_sys::Dwg_Object_Ref>(payload, kind, array)
+        .unwrap_or(std::ptr::null());
+    if references.is_null() {
+        diagnostics.note_lossy(format!(
+            "{kind} ownership array is missing; the array was skipped"
+        ));
+        return Some(Vec::new());
+    }
+    // LibreDWG owns the allocation; validate its declared count before reading.
+    let references = unsafe { std::slice::from_raw_parts(references, count) };
+    let mut objects = Vec::with_capacity(count);
+    let mut seen = HashSet::new();
+    for reference in references {
+        let object = reference_object(dwg, *reference);
+        if object.is_null() {
+            diagnostics.note_lossy(format!(
+                "{kind} ownership array contains an unresolved object"
+            ));
+        } else if seen.insert(object as usize) {
+            objects.push(object);
+        } else {
+            diagnostics.note_lossy(format!(
+                "{kind} ownership array repeats an object; repeated references were skipped"
+            ));
+        }
+    }
+    Some(objects)
+}
+
 unsafe fn owned_entities(
     dwg: *mut libredwg_sys::Dwg_Data,
     block_obj: *mut libredwg_sys::Dwg_Object,
     diagnostics: &mut ImportDiagnostics,
     r2004_colors: bool,
 ) -> OwnedGeometry {
-    // R2000 `get_next_owned_entity` skips ATTDEF. After a DXF read the owned
-    // vector still lists every definition, and it contains the iterator's
-    // entities. A DWG read is the other way around, so the vector is used only
-    // when it covers that iterator.
-    let version = get_header_field::<i32>(dwg, "version").unwrap_or(0);
-    if version <= LIBREDWG_R_2000 {
-        let from_iterator = iterator_entity_objects(block_obj);
-        let from_vector = block_header_entities(dwg, block_obj).unwrap_or_default();
-        let objects = r2000_owned_objects(from_iterator, from_vector);
-        return convert_owned_objects(dwg, &objects, diagnostics, r2004_colors);
-    }
-    let mut entities = Vec::new();
-    let mut handles = Vec::new();
-    let mut owned = unsafe { libredwg_sys::get_first_owned_entity(block_obj) };
-    while !owned.is_null() {
-        if let Some(entity) = unsafe { convert_one(dwg, owned, diagnostics, r2004_colors) } {
-            handles.push(object_handle(owned));
-            entities.push(entity);
-        }
-        owned = unsafe { libredwg_sys::get_next_owned_entity(block_obj, owned) };
-    }
-    OwnedGeometry { entities, handles }
+    let from_vector = block_header_entities(dwg, block_obj, diagnostics).unwrap_or_default();
+    // R13-R2000 DWG uses links; DXF may supply a more complete owned vector.
+    // Newer versions use the validated array directly, avoiding duplicate walks.
+    let objects = if (19..=LIBREDWG_R_2000).contains(&native_version(dwg)) {
+        let from_iterator = iterator_entity_objects(dwg, block_obj, diagnostics);
+        r2000_owned_objects(from_iterator, from_vector)
+    } else {
+        from_vector
+    };
+    convert_owned_objects(dwg, &objects, diagnostics, r2004_colors)
 }
 
 fn block_header_entities(
     dwg: *mut libredwg_sys::Dwg_Data,
     block_obj: *mut libredwg_sys::Dwg_Object,
+    diagnostics: &mut ImportDiagnostics,
 ) -> Option<Vec<*mut libredwg_sys::Dwg_Object>> {
     let header = unsafe { libredwg_sys::uncad_object_object_ptr(block_obj) };
-    if header.is_null() {
-        return None;
-    }
-    let count = get_field::<u32>(header, "BLOCK_HEADER", "num_owned")?;
-    if count == 0 {
-        return None;
-    }
-    let limit = unsafe { libredwg_sys::dwg_get_num_objects(dwg) } as u32;
-    if count > limit {
-        return None;
-    }
-    let handles =
-        get_field::<*const *mut libredwg_sys::Dwg_Object_Ref>(header, "BLOCK_HEADER", "entities")?;
-    if handles.is_null() {
-        return None;
-    }
-    let handles = unsafe { std::slice::from_raw_parts(handles, count as usize) };
-    let mut objects = Vec::with_capacity(handles.len());
-    for handle in handles {
-        if handle.is_null() {
-            continue;
-        }
-        let mut object = unsafe { (**handle).obj.cast::<libredwg_sys::Dwg_Object>() };
-        if object.is_null() {
-            object = unsafe { libredwg_sys::dwg_ref_object(dwg, *handle) };
-        }
-        if object.is_null() || is_linked_subentity(object_fixedtype(object)) {
-            continue;
-        }
-        objects.push(object);
-    }
-    Some(objects)
+    let objects = owned_reference_objects(dwg, header, "BLOCK_HEADER", "entities", diagnostics)?;
+    Some(
+        objects
+            .into_iter()
+            .filter_map(|mut object| {
+                if object_fixedtype(object) == libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_JUMP {
+                    // The native resolver dereferences the JUMP payload directly.
+                    // A partially decoded record may have no payload at all.
+                    if unsafe { libredwg_sys::uncad_object_entity_ptr(object) }.is_null() {
+                        diagnostics
+                            .note_lossy("BLOCK_HEADER contains a JUMP with a missing payload");
+                        return None;
+                    }
+                    object = unsafe { dwg_resolve_jump(object) };
+                    if object.is_null() {
+                        diagnostics.note_lossy("BLOCK_HEADER contains an unresolved JUMP");
+                        return None;
+                    }
+                }
+                (!object.is_null() && !is_linked_subentity(object_fixedtype(object)))
+                    .then_some(object)
+            })
+            .collect(),
+    )
 }
 
 fn is_linked_subentity(fixedtype: libredwg_sys::DWG_OBJECT_TYPE) -> bool {
@@ -995,16 +1116,42 @@ fn is_linked_subentity(fixedtype: libredwg_sys::DWG_OBJECT_TYPE) -> bool {
 }
 
 fn iterator_entity_objects(
+    dwg: *mut libredwg_sys::Dwg_Data,
     block_obj: *mut libredwg_sys::Dwg_Object,
+    diagnostics: &mut ImportDiagnostics,
 ) -> Vec<*mut libredwg_sys::Dwg_Object> {
-    let mut objects = Vec::new();
-    let mut seen = HashSet::new();
-    let mut owned = unsafe { libredwg_sys::get_first_owned_entity(block_obj) };
-    while !owned.is_null() && seen.insert(owned as usize) {
-        objects.push(owned);
-        owned = unsafe { libredwg_sys::get_next_owned_entity(block_obj, owned) };
+    let header = unsafe { libredwg_sys::uncad_object_object_ptr(block_obj) };
+    let first = resolve_owned_endpoint(dwg, header, "BLOCK_HEADER", "first_entity", diagnostics);
+    let last = resolve_owned_endpoint(dwg, header, "BLOCK_HEADER", "last_entity", diagnostics);
+    if first.is_null() && !last.is_null() {
+        diagnostics.note_lossy("BLOCK_HEADER ownership chain is missing its first entity");
     }
+    if !first.is_null() && last.is_null() {
+        diagnostics.note_lossy("BLOCK_HEADER ownership chain is missing its last entity");
+    }
+    let limit = unsafe { libredwg_sys::dwg_get_num_objects(dwg) } as usize;
+    let (objects, failure) = bounded_chain((!first.is_null()).then_some(first), limit, |current| {
+        if current == last || last.is_null() {
+            return None;
+        }
+        let payload = unsafe { libredwg_sys::uncad_object_entity_ptr(current) };
+        let link = get_common_field::<*mut libredwg_sys::Dwg_Object_Ref>(payload, "next_entity")
+            .unwrap_or(std::ptr::null_mut());
+        let next = if !link.is_null() && unsafe { (*link).absolute_ref } != 0 {
+            reference_object(dwg, link)
+        } else {
+            unsafe { dwg_next_object(current) }
+        };
+        (!next.is_null()).then_some(next)
+    });
+    if !first.is_null() && !last.is_null() && objects.last().copied() != Some(last) {
+        diagnostics.note_lossy("BLOCK_HEADER ownership chain ended before its last entity");
+    }
+    report_chain_failure(failure, "BLOCK_HEADER", diagnostics);
     objects
+        .into_iter()
+        .filter(|object| !is_linked_subentity(object_fixedtype(*object)))
+        .collect()
 }
 
 fn r2000_owned_objects(
@@ -1211,7 +1358,7 @@ unsafe fn convert_geometry(
             }
         }
         libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_POLYLINE_2D => {
-            let vertices = unsafe { polyline_2d_vertices(obj, entity_ptr, diagnostics) };
+            let vertices = unsafe { polyline_2d_vertices(dwg, obj, entity_ptr, diagnostics) };
             let flag = get_field::<u16>(entity_ptr, "POLYLINE_2D", "flag").unwrap_or(0);
             Geometry::Polyline {
                 vertices,
@@ -1220,7 +1367,7 @@ unsafe fn convert_geometry(
             }
         }
         libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_POLYLINE_3D => {
-            let vertices = unsafe { polyline_3d_vertices(obj) };
+            let vertices = unsafe { polyline_3d_vertices(dwg, obj, entity_ptr, diagnostics) };
             let flag = get_field::<u8>(entity_ptr, "POLYLINE_3D", "flag").unwrap_or(0);
             Geometry::Polyline {
                 vertices,
@@ -1292,8 +1439,14 @@ unsafe fn convert_geometry(
                             .filter(|name| !name.is_empty())
                     })
                     .unwrap_or_default();
-            let attribs =
-                insert_attribs(dwg, obj, entity_ptr, dxf, diagnostics.dwg_version != "DXF");
+            let attribs = insert_attribs(
+                dwg,
+                obj,
+                entity_ptr,
+                dxf,
+                diagnostics.dwg_version != "DXF",
+                diagnostics,
+            );
             Geometry::Insert {
                 block_name,
                 insertion: pt_field(entity_ptr, dxf, "ins_pt")?,
@@ -1780,58 +1933,134 @@ fn matrix12(entity_ptr: *mut c_void, field: &str) -> [f64; 12] {
     matrix
 }
 
+fn filter_subentity_objects(
+    objects: Vec<*mut libredwg_sys::Dwg_Object>,
+    expected_type: libredwg_sys::DWG_OBJECT_TYPE,
+    report_unexpected: bool,
+    kind: &str,
+    diagnostics: &mut ImportDiagnostics,
+) -> Vec<*mut libredwg_sys::Dwg_Object> {
+    objects.into_iter().filter(|object| {
+        if object_fixedtype(*object) == expected_type {
+            true
+        } else {
+            if report_unexpected {
+                diagnostics.note_lossy(format!("{kind} ownership contains an unexpected object type; that object was skipped"));
+            }
+            false
+        }
+    }).collect()
+}
+
+fn owned_subentity_objects(
+    dwg: *mut libredwg_sys::Dwg_Data,
+    owner: *mut libredwg_sys::Dwg_Object,
+    payload: *mut c_void,
+    kind: &str,
+    attribute: bool,
+    expected_type: libredwg_sys::DWG_OBJECT_TYPE,
+    diagnostics: &mut ImportDiagnostics,
+) -> Vec<*mut libredwg_sys::Dwg_Object> {
+    let array = if attribute { "attribs" } else { "vertex" };
+    let version = native_version(dwg);
+    let linked_format = (19..=LIBREDWG_R_2000).contains(&version);
+    // Legacy arrays can be shorter than the linked chain. Keep the existing
+    // linked-first behavior there; newer versions store authoritative arrays.
+    if !linked_format {
+        if let Some(objects) = owned_reference_objects(dwg, payload, kind, array, diagnostics) {
+            return filter_subentity_objects(objects, expected_type, true, kind, diagnostics);
+        }
+    }
+    let first_field = if attribute {
+        "first_attrib"
+    } else {
+        "first_vertex"
+    };
+    let last_field = if attribute {
+        "last_attrib"
+    } else {
+        "last_vertex"
+    };
+    let before_r13 = version < 19;
+    if before_r13 && attribute && get_field::<u8>(payload, kind, "has_attribs").unwrap_or(0) == 0 {
+        return Vec::new();
+    }
+    let mut first = if before_r13 {
+        unsafe { dwg_next_object(owner) }
+    } else {
+        resolve_owned_endpoint(dwg, payload, kind, first_field, diagnostics)
+    };
+    if before_r13
+        && !first.is_null()
+        && object_fixedtype(first) == libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_SEQEND
+    {
+        first = std::ptr::null_mut();
+    }
+    let last = resolve_owned_endpoint(dwg, payload, kind, last_field, diagnostics);
+    if !before_r13 && !first.is_null() && last.is_null() {
+        diagnostics.note_lossy(format!(
+            "{kind} ownership chain is missing its last subentity"
+        ));
+    }
+    let limit = unsafe { libredwg_sys::dwg_get_num_objects(dwg) } as usize;
+    let (objects, failure) = bounded_chain((!first.is_null()).then_some(first), limit, |current| {
+        if current == last
+            || (!before_r13 && last.is_null())
+            || (attribute && object_fixedtype(current) != expected_type)
+        {
+            return None;
+        }
+        let next = unsafe { dwg_next_object(current) };
+        if next.is_null()
+            || (before_r13
+                && object_fixedtype(next) == libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_SEQEND)
+        {
+            None
+        } else {
+            Some(next)
+        }
+    });
+    if !before_r13 && !last.is_null() && objects.last().copied() != Some(last) {
+        diagnostics.note_lossy(format!(
+            "{kind} ownership chain ended before its last subentity"
+        ));
+    }
+    report_chain_failure(failure, kind, diagnostics);
+    // Legacy polylines can have intervening non-vertex objects in the physical
+    // object sequence. Filter them after the bounded walk, preserving later
+    // vertices up to last_vertex, just as the original native iterator did.
+    let objects = filter_subentity_objects(objects, expected_type, attribute, kind, diagnostics);
+    if linked_format && objects.is_empty() {
+        if let Some(objects) = owned_reference_objects(dwg, payload, kind, array, diagnostics) {
+            return filter_subentity_objects(objects, expected_type, true, kind, diagnostics);
+        }
+    }
+    objects
+}
+
 fn insert_attribs(
     dwg: *mut libredwg_sys::Dwg_Data,
     obj: *mut libredwg_sys::Dwg_Object,
     entity_ptr: *mut c_void,
     dxf: &str,
     from_dwg: bool,
+    diagnostics: &mut ImportDiagnostics,
 ) -> Vec<TextData> {
-    let mut attribs = Vec::new();
-    let mut sub = unsafe { libredwg_sys::get_first_owned_subentity(obj) };
-    if sub.is_null() {
-        if let Some(first) =
-            get_field::<*mut libredwg_sys::Dwg_Object_Ref>(entity_ptr, dxf, "first_attrib")
-        {
-            if !first.is_null() {
-                sub = unsafe { libredwg_sys::dwg_ref_object(dwg, first) };
-            }
-        }
-    }
-    while !sub.is_null() {
-        if object_fixedtype(sub) == libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_ATTRIB {
-            let ap = unsafe { libredwg_sys::uncad_object_entity_ptr(sub) };
-            if let Some(text) = attrib_text(dwg, ap, from_dwg) {
-                attribs.push(text);
-            }
-        }
-        let next = unsafe { libredwg_sys::get_next_owned_subentity(obj, sub) };
-        if next.is_null() {
-            break;
-        }
-        sub = next;
-    }
-    if !attribs.is_empty() {
-        return attribs;
-    }
-    let refs: Vec<*mut libredwg_sys::Dwg_Object_Ref> =
-        get_array_field::<u32, _>(entity_ptr, dxf, "num_owned", "attribs");
-    for href in refs {
-        if href.is_null() {
-            continue;
-        }
-        let owned = unsafe { libredwg_sys::dwg_ref_object(dwg, href) };
-        if owned.is_null()
-            || object_fixedtype(owned) != libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_ATTRIB
-        {
-            continue;
-        }
-        let ap = unsafe { libredwg_sys::uncad_object_entity_ptr(owned) };
-        if let Some(text) = attrib_text(dwg, ap, from_dwg) {
-            attribs.push(text);
-        }
-    }
-    attribs
+    owned_subentity_objects(
+        dwg,
+        obj,
+        entity_ptr,
+        dxf,
+        true,
+        libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_ATTRIB,
+        diagnostics,
+    )
+    .into_iter()
+    .filter_map(|object| {
+        let payload = unsafe { libredwg_sys::uncad_object_entity_ptr(object) };
+        attrib_text(dwg, payload, from_dwg)
+    })
+    .collect()
 }
 
 fn attribute_fields(
@@ -2208,6 +2437,7 @@ fn pt3(p: Point3D) -> Point3 {
 }
 
 unsafe fn polyline_2d_vertices(
+    dwg: *mut libredwg_sys::Dwg_Data,
     obj: *mut libredwg_sys::Dwg_Object,
     entity_ptr: *mut c_void,
     diagnostics: &mut ImportDiagnostics,
@@ -2217,42 +2447,29 @@ unsafe fn polyline_2d_vertices(
     let default_end =
         positive_width(get_field::<f64>(entity_ptr, "POLYLINE_2D", "end_width").unwrap_or(0.0));
     let mut verts = Vec::new();
-    let mut sub = unsafe { libredwg_sys::get_first_owned_subentity(obj) };
-    while !sub.is_null() {
-        if object_fixedtype(sub) == libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_VERTEX_2D {
-            let vp = unsafe { libredwg_sys::uncad_object_entity_ptr(sub) };
-            if let Some(p) = get_field::<Point3D>(vp, "VERTEX_2D", "point") {
-                let bulge = get_field::<f64>(vp, "VERTEX_2D", "bulge").unwrap_or(0.0);
-                verts.push(PolyVertex {
-                    point: pt3(p),
-                    bulge,
-                    start_width: positive_width(
-                        get_field::<f64>(vp, "VERTEX_2D", "start_width").unwrap_or(0.0),
-                    ),
-                    end_width: positive_width(
-                        get_field::<f64>(vp, "VERTEX_2D", "end_width").unwrap_or(0.0),
-                    ),
-                    ..PolyVertex::new(Point3::default(), 0.0)
-                });
-            }
-        }
-        sub = unsafe { libredwg_sys::get_next_owned_subentity(obj, sub) };
-    }
-    if verts.is_empty() {
-        let mut error = 0i32;
-        let points_ptr =
-            unsafe { libredwg_sys::dwg_object_polyline_2d_get_points(obj, &mut error) };
-        let num_points =
-            unsafe { libredwg_sys::dwg_object_polyline_2d_get_numpoints(obj, &mut error) };
-        if !points_ptr.is_null() && num_points > 0 {
-            let slice = unsafe {
-                std::slice::from_raw_parts(points_ptr.cast::<Point2D>(), num_points as usize)
-            };
-            verts = slice
-                .iter()
-                .map(|p| PolyVertex::new(Point3::from_xy(p.x, p.y), 0.0))
-                .collect();
-            unsafe { libc::free(points_ptr.cast()) };
+    for sub in owned_subentity_objects(
+        dwg,
+        obj,
+        entity_ptr,
+        "POLYLINE_2D",
+        false,
+        libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_VERTEX_2D,
+        diagnostics,
+    ) {
+        let vp = unsafe { libredwg_sys::uncad_object_entity_ptr(sub) };
+        if let Some(p) = get_field::<Point3D>(vp, "VERTEX_2D", "point") {
+            let bulge = get_field::<f64>(vp, "VERTEX_2D", "bulge").unwrap_or(0.0);
+            verts.push(PolyVertex {
+                point: pt3(p),
+                bulge,
+                start_width: positive_width(
+                    get_field::<f64>(vp, "VERTEX_2D", "start_width").unwrap_or(0.0),
+                ),
+                end_width: positive_width(
+                    get_field::<f64>(vp, "VERTEX_2D", "end_width").unwrap_or(0.0),
+                ),
+                ..PolyVertex::new(Point3::default(), 0.0)
+            });
         }
     }
     if verts.iter().all(|vertex| !vertex.is_wide()) && (default_start > 0.0 || default_end > 0.0) {
@@ -2268,42 +2485,97 @@ unsafe fn polyline_2d_vertices(
     verts
 }
 
-unsafe fn polyline_3d_vertices(obj: *mut libredwg_sys::Dwg_Object) -> Vec<PolyVertex> {
-    // LibreDWG's R2000 get_points walk stops before the last vertex. The
-    // owned-subentity list includes it.
-    let mut verts = Vec::new();
-    let mut sub = unsafe { libredwg_sys::get_first_owned_subentity(obj) };
-    while !sub.is_null() {
-        if object_fixedtype(sub) == libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_VERTEX_3D {
-            let vertex = unsafe { libredwg_sys::uncad_object_entity_ptr(sub) };
-            if let Some(point) = get_field::<Point3D>(vertex, "VERTEX_3D", "point") {
-                verts.push(PolyVertex::new(pt3(point), 0.0));
-            }
-        }
-        sub = unsafe { libredwg_sys::get_next_owned_subentity(obj, sub) };
-    }
-    if !verts.is_empty() {
-        return verts;
-    }
-    let mut error = 0i32;
-    let points_ptr = unsafe { libredwg_sys::dwg_object_polyline_3d_get_points(obj, &mut error) };
-    let num_points = unsafe { libredwg_sys::dwg_object_polyline_3d_get_numpoints(obj, &mut error) };
-    if points_ptr.is_null() || num_points == 0 {
-        return Vec::new();
-    }
-    let slice =
-        unsafe { std::slice::from_raw_parts(points_ptr.cast::<Point3D>(), num_points as usize) };
-    let verts = slice
-        .iter()
-        .map(|p| PolyVertex::new(pt3(*p), 0.0))
-        .collect();
-    unsafe { libc::free(points_ptr.cast()) };
-    verts
+unsafe fn polyline_3d_vertices(
+    dwg: *mut libredwg_sys::Dwg_Data,
+    obj: *mut libredwg_sys::Dwg_Object,
+    entity_ptr: *mut c_void,
+    diagnostics: &mut ImportDiagnostics,
+) -> Vec<PolyVertex> {
+    owned_subentity_objects(
+        dwg,
+        obj,
+        entity_ptr,
+        "POLYLINE_3D",
+        false,
+        libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_VERTEX_3D,
+        diagnostics,
+    )
+    .into_iter()
+    .filter_map(|object| {
+        let payload = unsafe { libredwg_sys::uncad_object_entity_ptr(object) };
+        get_field::<Point3D>(payload, "VERTEX_3D", "point")
+            .map(|point| PolyVertex::new(pt3(point), 0.0))
+    })
+    .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ownership_walk_stops_cycles_before_repeating_objects() {
+        let mut calls = 0;
+        let (objects, failure) = bounded_chain(Some(1usize), 10, |object| {
+            calls += 1;
+            Some(if object == 3 { 2 } else { object + 1 })
+        });
+        assert_eq!(objects, vec![1, 2, 3]);
+        assert_eq!(failure, Some(ChainFailure::Cycle));
+        assert_eq!(calls, 3);
+
+        let (objects, failure) = bounded_chain(Some(7usize), 10, Some);
+        assert_eq!(objects, vec![7]);
+        assert_eq!(failure, Some(ChainFailure::Cycle));
+    }
+
+    #[test]
+    fn ownership_walk_limits_unique_but_unterminated_chains() {
+        let mut calls = 0;
+        let (objects, failure) = bounded_chain(Some(1usize), 3, |object| {
+            calls += 1;
+            Some(object + 1)
+        });
+        assert_eq!(objects, vec![1, 2, 3]);
+        assert_eq!(failure, Some(ChainFailure::ObjectLimit));
+        assert_eq!(calls, 3);
+        let (objects, failure) = bounded_chain(Some(1usize), 0, |_| {
+            panic!("a zero-object drawing must not advance an ownership pointer")
+        });
+        assert!(objects.is_empty());
+        assert_eq!(failure, Some(ChainFailure::ObjectLimit));
+    }
+
+    #[test]
+    fn ownership_walk_preserves_the_last_valid_object_at_the_limit() {
+        let (objects, failure) =
+            bounded_chain(Some(1usize), 3, |object| (object < 3).then_some(object + 1));
+        assert_eq!(objects, vec![1, 2, 3]);
+        assert_eq!(failure, None);
+        let (objects, failure) = bounded_chain(None::<usize>, 0, |_| {
+            panic!("an empty chain must not call the native iterator")
+        });
+        assert!(objects.is_empty());
+        assert_eq!(failure, None);
+    }
+
+    #[test]
+    fn ownership_walk_reports_truncation_as_lossy_without_duplicate_warnings() {
+        let mut diagnostics = ImportDiagnostics::default();
+        for _ in 0..2 {
+            report_chain_failure(Some(ChainFailure::Cycle), "INSERT", &mut diagnostics);
+        }
+        assert_eq!(diagnostics.warnings.len(), 1);
+        assert_eq!(diagnostics.lossy_notes.len(), 1);
+        assert!(diagnostics.lossy_notes[0].contains("cycle"));
+        report_chain_failure(
+            Some(ChainFailure::ObjectLimit),
+            "POLYLINE_2D",
+            &mut diagnostics,
+        );
+        assert_eq!(diagnostics.lossy_notes.len(), 2);
+        assert!(diagnostics.lossy_notes[1].contains("object count"));
+    }
 
     #[test]
     fn sort_handles_put_the_smaller_key_behind() {

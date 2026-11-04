@@ -5,9 +5,28 @@ All notable changes to EntoCAD are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project versions with [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Workspace version is `0.57.0` (`Cargo.toml`).
+Workspace version is `0.58.0` (`Cargo.toml`).
 
 ## [Unreleased]
+
+## [0.58.0] - 2026-11-04
+
+### Added
+- Expose native dynamic actions beyond Move and Stretch in the authoring dock, with an angle parameter shortcut for rotation.
+
+### Changed
+- Reuse shared block dependency visits and geometry membership sets to speed up native dynamic evaluation.
+- Update only affected entity indices during edits, and remove per-frame block geometry clones from the authoring dock.
+- Avoid redundant bounds calculation during dynamic previews.
+
+### Fixed
+- Keep failed action setups open, require explicit pivots and attachment points, and preserve selected targets while picking those points.
+- Apply numeric bounds reliably and validate transform coordinates, option mappings and single-sided numeric limits.
+- Preserve newer edits and pending actions when an older background save finishes; avoid copying shared drawings for empty Undo/Redo.
+- Use evaluated geometry bounds when preparing dynamic previews.
+- Route Test-mode configurations to the edited block occurrence, keeping rendering, snapping and measurements aligned while preserving other instances.
+- Detect malformed DWG ownership chains and report incomplete geometry with import warnings.
+- Preserve assigned entity IDs while filling missing IDs, and reject conflicting or exhausted native-file identities.
 
 ## [0.57.0] - 2026-11-04
 

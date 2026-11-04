@@ -162,6 +162,38 @@ fn varying_z_polyline_survives_dxf_roundtrip() {
     assert_geometry(&expected, &actual, "3D POLYLINE → DXF → import");
 }
 
+#[test]
+fn point_fields_preserve_xyz_and_nonuniform_insert_scale() {
+    let mut expected = primitives_document();
+    for (index, entity) in expected.model_space.iter_mut().enumerate() {
+        match &mut entity.geometry {
+            Geometry::Line { start, end } => {
+                start.z = index as f64 + 0.125;
+                end.z = -(index as f64) - 0.375;
+            }
+            Geometry::Insert {
+                insertion, scale, ..
+            } => {
+                insertion.z = 7.25;
+                *scale = Point3::new(2.0, 0.75, 3.0);
+            }
+            Geometry::Arc { center, .. } | Geometry::Circle { center, .. } => {
+                center.z = 6.25;
+            }
+            _ => {}
+        }
+    }
+    let dxf = temp_path("dxf");
+    let dwg = temp_path("dwg");
+    write_dxf(&expected, &dxf, &DxfExportOptions::default()).expect("write varied points");
+    let from_dxf = import_dxf(&dxf).expect("read varied points");
+    convert_dxf_file(&dxf, &dwg).expect("convert varied points");
+    let from_dwg = import_dwg(&dwg).expect("read converted points");
+    cleanup(&[&dxf, &dwg]);
+    assert_geometry(&expected, &from_dxf, "DXF point fields");
+    assert_geometry(&expected, &from_dwg, "DWG point fields");
+}
+
 fn inches_line_document() -> Document {
     let mut document = Document::default();
     document.units = DrawingUnits::Inches;

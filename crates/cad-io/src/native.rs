@@ -1582,9 +1582,13 @@ fn from_wire_document(wire: WireDocument) -> Result<Document, ExportError> {
             .insert(linetype.name.clone(), from_wire_linetype(linetype));
     }
     let mut seen_defs = BTreeSet::new();
+    let mut seen_names = BTreeSet::new();
     let mut entity_total = wire.model_space.len();
+    if entity_total > MAX_ENTITIES {
+        return Err(ExportError::Validation("too many entities".into()));
+    }
     for block in &wire.blocks {
-        entity_total += block.entities.len();
+        entity_total = entity_total.saturating_add(block.entities.len());
         if entity_total > MAX_ENTITIES {
             return Err(ExportError::Validation("too many entities".into()));
         }
@@ -1594,20 +1598,19 @@ fn from_wire_document(wire: WireDocument) -> Result<Document, ExportError> {
                 block.id
             )));
         }
+        if !seen_names.insert(block.name.to_ascii_uppercase()) {
+            return Err(ExportError::Validation(format!(
+                "duplicate block name {}",
+                block.name
+            )));
+        }
     }
     for block in wire.blocks {
         let definition = from_wire_block(block)?;
         document.blocks.insert(definition.name.clone(), definition);
     }
-    let mut seen_entities = BTreeSet::new();
     for entity in wire.model_space {
         let entity = from_wire_entity(entity)?;
-        if entity.id.is_assigned() && !seen_entities.insert(entity.id.raw()) {
-            return Err(ExportError::Validation(format!(
-                "duplicate entity identity {}",
-                entity.id.raw()
-            )));
-        }
         document.model_space.push(entity);
     }
     document.set_identity_counters(
@@ -1622,6 +1625,7 @@ fn from_wire_document(wire: WireDocument) -> Result<Document, ExportError> {
     document.set_next_vertex_id(wire.next_vertex_id);
     document.set_next_anchor_id(wire.next_anchor_id);
     document.set_next_preset_id(wire.next_preset_id);
+    validate_document_identities(&document)?;
     document.assign_missing_ids();
     for block in document.blocks.values() {
         if let Some(dynamic) = &block.dynamic {
@@ -1630,6 +1634,110 @@ fn from_wire_document(wire: WireDocument) -> Result<Document, ExportError> {
         }
     }
     Ok(document)
+}
+
+// Validate the entire native drawing before ID assignment or index creation.
+// Existing IDs are reference targets, so conflicting identities must be rejected
+// rather than repaired by silently retargeting dynamic actions.
+fn validate_document_identities(document: &Document) -> Result<(), ExportError> {
+    struct Budget {
+        kind: &'static str,
+        next: u64,
+        missing: u64,
+    }
+    impl Budget {
+        fn new(kind: &'static str, next: u64) -> Self {
+            Self {
+                kind,
+                next: next.max(1),
+                missing: 0,
+            }
+        }
+        fn observe(&mut self, id: u64, assign_missing: bool) -> Result<(), ExportError> {
+            if id == 0 {
+                self.missing += u64::from(assign_missing);
+            } else {
+                self.next = self
+                    .next
+                    .max(id.checked_add(1).ok_or_else(|| self.exhausted())?);
+            }
+            Ok(())
+        }
+        fn exhausted(&self) -> ExportError {
+            ExportError::Validation(format!("{} identity space is exhausted", self.kind))
+        }
+        fn finish(&self) -> Result<(), ExportError> {
+            self.next
+                .checked_add(self.missing)
+                .filter(|next| *next < u64::MAX)
+                .map(|_| ())
+                .ok_or_else(|| self.exhausted())
+        }
+    }
+    let (entity, definition, parameter, option, action, _, _) = document.identity_counters();
+    let mut entities = Budget::new("entity", entity);
+    let mut definitions = Budget::new("block", definition);
+    let mut parameters = Budget::new("parameter", parameter);
+    let mut options = Budget::new("option", option);
+    let mut actions = Budget::new("action", action);
+    let mut vertices = Budget::new("vertex", document.next_vertex_id());
+    let mut anchors = Budget::new("anchor", document.next_anchor_id());
+    let mut presets = Budget::new("preset", document.next_preset_id());
+    let mut seen_entities = BTreeSet::new();
+    for entity in document.model_space.iter().chain(
+        document
+            .blocks
+            .values()
+            .flat_map(|block| block.entities.iter()),
+    ) {
+        if entity.id.is_assigned() && !seen_entities.insert(entity.id) {
+            return Err(ExportError::Validation(format!(
+                "duplicate entity identity {}",
+                entity.id.raw()
+            )));
+        }
+        entities.observe(entity.id.raw(), true)?;
+        if let Some(points) = entity.geometry.polyline_vertices() {
+            for point in points {
+                vertices.observe(point.vertex_id.raw(), true)?;
+            }
+        }
+    }
+    for block in document.blocks.values() {
+        definitions.observe(block.id.raw(), true)?;
+        if let Some(dynamic) = &block.dynamic {
+            for parameter in &dynamic.parameters {
+                parameters.observe(parameter.id.raw(), false)?;
+                if let ParameterKind::Choice(choice) = &parameter.kind {
+                    for option in &choice.options {
+                        options.observe(option.id.raw(), false)?;
+                    }
+                }
+            }
+            for action in dynamic.collect_action_ids() {
+                actions.observe(action.raw(), false)?;
+            }
+            for anchor in &dynamic.anchors {
+                anchors.observe(anchor.id.raw(), false)?;
+            }
+            for preset in &dynamic.presets {
+                presets.observe(preset.id.raw(), false)?;
+            }
+        }
+    }
+    for budget in [
+        &entities,
+        &definitions,
+        &parameters,
+        &options,
+        &actions,
+        &vertices,
+        &anchors,
+        &presets,
+    ] {
+        budget.finish()?;
+    }
+    Ok(())
 }
 
 pub(crate) fn to_wire_block(block: &BlockDefinition) -> WireBlock {
@@ -3606,6 +3714,124 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("mycad-native-{stamp}-{name}"))
+    }
+
+    #[test]
+    fn native_rejects_duplicate_entity_ids_across_all_spaces() {
+        let mut entity = Entity::new(Geometry::Line {
+            start: Point3::default(),
+            end: Point3::from_xy(10.0, 0.0),
+        });
+        entity.id = EntityId(7);
+        for duplicate_space in ["model", "same block", "other block"] {
+            let mut document = Document::default();
+            let mut block = BlockDefinition::plain("A", Point3::default(), vec![entity.clone()]);
+            match duplicate_space {
+                "model" => document.model_space.push(entity.clone()),
+                "same block" => block.entities.push(entity.clone()),
+                _ => {
+                    document.blocks.insert(
+                        "B".into(),
+                        BlockDefinition::plain("B", Point3::default(), vec![entity.clone()]),
+                    );
+                }
+            }
+            document.blocks.insert("A".into(), block);
+            let error = from_wire_document(to_wire_document(&document)).unwrap_err();
+            assert!(
+                error.to_string().contains("duplicate entity identity 7"),
+                "{duplicate_space}: {error}"
+            );
+        }
+        // A repeated name must not overwrite its predecessor before the global
+        // identity check can inspect both blocks.
+        let mut wire = to_wire_document(&Document::default());
+        wire.blocks = vec![
+            to_wire_block(&BlockDefinition::plain(
+                "Frame",
+                Point3::default(),
+                Vec::new(),
+            )),
+            to_wire_block(&BlockDefinition::plain(
+                "frame",
+                Point3::default(),
+                Vec::new(),
+            )),
+        ];
+        assert!(from_wire_document(wire)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate block name"));
+    }
+
+    #[test]
+    fn native_rejects_exhausted_identity_counters_and_existing_ids() {
+        let base = serde_json::to_value(to_wire_document(&Document::default())).unwrap();
+        for counter in [
+            "next_entity_id",
+            "next_definition_id",
+            "next_parameter_id",
+            "next_option_id",
+            "next_action_id",
+            "next_vertex_id",
+            "next_anchor_id",
+            "next_preset_id",
+        ] {
+            let mut value = base.clone();
+            value[counter] = serde_json::json!(u64::MAX);
+            let wire = serde_json::from_value(value).unwrap();
+            assert!(
+                from_wire_document(wire)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("identity space is exhausted"),
+                "{counter}"
+            );
+        }
+        let mut document = Document::default();
+        let mut existing = Entity::new(Geometry::Point {
+            position: Point3::default(),
+        });
+        existing.id = EntityId(u64::MAX);
+        document.model_space.push(existing);
+        assert!(from_wire_document(to_wire_document(&document))
+            .unwrap_err()
+            .to_string()
+            .contains("identity space is exhausted"));
+
+        // The counter itself can be valid while missing entities would consume
+        // the remaining IDs. Reject before assignment wraps or aliases an ID.
+        let mut wire = to_wire_document(&Document::default());
+        wire.next_entity_id = u64::MAX - 2;
+        let empty = Entity::new(Geometry::Point {
+            position: Point3::default(),
+        });
+        wire.model_space = vec![to_wire_entity(&empty), to_wire_entity(&empty)];
+        assert!(from_wire_document(wire)
+            .unwrap_err()
+            .to_string()
+            .contains("identity space is exhausted"));
+    }
+
+    #[test]
+    fn native_fills_missing_ids_without_retargeting_existing_entities() {
+        let missing = Entity::new(Geometry::Point {
+            position: Point3::from_xy(2.0, 3.0),
+        });
+        let mut existing = Entity::new(Geometry::Point {
+            position: Point3::from_xy(5.0, 7.0),
+        });
+        existing.id = EntityId(1);
+        let mut document = Document::default();
+        document.model_space = vec![missing, existing];
+        let loaded = from_wire_document(to_wire_document(&document)).unwrap();
+        assert_eq!(loaded.model_space[1].id, EntityId(1));
+        assert_ne!(loaded.model_space[0].id, EntityId(1));
+        assert!(loaded.entity_index_is_consistent());
+        assert_eq!(
+            loaded.entity_by_id(EntityId(1)),
+            Some(&loaded.model_space[1])
+        );
     }
 
     #[test]

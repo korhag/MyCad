@@ -180,19 +180,20 @@ pub enum BehaviorWizard {
         axis_a: Option<Point2>,
         axis_b: Option<Point2>,
         parameter: ParameterId,
-        use_visibility: bool,
+        options: Vec<OptionId>,
+        boolean: bool,
         policy: cad_core::TextReflectPolicy,
     },
     Position {
         members: Vec<EntityId>,
         attachment: Option<Point2>,
         parameter: ParameterId,
+        destinations: BTreeMap<OptionId, Point2>,
     },
     Rotate {
         members: Vec<EntityId>,
         pivot: Option<Point2>,
         parameter: ParameterId,
-        degrees: bool,
     },
 }
 
@@ -608,6 +609,35 @@ pub fn add_number_parameter(document: &mut Document, history: &mut History, bloc
     let mut numeric = NumericParameter::length(0.0);
     numeric.reference = 0.0;
     let _ = add_size_parameter(document, history, block_name, "Offset".into(), numeric);
+}
+
+fn add_angle_parameter(app: &mut MyCadApp) {
+    let Some(state) = app.dynamic_authoring.as_ref() else {
+        return;
+    };
+    let name = state.block_name.clone();
+    let Some(document) = app.document.as_mut().map(std::sync::Arc::make_mut) else {
+        return;
+    };
+    let mut numeric = NumericParameter::length(0.0);
+    numeric.quantity = cad_core::NumericQuantity::Angle;
+    numeric.unit = cad_core::ParameterUnit::Degrees;
+    app.history.begin();
+    let result = add_size_parameter(document, &mut app.history, &name, "Angle".into(), numeric);
+    app.history.commit_open();
+    match result {
+        Ok(id) => {
+            if let Some(state) = app.dynamic_authoring.as_mut() {
+                state.selected_parameter = Some(id);
+                state.status = Some(
+                    "Angle created in degrees. Select objects, choose Rotate, and pick a pivot."
+                        .into(),
+                );
+            }
+            app.request_preview();
+        }
+        Err(error) => app.status = error,
+    }
 }
 
 fn unique_parameter_name(dynamic: Option<&DynamicDefinition>, base: &str) -> String {
@@ -1144,6 +1174,13 @@ pub fn show_authoring(ui: &mut Ui, app: &mut MyCadApp) {
         {
             start_size_wizard(app);
         }
+        if ui
+            .button("Add angle parameter")
+            .on_hover_text("Create a rotation angle in degrees; optional limits can be set below.")
+            .clicked()
+        {
+            add_angle_parameter(app);
+        }
         if ui.button("Add Choice…").clicked() {
             add_choice_parameter(app);
         }
@@ -1175,7 +1212,7 @@ pub fn show_authoring(ui: &mut Ui, app: &mut MyCadApp) {
         show_save_discard(ui, app);
         return;
     }
-    let (dynamic, entities) = {
+    let (dynamic, broken) = {
         let Some(document) = app.document.as_deref() else {
             return;
         };
@@ -1183,14 +1220,22 @@ pub fn show_authoring(ui: &mut Ui, app: &mut MyCadApp) {
             ui.weak("The definition is no longer in the drawing.");
             return;
         };
-        (
-            block.dynamic.clone().unwrap_or_default(),
-            block.entities.clone(),
-        )
+        let dynamic = block.dynamic.clone().unwrap_or_default();
+        let broken = if state.mode == AuthoringMode::Author {
+            collect_broken_bindings(&dynamic, &block.entities)
+        } else {
+            Vec::new()
+        };
+        (dynamic, broken)
     };
     ui.add_space(6.0);
     ui.label(RichText::new("Parameters").small().weak());
-    let mut selected = state.selected_parameter;
+    // Parameter creation above can change selection during this frame.
+    // Read the live state so the new parameter remains ready for action linking.
+    let mut selected = app
+        .dynamic_authoring
+        .as_ref()
+        .and_then(|state| state.selected_parameter);
     for parameter in dynamic.sorted_parameters() {
         if ui
             .selectable_label(selected == Some(parameter.id), &parameter.name)
@@ -1203,7 +1248,7 @@ pub fn show_authoring(ui: &mut Ui, app: &mut MyCadApp) {
         authoring.selected_parameter = selected;
     }
     if state.mode == AuthoringMode::Author {
-        show_repair_bindings(ui, app, &dynamic, &entities);
+        show_repair_bindings(ui, app, &broken);
         show_selection_bindings(ui, app, &dynamic);
         if let Some(parameter) = selected.and_then(|id| dynamic.parameter(id)).cloned() {
             match &parameter.kind {
@@ -1984,7 +2029,8 @@ fn show_parameter_editor(
         if let Some(err) = draft.errors.get("name") {
             ui.colored_label(egui::Color32::from_rgb(220, 90, 70), err);
         }
-        ui.label("Default");
+        let unit = draft.numeric.unit.label();
+        ui.label(if unit.is_empty() { "Default".into() } else { format!("Default ({unit})") });
         if ui.add(egui::DragValue::new(&mut draft.numeric.default).speed(1.0)).changed() {
             draft.dirty = true;
         }
@@ -2026,13 +2072,13 @@ fn show_parameter_editor(
         }
         let list_mode = draft.numeric.domain.is_list();
         let mut list_mode = list_mode;
-        if ui.radio_value(&mut list_mode, false, "Any valid size").clicked() && draft.numeric.domain.is_list()
+        if ui.radio_value(&mut list_mode, false, "Any valid value").clicked() && draft.numeric.domain.is_list()
         {
             draft.numeric.domain = NumericDomain::Continuous;
             draft.dirty = true;
         }
         if ui
-            .radio_value(&mut list_mode, true, "Choose from available sizes")
+            .radio_value(&mut list_mode, true, "Choose from available values")
             .clicked()
             && !draft.numeric.domain.is_list()
         {
@@ -2041,7 +2087,7 @@ fn show_parameter_editor(
             draft.dirty = true;
         }
         if draft.numeric.domain.is_list() {
-            ui.label("Available sizes (one per line or semicolon-separated)");
+            ui.label("Available values (one per line or semicolon-separated)");
             if ui.text_edit_multiline(&mut draft.allowed_paste).changed() {
                 draft.dirty = true;
             }
@@ -2086,6 +2132,7 @@ fn show_parameter_editor(
             }
         });
     });
+    draft.dirty |= draft.name != draft.original_name || draft.numeric != draft.original;
     if let Some(authoring) = app.dynamic_authoring.as_mut() {
         authoring.parameter_drafts.insert(id, draft);
     }
@@ -2404,9 +2451,78 @@ fn set_behavior_follow(app: &mut MyCadApp, id: ActionId, follow: FollowRole) {
     app.request_preview();
 }
 
+fn show_parameter_action_buttons(ui: &mut Ui, app: &mut MyCadApp) {
+    let (has_parameter, choice, condition, angle) = app
+        .dynamic_authoring
+        .as_ref()
+        .and_then(|state| {
+            let kind = &app
+                .document
+                .as_deref()?
+                .block_by_name(&state.block_name)?
+                .dynamic
+                .as_ref()?
+                .parameter(state.selected_parameter?)?
+                .kind;
+            let choice = matches!(kind, ParameterKind::Choice(_));
+            Some((
+                true,
+                choice,
+                choice || matches!(kind, ParameterKind::Boolean(_)),
+                is_angle_parameter(kind),
+            ))
+        })
+        .unwrap_or((false, false, false, false));
+    let selected = !app.selection.ids().is_empty();
+    ui.weak("Select objects in the block, then connect the selected parameter to an action.");
+    ui.horizontal_wrapped(|ui| {
+        if ui
+            .add_enabled(selected && angle, egui::Button::new("Rotate…"))
+            .on_hover_text("Rotate selected objects around a pivot using an angle parameter.")
+            .clicked()
+        {
+            rotate_from_selection(app);
+        }
+        if ui
+            .add_enabled(selected && condition, egui::Button::new("Flip / mirror…"))
+            .on_hover_text(
+                "Reflect objects across a picked axis for selected Choice or On/Off states.",
+            )
+            .clicked()
+        {
+            mirror_from_selection(app);
+        }
+        if ui
+            .add_enabled(selected && choice, egui::Button::new("Position by option…"))
+            .on_hover_text("Place selected objects at a destination for each Choice option.")
+            .clicked()
+        {
+            position_from_selection(app);
+        }
+        if ui
+            .add_enabled(selected && condition, egui::Button::new("Show / hide…"))
+            .on_hover_text("Show selected objects only for selected Choice or On/Off states.")
+            .clicked()
+        {
+            show_when_from_selection(app);
+        }
+        if ui
+            .add_enabled(selected && has_parameter, egui::Button::new("Link text…"))
+            .on_hover_text(
+                "Select TEXT or MTEXT to display a parameter, option label, or formatted text.",
+            )
+            .clicked()
+        {
+            link_text_from_selection(app);
+        }
+    });
+    ui.weak("Rotate uses an angle; Flip and Show/hide use Choice or On/Off; Position uses Choice.");
+}
+
 fn show_attach_controls(ui: &mut Ui, app: &mut MyCadApp) {
     ui.add_space(8.0);
     ui.label(RichText::new("2. Choose what this parameter changes").strong());
+    show_parameter_action_buttons(ui, app);
     let parameter = app.dynamic_authoring.as_ref().and_then(|state| {
         let id = state
             .attach
@@ -3293,10 +3409,8 @@ fn apply_test_values_as_defaults(app: &mut MyCadApp, _dynamic: &DynamicDefinitio
 fn show_repair_bindings(
     ui: &mut Ui,
     app: &mut MyCadApp,
-    dynamic: &DynamicDefinition,
-    entities: &[Entity],
+    broken: &[(ActionId, GeometryTarget, &'static str)],
 ) {
-    let broken = collect_broken_bindings(dynamic, entities);
     if broken.is_empty() {
         return;
     }
@@ -3305,7 +3419,7 @@ fn show_repair_bindings(
         egui::Color32::from_rgb(220, 90, 70),
         RichText::new("Broken bindings — repair or remove").strong(),
     );
-    for (action, target, reason) in &broken {
+    for (action, target, reason) in broken {
         ui.label(format!("{reason}: {target:?}"));
         if action.is_assigned() {
             ui.push_id(action.raw(), |ui| {
@@ -3327,8 +3441,8 @@ fn show_repair_bindings(
     }
 }
 
-fn show_selection_bindings(ui: &mut Ui, app: &mut MyCadApp, dynamic: &DynamicDefinition) {
-    let ids = app.selection.ids().to_vec();
+fn show_selection_bindings(ui: &mut Ui, app: &MyCadApp, dynamic: &DynamicDefinition) {
+    let ids = app.selection.ids();
     if ids.is_empty() {
         return;
     }
@@ -3419,7 +3533,7 @@ fn show_behavior_wizard(ui: &mut Ui, app: &mut MyCadApp, dynamic: &DynamicDefini
                         formatted.push_str(&format!("{{{}}}", item.name));
                     }
                 }
-                ui.weak("Tokens are stored by parameter ID after confirm.");
+                ui.weak("Use parameter buttons to insert live values into the text.");
             }
             if matches!(
                 dynamic.parameter(*parameter).map(|item| &item.kind),
@@ -3440,40 +3554,19 @@ fn show_behavior_wizard(ui: &mut Ui, app: &mut MyCadApp, dynamic: &DynamicDefini
             boolean,
         } => {
             ui.label(format!("Show When — {} objects", members.len()));
-            parameter_picker(ui, dynamic, parameter);
-            match dynamic.parameter(*parameter).map(|item| &item.kind) {
-                Some(ParameterKind::Choice(choice)) => {
-                    for option in &choice.options {
-                        let mut on = options.contains(&option.id);
-                        if ui.checkbox(&mut on, &option.label).changed() {
-                            if on {
-                                if !options.contains(&option.id) {
-                                    options.push(option.id);
-                                }
-                            } else {
-                                options.retain(|id| *id != option.id);
-                            }
-                        }
-                    }
-                }
-                Some(ParameterKind::Boolean(flag)) => {
-                    ui.checkbox(boolean, &format!("Required {}", flag.true_label));
-                }
-                _ => {
-                    ui.weak("Select a Choice or On/Off parameter.");
-                }
-            }
+            show_condition_controls(ui, dynamic, parameter, options, boolean);
         }
         BehaviorWizard::Mirror {
             members,
             axis_a,
             axis_b,
             parameter,
-            use_visibility,
+            options,
+            boolean,
             policy,
         } => {
             ui.label(format!("Mirror for Option — {} objects", members.len()));
-            parameter_picker(ui, dynamic, parameter);
+            show_condition_controls(ui, dynamic, parameter, options, boolean);
             ui.label(format!(
                 "Axis: {} → {}",
                 axis_a
@@ -3489,8 +3582,7 @@ fn show_behavior_wizard(ui: &mut Ui, app: &mut MyCadApp, dynamic: &DynamicDefini
                     authoring.status = Some("Specify first axis point".into());
                 }
             }
-            ui.radio_value(use_visibility, false, "Mirror these parts");
-            ui.radio_value(use_visibility, true, "Use different parts");
+            ui.weak("To switch between different geometry instead, use Show / hide.");
             ui.radio_value(
                 policy,
                 cad_core::TextReflectPolicy::KeepReadable,
@@ -3507,9 +3599,12 @@ fn show_behavior_wizard(ui: &mut Ui, app: &mut MyCadApp, dynamic: &DynamicDefini
             members,
             attachment,
             parameter,
+            destinations,
         } => {
             ui.label(format!("Position by Option — {} objects", members.len()));
-            parameter_picker(ui, dynamic, parameter);
+            parameter_picker(ui, dynamic, parameter, |kind| {
+                matches!(kind, ParameterKind::Choice(_))
+            });
             ui.label(format!(
                 "Attachment: {}",
                 attachment
@@ -3522,15 +3617,32 @@ fn show_behavior_wizard(ui: &mut Ui, app: &mut MyCadApp, dynamic: &DynamicDefini
                     authoring.status = Some("Specify the group's attachment point".into());
                 }
             }
+            if let Some(attachment) = *attachment {
+                ui.weak("Destination of the attachment point for each option (block coordinates, drawing units):");
+                if let Some(ParameterKind::Choice(choice)) =
+                    dynamic.parameter(*parameter).map(|item| &item.kind)
+                {
+                    destinations
+                        .retain(|id, _| choice.options.iter().any(|option| option.id == *id));
+                    for option in &choice.options {
+                        let point = destinations.entry(option.id).or_insert(attachment);
+                        ui.label(&option.label);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.add(egui::DragValue::new(&mut point.x).prefix("X: ").speed(1.0));
+                            ui.add(egui::DragValue::new(&mut point.y).prefix("Y: ").speed(1.0));
+                        });
+                    }
+                }
+                ui.weak("Destinations initially keep the current position. Change only the options that should move.");
+            }
         }
         BehaviorWizard::Rotate {
             members,
             pivot,
             parameter,
-            degrees,
         } => {
             ui.label(format!("Rotate by Parameter — {} objects", members.len()));
-            parameter_picker(ui, dynamic, parameter);
+            parameter_picker(ui, dynamic, parameter, is_angle_parameter);
             ui.label(format!(
                 "Pivot: {}",
                 pivot
@@ -3543,7 +3655,12 @@ fn show_behavior_wizard(ui: &mut Ui, app: &mut MyCadApp, dynamic: &DynamicDefini
                     authoring.status = Some("Specify rotation pivot".into());
                 }
             }
-            ui.checkbox(degrees, "Angle parameter is in degrees");
+            if let Some(ParameterKind::Number(number)) =
+                dynamic.parameter(*parameter).map(|item| &item.kind)
+            {
+                ui.label(format!("Angle unit: {}", number.unit.label()));
+            }
+            ui.weak("Use Add angle parameter for rotation. Its default is zero, so the current orientation is unchanged.");
         }
     }
     ui.horizontal(|ui| {
@@ -3568,7 +3685,51 @@ fn show_behavior_wizard(ui: &mut Ui, app: &mut MyCadApp, dynamic: &DynamicDefini
     }
 }
 
-fn parameter_picker(ui: &mut Ui, dynamic: &DynamicDefinition, parameter: &mut ParameterId) {
+fn is_angle_parameter(kind: &ParameterKind) -> bool {
+    matches!(kind, ParameterKind::Number(number) if matches!(number.unit, cad_core::ParameterUnit::Degrees | cad_core::ParameterUnit::Radians))
+}
+
+fn show_condition_controls(
+    ui: &mut Ui,
+    dynamic: &DynamicDefinition,
+    parameter: &mut ParameterId,
+    options: &mut Vec<OptionId>,
+    boolean: &mut bool,
+) {
+    parameter_picker(ui, dynamic, parameter, |kind| {
+        matches!(kind, ParameterKind::Choice(_) | ParameterKind::Boolean(_))
+    });
+    match dynamic.parameter(*parameter).map(|item| &item.kind) {
+        Some(ParameterKind::Choice(choice)) => {
+            options.retain(|id| choice.options.iter().any(|option| option.id == *id));
+            ui.weak("Apply for these options:");
+            for option in &choice.options {
+                let mut enabled = options.contains(&option.id);
+                if ui.checkbox(&mut enabled, &option.label).changed() {
+                    if enabled {
+                        options.push(option.id);
+                    } else {
+                        options.retain(|id| *id != option.id);
+                    }
+                }
+            }
+        }
+        Some(ParameterKind::Boolean(flag)) => {
+            ui.radio_value(boolean, true, &flag.true_label);
+            ui.radio_value(boolean, false, &flag.false_label);
+        }
+        _ => {
+            ui.weak("Add a Choice or On/Off parameter first.");
+        }
+    }
+}
+
+fn parameter_picker(
+    ui: &mut Ui,
+    dynamic: &DynamicDefinition,
+    parameter: &mut ParameterId,
+    accepts: impl Fn(&ParameterKind) -> bool,
+) {
     egui::ComboBox::from_id_salt(format!("wiz-param-{}", parameter.raw()))
         .selected_text(
             dynamic
@@ -3577,7 +3738,11 @@ fn parameter_picker(ui: &mut Ui, dynamic: &DynamicDefinition, parameter: &mut Pa
                 .unwrap_or_else(|| "Parameter".into()),
         )
         .show_ui(ui, |ui| {
-            for item in dynamic.sorted_parameters() {
+            for item in dynamic
+                .sorted_parameters()
+                .into_iter()
+                .filter(|item| accepts(&item.kind))
+            {
                 if ui
                     .selectable_label(*parameter == item.id, &item.name)
                     .clicked()
@@ -3658,8 +3823,27 @@ fn confirm_behavior_wizard(app: &mut MyCadApp, _dynamic: &DynamicDefinition) {
     let Some(wizard) = state.wizard.clone() else {
         return;
     };
-    attach_named_behavior(
+    let (members, parameter) = match &wizard {
+        BehaviorWizard::LinkText {
+            target, parameter, ..
+        } => (vec![*target], *parameter),
+        BehaviorWizard::ShowWhen {
+            members, parameter, ..
+        }
+        | BehaviorWizard::Mirror {
+            members, parameter, ..
+        }
+        | BehaviorWizard::Position {
+            members, parameter, ..
+        }
+        | BehaviorWizard::Rotate {
+            members, parameter, ..
+        } => (members.clone(), *parameter),
+    };
+    let committed = commit_named_behavior(
         app,
+        members,
+        parameter,
         |document, dynamic, _members, _parameter| match wizard {
             BehaviorWizard::LinkText {
                 target,
@@ -3699,20 +3883,7 @@ fn confirm_behavior_wizard(app: &mut MyCadApp, _dynamic: &DynamicDefinition) {
                 options,
                 boolean,
             } => {
-                let condition = match &dynamic
-                    .parameter(parameter)
-                    .ok_or("Select a parameter")?
-                    .kind
-                {
-                    ParameterKind::Choice(_) => {
-                        cad_core::ParameterCondition::Choice { parameter, options }
-                    }
-                    ParameterKind::Boolean(_) => cad_core::ParameterCondition::Boolean {
-                        parameter,
-                        state: boolean,
-                    },
-                    _ => return Err("Show When needs a Choice or On/Off parameter".into()),
-                };
+                let condition = condition_for_parameter(dynamic, parameter, options, boolean)?;
                 dynamic.visibility.push(cad_core::VisibilityGroup {
                     id: document.allocate_action_id(),
                     name: dynamic
@@ -3729,21 +3900,17 @@ fn confirm_behavior_wizard(app: &mut MyCadApp, _dynamic: &DynamicDefinition) {
                 axis_a,
                 axis_b,
                 parameter,
-                use_visibility,
+                options,
+                boolean,
                 policy,
             } => {
-                if use_visibility {
-                    return Err(
-                        "Use Show When to assign different parts instead of mirroring".into(),
-                    );
-                }
                 let Some(a) = axis_a else {
                     return Err("Pick two axis points".into());
                 };
                 let Some(b) = axis_b else {
                     return Err("Pick two axis points".into());
                 };
-                let condition = condition_for_parameter(dynamic, parameter)?;
+                let condition = condition_for_parameter(dynamic, parameter, options, boolean)?;
                 let id = document.allocate_action_id();
                 dynamic.reflections.push(cad_core::ReflectionBehavior {
                     id,
@@ -3761,6 +3928,7 @@ fn confirm_behavior_wizard(app: &mut MyCadApp, _dynamic: &DynamicDefinition) {
                 members,
                 attachment,
                 parameter,
+                destinations: destination_points,
             } => {
                 let options = match &dynamic.parameter(parameter).ok_or("Select a Choice")?.kind {
                     ParameterKind::Choice(choice) => choice
@@ -3770,13 +3938,22 @@ fn confirm_behavior_wizard(app: &mut MyCadApp, _dynamic: &DynamicDefinition) {
                         .collect::<Vec<_>>(),
                     _ => return Err("Position by Option needs a Choice parameter".into()),
                 };
+                let attachment = attachment.ok_or("Pick the attachment point first")?;
+                if !attachment.is_finite()
+                    || destination_points.values().any(|point| !point.is_finite())
+                {
+                    return Err("Attachment and destination coordinates must be finite".into());
+                }
                 let mut destinations = std::collections::BTreeMap::new();
-                for (index, (option_id, label)) in options.into_iter().enumerate() {
+                for (option_id, label) in options {
                     let id = document.allocate_anchor_id();
                     dynamic.anchors.push(cad_core::AnchorDef {
                         id,
                         name: label,
-                        position: Point2::new(index as f64 * 100.0, 0.0),
+                        position: destination_points
+                            .get(&option_id)
+                            .copied()
+                            .unwrap_or(attachment),
                         orientation: Some(0.0),
                         follow: None,
                     });
@@ -3787,7 +3964,7 @@ fn confirm_behavior_wizard(app: &mut MyCadApp, _dynamic: &DynamicDefinition) {
                     id: action,
                     name: Some("Position".into()),
                     members,
-                    attachment: attachment.unwrap_or(Point2::new(0.0, 0.0)),
+                    attachment,
                     attachment_angle: 0.0,
                     parameter,
                     destinations,
@@ -3802,12 +3979,22 @@ fn confirm_behavior_wizard(app: &mut MyCadApp, _dynamic: &DynamicDefinition) {
                 parameter,
                 ..
             } => {
+                let pivot = pivot.ok_or("Pick the rotation pivot first")?;
+                if !pivot.is_finite() {
+                    return Err("The rotation pivot must be finite".into());
+                }
+                if !dynamic
+                    .parameter(parameter)
+                    .is_some_and(|item| is_angle_parameter(&item.kind))
+                {
+                    return Err("Choose an angle parameter in degrees or radians; use Add angle parameter to create one".into());
+                }
                 let action = document.allocate_action_id();
                 dynamic.rotations.push(cad_core::RotationBehavior {
                     id: action,
                     name: Some("Rotate".into()),
                     members,
-                    pivot: pivot.unwrap_or(Point2::new(0.0, 0.0)),
+                    pivot,
                     source: cad_core::RotationSource::AngleParameter(parameter),
                 });
                 dynamic.transform_order.push(action);
@@ -3815,9 +4002,11 @@ fn confirm_behavior_wizard(app: &mut MyCadApp, _dynamic: &DynamicDefinition) {
             }
         },
     );
-    if let Some(authoring) = app.dynamic_authoring.as_mut() {
-        authoring.wizard = None;
-        authoring.pick = AuthoringPick::Idle;
+    if committed {
+        if let Some(authoring) = app.dynamic_authoring.as_mut() {
+            authoring.wizard = None;
+            authoring.pick = AuthoringPick::Idle;
+        }
     }
 }
 
@@ -3976,6 +4165,7 @@ fn show_phase3_authoring(ui: &mut Ui, app: &mut MyCadApp, dynamic: &DynamicDefin
         }
     }
     ui.label(RichText::new("Presets").small().weak());
+    ui.weak("Save named combinations of parameter values, then apply them in Test mode.");
     for preset in &dynamic.presets {
         ui.horizontal(|ui| {
             ui.label(&preset.name);
@@ -4278,14 +4468,17 @@ pub fn always_visible_from_selection(app: &mut MyCadApp) {
 }
 
 pub fn mirror_from_selection(app: &mut MyCadApp) {
-    start_member_wizard(app, |members, parameter| BehaviorWizard::Mirror {
+    if !start_member_wizard(app, |members, parameter| BehaviorWizard::Mirror {
         members,
         axis_a: None,
         axis_b: None,
         parameter,
-        use_visibility: false,
+        options: Vec::new(),
+        boolean: true,
         policy: cad_core::TextReflectPolicy::KeepReadable,
-    });
+    }) {
+        return;
+    }
     if let Some(authoring) = app.dynamic_authoring.as_mut() {
         authoring.pick = AuthoringPick::MirrorAxisA;
         authoring.status = Some("Specify first axis point".into());
@@ -4293,11 +4486,14 @@ pub fn mirror_from_selection(app: &mut MyCadApp) {
 }
 
 pub fn position_from_selection(app: &mut MyCadApp) {
-    start_member_wizard(app, |members, parameter| BehaviorWizard::Position {
+    if !start_member_wizard(app, |members, parameter| BehaviorWizard::Position {
         members,
         attachment: None,
         parameter,
-    });
+        destinations: BTreeMap::new(),
+    }) {
+        return;
+    }
     if let Some(authoring) = app.dynamic_authoring.as_mut() {
         authoring.pick = AuthoringPick::PlaceAttachment;
         authoring.status = Some("Specify the group's attachment point".into());
@@ -4305,12 +4501,13 @@ pub fn position_from_selection(app: &mut MyCadApp) {
 }
 
 pub fn rotate_from_selection(app: &mut MyCadApp) {
-    start_member_wizard(app, |members, parameter| BehaviorWizard::Rotate {
+    if !start_member_wizard(app, |members, parameter| BehaviorWizard::Rotate {
         members,
         pivot: None,
         parameter,
-        degrees: true,
-    });
+    }) {
+        return;
+    }
     if let Some(authoring) = app.dynamic_authoring.as_mut() {
         authoring.pick = AuthoringPick::RotatePivot;
         authoring.status = Some("Specify rotation pivot".into());
@@ -4320,23 +4517,24 @@ pub fn rotate_from_selection(app: &mut MyCadApp) {
 fn start_member_wizard(
     app: &mut MyCadApp,
     build: impl FnOnce(Vec<EntityId>, ParameterId) -> BehaviorWizard,
-) {
+) -> bool {
     let Some(state) = app.dynamic_authoring.as_ref() else {
         app.status = "Open Edit Dynamic Block first".into();
-        return;
+        return false;
     };
     let Some(parameter) = state.selected_parameter else {
         app.status = "Select a parameter first".into();
-        return;
+        return false;
     };
     let members = app.selection.ids().to_vec();
     if members.is_empty() {
         app.status = "Select objects first".into();
-        return;
+        return false;
     }
     if let Some(authoring) = app.dynamic_authoring.as_mut() {
         authoring.wizard = Some(build(members, parameter));
     }
+    true
 }
 
 pub fn save_preset_from_test(app: &mut MyCadApp) {
@@ -4380,21 +4578,32 @@ pub fn save_preset_from_test(app: &mut MyCadApp) {
 fn condition_for_parameter(
     dynamic: &DynamicDefinition,
     parameter: ParameterId,
+    options: Vec<OptionId>,
+    boolean: bool,
 ) -> Result<cad_core::ParameterCondition, String> {
     match &dynamic
         .parameter(parameter)
         .ok_or("Select a parameter")?
         .kind
     {
-        ParameterKind::Choice(choice) => Ok(cad_core::ParameterCondition::Choice {
-            parameter,
-            options: vec![choice.default],
-        }),
+        ParameterKind::Choice(_) => {
+            if options.is_empty() {
+                return Err("Select at least one option for this action".into());
+            }
+            Ok(cad_core::ParameterCondition::Choice { parameter, options })
+        }
         ParameterKind::Boolean(_) => Ok(cad_core::ParameterCondition::Boolean {
             parameter,
-            state: true,
+            state: boolean,
         }),
         _ => Err("Show When / Mirror needs a Choice or On/Off parameter".into()),
+    }
+}
+
+fn report_authoring_error(app: &mut MyCadApp, message: String) {
+    app.status = message.clone();
+    if let Some(state) = app.dynamic_authoring.as_mut() {
+        state.status = Some(message);
     }
 }
 
@@ -4407,53 +4616,72 @@ fn attach_named_behavior(
         ParameterId,
     ) -> Result<String, String>,
 ) {
-    let Some(state) = app.dynamic_authoring.clone() else {
+    let Some(parameter) = app
+        .dynamic_authoring
+        .as_ref()
+        .and_then(|state| state.selected_parameter)
+    else {
+        report_authoring_error(app, "Select a parameter first".into());
+        return;
+    };
+    commit_named_behavior(app, app.selection.ids().to_vec(), parameter, write);
+}
+
+fn commit_named_behavior(
+    app: &mut MyCadApp,
+    members: Vec<EntityId>,
+    parameter: ParameterId,
+    write: impl FnOnce(
+        &mut Document,
+        &mut DynamicDefinition,
+        Vec<EntityId>,
+        ParameterId,
+    ) -> Result<String, String>,
+) -> bool {
+    let Some(state) = app.dynamic_authoring.as_ref() else {
         app.status = "Open Edit Dynamic Block first".into();
-        return;
+        return false;
     };
-    let Some(parameter) = state.selected_parameter else {
-        app.status = "Select a parameter first".into();
-        return;
-    };
-    let members: Vec<EntityId> = app.selection.ids().to_vec();
+    let name = state.block_name.clone();
     if members.is_empty() {
-        app.status = "Select objects first".into();
-        return;
+        report_authoring_error(app, "Select objects first".into());
+        return false;
     }
-    if let Some(document) = app.document.as_mut().map(std::sync::Arc::make_mut) {
-        app.history.begin();
-        let Some(block) = document.block_by_name(&state.block_name).cloned() else {
-            return;
-        };
-        let mut after = block.clone();
-        let Some(dynamic) = after.dynamic.as_mut() else {
-            return;
-        };
-        match write(document, dynamic, members, parameter) {
-            Ok(status) => {
-                if let Err(err) = cad_core::validate_definition(dynamic, &after.entities) {
-                    app.history.commit_open();
-                    app.status = err.to_string();
-                    return;
-                }
-                document.replace_block_definition(after.clone());
-                app.history.record(Edit::ReplaceBlockDefinition {
-                    name: state.block_name,
-                    before: Some(block),
-                    after: Some(after),
-                });
-                app.history.commit_open();
-                if let Some(authoring) = app.dynamic_authoring.as_mut() {
-                    authoring.status = Some(status);
-                }
-                app.request_preview();
-            }
-            Err(err) => {
-                app.history.commit_open();
-                app.status = err;
-            }
+    let Some(document) = app.document.as_mut().map(std::sync::Arc::make_mut) else {
+        return false;
+    };
+    let Some(block) = document.block_by_name(&name).cloned() else {
+        return false;
+    };
+    let mut after = block.clone();
+    let Some(dynamic) = after.dynamic.as_mut() else {
+        return false;
+    };
+    let status = match write(document, dynamic, members, parameter) {
+        Ok(status) => status,
+        Err(error) => {
+            report_authoring_error(app, error);
+            return false;
         }
+    };
+    if let Err(error) = cad_core::validate_definition(dynamic, &after.entities) {
+        report_authoring_error(app, error.to_string());
+        return false;
     }
+    app.history.begin();
+    document.replace_block_definition(after.clone());
+    app.history.record(Edit::ReplaceBlockDefinition {
+        name,
+        before: Some(block),
+        after: Some(after),
+    });
+    app.history.commit_open();
+    app.status = status.clone();
+    if let Some(state) = app.dynamic_authoring.as_mut() {
+        state.status = Some(status);
+    }
+    app.request_preview();
+    true
 }
 
 pub fn authoring_size_parameters(app: &MyCadApp) -> Vec<(ParameterId, String)> {
@@ -5412,6 +5640,361 @@ mod tests {
         assert!(size_wizard_parameter(&wizard)
             .unwrap_err()
             .contains("parameter name"));
+    }
+
+    fn evaluate_authoring_line(
+        app: &MyCadApp,
+        parameter: ParameterId,
+        value: ParameterValue,
+    ) -> (Point3, Point3) {
+        let document = app.document.as_deref().unwrap();
+        let mut config = InstanceConfiguration::default();
+        config.set(parameter, value);
+        let evaluated = cad_core::evaluate_definition(
+            document,
+            document.block_by_name("Offset").unwrap(),
+            Some(&config),
+            &mut cad_core::EvaluationCache::default(),
+            cad_core::EvaluationRequest {
+                generation: document.content_generation(),
+            },
+        )
+        .unwrap();
+        let Geometry::Line { start, end } = evaluated.entities[0].geometry else {
+            panic!("line");
+        };
+        (start, end)
+    }
+
+    #[test]
+    fn action_wizard_rotation_uses_degrees_and_captured_targets_after_selection_changes() {
+        let (mut app, _) = wizard_app();
+        add_angle_parameter(&mut app);
+        let parameter = app
+            .dynamic_authoring
+            .as_ref()
+            .unwrap()
+            .selected_parameter
+            .unwrap();
+        let member = app
+            .document
+            .as_ref()
+            .unwrap()
+            .block_by_name("Offset")
+            .unwrap()
+            .entities[0]
+            .id;
+        app.dynamic_authoring.as_mut().unwrap().wizard = Some(BehaviorWizard::Rotate {
+            members: vec![member],
+            parameter,
+            pivot: Some(Point2::new(0.0, 0.0)),
+        });
+        app.selection.clear();
+        app.dynamic_authoring.as_mut().unwrap().selected_parameter = None;
+        confirm_behavior_wizard(&mut app, &DynamicDefinition::default());
+        assert!(app.dynamic_authoring.as_ref().unwrap().wizard.is_none());
+        let (start, end) = evaluate_authoring_line(&app, parameter, ParameterValue::Number(180.0));
+        assert!(start.x.abs() < 1e-9 && start.y.abs() < 1e-9);
+        assert!((end.x + 10.0).abs() < 1e-9 && end.y.abs() < 1e-9);
+        app.history
+            .undo(std::sync::Arc::make_mut(app.document.as_mut().unwrap()));
+        let (_, end) = evaluate_authoring_line(&app, parameter, ParameterValue::Number(180.0));
+        assert_eq!(end.x, 10.0);
+    }
+
+    #[test]
+    fn action_wizard_keeps_failed_rotation_draft_and_requires_explicit_pivot() {
+        let (mut app, _) = wizard_app();
+        add_angle_parameter(&mut app);
+        let parameter = app
+            .dynamic_authoring
+            .as_ref()
+            .unwrap()
+            .selected_parameter
+            .unwrap();
+        let block = app
+            .document
+            .as_ref()
+            .unwrap()
+            .block_by_name("Offset")
+            .unwrap()
+            .clone();
+        app.dynamic_authoring.as_mut().unwrap().wizard = Some(BehaviorWizard::Rotate {
+            members: vec![block.entities[0].id],
+            parameter,
+            pivot: None,
+        });
+        confirm_behavior_wizard(&mut app, &DynamicDefinition::default());
+        let state = app.dynamic_authoring.as_ref().unwrap();
+        assert!(state.wizard.is_some());
+        assert!(state.status.as_ref().unwrap().contains("pivot"));
+        assert_eq!(
+            app.document
+                .as_ref()
+                .unwrap()
+                .block_by_name("Offset")
+                .unwrap(),
+            &block
+        );
+        if let Some(BehaviorWizard::Rotate { pivot, .. }) =
+            app.dynamic_authoring.as_mut().unwrap().wizard.as_mut()
+        {
+            *pivot = Some(Point2::new(0.0, 0.0));
+        }
+        confirm_behavior_wizard(&mut app, &DynamicDefinition::default());
+        assert!(app.dynamic_authoring.as_ref().unwrap().wizard.is_none());
+        assert_eq!(app.status, "Rotate by Parameter added");
+    }
+
+    #[test]
+    fn action_wizard_position_requires_attachment_and_uses_explicit_destinations() {
+        let (mut app, _) = wizard_app();
+        add_choice_parameter(&mut app);
+        let parameter = app
+            .dynamic_authoring
+            .as_ref()
+            .unwrap()
+            .selected_parameter
+            .unwrap();
+        let block = app
+            .document
+            .as_ref()
+            .unwrap()
+            .block_by_name("Offset")
+            .unwrap()
+            .clone();
+        let ParameterKind::Choice(choice) = &block
+            .dynamic
+            .as_ref()
+            .unwrap()
+            .parameter(parameter)
+            .unwrap()
+            .kind
+        else {
+            panic!("choice");
+        };
+        let first = choice.options[0].id;
+        let second = choice.options[1].id;
+        app.dynamic_authoring.as_mut().unwrap().wizard = Some(BehaviorWizard::Position {
+            members: vec![block.entities[0].id],
+            parameter,
+            attachment: None,
+            destinations: BTreeMap::from([(second, Point2::new(25.0, 10.0))]),
+        });
+        confirm_behavior_wizard(&mut app, &DynamicDefinition::default());
+        assert!(app.dynamic_authoring.as_ref().unwrap().wizard.is_some());
+        assert_eq!(
+            app.document
+                .as_ref()
+                .unwrap()
+                .block_by_name("Offset")
+                .unwrap(),
+            &block
+        );
+        if let Some(BehaviorWizard::Position { attachment, .. }) =
+            app.dynamic_authoring.as_mut().unwrap().wizard.as_mut()
+        {
+            *attachment = Some(Point2::new(5.0, 0.0));
+        }
+        confirm_behavior_wizard(&mut app, &DynamicDefinition::default());
+        assert!(app.dynamic_authoring.as_ref().unwrap().wizard.is_none());
+        let (start, end) = evaluate_authoring_line(&app, parameter, ParameterValue::Choice(first));
+        assert_eq!((start.x, start.y, end.x, end.y), (0.0, 0.0, 10.0, 0.0));
+        let (start, end) = evaluate_authoring_line(&app, parameter, ParameterValue::Choice(second));
+        assert_eq!((start.x, start.y, end.x, end.y), (20.0, 10.0, 30.0, 10.0));
+    }
+
+    #[test]
+    fn action_wizard_mirror_respects_chosen_option_and_keeps_invalid_axis_draft() {
+        let (mut app, _) = wizard_app();
+        add_choice_parameter(&mut app);
+        let parameter = app
+            .dynamic_authoring
+            .as_ref()
+            .unwrap()
+            .selected_parameter
+            .unwrap();
+        let block = app
+            .document
+            .as_ref()
+            .unwrap()
+            .block_by_name("Offset")
+            .unwrap()
+            .clone();
+        let ParameterKind::Choice(choice) = &block
+            .dynamic
+            .as_ref()
+            .unwrap()
+            .parameter(parameter)
+            .unwrap()
+            .kind
+        else {
+            panic!("choice");
+        };
+        let first = choice.options[0].id;
+        let second = choice.options[1].id;
+        app.dynamic_authoring.as_mut().unwrap().wizard = Some(BehaviorWizard::Mirror {
+            members: vec![block.entities[0].id],
+            parameter,
+            axis_a: Some(Point2::new(0.0, 0.0)),
+            axis_b: Some(Point2::new(0.0, 0.0)),
+            options: vec![second],
+            boolean: true,
+            policy: cad_core::TextReflectPolicy::KeepReadable,
+        });
+        confirm_behavior_wizard(&mut app, &DynamicDefinition::default());
+        assert!(app.dynamic_authoring.as_ref().unwrap().wizard.is_some());
+        assert_eq!(
+            app.document
+                .as_ref()
+                .unwrap()
+                .block_by_name("Offset")
+                .unwrap(),
+            &block
+        );
+        if let Some(BehaviorWizard::Mirror { axis_b, .. }) =
+            app.dynamic_authoring.as_mut().unwrap().wizard.as_mut()
+        {
+            *axis_b = Some(Point2::new(0.0, 10.0));
+        }
+        confirm_behavior_wizard(&mut app, &DynamicDefinition::default());
+        assert!(app.dynamic_authoring.as_ref().unwrap().wizard.is_none());
+        assert_eq!(
+            evaluate_authoring_line(&app, parameter, ParameterValue::Choice(first))
+                .1
+                .x,
+            10.0
+        );
+        assert_eq!(
+            evaluate_authoring_line(&app, parameter, ParameterValue::Choice(second))
+                .1
+                .x,
+            -10.0
+        );
+    }
+
+    #[test]
+    fn action_wizard_without_selection_does_not_start_geometry_picking() {
+        let (mut app, _) = wizard_app();
+        add_angle_parameter(&mut app);
+        rotate_from_selection(&mut app);
+        assert!(app.dynamic_authoring.as_ref().unwrap().wizard.is_none());
+        assert_eq!(
+            app.dynamic_authoring.as_ref().unwrap().pick,
+            AuthoringPick::Idle
+        );
+    }
+
+    #[test]
+    fn parameter_creation_button_keeps_the_new_angle_selected_in_the_same_frame() {
+        let (mut app, _) = wizard_app();
+        let context = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(400.0, 1400.0),
+            )),
+            ..Default::default()
+        };
+        let output = context.run(input.clone(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| show_authoring(ui, &mut app));
+        });
+        let point = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) if text.galley.text() == "Add angle parameter" => {
+                    Some(text.pos + text.galley.size() * 0.5)
+                }
+                _ => None,
+            })
+            .expect("angle button is visible");
+        let mut click = input;
+        click.events = vec![
+            egui::Event::PointerMoved(point),
+            egui::Event::PointerButton {
+                pos: point,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos: point,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ];
+        let _ = context.run(click, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| show_authoring(ui, &mut app));
+        });
+        let id = app
+            .dynamic_authoring
+            .as_ref()
+            .unwrap()
+            .selected_parameter
+            .expect("created angle stays selected");
+        let definition = app
+            .document
+            .as_ref()
+            .unwrap()
+            .block_by_name("Offset")
+            .unwrap()
+            .dynamic
+            .as_ref()
+            .unwrap();
+        assert_eq!(definition.parameter(id).unwrap().name, "Angle");
+        assert!(is_angle_parameter(&definition.parameter(id).unwrap().kind));
+    }
+
+    #[test]
+    fn numeric_editor_keeps_bound_edits_dirty_between_frames() {
+        let (mut app, _) = wizard_app();
+        add_angle_parameter(&mut app);
+        let parameter = app
+            .dynamic_authoring
+            .as_ref()
+            .unwrap()
+            .selected_parameter
+            .unwrap();
+        let number = app
+            .document
+            .as_ref()
+            .unwrap()
+            .block_by_name("Offset")
+            .unwrap()
+            .dynamic
+            .as_ref()
+            .unwrap()
+            .parameter(parameter)
+            .unwrap()
+            .clone();
+        let ParameterKind::Number(numeric) = number.kind else {
+            panic!("numeric");
+        };
+        let mut draft = ParameterDraft::from_parameter("Angle", &numeric);
+        draft.numeric.min = Some(-180.0);
+        draft.numeric.max = Some(180.0);
+        draft.numeric.step = Some(15.0);
+        draft.numeric.step_policy = StepPolicy::RequiredIncrement;
+        app.dynamic_authoring
+            .as_mut()
+            .unwrap()
+            .parameter_drafts
+            .insert(parameter, draft);
+        let context = egui::Context::default();
+        let _ = context.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_parameter_editor(ui, &mut app, "Offset", parameter, "Angle", &numeric);
+            });
+        });
+        let draft = &app.dynamic_authoring.as_ref().unwrap().parameter_drafts[&parameter];
+        assert!(draft.dirty);
+        assert_eq!(
+            (draft.numeric.min, draft.numeric.max, draft.numeric.step),
+            (Some(-180.0), Some(180.0), Some(15.0))
+        );
+        assert_eq!(draft.numeric.step_policy, StepPolicy::RequiredIncrement);
     }
 
     #[test]

@@ -709,16 +709,26 @@ impl Document {
 
     pub fn assign_missing_ids(&mut self) {
         let mut next = self.next_entity_id.max(1);
+        // Native files may interleave unassigned entities with existing IDs.
+        // Reserve all existing identities before filling holes so a later
+        // entity (and any dynamic action targeting it) keeps its identity.
+        for entity in self
+            .model_space
+            .iter()
+            .chain(self.blocks.values().flat_map(|block| block.entities.iter()))
+        {
+            if entity.id.is_assigned() {
+                next = next.max(entity.id.raw().saturating_add(1));
+            }
+        }
         for entity in self.model_space.iter_mut().chain(
             self.blocks
                 .values_mut()
                 .flat_map(|block| block.entities.iter_mut()),
         ) {
-            if entity.id.is_assigned() {
-                next = next.max(entity.id.raw() + 1);
-            } else {
+            if !entity.id.is_assigned() {
                 entity.id = EntityId(next);
-                next += 1;
+                next = next.saturating_add(1);
             }
         }
         self.next_entity_id = next;
@@ -1035,7 +1045,7 @@ impl Document {
     }
 
     fn on_entity_inserted(&mut self, space: &EntitySpace, index: usize, id: EntityId) {
-        self.shift_indices(space, index, 1);
+        self.reindex_space_suffix(space, index + 1);
         self.entity_locations.insert(
             id,
             EntityLocation {
@@ -1047,13 +1057,23 @@ impl Document {
 
     fn on_entity_removed(&mut self, space: &EntitySpace, index: usize, id: EntityId) {
         self.entity_locations.remove(&id);
-        self.shift_indices(space, index + 1, -1);
+        self.reindex_space_suffix(space, index);
     }
 
-    fn shift_indices(&mut self, space: &EntitySpace, from: usize, delta: isize) {
-        for location in self.entity_locations.values_mut() {
-            if location.space.matches(space) && location.index >= from {
-                location.index = location.index.saturating_add_signed(delta);
+    fn reindex_space_suffix(&mut self, space: &EntitySpace, from: usize) {
+        // Callers have already updated the vector and canonicalized the space.
+        // Only its shifted suffix needs new indices. Appending or removing the
+        // last entity touches no existing entries, regardless of drawing size.
+        let entities = match space {
+            EntitySpace::ModelSpace => &self.model_space,
+            EntitySpace::Block(name) => match self.blocks.get(name) {
+                Some(block) => &block.entities,
+                None => return,
+            },
+        };
+        for (index, entity) in entities.iter().enumerate().skip(from) {
+            if let Some(location) = self.entity_locations.get_mut(&entity.id) {
+                location.index = index;
             }
         }
     }
@@ -1740,6 +1760,78 @@ mod tests {
     }
 
     #[test]
+    fn missing_entity_ids_do_not_claim_existing_later_identities() {
+        let mut document = Document::default();
+        let mut existing_model = line(10.0, 0.0, 20.0, 0.0);
+        existing_model.id = EntityId(1);
+        document.model_space = vec![line(0.0, 0.0, 5.0, 0.0), existing_model];
+
+        let mut target = line(0.0, 0.0, 10.0, 0.0);
+        target.id = EntityId(50);
+        let mut block = BlockDefinition::plain(
+            "Frame",
+            Point3::default(),
+            vec![line(0.0, 1.0, 10.0, 1.0), target],
+        );
+        block.dynamic = Some(crate::DynamicDefinition {
+            behaviors: vec![crate::DynamicBehavior {
+                id: crate::ActionId(1),
+                kind: crate::BehaviorKind::Stretch,
+                parameter: crate::ParameterId(1),
+                targets: vec![crate::GeometryTarget::LineEnd(EntityId(50))],
+                local_direction: crate::Point2::new(1.0, 0.0),
+                reference_value: 10.0,
+                multiplier: 1.0,
+                composition: crate::CompositionRule::Additive,
+                follow: crate::FollowRole::Second,
+                name: None,
+            }],
+            parameters: vec![crate::ParameterDef::number(
+                crate::ParameterId(1),
+                "Width",
+                crate::NumericParameter::length(10.0),
+            )],
+            ..Default::default()
+        });
+        document.blocks.insert(block.name.clone(), block);
+        document.assign_missing_ids();
+
+        assert!(document.entity_index_is_consistent());
+        assert_eq!(document.model_space[1].id, EntityId(1));
+        assert!(document.model_space[0].id.raw() > 50);
+        let block = document.block_by_name("Frame").unwrap();
+        assert_eq!(block.entities[1].id, EntityId(50));
+        assert!(block.entities[0].id.raw() > 50);
+        assert_ne!(block.entities[0].id, document.model_space[0].id);
+        assert_eq!(
+            block.dynamic.as_ref().unwrap().behaviors[0].targets,
+            vec![crate::GeometryTarget::LineEnd(EntityId(50))]
+        );
+        assert_eq!(
+            document.entity_by_id(EntityId(1)),
+            Some(&document.model_space[1])
+        );
+        assert_eq!(
+            document.entity_by_id(EntityId(50)),
+            Some(&block.entities[1])
+        );
+        let stable_ids: Vec<_> = document
+            .model_space
+            .iter()
+            .map(|entity| entity.id)
+            .collect();
+        document.assign_missing_ids();
+        assert_eq!(
+            document
+                .model_space
+                .iter()
+                .map(|entity| entity.id)
+                .collect::<Vec<_>>(),
+            stable_ids
+        );
+    }
+
+    #[test]
     fn unhandled_class_names_require_a_save_loss_warning() {
         let mut diagnostics = ImportDiagnostics::default();
         diagnostics.record_unhandled_class("ACDB_DYNAMICBLOCKPURGEPREVENTER");
@@ -2176,7 +2268,15 @@ mod tests {
                 }
                 4 => {
                     let x = (next() % 50) as f64;
-                    let _ = document.add_entity_to(&space, line(x, 3.0, x + 1.0, 3.0));
+                    let len = document.entities(&space).unwrap().len();
+                    let at = (next() as usize) % (len + 2);
+                    // Exercise suffix updates, clamped appends and canonical
+                    // block names while model-space entries remain unchanged.
+                    let _ = document.insert_entity(
+                        &EntitySpace::Block("cell".into()),
+                        at,
+                        line(x, 3.0, x + 1.0, 3.0),
+                    );
                 }
                 5 => {
                     let id = document.block_by_name("CELL").and_then(|block| {
