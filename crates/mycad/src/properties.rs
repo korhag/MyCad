@@ -24,6 +24,34 @@ pub(crate) struct PropertySummary {
     pub shared_linetype: String,
 }
 
+fn draft_id() -> egui::Id {
+    egui::Id::new("entocad-property-editor-draft")
+}
+
+fn current_draft_key(app: &MyCadApp) -> Option<(usize, u64, u64)> {
+    let document = app.document.as_ref()?;
+    if app.selection.is_empty() {
+        return None;
+    }
+    Some((
+        std::sync::Arc::as_ptr(document) as usize,
+        app.selection.generation(),
+        document.content_generation(),
+    ))
+}
+
+/// Unapplied properties belong to the current document and selection only.
+/// A stable context ID also lets restart guards find edits while this pane is hidden.
+pub(crate) fn has_pending_edits(ctx: &egui::Context, app: &MyCadApp) -> bool {
+    let Some(key) = current_draft_key(app) else {
+        return false;
+    };
+    ctx.data_mut(|data| {
+        data.get_temp::<PropertyEditor>(draft_id())
+            .is_some_and(|draft| draft.key == key && draft.is_dirty())
+    })
+}
+
 pub fn show(ui: &mut Ui, app: &mut MyCadApp) {
     let _span = cad_core::perf::span("properties");
     ui.heading("Properties");
@@ -42,11 +70,10 @@ fn show_contents(ui: &mut Ui, app: &mut MyCadApp) {
         ui.weak("Select objects to inspect or edit their properties.");
         return;
     }
-    let selection_gen = app.selection.generation();
-    let content_gen = document.content_generation();
-    let document_identity = std::sync::Arc::as_ptr(document) as usize;
-    let key = (document_identity, selection_gen, content_gen);
-    let memory = ui.id().with("property-editor-draft");
+    let Some(key) = current_draft_key(app) else {
+        return;
+    };
+    let memory = draft_id();
     let mut draft = ui.data_mut(|data| data.get_temp::<PropertyEditor>(memory));
     if draft.as_ref().is_none_or(|draft| draft.key != key) {
         draft = Some(PropertyEditor::new(document, app.selection.ids(), key));
@@ -1200,6 +1227,65 @@ mod tests {
         app.refresh_derived();
         app.selection.replace_all(ids.to_vec());
         app
+    }
+
+    #[test]
+    fn pending_property_edits_follow_current_document_and_selection() {
+        let mut document = Document::default();
+        let first = add(
+            &mut document,
+            line(Point3::default(), Point3::new(10.0, 0.0, 0.0)),
+        );
+        let second = add(
+            &mut document,
+            line(Point3::default(), Point3::new(20.0, 0.0, 0.0)),
+        );
+        let mut app = app_with(document, &[first]);
+        let ctx = egui::Context::default();
+        let mut draft = PropertyEditor::new(
+            app.document.as_deref().unwrap(),
+            app.selection.ids(),
+            current_draft_key(&app).unwrap(),
+        );
+        ctx.data_mut(|data| data.insert_temp(draft_id(), draft.clone()));
+        assert!(!has_pending_edits(&ctx, &app));
+
+        set(&mut draft, PropertyKey::X, "42");
+        ctx.data_mut(|data| data.insert_temp(draft_id(), draft.clone()));
+        assert!(has_pending_edits(&ctx, &app));
+
+        app.selection.replace_all(vec![second]);
+        assert!(
+            !has_pending_edits(&ctx, &app),
+            "selection changes discard drafts"
+        );
+        draft.key = current_draft_key(&app).unwrap();
+        ctx.data_mut(|data| data.insert_temp(draft_id(), draft.clone()));
+        assert!(has_pending_edits(&ctx, &app));
+
+        let previous_document = app.document.clone().unwrap();
+        app.document = Some(Arc::new((*previous_document).clone()));
+        assert!(
+            !has_pending_edits(&ctx, &app),
+            "another document invalidates the draft"
+        );
+        draft.key = current_draft_key(&app).unwrap();
+        ctx.data_mut(|data| data.insert_temp(draft_id(), draft.clone()));
+        assert!(has_pending_edits(&ctx, &app));
+
+        add(
+            Arc::get_mut(app.document.as_mut().unwrap()).unwrap(),
+            line(Point3::default(), Point3::new(30.0, 0.0, 0.0)),
+        );
+        assert!(
+            !has_pending_edits(&ctx, &app),
+            "content changes invalidate the draft"
+        );
+        draft.key = current_draft_key(&app).unwrap();
+        ctx.data_mut(|data| data.insert_temp(draft_id(), draft));
+        assert!(has_pending_edits(&ctx, &app));
+        app.selection.replace_all(Vec::new());
+        assert!(!has_pending_edits(&ctx, &app));
     }
 
     #[test]

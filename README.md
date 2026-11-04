@@ -95,65 +95,106 @@ Install the Vulkan driver that matches the GPU (`vulkan-intel`, `vulkan-radeon`,
 or the NVIDIA package). `mesa-vulkan-drivers` is the Debian and Fedora name for
 the same drivers.
 
+### macOS
+
+Install Rust with [rustup](https://rustup.rs) and the Xcode Command Line Tools:
+
+```bash
+xcode-select --install
+```
+
+If bindgen cannot find libclang from Xcode, install LLVM with Homebrew and set
+`LIBCLANG_PATH` to its library directory before running the installer:
+
+```bash
+brew install llvm
+export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
+```
+
 ## Install as a desktop app
 
-These scripts build a release binary and register EntoCAD for the current
-user. They do not need an administrator or sudo. Run the same command again
-after a git pull to update. Headless `--import-only` stays a terminal command
-(`cargo run -p mycad -- --import-only <file>`), because a Start menu launch
-has no console.
+The three installers live in `scripts/`. They build the checked-out release
+with `Cargo.lock` and install it for the current user. Install the build tools
+listed above first; Linux also requires Python 3 to read Cargo's build output.
+The first build can take several minutes. No administrator privileges are
+needed for the app installation. Cargo may download the pinned toolchain and
+project dependencies.
 
-### Windows
+| OS | Install and open (run from the repository root) | Installed app |
+| --- | --- | --- |
+| Windows | `powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\install-windows.ps1 -Launch` | `%LOCALAPPDATA%\Programs\EntoCAD\EntoCAD.exe` |
+| Linux | `bash scripts/install-linux.sh --launch` | `~/.local/bin/entocad` |
+| macOS | `bash scripts/install-macos.sh --launch` | `~/Applications/EntoCAD.app` |
 
-Double-click `packaging\windows\Install EntoCAD.cmd`. The first build can
-take several minutes. When it finishes, EntoCAD opens. Double-click
-`packaging\windows\Uninstall EntoCAD.cmd` to remove it. Drawings and
-preferences are kept.
+On Windows you can also double-click `scripts\install-windows.cmd`.
+ExecutionPolicy Bypass applies to that process only; organizational policies
+may still require your administrator's approved way to run local scripts.
+Omit `-Launch` / `--launch` to install without opening the app.
 
-Typing `.\install.ps1` directly fails on this machine because Windows is set
-to AllSigned, which blocks unsigned scripts. The `.cmd` files pass
-`-ExecutionPolicy Bypass` for that one run and do not change the setting.
-The same command from a terminal is:
+Windows gets a Start menu entry and **Open with** entries for DWG/DXF; Linux
+gets an application-menu entry and file-manager launcher. On macOS, open the
+app from your user Applications folder in Finder. Pin the Start/application
+menu entry to the taskbar, or drag the macOS app to the Dock. Pinning remains
+your choice. Existing pins keep using the same installed path after updates.
+On macOS use **File → Open** for drawings; Finder document associations are
+not registered yet. The installed app is separate from Cargo's build folder,
+so `cargo clean` does not remove it.
+
+### Updating after a pull
+
+1. Run `git pull` in the checkout that originally installed the app.
+2. Run the same installer again, or open the installed EntoCAD and accept
+   **Update and restart** when offered. **Settings → Check for updates** checks
+   the local checkout again at any time.
+3. Save your drawing and finish pending commands or block/property edits before
+   accepting the update. The installer waits for EntoCAD to exit, builds and
+   replaces the installed copy, then opens the app with your saved drawing.
+
+Checks run in the background and compare the running version with the local
+checkout. Builds from Git also detect a changed commit at the same version.
+**Later** hides that version/revision until another change or a manual check.
+EntoCAD never pulls Git automatically. Keep the checkout at its original path;
+if you move it, run its installer once to update the recorded location.
+Build or replacement failures preserve the previous installed app and write a
+log. Windows shows build progress in a console; Linux/macOS write progress to
+the log. An update can take several minutes before the app reopens.
+
+Close EntoCAD before a manual Windows reinstall. Linux/macOS can replace their
+installed files while an existing window remains open, but that window keeps
+running its old build until you close and reopen it.
+
+Installer logs are written to:
+
+- Windows: `%LOCALAPPDATA%\EntoCAD\logs`
+- Linux: `$XDG_STATE_HOME/entocad`, or `~/.local/state/entocad`
+- macOS: `~/Library/Logs/EntoCAD`
+
+Manual installs append `install.log` (`install-windows.log` on Windows).
+In-app updates use timestamped `update-*.log` files; on Linux/macOS a sibling
+`.startup.log` also captures shell startup errors. If an update fails, reopen
+EntoCAD from its usual icon, read the log, fix the reported build prerequisite,
+and run the installer again. The old `packaging/` entry points remain forwarding
+wrappers so installations from earlier releases can still update.
+
+### Uninstalling
+
+Drawings outside the installed application and your preferences are retained.
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File packaging\windows\install.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\install-windows.ps1 -Uninstall
 ```
-
-EntoCAD appears in the Start menu. Right-click it to pin it to Start or the
-taskbar. It opens with no console window. DWG and DXF show EntoCAD under
-**Open with**; choose **Always** once if you want it as the default. The
-installed copy is `%LOCALAPPDATA%\Programs\EntoCAD\EntoCAD.exe`, so a later
-`cargo clean` does not remove it. Settings → Apps lists EntoCAD.
-
-The installed app compares its version with the workshop and offers to run
-this installer when the workshop is newer. Later hides that version until a
-newer one appears. Close EntoCAD before updating by hand. If the compiler
-crashes, the script stops;
-retry the build with `cargo build --release -p mycad -j 1`, then run the
-installer again.
-
-Uninstall from a terminal (drawings and preferences are kept):
-
-```powershell
-powershell -ExecutionPolicy Bypass -File packaging\windows\install.ps1 -Uninstall
-```
-
-### Linux
 
 ```bash
-./packaging/linux/install.sh
+bash scripts/install-linux.sh --uninstall
+bash scripts/install-macos.sh --uninstall
 ```
 
-If the script is not executable, run `bash packaging/linux/install.sh`.
-EntoCAD appears in the application menu. Pin it to the dock or taskbar; the
-window stays grouped with that launcher. The file manager can open DWG and
-DXF with EntoCAD. The binary is `~/.local/bin/entocad`.
-
-Uninstall (drawings and preferences are kept):
-
-```bash
-./packaging/linux/install.sh --uninstall
-```
+Windows also lists EntoCAD under **Settings → Apps**. Linux supports `--prefix`
+and `--data-dir`, and macOS supports `--install-dir`, for custom installation
+locations; use the same options when uninstalling. In-app updates remember
+these locations. See each script's `--help` (Windows `-Help`) for options.
+Headless `--import-only` remains a terminal command, for example
+`cargo run -p mycad -- --import-only drawing.dwg`.
 
 ### Troubleshooting
 

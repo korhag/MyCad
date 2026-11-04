@@ -596,6 +596,10 @@ pub struct MyCadApp {
     brand: Option<crate::brand::BrandTextures>,
     splash: Option<crate::brand::SplashState>,
     update_offer: Option<crate::update_check::UpdateOffer>,
+    update_check_rx: Option<Receiver<Result<crate::update_check::UpdateStatus, String>>>,
+    update_check_manual: bool,
+    update_launch_rx: Option<Receiver<Result<PathBuf, String>>>,
+    update_closing: bool,
     recent_files: crate::recent_files::RecentFiles,
     recent_files_changed: bool,
 }
@@ -615,6 +619,7 @@ impl MyCadApp {
         app.recent_files = crate::recent_files::RecentFiles::load(cc.storage);
         app.brand = crate::brand::BrandTextures::load(&cc.egui_ctx);
         app.splash = Some(crate::brand::SplashState::start());
+        app.start_update_check(false);
         workspace::sanitize_dock_state(&mut app.dock_state);
         if let Some(path) = app.pending_open.take() {
             app.start_load(path);
@@ -625,14 +630,6 @@ impl MyCadApp {
     fn from_settings(settings: AppSettings, initial_path: Option<PathBuf>) -> Self {
         let drafting_preferences = settings.drafting;
         let shown_background = settings.display.model_background;
-        let update_offer = match crate::update_check::check_installed() {
-            crate::update_check::UpdateStatus::Newer(offer)
-                if settings.dismissed_update.as_deref() != Some(offer.available.as_str()) =>
-            {
-                Some(offer)
-            }
-            _ => None,
-        };
         Self {
             camera: Camera2::default(),
             document: None,
@@ -726,7 +723,11 @@ impl MyCadApp {
             status_text: StatusText::default(),
             brand: None,
             splash: None,
-            update_offer,
+            update_offer: None,
+            update_check_rx: None,
+            update_check_manual: false,
+            update_launch_rx: None,
+            update_closing: false,
             recent_files: crate::recent_files::RecentFiles::default(),
             recent_files_changed: false,
         }
@@ -788,6 +789,9 @@ impl MyCadApp {
                     };
                     match loaded {
                         Ok(mut document) => {
+                            // A native snapshot can contain an older source path (or none).
+                            // Save/restart must refer to the file the user actually opened.
+                            document.source_path = Some(path.clone());
                             warm_document_fonts(&mut document);
                             let (companion_note, helper) =
                                 crate::compatibility::apply_open_companion(&path, &mut document);
@@ -6375,16 +6379,170 @@ impl MyCadApp {
     }
 
     fn check_for_updates(&mut self) {
-        match crate::update_check::check_installed() {
-            crate::update_check::UpdateStatus::Newer(offer) => {
+        self.start_update_check(true);
+    }
+
+    fn start_update_check(&mut self, manual: bool) {
+        if self.update_check_rx.is_some() {
+            self.update_check_manual |= manual;
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        match thread::Builder::new()
+            .name("check-update".into())
+            .spawn(move || {
+                let _ = tx.send(catch_worker(crate::update_check::check_installed));
+            }) {
+            Ok(_) => {
+                self.update_check_rx = Some(rx);
+                self.update_check_manual = manual;
+                if manual {
+                    self.status = "Checking the local checkout for updates…".into();
+                }
+            }
+            Err(error) if manual => self.status = format!("Could not check for updates: {error}"),
+            Err(_) => {}
+        }
+    }
+
+    fn accept_update_check(&mut self, result: Result<crate::update_check::UpdateStatus, String>) {
+        let manual = self.update_check_manual;
+        match result {
+            Ok(crate::update_check::UpdateStatus::Newer(offer))
+                if manual
+                    || self.settings.dismissed_update.as_deref() != Some(&offer.update_key) =>
+            {
                 self.update_offer = Some(offer);
             }
-            crate::update_check::UpdateStatus::Current { version } => {
-                self.status = format!("This copy is {version}, the same as the workshop.");
+            Ok(crate::update_check::UpdateStatus::Current { version }) if manual => {
+                self.update_offer = None;
+                self.status = format!("EntoCAD {version} is up to date with this checkout.");
             }
-            crate::update_check::UpdateStatus::Unavailable { message } => {
+            Ok(crate::update_check::UpdateStatus::Unavailable { message }) if manual => {
+                self.update_offer = None;
                 self.status = message;
             }
+            Err(message) if manual => {
+                self.status = format!("Could not check for updates: {message}")
+            }
+            _ => {}
+        }
+    }
+
+    /// Returns true while the drawing must remain frozen for the installer handoff.
+    fn poll_update_jobs(&mut self, ctx: &egui::Context) -> bool {
+        if let Some(rx) = &self.update_check_rx {
+            let result = match rx.try_recv() {
+                Ok(result) => Some(result),
+                Err(TryRecvError::Disconnected) => {
+                    Some(Err("The update check stopped unexpectedly.".into()))
+                }
+                Err(TryRecvError::Empty) => None,
+            };
+            if let Some(result) = result {
+                self.update_check_rx = None;
+                self.accept_update_check(result);
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            }
+        }
+        if let Some(rx) = &self.update_launch_rx {
+            let result = match rx.try_recv() {
+                Ok(result) => Some(result),
+                Err(TryRecvError::Disconnected) => {
+                    Some(Err("The installer launcher stopped unexpectedly.".into()))
+                }
+                Err(TryRecvError::Empty) => None,
+            };
+            if let Some(result) = result {
+                self.update_launch_rx = None;
+                match result {
+                    Ok(log) => {
+                        self.update_closing = true;
+                        self.status = format!("Installing the update. Log: {}", log.display());
+                    }
+                    Err(message) => self.status = format!("Could not start the update: {message}"),
+                }
+            }
+        }
+        if self.update_closing {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        } else if self.update_launch_rx.is_some()
+            && ctx.input(|input| input.viewport().close_requested())
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
+        let pending = self.update_launch_rx.is_some() || self.update_closing;
+        if pending {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.heading("Updating EntoCAD");
+                ui.spinner();
+                ui.label("Starting the installer. EntoCAD will reopen when the build finishes.");
+                ui.label(&self.status);
+            });
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+        pending
+    }
+
+    fn update_block_reason(&self, ctx: &egui::Context) -> Option<&'static str> {
+        if self.is_busy() || crate::blocks::library_work_pending(self) {
+            Some("Wait for the current operation to finish or cancel library placement.")
+        } else if self.is_dirty() {
+            Some("Save your drawing before updating.")
+        } else if self.block_edit.is_active() || self.dynamic_authoring.is_some() {
+            Some("Finish editing the block before updating.")
+        } else if crate::properties::has_pending_edits(ctx, self) {
+            Some("Apply or discard your pending Properties changes before updating.")
+        } else if self.command.is_active()
+            || self.dynamic_convert.is_some()
+            || self.configure_dialog.is_some()
+            || self.config_pending.is_some()
+            || !self.parameter_previews.is_empty()
+            || !self.pdf_plot.is_closed()
+            || self.pending_discard.is_some()
+            || self.pending_lossy_save
+            || self.pending_save_review.is_some()
+            || self.show_settings
+            || self.capture.is_some()
+        {
+            Some("Finish or cancel the current edit or dialog before updating.")
+        } else {
+            None
+        }
+    }
+
+    fn start_update_install(
+        &mut self,
+        ctx: &egui::Context,
+        offer: crate::update_check::UpdateOffer,
+    ) {
+        if self.update_launch_rx.is_some() || self.update_closing {
+            return;
+        }
+        if let Some(reason) = self.update_block_reason(ctx) {
+            self.status = reason.into();
+            return;
+        }
+        let reopen = self
+            .document
+            .as_ref()
+            .and_then(|document| document.source_path.clone());
+        let (tx, rx) = mpsc::channel();
+        match thread::Builder::new()
+            .name("launch-update".into())
+            .spawn(move || {
+                let result =
+                    catch_worker(|| crate::update_check::launch_update(&offer, reopen.as_deref()))
+                        .and_then(|result| result);
+                let _ = tx.send(result);
+            }) {
+            Ok(_) => {
+                self.update_launch_rx = Some(rx);
+                self.status = "Starting the installer…".into();
+                ctx.request_repaint();
+            }
+            Err(error) => self.status = format!("Could not start the update: {error}"),
         }
     }
 
@@ -6394,42 +6552,39 @@ impl MyCadApp {
         };
         let mut update = false;
         let mut later = false;
+        let blocked = self.update_block_reason(ctx);
         egui::Window::new("Update EntoCAD")
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                ui.label(format!(
-                    "This copy is {}. The workshop is {}.",
-                    offer.current, offer.available
-                ));
-                ui.label(
-                    "Update closes this window and runs the installer. The build can take several minutes, then EntoCAD opens again.",
-                );
+                ui.set_max_width(440.0);
+                if offer.current == offer.available {
+                    ui.label(format!("A different revision of EntoCAD {} is available in your local checkout.", offer.available));
+                } else {
+                    ui.label(format!("EntoCAD {} is installed. Your local checkout contains {}.", offer.current, offer.available));
+                }
+                if let Some(revision) = &offer.available_revision {
+                    ui.weak(format!("Checkout revision: {}", revision.chars().take(12).collect::<String>()));
+                }
+                ui.label("Update closes EntoCAD, builds and installs this checkout, then reopens your saved drawing. The build can take several minutes.");
+                if let Some(reason) = blocked {
+                    ui.add_space(8.0);
+                    ui.colored_label(ui.visuals().warn_fg_color, reason);
+                }
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Update").clicked() {
-                        update = true;
-                    }
-                    if ui.button("Later").clicked() {
-                        later = true;
-                    }
+                    update = ui.add_enabled(blocked.is_none(), egui::Button::new("Update and restart")).clicked();
+                    later = ui.button("Later").clicked();
                 });
             });
         if later {
-            self.settings.dismissed_update = Some(offer.available.clone());
+            self.settings.dismissed_update = Some(offer.update_key.clone());
             self.settings_draft.dismissed_update = self.settings.dismissed_update.clone();
             self.update_offer = None;
             return true;
         } else if update {
-            if self.is_dirty() || self.block_edit.is_active() {
-                self.status = "Save the drawing and leave block edit before updating.".into();
-                return false;
-            }
-            match crate::update_check::launch_update(&offer.update_command) {
-                Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
-                Err(message) => self.status = message,
-            }
+            self.start_update_install(ctx, offer);
         }
         false
     }
@@ -6514,6 +6669,9 @@ impl MyCadApp {
 impl eframe::App for MyCadApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         let _span = cad_core::perf::span("MyCadApp::update");
+        if self.poll_update_jobs(ctx) {
+            return;
+        }
         self.poll_io(ctx);
         crate::blocks::poll_library_job(self);
         self.poll_preview(ctx);
@@ -7146,6 +7304,9 @@ impl eframe::App for MyCadApp {
             if let Some(storage) = frame.storage_mut() {
                 self.settings.save(storage);
             }
+        }
+        if self.update_launch_rx.is_some() {
+            return;
         }
         if self.recent_files_changed {
             if let Some(storage) = frame.storage_mut() {
@@ -10583,5 +10744,105 @@ mod gui_workflow_tests {
             app.tree_generation,
             Some(app.document.as_ref().unwrap().content_generation())
         );
+    }
+}
+
+#[cfg(test)]
+mod update_workflow_tests {
+    use super::*;
+
+    #[test]
+    fn native_snapshot_restart_uses_the_file_actually_opened() {
+        let path =
+            std::env::temp_dir().join(format!("entocad-reopen-{}.mycad", std::process::id()));
+        let mut document = Document::default();
+        document.source_path = Some(PathBuf::from("previous-source.dwg"));
+        cad_io::write_mycad(&document, &path).unwrap();
+        let mut app = MyCadApp::for_test();
+        app.start_load_now(path.clone());
+        let result = app
+            .load_rx
+            .take()
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let LoadMsg::Success { document, .. } = result else {
+            panic!("snapshot did not load")
+        };
+        assert_eq!(document.source_path.as_ref(), Some(&path));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn update_waits_for_dirty_drawing_dialogs_and_background_loading() {
+        let mut app = MyCadApp::for_test();
+        let context = egui::Context::default();
+        assert!(
+            app.update_check_rx.is_none(),
+            "test construction must not read the installation"
+        );
+        assert!(app.update_block_reason(&context).is_none());
+        app.history.mark_dirty();
+        assert!(app.update_block_reason(&context).unwrap().contains("Save"));
+        app.history.clear();
+        app.pending_save_review = Some(PathBuf::from("review.dwg"));
+        assert!(app.update_block_reason(&context).is_some());
+        app.pending_save_review = None;
+        let (_sender, receiver) = mpsc::channel();
+        app.load_rx = Some(receiver);
+        assert!(app.update_block_reason(&context).unwrap().contains("Wait"));
+        app.load_rx = None;
+        app.show_settings = true;
+        assert!(app.update_block_reason(&context).is_some());
+    }
+
+    #[test]
+    fn automatic_update_check_is_quiet_but_manual_failure_is_visible() {
+        let mut app = MyCadApp::for_test();
+        app.accept_update_check(Err("missing checkout".into()));
+        assert_eq!(app.status, "Ready");
+        app.update_check_manual = true;
+        app.accept_update_check(Err("missing checkout".into()));
+        assert!(app.status.contains("missing checkout"));
+    }
+
+    #[test]
+    fn installer_launch_failure_keeps_app_open_and_success_requests_close() {
+        let mut app = MyCadApp::for_test();
+        let context = egui::Context::default();
+        let (sender, receiver) = mpsc::channel();
+        app.update_launch_rx = Some(receiver);
+        let _ = context.run(Default::default(), |ctx| {
+            assert!(
+                app.poll_update_jobs(ctx),
+                "freeze drawing until launch resolves"
+            );
+        });
+        sender.send(Err("permission denied".into())).unwrap();
+        assert!(!app.poll_update_jobs(&context));
+        assert!(!app.update_closing);
+        assert!(app.status.contains("permission denied"));
+        let (sender, receiver) = mpsc::channel();
+        app.update_launch_rx = Some(receiver);
+        sender
+            .send(Ok(PathBuf::from("/tmp/entocad-install.log")))
+            .unwrap();
+        let output = context.run(Default::default(), |ctx| assert!(app.poll_update_jobs(ctx)));
+        assert!(app.update_closing);
+        assert!(output.viewport_output.values().any(|viewport| viewport
+            .commands
+            .iter()
+            .any(|command| matches!(command, egui::ViewportCommand::Close))));
+    }
+
+    #[test]
+    fn disconnected_installer_worker_restores_interactive_app() {
+        let mut app = MyCadApp::for_test();
+        let (sender, receiver) = mpsc::channel();
+        app.update_launch_rx = Some(receiver);
+        drop(sender);
+        assert!(!app.poll_update_jobs(&egui::Context::default()));
+        assert!(!app.update_closing);
+        assert!(app.status.contains("stopped unexpectedly"));
     }
 }

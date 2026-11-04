@@ -497,6 +497,12 @@ pub(crate) fn library_placement_active(app: &MyCadApp) -> bool {
     app.blocks_panel.placement.is_some()
 }
 
+pub(crate) fn library_work_pending(app: &MyCadApp) -> bool {
+    app.blocks_panel.library_job.is_some()
+        || app.blocks_panel.placement.is_some()
+        || app.blocks_panel.new_library.is_some()
+}
+
 pub(crate) fn library_source_pending(app: &MyCadApp) -> bool {
     library_placement_active(app)
         || app

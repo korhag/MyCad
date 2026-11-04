@@ -5,9 +5,25 @@ All notable changes to EntoCAD are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project versions with [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Workspace version is `0.59.0` (`Cargo.toml`).
+Workspace version is `0.60.0` (`Cargo.toml`).
 
 ## [Unreleased]
+
+## [0.60.0] - 2026-11-04
+
+### Added
+- Add per-user Windows, Linux and macOS installers under `scripts/`, with stable OS launchers and a native macOS application bundle.
+- Offer local-checkout updates in the installed app, including changed Git revisions at the same version, and reopen the saved drawing after installation.
+
+### Changed
+- Run installation checks and installer startup in background workers so opening the app stays responsive.
+- Keep legacy installer entry points as forwarding wrappers for existing installations.
+
+### Fixed
+- Stage installation replacements and restore the previous app if publication fails; retain build and update logs for recovery.
+- Wait for the old app to close before automatic replacement, and block updates while drawings, Properties or block edits need attention.
+- Preserve user drawings and preferences when uninstalling and keep custom installation paths during updates.
+- Retain the actual opened filename for native snapshots so restarting reopens the correct drawing.
 
 ## [0.59.0] - 2026-11-04
 

@@ -1,9 +1,12 @@
 @echo off
-echo Building EntoCAD. The first build can take several minutes.
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0install.ps1"
+setlocal DisableDelayedExpansion
+set "EntoCadLaunch="
+if "%~1"=="" set "EntoCadLaunch=-Launch"
+rem Legacy entry point retained for existing installed update records.
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0..\..\scripts\install-windows.ps1" %EntoCadLaunch% %*
 if errorlevel 1 (
-    echo Install failed.
+    echo Installation failed. See the error dialog or installer log for details.
     pause
     exit /b 1
 )
-start "" "%LOCALAPPDATA%\Programs\EntoCAD\EntoCAD.exe"
+exit /b 0
