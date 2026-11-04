@@ -92,6 +92,7 @@ pub enum ToolbarAction {
     Save,
     SaveAndClose,
     DiscardAndClose,
+    ReturnToAuthoring,
     Breadcrumb(usize),
 }
 
@@ -345,6 +346,7 @@ pub fn show_toolbar(
     session: &BlockEditSession,
     can_add: bool,
     can_remove: bool,
+    test_preview: bool,
 ) -> ToolbarAction {
     let Some(frame) = session.current() else {
         return ToolbarAction::None;
@@ -355,66 +357,38 @@ pub fn show_toolbar(
         .fill(Color32::from_rgb(28, 38, 36))
         .inner_margin(egui::Margin::symmetric(8, 6))
         .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new("BLOCK EDIT")
-                        .strong()
-                        .size(12.0)
-                        .color(Color32::from_rgb(120, 210, 180)),
-                );
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(if test_preview { "TEST PREVIEW" } else { "EDIT SHARED DEFINITION" })
+                    .strong().size(12.0).color(Color32::from_rgb(120, 210, 180)));
                 ui.separator();
                 let crumbs = session.breadcrumb();
                 for (index, name) in crumbs.iter().enumerate() {
-                    if index > 0 {
-                        ui.label(RichText::new(">").color(Color32::from_rgb(110, 128, 124)));
-                    }
+                    if index > 0 { ui.label(RichText::new(">").color(Color32::from_rgb(110, 128, 124))); }
                     let current = index + 1 == crumbs.len();
-                    let text = if current {
-                        RichText::new(name)
-                            .strong()
-                            .color(Color32::from_rgb(230, 236, 232))
-                    } else {
-                        RichText::new(name).color(Color32::from_rgb(160, 180, 176))
-                    };
-                    if ui.add(egui::Button::new(text).frame(false)).clicked() && !current {
+                    let text = if current { RichText::new(name).strong().color(Color32::from_rgb(230, 236, 232)) }
+                        else { RichText::new(name).color(Color32::from_rgb(160, 180, 176)) };
+                    if ui.add_enabled(!test_preview, egui::Button::new(text).frame(false)).clicked() && !current {
                         action = ToolbarAction::Breadcrumb(index);
                     }
                 }
                 ui.separator();
-                ui.label(
-                    RichText::new(format!(
-                        "{references} reference{}",
-                        if references == 1 { "" } else { "s" }
-                    ))
-                    .color(Color32::from_rgb(150, 170, 166)),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Discard & Close").clicked() {
-                        action = ToolbarAction::DiscardAndClose;
-                    }
-                    if ui.button("Save & Close").clicked() {
-                        action = ToolbarAction::SaveAndClose;
-                    }
-                    if ui
-                        .add_enabled(frame.dirty, egui::Button::new("Save"))
-                        .clicked()
-                    {
-                        action = ToolbarAction::Save;
-                    }
+                if test_preview {
+                    ui.label("This occurrence only · values are temporary");
+                } else {
+                    ui.label(format!("Affects {references} reference{}", if references == 1 { "" } else { "s" }));
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                if test_preview {
+                    if ui.button("Return to authoring").clicked() { action = ToolbarAction::ReturnToAuthoring; }
+                } else {
+                    if ui.add_enabled(can_add, egui::Button::new("Add to Block")).clicked() { action = ToolbarAction::AddToBlock; }
+                    if ui.add_enabled(can_remove, egui::Button::new("Remove from Block")).clicked() { action = ToolbarAction::RemoveFromBlock; }
                     ui.separator();
-                    if ui
-                        .add_enabled(can_remove, egui::Button::new("Remove from Block"))
-                        .clicked()
-                    {
-                        action = ToolbarAction::RemoveFromBlock;
-                    }
-                    if ui
-                        .add_enabled(can_add, egui::Button::new("Add to Block"))
-                        .clicked()
-                    {
-                        action = ToolbarAction::AddToBlock;
-                    }
-                });
+                    if ui.add_enabled(frame.dirty, egui::Button::new("Save definition")).on_hover_text("Apply the shared definition; save the drawing separately to write its file.").clicked() { action = ToolbarAction::Save; }
+                    if ui.button("Save definition & close").clicked() { action = ToolbarAction::SaveAndClose; }
+                    if ui.button("Discard definition & close").clicked() { action = ToolbarAction::DiscardAndClose; }
+                }
             });
         });
     action
@@ -484,10 +458,12 @@ pub fn show_leave_dialog(ctx: &egui::Context, name: &str) -> Option<LeaveChoice>
         .resizable(false)
         .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
-            ui.label(format!("Save changes to block \"{name}\"?"));
+            ui.label(format!(
+                "Save changes to shared block definition \"{name}\"?"
+            ));
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                if ui.button("Save").clicked() {
+                if ui.button("Save definition").clicked() {
                     choice = Some(LeaveChoice::Save);
                 }
                 if ui.button("Discard").clicked() {

@@ -5,9 +5,29 @@ All notable changes to EntoCAD are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project versions with [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Workspace version is `0.58.0` (`Cargo.toml`).
+Workspace version is `0.59.0` (`Cargo.toml`).
 
 ## [Unreleased]
+
+## [0.59.0] - 2026-11-04
+
+### Added
+- Guide dynamic-block authoring through parameter, action, geometry and test steps, with consistent action editing and target highlighting.
+- Add validated, undoable Properties edits for selected objects, including common properties, coordinates, dimensions and block transforms.
+- Browse block-library thumbnails, favorites, descriptions and recent folders, then snap and rotate a placement preview before inserting.
+- Add a dockable Drawing compatibility panel with helper verification status, affected-block links and save-format explanations.
+
+### Changed
+- Separate selected-instance edits, shared-definition edits and temporary Test values with explicit scope and save labels.
+- Review the selected DWG/DXF format and destination in the compatibility dock before saving a new copy.
+- Record dynamic metadata changes without copying the block geometry.
+
+### Fixed
+- Preserve panel navigation requests made inside docked controls.
+- Keep library insertions isolated until placement and reject results from an older drawing or editing context.
+- Preserve configured dynamic geometry when editing instance properties, and align authoring guides with source definition geometry.
+- Refresh block lists and clear removed selections after background previews and Undo.
+- Prevent Test-mode commands and palette actions from changing source geometry or shared metadata.
 
 ## [0.58.0] - 2026-11-04
 

@@ -1,6 +1,8 @@
 //! Dockable Blocks tree: definition hierarchy, counts, and inline rename.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Weak};
 
 use cad_core::{
     insert_instance_ids_in_space, is_user_editable_block_name, validate_block_rename,
@@ -13,6 +15,7 @@ use egui_phosphor::regular::{
 };
 
 use crate::app::MyCadApp;
+use crate::library_preview::{paint_thumbnail, preview_for_asset, LibraryPreview};
 
 const ACCENT: Color32 = Color32::from_rgb(120, 210, 180);
 const COUNT_COLOR: Color32 = Color32::from_rgb(140, 158, 154);
@@ -47,6 +50,13 @@ pub struct BlocksPanel {
     library_search: String,
     new_library: Option<(std::path::PathBuf, String)>,
     library_job: Option<LibraryJob>,
+    library_restored: bool,
+    library_favorites_only: bool,
+    library_selected: Option<PathBuf>,
+    library_description: String,
+    thumbnails: HashMap<PathBuf, Result<LibraryPreview, String>>,
+    thumbnail_job: Option<ThumbnailJob>,
+    placement: Option<LibraryPlacement>,
 }
 
 impl Default for BlocksPanel {
@@ -65,12 +75,20 @@ impl Default for BlocksPanel {
             library_search: String::new(),
             new_library: None,
             library_job: None,
+            library_restored: false,
+            library_favorites_only: false,
+            library_selected: None,
+            library_description: String::new(),
+            thumbnails: HashMap::new(),
+            thumbnail_job: None,
+            placement: None,
         }
     }
 }
 
 impl BlocksPanel {
     pub(crate) fn cancel_library_insert_for_open(&mut self) {
+        self.placement = None;
         if self
             .library_job
             .as_ref()
@@ -149,6 +167,26 @@ const MAX_LIBRARY_SCAN_ENTRIES: usize = 20_000;
 const MAX_LIBRARY_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug)]
+struct ThumbnailJob {
+    path: PathBuf,
+    receiver: std::sync::mpsc::Receiver<Result<LibraryPreview, String>>,
+}
+
+#[derive(Debug)]
+struct LibraryPlacement {
+    document: Document,
+    edits: Vec<crate::history::Edit>,
+    inserted: EntityId,
+    name: String,
+    preview: LibraryPreview,
+    source: Weak<Document>,
+    generation: u64,
+    space: EntitySpace,
+    point: cad_core::Point2,
+    rotation: f64,
+}
+
+#[derive(Debug)]
 struct LibraryJob {
     receiver: std::sync::mpsc::Receiver<Result<LibraryResult, String>>,
     source: Option<(std::sync::Weak<Document>, u64)>,
@@ -166,6 +204,7 @@ enum LibraryResult {
         edits: Vec<crate::history::Edit>,
         inserted: EntityId,
         name: String,
+        preview: LibraryPreview,
     },
 }
 
@@ -253,6 +292,7 @@ fn prepare_library_insert(
     if asset.blocks.is_empty() {
         return Err("The library file contains no blocks.".into());
     }
+    let preview = preview_for_asset(&asset)?;
     let source_layers: HashSet<_> = document.layers.keys().cloned().collect();
     let source_linetypes: HashSet<_> = document.linetypes.keys().cloned().collect();
     let source_styles: HashSet<_> = document.text_styles.keys().cloned().collect();
@@ -332,6 +372,7 @@ fn prepare_library_insert(
         edits,
         inserted: inserted.id,
         name,
+        preview,
     })
 }
 
@@ -405,8 +446,12 @@ pub(crate) fn poll_library_job(app: &mut MyCadApp) {
     }
     match result {
         Ok(LibraryResult::Listed { folder, files }) => {
+            app.settings.library_browser.remember_folder(folder.clone());
             app.blocks_panel.library_folder = Some(folder);
             app.blocks_panel.library_files = files;
+            app.blocks_panel.thumbnails.clear();
+            app.blocks_panel.thumbnail_job = None;
+            app.blocks_panel.library_selected = None;
             app.status = format!(
                 "Library ready: {} blocks",
                 app.blocks_panel.library_files.len()
@@ -417,153 +462,443 @@ pub(crate) fn poll_library_job(app: &mut MyCadApp) {
             edits,
             inserted,
             name,
+            preview,
         }) => {
-            app.block_edit.refresh_dirty(&document);
-            app.document = Some(std::sync::Arc::new(document));
-            app.history.begin();
-            for edit in edits {
-                app.history.record(edit);
+            if !library_authoring_available(app) {
+                app.blocks_panel.error = Some("Finish the current block setup or leave Test mode before inserting a library block.".into());
+                return;
             }
-            app.history.commit_open();
-            app.selection.replace(inserted);
-            app.blocks_panel.selected = Some(name.clone());
-            app.schedule_full_refresh();
-            app.status =
-                format!("Inserted {name} from library at the center of the view; Move to place it");
+            app.cancel_active_command();
+            let (Some((source, generation)), Some(space)) = (job.source, job.space) else {
+                app.blocks_panel.error =
+                    Some("The insertion source is no longer available.".into());
+                return;
+            };
+            let point = app.block_edit.local_from_world().apply(app.camera.center);
+            app.status = format!("Place {name}: click a snap point; R rotates 90°; Esc cancels");
+            app.blocks_panel.placement = Some(LibraryPlacement {
+                document,
+                edits,
+                inserted,
+                name,
+                preview,
+                source,
+                generation,
+                space,
+                point,
+                rotation: 0.0,
+            });
         }
         Err(err) => app.blocks_panel.error = Some(err),
     }
 }
 
+pub(crate) fn library_placement_active(app: &MyCadApp) -> bool {
+    app.blocks_panel.placement.is_some()
+}
+
+pub(crate) fn library_source_pending(app: &MyCadApp) -> bool {
+    library_placement_active(app)
+        || app
+            .blocks_panel
+            .library_job
+            .as_ref()
+            .is_some_and(|job| job.source.is_some())
+}
+
+pub(crate) fn update_library_placement(app: &mut MyCadApp, point: cad_core::Point2) {
+    if point.is_finite() {
+        if let Some(placement) = &mut app.blocks_panel.placement {
+            placement.point = point;
+        }
+    }
+}
+
+pub(crate) fn rotate_library_placement(app: &mut MyCadApp, degrees: f64) {
+    if degrees.is_finite() {
+        if let Some(placement) = &mut app.blocks_panel.placement {
+            placement.rotation =
+                (placement.rotation + degrees.to_radians()).rem_euclid(std::f64::consts::TAU);
+        }
+    }
+}
+
+pub(crate) fn cancel_library_placement(app: &mut MyCadApp) -> bool {
+    let pending = app
+        .blocks_panel
+        .library_job
+        .as_ref()
+        .is_some_and(|job| job.source.is_some());
+    if pending {
+        app.blocks_panel.library_job = None;
+    }
+    let active = app.blocks_panel.placement.take().is_some();
+    if pending || active {
+        app.status = "Library placement canceled".into();
+    }
+    pending || active
+}
+
+fn placement_is_current(app: &MyCadApp, placement: &LibraryPlacement) -> bool {
+    app.document.as_ref().is_some_and(|current| {
+        placement.source.ptr_eq(&Arc::downgrade(current))
+            && placement.generation == current.content_generation()
+    }) && placement.space == app.block_edit.active_space()
+        && library_authoring_available(app)
+}
+
+/// Commit the worker-prepared transaction without cloning the drawing on click.
+pub(crate) fn commit_library_placement(app: &mut MyCadApp) -> bool {
+    let Some(mut placement) = app.blocks_panel.placement.take() else {
+        return false;
+    };
+    if !placement_is_current(app, &placement) {
+        app.blocks_panel.error =
+            Some("The drawing changed during placement. Insert the block again.".into());
+        return true;
+    }
+    if app.io_busy() || app.loading_path.is_some() {
+        app.status = "Wait for the current file operation before placing the block".into();
+        app.blocks_panel.placement = Some(placement);
+        return true;
+    }
+    let Some(entity) = placement.document.entity_by_id(placement.inserted) else {
+        app.blocks_panel.error = Some("The prepared block is unavailable. Insert it again.".into());
+        return true;
+    };
+    let mut entity = entity.clone();
+    if let Geometry::Insert {
+        insertion,
+        rotation,
+        ..
+    } = &mut entity.geometry
+    {
+        insertion.x = placement.point.x;
+        insertion.y = placement.point.y;
+        *rotation = placement.rotation;
+    }
+    if placement
+        .document
+        .replace_entity_in(&placement.space, placement.inserted, entity.clone())
+        .is_none()
+    {
+        app.blocks_panel.error = Some("The placement destination no longer exists.".into());
+        return true;
+    }
+    if let Some(crate::history::Edit::InsertEntity {
+        entity: recorded, ..
+    }) = placement.edits.last_mut()
+    {
+        *recorded = entity;
+    } else {
+        app.blocks_panel.error = Some("The prepared insertion has no undo record.".into());
+        return true;
+    }
+    placement.document.mark_extents_stale();
+    app.block_edit.refresh_dirty(&placement.document);
+    app.document = Some(Arc::new(placement.document));
+    app.history.begin();
+    for edit in placement.edits {
+        app.history.record(edit);
+    }
+    app.history.commit_open();
+    app.selection.replace(placement.inserted);
+    app.blocks_panel.selected = Some(placement.name.clone());
+    app.schedule_full_refresh();
+    app.status = format!("Placed {} from library", placement.name);
+    true
+}
+
+pub(crate) fn paint_library_placement(
+    app: &MyCadApp,
+    painter: &egui::Painter,
+    world_to_screen: impl Fn(cad_core::Point2) -> egui::Pos2,
+) {
+    let Some(placement) = &app.blocks_panel.placement else {
+        return;
+    };
+    if !placement_is_current(app, placement) {
+        return;
+    }
+    let transform = app
+        .block_edit
+        .world_from_local()
+        .then(Transform2::translate(placement.point.x, placement.point.y))
+        .then(Transform2::rotate(placement.rotation));
+    for line in &placement.preview.lines {
+        let start = world_to_screen(transform.apply(line[0]));
+        let end = world_to_screen(transform.apply(line[1]));
+        if start.is_finite() && end.is_finite() {
+            painter.line_segment([start, end], egui::Stroke::new(1.5_f32, ACCENT));
+        }
+    }
+    let origin = world_to_screen(app.block_edit.world_from_local().apply(placement.point));
+    if origin.is_finite() {
+        painter.circle_stroke(origin, 5.0, egui::Stroke::new(1.0_f32, ACCENT));
+    }
+}
+
+fn poll_thumbnail(app: &mut MyCadApp) {
+    let Some(job) = &app.blocks_panel.thumbnail_job else {
+        return;
+    };
+    let result = match job.receiver.try_recv() {
+        Ok(result) => result,
+        Err(std::sync::mpsc::TryRecvError::Empty) => return,
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            Err("Preview worker ended unexpectedly".into())
+        }
+    };
+    let Some(job) = app.blocks_panel.thumbnail_job.take() else {
+        return;
+    };
+    if app.blocks_panel.library_files.contains(&job.path) {
+        // Keep the transient preview cache bounded even in a large library.
+        if app.blocks_panel.thumbnails.len() >= 128 {
+            if let Some(old) = app.blocks_panel.thumbnails.keys().next().cloned() {
+                app.blocks_panel.thumbnails.remove(&old);
+            }
+        }
+        app.blocks_panel.thumbnails.insert(job.path, result);
+    }
+}
+
+fn read_library_asset(path: &Path) -> Result<cad_io::BlockAsset, String> {
+    let metadata = std::fs::metadata(path).map_err(|error| error.to_string())?;
+    if !metadata.is_file() {
+        return Err("Choose a regular library block file.".into());
+    }
+    if metadata.len() > MAX_LIBRARY_FILE_BYTES {
+        return Err("The library block exceeds the 64 MB size limit.".into());
+    }
+    cad_io::read_mycadblock(path).map_err(|error| error.to_string())
+}
+
+fn start_thumbnail(app: &mut MyCadApp, ctx: &egui::Context, path: PathBuf) {
+    if app.blocks_panel.thumbnail_job.is_some() {
+        return;
+    }
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let ctx = ctx.clone();
+    let worker_path = path.clone();
+    match std::thread::Builder::new()
+        .name("mycad-library-thumbnail".into())
+        .spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                preview_for_asset(&read_library_asset(&worker_path)?)
+            }))
+            .unwrap_or_else(|_| Err("Could not render this library preview".into()));
+            let _ = sender.send(result);
+            ctx.request_repaint();
+        }) {
+        Ok(_) => app.blocks_panel.thumbnail_job = Some(ThumbnailJob { path, receiver }),
+        Err(error) => {
+            app.blocks_panel
+                .thumbnails
+                .insert(path, Err(error.to_string()));
+        }
+    }
+}
+
+fn library_authoring_available(app: &MyCadApp) -> bool {
+    matches!(app.block_edit.ui, crate::block_edit::BlockUi::None)
+        && app.dynamic_authoring.as_ref().is_none_or(|state| {
+            state.mode == crate::dynamic_block::AuthoringMode::Author
+                && state.pick == crate::dynamic_block::AuthoringPick::Idle
+                && state.wizard.is_none()
+                && state.attach.is_none()
+                && state.size_wizard.is_none()
+                && !state.action_inspector.has_draft()
+        })
+}
+
 fn show_library(ui: &mut Ui, app: &mut MyCadApp) {
-    egui::CollapsingHeader::new("Block library")
-        .default_open(true)
-        .show(ui, |ui| {
-            ui.weak("Keep reusable blocks in a folder. Dynamic parameters are included.");
-            ui.weak("Blocks use the current drawing’s units.");
-            ui.weak("For DWG/DXF libraries, use File → Open, then save the blocks you need here.");
-            let busy = app.blocks_panel.library_job.is_some();
-            ui.add_enabled_ui(!busy, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    if ui.button("Open library…").clicked() {
-                        if let Some(folder) = rfd::FileDialog::new()
-                            .set_title("Choose a block library folder")
-                            .pick_folder()
-                        {
-                            start_library_job(app, ui.ctx(), None, move || list_library(folder));
-                        }
+    poll_thumbnail(app);
+    if !app.blocks_panel.library_restored {
+        app.blocks_panel.library_restored = true;
+        if let Some(folder) = app.settings.library_browser.selected_folder.clone() {
+            start_library_job(app, ui.ctx(), None, move || list_library(folder));
+        }
+    }
+    egui::CollapsingHeader::new("Block library").default_open(true).show(ui, |ui| {
+        ui.weak("Choose a block, then snap and click to place it.");
+        ui.weak("Blocks use the current drawing's units.");
+        let busy = app.blocks_panel.library_job.is_some();
+        ui.add_enabled_ui(!busy, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Open library…").clicked() {
+                    if let Some(folder) = rfd::FileDialog::new().set_title("Choose a block library folder").pick_folder() {
+                        start_library_job(app, ui.ctx(), None, move || list_library(folder));
                     }
-                    if ui.button("New library…").clicked() {
-                        if let Some(parent) = rfd::FileDialog::new()
-                            .set_title("Choose where to create the library")
-                            .pick_folder()
-                        {
-                            app.blocks_panel.new_library = Some((parent, "My library".into()));
-                        }
-                    }
-                    if let Some(folder) = app.blocks_panel.library_folder.clone() {
-                        if ui.button("Refresh").clicked() {
-                            start_library_job(app, ui.ctx(), None, move || list_library(folder));
-                        }
-                    }
-                });
-                let mut create = None;
-                let mut cancel = false;
-                if let Some((parent, name)) = &mut app.blocks_panel.new_library {
-                    ui.label(format!("Create in {}", parent.display()));
-                    ui.text_edit_singleline(name);
-                    ui.horizontal(|ui| {
-                        if ui.add_enabled(valid_library_name(name), egui::Button::new("Create folder")).clicked() {
-                            create = Some(parent.join(name.trim()));
-                        }
-                        cancel = ui.button("Cancel").clicked();
-                    });
-                    ui.weak("Use a folder name without / or \\.");
                 }
-                if cancel {
-                    app.blocks_panel.new_library = None;
-                }
-                if let Some(folder) = create {
-                    app.blocks_panel.new_library = None;
-                    start_library_job(app, ui.ctx(), None, move || {
-                        std::fs::create_dir(&folder).map_err(|err| err.to_string())?;
-                        list_library(folder)
-                    });
+                if ui.button("New library…").clicked() {
+                    if let Some(parent) = rfd::FileDialog::new().set_title("Choose where to create the library").pick_folder() {
+                        app.blocks_panel.new_library = Some((parent, "My library".into()));
+                    }
                 }
                 if let Some(folder) = app.blocks_panel.library_folder.clone() {
-                    ui.label(folder.display().to_string());
-                    ui.weak("Library folder stays selected for this session.");
-                    let name = app.block_edit.current()
-                        .map(|frame| frame.block_name.clone())
-                        .or_else(|| app.blocks_panel.selected.clone());
-                    let enabled = app.document.is_some() && name.is_some() && !app.io_busy();
-                    let label = name.as_ref()
-                        .map(|name| format!("Save {name} to library"))
-                        .unwrap_or_else(|| "Save selected block to library".into());
-                    if ui.add_enabled(enabled, egui::Button::new(label))
-                        .on_hover_text("Choose a block in the drawing tree, or edit a block first. Existing library files are kept.")
-                        .clicked()
-                    {
-                        if let (Some(source), Some(name)) = (app.document.clone(), name) {
-                            start_library_job(app, ui.ctx(), None, move || {
-                                save_library_block(&source, &name, &folder)?;
-                                drop(source);
-                                list_library(folder)
-                            });
-                        }
+                    if ui.button("Refresh").clicked() {
+                        start_library_job(app, ui.ctx(), None, move || list_library(folder));
                     }
                 }
-                ui.add(TextEdit::singleline(&mut app.blocks_panel.library_search)
-                    .hint_text("Find a library block"));
-                let query = app.blocks_panel.library_search.trim().to_lowercase();
-                let mut insert = None;
-                let files: Vec<_> = app.blocks_panel.library_files.iter()
-                    .filter(|path| path.file_stem().is_some_and(|name| {
-                        name.to_string_lossy().to_lowercase().contains(&query)
-                    }))
-                    .collect();
-                if files.is_empty() {
-                    ui.weak("No matching blocks. Save a block here or open another library.");
+            });
+            let mut open_recent = None;
+            egui::ComboBox::from_id_salt("recent-library-folders")
+                .selected_text("Recent libraries")
+                .show_ui(ui, |ui| {
+                    for folder in &app.settings.library_browser.recent_folders {
+                        if ui.selectable_label(app.blocks_panel.library_folder.as_ref() == Some(folder), folder.display().to_string()).clicked() {
+                            open_recent = Some(folder.clone());
+                        }
+                    }
+                    if app.settings.library_browser.recent_folders.is_empty() { ui.weak("No recent libraries"); }
+                });
+            if let Some(folder) = open_recent {
+                start_library_job(app, ui.ctx(), None, move || list_library(folder));
+            }
+            let mut create = None;
+            let mut cancel = false;
+            if let Some((parent, name)) = &mut app.blocks_panel.new_library {
+                ui.label(format!("Create in {}", parent.display()));
+                ui.text_edit_singleline(name);
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(valid_library_name(name), egui::Button::new("Create folder")).clicked() { create = Some(parent.join(name.trim())); }
+                    cancel = ui.button("Cancel").clicked();
+                });
+                ui.weak("Use a folder name without path separators.");
+            }
+            if cancel { app.blocks_panel.new_library = None; }
+            if let Some(folder) = create {
+                app.blocks_panel.new_library = None;
+                start_library_job(app, ui.ctx(), None, move || {
+                    std::fs::create_dir(&folder).map_err(|err| err.to_string())?;
+                    list_library(folder)
+                });
+            }
+            if let Some(folder) = app.blocks_panel.library_folder.clone() {
+                ui.label(folder.file_name().unwrap_or_default().to_string_lossy()).on_hover_text(folder.display().to_string());
+                let name = app.block_edit.current().map(|frame| frame.block_name.clone()).or_else(|| app.blocks_panel.selected.clone());
+                let enabled = app.document.is_some() && name.is_some() && !app.io_busy() && library_authoring_available(app);
+                let label = name.as_ref().map(|name| format!("Save {name} to library")).unwrap_or_else(|| "Save selected block to library".into());
+                if ui.add_enabled(enabled, egui::Button::new(label)).on_hover_text("Choose a block in the drawing tree or edit a block. Existing assets are kept.").clicked() {
+                    if let (Some(source), Some(name)) = (app.document.clone(), name) {
+                        start_library_job(app, ui.ctx(), None, move || {
+                            save_library_block(&source, &name, &folder)?;
+                            drop(source);
+                            list_library(folder)
+                        });
+                    }
                 }
-                egui::ScrollArea::vertical()
-                    .id_salt("library-files")
-                    .max_height(180.0)
-                    .show_rows(ui, 24.0, files.len(), |ui, range| {
-                        for index in range {
-                            let path = files[index];
-                            ui.horizontal(|ui| {
-                                ui.label(path.file_stem().unwrap_or_default().to_string_lossy());
-                                if ui.add_enabled(app.document.is_some() && !app.io_busy() && app.loading_path.is_none(), egui::Button::new("Insert")).clicked() {
-                                    insert = Some(path.clone());
-                                }
+            }
+        });
+        if let Some(placement) = app.blocks_panel.placement.as_mut() {
+            ui.separator();
+            ui.strong(format!("Placing {}", placement.name));
+            ui.label("Click a snap point. R: rotate 90°. Esc: cancel.");
+            let mut angle = placement.rotation.to_degrees();
+            ui.horizontal(|ui| {
+                ui.label("Rotation");
+                if ui.add(egui::DragValue::new(&mut angle).suffix("°").speed(1.0)).changed() && angle.is_finite() {
+                    placement.rotation = angle.to_radians().rem_euclid(std::f64::consts::TAU);
+                }
+                if ui.button("+90°").clicked() { placement.rotation = (placement.rotation + std::f64::consts::FRAC_PI_2).rem_euclid(std::f64::consts::TAU); }
+            });
+            if placement.preview.simplified { ui.weak("Simplified placement preview; all geometry will be inserted."); }
+            if ui.button("Cancel placement").clicked() { cancel_library_placement(app); }
+        }
+        ui.separator();
+        ui.add(TextEdit::singleline(&mut app.blocks_panel.library_search).hint_text("Find a name or description"));
+        ui.horizontal_wrapped(|ui| {
+            ui.checkbox(&mut app.blocks_panel.library_favorites_only, "Favorites only");
+            ui.checkbox(&mut app.settings.library_preview.show_thumbnails, "Previews");
+        });
+        let query = app.blocks_panel.library_search.trim().to_lowercase();
+        let favorites: HashSet<_> = app.settings.library_browser.favorites.iter().collect();
+        let files: Vec<_> = app.blocks_panel.library_files.iter().filter(|path| {
+            (!app.blocks_panel.library_favorites_only || favorites.contains(path))
+                && library_item_matches(path, app.settings.library_browser.descriptions.get(*path).map(String::as_str).unwrap_or_default(), &query)
+        }).cloned().collect();
+        let mut insert = None;
+        let mut thumbnail = None;
+        let mut selected = None;
+        let mut toggle_favorite = None;
+        let available = app.document.is_some() && !app.io_busy() && app.loading_path.is_none() && !busy && library_authoring_available(app);
+        let previews = app.settings.library_preview.show_thumbnails;
+        let row_height = if previews { 66.0 } else { 32.0 };
+        egui::ScrollArea::vertical().id_salt("library-files").max_height(330.0)
+            .show_rows(ui, row_height, files.len(), |ui, range| {
+                for index in range {
+                    let Some(path) = files.get(index) else { continue };
+                    ui.push_id(path, |ui| {
+                        ui.horizontal(|ui| {
+                            if previews {
+                                let cached = app.blocks_panel.thumbnails.get(path);
+                                paint_thumbnail(ui, cached.and_then(|value| value.as_ref().ok()));
+                                if cached.is_none() && thumbnail.is_none() && app.settings.library_preview.generate_missing { thumbnail = Some(path.clone()); }
+                            }
+                            ui.vertical(|ui| {
+                                let name = path.file_stem().unwrap_or_default().to_string_lossy();
+                                if ui.selectable_label(app.blocks_panel.library_selected.as_ref() == Some(path), name).on_hover_text(path.display().to_string()).clicked() { selected = Some(path.clone()); }
+                                ui.horizontal(|ui| {
+                                    let favorite = favorites.contains(path);
+                                    if ui.small_button(if favorite { "Unfavorite" } else { "Favorite" }).clicked() { toggle_favorite = Some(path.clone()); }
+                                    if ui.add_enabled(available, egui::Button::new("Place")).clicked() { insert = Some(path.clone()); }
+                                });
                             });
-                        }
-                    });
-                if let (Some(path), Some(source)) = (insert, app.document.clone()) {
-                    let space = app.block_edit.active_space();
-                    let point = app.block_edit.local_from_world().apply(app.camera.center);
-                    let snapshot = std::sync::Arc::clone(&source);
-                    start_library_job(app, ui.ctx(), Some(source), move || {
-                        // Copy on the worker, then release the shared drawing before file I/O.
-                        let document = snapshot.as_ref().clone();
-                        drop(snapshot);
-                        if std::fs::metadata(&path).map_err(|err| err.to_string())?.len() > MAX_LIBRARY_FILE_BYTES {
-                            return Err("The library block exceeds the 64 MB size limit.".into());
-                        }
-                        let asset = cad_io::read_mycadblock(&path).map_err(|err| err.to_string())?;
-                        prepare_library_insert(document, asset, space, point)
+                        });
                     });
                 }
             });
-            if let Some(error) = &app.blocks_panel.error {
-                ui.colored_label(CYCLE_COLOR, error);
+        if files.is_empty() { ui.weak("No matching blocks. Save a block here or open another library."); }
+        if let Some(path) = toggle_favorite {
+            let favorites = &mut app.settings.library_browser.favorites;
+            if favorites.contains(&path) { favorites.retain(|item| item != &path); }
+            else if favorites.len() < MAX_LIBRARY_ITEMS { favorites.push(path); }
+        }
+        if let Some(path) = selected {
+            app.blocks_panel.library_description = app.settings.library_browser.descriptions.get(&path).cloned().unwrap_or_default();
+            app.blocks_panel.library_selected = Some(path);
+        }
+        if let Some(path) = app.blocks_panel.library_selected.clone() {
+            ui.separator();
+            ui.label("Personal description");
+            ui.add(TextEdit::multiline(&mut app.blocks_panel.library_description).desired_rows(2).char_limit(500).hint_text("Describe this block for search"));
+            if ui.button("Save description").clicked() {
+                let value = app.blocks_panel.library_description.trim().to_owned();
+                if value.is_empty() { app.settings.library_browser.descriptions.remove(&path); }
+                else { app.settings.library_browser.descriptions.insert(path.clone(), value); }
+                app.status = "Library description saved in your preferences".into();
             }
-            if busy {
-                ui.spinner();
-                ui.label("Working on library…");
-                ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
+            ui.weak("Personal descriptions travel with exported preferences, not with the block file.");
+            if let Some(Err(error)) = app.blocks_panel.thumbnails.get(&path) { ui.colored_label(CYCLE_COLOR, error); }
+            if ui.button("Generate preview").clicked() { thumbnail = Some(path); }
+        }
+        if let Some(path) = thumbnail {
+            if app.blocks_panel.thumbnail_job.is_none() && !busy { start_thumbnail(app, ui.ctx(), path); }
+        }
+        if let Some(path) = insert {
+            cancel_library_placement(app);
+            app.cancel_active_command();
+            if let Some(source) = app.document.clone() {
+                let space = app.block_edit.active_space();
+                let snapshot = Arc::clone(&source);
+                start_library_job(app, ui.ctx(), Some(source), move || {
+                    let document = snapshot.as_ref().clone();
+                    drop(snapshot);
+                    prepare_library_insert(document, read_library_asset(&path)?, space, cad_core::Point2::default())
+                });
             }
-        });
+        }
+        if let Some(error) = &app.blocks_panel.error { ui.colored_label(CYCLE_COLOR, error); }
+        if busy { ui.horizontal(|ui| { ui.spinner(); ui.label("Working on library…"); }); }
+        if busy || app.blocks_panel.thumbnail_job.is_some() { ui.ctx().request_repaint_after(std::time::Duration::from_millis(50)); }
+    });
+}
+
+fn library_item_matches(path: &Path, description: &str, query: &str) -> bool {
+    path.file_stem()
+        .is_some_and(|name| name.to_string_lossy().to_lowercase().contains(query))
+        || description.to_lowercase().contains(query)
 }
 
 fn valid_library_name(name: &str) -> bool {
@@ -1304,6 +1639,129 @@ mod tests {
         std::fs::remove_dir_all(folder).unwrap();
     }
 
+    fn staged_placement_app() -> (MyCadApp, Arc<Document>, EntityId) {
+        let mut host = Document::default();
+        let selected = host
+            .add_entity(Entity::new(Geometry::Line {
+                start: Point3::new(50.0, 0.0, 0.0),
+                end: Point3::new(60.0, 0.0, 0.0),
+            }))
+            .id;
+        let source = Arc::new(host);
+        let mut app = MyCadApp::for_test();
+        app.document = Some(Arc::clone(&source));
+        app.selection.replace(selected);
+        let asset = cad_io::BlockAsset {
+            blocks: vec![BlockDefinition::plain(
+                "Door",
+                Point3::default(),
+                vec![Entity::new(Geometry::Line {
+                    start: Point3::default(),
+                    end: Point3::new(10.0, 0.0, 0.0),
+                })],
+            )],
+            layers: Vec::new(),
+            linetypes: Vec::new(),
+            text_styles: Vec::new(),
+        };
+        let prepared = prepare_library_insert(
+            source.as_ref().clone(),
+            asset,
+            EntitySpace::ModelSpace,
+            cad_core::Point2::default(),
+        )
+        .unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        app.blocks_panel.library_job = Some(LibraryJob {
+            receiver,
+            source: Some((Arc::downgrade(&source), source.content_generation())),
+            space: Some(EntitySpace::ModelSpace),
+        });
+        sender.send(Ok(prepared)).unwrap();
+        poll_library_job(&mut app);
+        (app, source, selected)
+    }
+
+    #[test]
+    fn library_placement_is_a_preview_until_click_and_commits_one_undoable_transaction() {
+        let (mut app, source, selected) = staged_placement_app();
+        assert!(library_placement_active(&app));
+        assert!(Arc::ptr_eq(app.document.as_ref().unwrap(), &source));
+        assert_eq!(app.selection.ids(), &[selected]);
+        assert_eq!(app.history.undo_len(), 0);
+        assert!(source.blocks.is_empty());
+        update_library_placement(&mut app, cad_core::Point2::new(25.0, 50.0));
+        rotate_library_placement(&mut app, 90.0);
+        assert!(commit_library_placement(&mut app));
+        assert!(!library_placement_active(&app));
+        assert_eq!(app.history.undo_len(), 1);
+        let document = Arc::get_mut(app.document.as_mut().unwrap()).unwrap();
+        let inserted = document.model_space.last().unwrap();
+        let Geometry::Insert {
+            insertion,
+            rotation,
+            ..
+        } = &inserted.geometry
+        else {
+            panic!("insert")
+        };
+        assert_eq!(*insertion, Point3::new(25.0, 50.0, 0.0));
+        assert_eq!(*rotation, std::f64::consts::FRAC_PI_2);
+        assert!(app.history.undo(document));
+        assert_eq!(document.model_space.len(), 1);
+        assert_eq!(document.model_space[0].id, selected);
+        assert!(document.blocks.is_empty());
+        assert!(app.history.redo(document));
+        assert_eq!(document.model_space.len(), 2);
+        let Geometry::Insert {
+            insertion,
+            rotation,
+            ..
+        } = &document.model_space[1].geometry
+        else {
+            panic!("insert")
+        };
+        assert_eq!(*insertion, Point3::new(25.0, 50.0, 0.0));
+        assert_eq!(*rotation, std::f64::consts::FRAC_PI_2);
+    }
+
+    #[test]
+    fn cancel_library_placement_preserves_document_selection_and_history() {
+        let (mut app, source, selected) = staged_placement_app();
+        update_library_placement(&mut app, cad_core::Point2::new(3.0, 4.0));
+        assert!(cancel_library_placement(&mut app));
+        assert!(!commit_library_placement(&mut app));
+        assert!(Arc::ptr_eq(app.document.as_ref().unwrap(), &source));
+        assert_eq!(app.selection.ids(), &[selected]);
+        assert_eq!(app.history.undo_len(), 0);
+        assert!(source.blocks.is_empty());
+    }
+
+    #[test]
+    fn changed_drawing_rejects_a_staged_library_placement() {
+        let (mut app, _, selected) = staged_placement_app();
+        let replacement = Arc::new(Document::default());
+        app.document = Some(Arc::clone(&replacement));
+        assert!(commit_library_placement(&mut app));
+        assert!(Arc::ptr_eq(app.document.as_ref().unwrap(), &replacement));
+        assert_eq!(app.selection.ids(), &[selected]);
+        assert_eq!(app.history.undo_len(), 0);
+        assert!(app
+            .blocks_panel
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("changed during placement"));
+    }
+
+    #[test]
+    fn library_search_includes_personal_descriptions() {
+        let path = Path::new("Door.mycadblock");
+        assert!(library_item_matches(path, "Fire rated steel", "steel"));
+        assert!(library_item_matches(path, "Fire rated steel", "door"));
+        assert!(!library_item_matches(path, "Fire rated steel", "window"));
+    }
+
     #[test]
     fn library_names_and_asset_paths_cannot_escape_the_folder() {
         for bad in ["", "..", "../outside", "a/b", "a\\b", "name."] {
@@ -1343,6 +1801,7 @@ mod tests {
                 edits: Vec::new(),
                 inserted,
                 name: "Library block".into(),
+                preview: LibraryPreview::default(),
             }))
             .unwrap();
         let replacement = std::sync::Arc::new(Document::default());
@@ -1388,6 +1847,7 @@ mod tests {
                 edits: Vec::new(),
                 inserted,
                 name: "Unwanted".into(),
+                preview: LibraryPreview::default(),
             }))
             .unwrap();
         app.block_edit

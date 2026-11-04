@@ -21,6 +21,7 @@ pub enum WorkspaceTab {
     Viewport,
     Properties,
     Diagnostics,
+    Compatibility,
     Blocks,
     DynamicBlock,
     CommandLine,
@@ -33,6 +34,7 @@ impl WorkspaceTab {
             Self::Viewport => "Viewport",
             Self::Properties => "Properties",
             Self::Diagnostics => "Diagnostics",
+            Self::Compatibility => "Compatibility",
             Self::Blocks => "Blocks",
             Self::DynamicBlock => "Dynamic Block",
             Self::CommandLine => "Command",
@@ -73,10 +75,11 @@ pub fn default_dock_state() -> DockState<WorkspaceTab> {
         0.24,
         vec![WorkspaceTab::Properties, WorkspaceTab::Blocks],
     );
-    let [viewport, _diag] =
-        state
-            .main_surface_mut()
-            .split_right(viewport, 0.76, vec![WorkspaceTab::Diagnostics]);
+    let [viewport, _diag] = state.main_surface_mut().split_right(
+        viewport,
+        0.76,
+        vec![WorkspaceTab::Compatibility, WorkspaceTab::Diagnostics],
+    );
     let _ = state
         .main_surface_mut()
         .split_below(viewport, 0.88, vec![WorkspaceTab::CommandLine]);
@@ -289,6 +292,12 @@ pub fn ensure_tab(state: &mut DockState<WorkspaceTab>, tab: WorkspaceTab) {
     if state.find_tab(&tab).is_some() {
         return;
     }
+    if tab == WorkspaceTab::Compatibility {
+        if let Some((surface, node, _)) = state.find_tab(&WorkspaceTab::Diagnostics) {
+            state[surface][node].append_tab(tab);
+            return;
+        }
+    }
     if tab == WorkspaceTab::Blocks || tab == WorkspaceTab::DynamicBlock {
         if let Some((surface, node, _)) = state.find_tab(&WorkspaceTab::Properties) {
             state[surface][node].append_tab(tab);
@@ -307,6 +316,13 @@ pub fn ensure_tab(state: &mut DockState<WorkspaceTab>, tab: WorkspaceTab) {
         }
     }
     state.push_to_focused_leaf(tab);
+}
+
+pub fn focus_tab(state: &mut DockState<WorkspaceTab>, tab: WorkspaceTab) {
+    ensure_tab(state, tab);
+    if let Some(location) = state.find_tab(&tab) {
+        state.set_active_tab(location);
+    }
 }
 
 pub fn encode_dock_layout(state: &DockState<WorkspaceTab>) -> serde_json::Value {
@@ -381,6 +397,10 @@ pub fn show_workspace(ui: &mut Ui, app: &mut MyCadApp) {
             .show_inside(ui, &mut viewer);
     }
     app.dock_state = dock_state;
+    if let Some(tab) = app.pending_workspace_focus.take() {
+        focus_tab(&mut app.dock_state, tab);
+        ui.ctx().request_repaint();
+    }
 }
 
 /// egui_dock `Style::TAB_COLLAPSE_BUTTON_SIZE`. A tab strip of this width
@@ -552,6 +572,7 @@ impl TabViewer for WorkspaceViewer<'_> {
             WorkspaceTab::Viewport => self.app.show_viewport(ui),
             WorkspaceTab::Properties => properties::show(ui, self.app),
             WorkspaceTab::Diagnostics => crate::diagnostics::show(ui, self.app),
+            WorkspaceTab::Compatibility => self.app.show_compatibility(ui),
             WorkspaceTab::Blocks => crate::blocks::show(ui, self.app),
             WorkspaceTab::DynamicBlock => crate::dynamic_block::show_authoring(ui, self.app),
             WorkspaceTab::CommandLine => crate::command_line::show(ui, self.app),

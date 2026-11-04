@@ -50,6 +50,13 @@ pub enum AuthoringMode {
     Test,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AuthoringStep {
+    #[default]
+    Parameter,
+    Actions,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthoringPick {
     Idle,
@@ -255,6 +262,10 @@ pub struct AuthoringState {
     pub selected_parameter: Option<ParameterId>,
     pub selected_behavior: Option<ActionId>,
     pub mode: AuthoringMode,
+    pub step: AuthoringStep,
+    pub action_inspector: crate::dynamic_actions::InspectorState,
+    // Independent metadata ownership never keeps the source document shared.
+    cached_metadata: Option<(u64, u64, std::sync::Arc<DynamicDefinition>)>,
     pub test_values: BTreeMap<ParameterId, ParameterValue>,
     pub test_drafts: BTreeMap<ParameterId, String>,
     pub test_initial: BTreeMap<ParameterId, ParameterValue>,
@@ -295,6 +306,9 @@ impl AuthoringState {
             selected_parameter: None,
             selected_behavior: None,
             mode: AuthoringMode::Author,
+            step: AuthoringStep::Parameter,
+            action_inspector: Default::default(),
+            cached_metadata: None,
             test_values: BTreeMap::new(),
             test_drafts: BTreeMap::new(),
             test_initial: BTreeMap::new(),
@@ -329,6 +343,11 @@ impl AuthoringState {
         self.pick = AuthoringPick::Idle;
         self.size_wizard = None;
         self.attach = None;
+        self.wizard = None;
+        self.action_inspector = Default::default();
+        self.selected_behavior = None;
+        self.highlight.clear();
+        self.status = None;
         if let Some(definition) = document.block_by_name(&self.block_name) {
             if let Some(entity) = document.entity_by_id(self.instance_id) {
                 self.test_values.clear();
@@ -366,6 +385,16 @@ impl AuthoringState {
         self.test_errors.clear();
         self.test_compare = false;
         self.mark_preview_dirty();
+    }
+
+    /// Returns configuration metadata for preview construction. Authoring
+    /// renders source geometry; Test evaluates this temporary configuration.
+    pub fn preview_config(&self, document: &Document) -> Option<InstanceConfiguration> {
+        if self.mode == AuthoringMode::Test {
+            return self.test_config(document);
+        }
+        document.block_by_name(&self.block_name)?.dynamic.as_ref()?;
+        Some(InstanceConfiguration::default())
     }
 
     pub fn test_config(&self, document: &Document) -> Option<InstanceConfiguration> {
@@ -432,10 +461,7 @@ pub fn begin_create_dynamic(app: &mut MyCadApp) {
     if already_dynamic {
         app.enter_block_edit(id);
         app.dynamic_authoring = Some(AuthoringState::new(name, id, false, None));
-        crate::workspace::ensure_tab(
-            &mut app.dock_state,
-            crate::workspace::WorkspaceTab::DynamicBlock,
-        );
+        app.focus_workspace_tab(crate::workspace::WorkspaceTab::DynamicBlock);
         app.status = "Editing dynamic block".into();
         return;
     }
@@ -514,10 +540,7 @@ pub fn convert_and_enter(app: &mut MyCadApp, instance_id: EntityId, mode: Conver
     app.history.commit_open();
     app.enter_block_edit(instance_id);
     app.dynamic_authoring = Some(AuthoringState::new(name, instance_id, unique, previous));
-    crate::workspace::ensure_tab(
-        &mut app.dock_state,
-        crate::workspace::WorkspaceTab::DynamicBlock,
-    );
+    app.focus_workspace_tab(crate::workspace::WorkspaceTab::DynamicBlock);
     app.status = "Editing dynamic block".into();
     app.schedule_full_refresh();
 }
@@ -564,12 +587,29 @@ pub fn revert_unique_conversion(app: &mut MyCadApp) {
 }
 
 pub fn discard_authoring(app: &mut MyCadApp) {
-    if let Some(document) = app.document.as_mut().map(std::sync::Arc::make_mut) {
-        app.block_edit.discard_current(document, &mut app.history);
+    app.close_block_level(true);
+}
+
+fn commit_dynamic_metadata(
+    document: &mut Document,
+    history: &mut History,
+    block_name: &str,
+    before: Option<DynamicDefinition>,
+    after: DynamicDefinition,
+) -> Result<(), String> {
+    let block = document
+        .block_by_name(block_name)
+        .ok_or("Block definition was not found")?;
+    cad_core::validate_definition(&after, &block.entities).map_err(|error| error.to_string())?;
+    if !document.replace_dynamic_definition(block_name, Some(after.clone())) {
+        return Err("Block definition was not found".into());
     }
-    revert_unique_conversion(app);
-    app.status = "Discarded dynamic-block authoring".into();
-    app.schedule_full_refresh();
+    history.record(Edit::ReplaceDynamicDefinition {
+        name: block_name.to_owned(),
+        before,
+        after: Some(after),
+    });
+    Ok(())
 }
 
 pub fn add_size_parameter(
@@ -579,29 +619,20 @@ pub fn add_size_parameter(
     name: String,
     numeric: NumericParameter,
 ) -> Result<ParameterId, String> {
-    let Some(block) = document.block_by_name(block_name).cloned() else {
-        return Err("Block definition was not found".into());
-    };
-    let mut after = block.clone();
+    let before = document
+        .block_by_name(block_name)
+        .ok_or("Block definition was not found")?
+        .dynamic
+        .clone();
+    let mut after = before.clone().unwrap_or_default();
     let id = document.allocate_parameter_id();
     let mut numeric = numeric;
-    numeric.display_order = after
-        .dynamic
-        .as_ref()
-        .map(|dynamic| dynamic.parameters.len() as i32)
-        .unwrap_or(0);
-    let name = unique_parameter_name(after.dynamic.as_ref(), &name);
-    let dynamic = after.dynamic.get_or_insert_with(DynamicDefinition::default);
-    dynamic
+    numeric.display_order = after.parameters.len() as i32;
+    let name = unique_parameter_name(Some(&after), &name);
+    after
         .parameters
         .push(ParameterDef::number(id, name, numeric));
-    cad_core::validate_definition(dynamic, &after.entities).map_err(|err| err.to_string())?;
-    document.replace_block_definition(after.clone());
-    history.record(Edit::ReplaceBlockDefinition {
-        name: block_name.to_string(),
-        before: Some(block),
-        after: Some(after),
-    });
+    commit_dynamic_metadata(document, history, block_name, before, after)?;
     Ok(id)
 }
 
@@ -777,21 +808,13 @@ fn push_parameter(
     block_name: &str,
     parameter: ParameterDef,
 ) {
-    let Some(block) = document.block_by_name(block_name).cloned() else {
+    let Some(block) = document.block_by_name(block_name) else {
         return;
     };
-    let mut after = block.clone();
-    after
-        .dynamic
-        .get_or_insert_with(DynamicDefinition::default)
-        .parameters
-        .push(parameter);
-    document.replace_block_definition(after.clone());
-    history.record(Edit::ReplaceBlockDefinition {
-        name: block_name.to_string(),
-        before: Some(block),
-        after: Some(after),
-    });
+    let before = block.dynamic.clone();
+    let mut after = before.clone().unwrap_or_default();
+    after.parameters.push(parameter);
+    let _ = commit_dynamic_metadata(document, history, block_name, before, after);
 }
 
 fn replace_parameter_kind(
@@ -804,15 +827,12 @@ fn replace_parameter_kind(
     display_order: i32,
     description: Option<String>,
 ) -> Result<(), String> {
-    let Some(block) = document.block_by_name(block_name).cloned() else {
+    let Some(block) = document.block_by_name(block_name) else {
         return Err("Block definition was not found".into());
     };
-    let mut after = block.clone();
-    let Some(parameter) = after
-        .dynamic
-        .as_mut()
-        .and_then(|dynamic| dynamic.parameters.iter_mut().find(|item| item.id == id))
-    else {
+    let before = block.dynamic.clone();
+    let mut after = before.clone().unwrap_or_default();
+    let Some(parameter) = after.parameters.iter_mut().find(|item| item.id == id) else {
         return Err("Parameter was not found".into());
     };
     parameter.name = name;
@@ -820,17 +840,7 @@ fn replace_parameter_kind(
     parameter.display_order = display_order;
     parameter.description = description;
     cad_core::validate_parameter_def(parameter).map_err(|err| err.to_string())?;
-    let Some(dynamic) = after.dynamic.as_ref() else {
-        return Err("Block is not dynamic".into());
-    };
-    cad_core::validate_definition(dynamic, &after.entities).map_err(|err| err.to_string())?;
-    document.replace_block_definition(after.clone());
-    history.record(Edit::ReplaceBlockDefinition {
-        name: block_name.to_string(),
-        before: Some(block),
-        after: Some(after),
-    });
-    Ok(())
+    commit_dynamic_metadata(document, history, block_name, before, after)
 }
 
 fn follow_from_multiplier(multiplier: f64) -> FollowRole {
@@ -1119,56 +1129,335 @@ pub fn show_convert_dialog(ctx: &egui::Context, dialog: &mut ConvertDialog) -> C
     }
 }
 
+fn authoring_metadata(app: &mut MyCadApp) -> std::sync::Arc<DynamicDefinition> {
+    let Some(state) = app.dynamic_authoring.as_mut() else {
+        return Default::default();
+    };
+    let Some(document) = app.document.as_deref() else {
+        return Default::default();
+    };
+    let Some(block) = document.block_by_name(&state.block_name) else {
+        return Default::default();
+    };
+    let generation = document.content_generation();
+    let revision = block.content_revision;
+    if let Some((cached_generation, cached_revision, dynamic)) = &state.cached_metadata {
+        if *cached_generation == generation && *cached_revision == revision {
+            return std::sync::Arc::clone(dynamic);
+        }
+    }
+    let dynamic = std::sync::Arc::new(block.dynamic.clone().unwrap_or_default());
+    state.cached_metadata = Some((generation, revision, std::sync::Arc::clone(&dynamic)));
+    dynamic
+}
+
 pub fn show_authoring(ui: &mut Ui, app: &mut MyCadApp) {
     ui.heading("Dynamic Block");
-    ui.weak("1. Add a parameter  →  2. Choose what changes  →  3. Test and save");
-    ui.separator();
-    let Some(state) = app.dynamic_authoring.clone() else {
-        ui.weak("Use Create a Dynamic Block… on a block reference.");
+    let busy = app
+        .dynamic_authoring
+        .as_ref()
+        .is_some_and(|state| state.mode == AuthoringMode::Author)
+        && (app.io_busy()
+            || app.loading_path.is_some()
+            || app
+                .document
+                .as_ref()
+                .is_some_and(|document| std::sync::Arc::strong_count(document) > 1));
+    if busy {
+        ui.weak("Preparing preview or saving… Controls will be available when this finishes.");
+        ui.disable();
+    }
+    let Some(state) = app.dynamic_authoring.as_ref() else {
+        ui.weak("Select a block reference, then choose Create a Dynamic Block…");
         return;
     };
+    let block_name = state.block_name.clone();
+    let mode = state.mode;
+    let step = state.step;
+    let pending_geometry =
+        state.wizard.is_some() || state.attach.is_some() || state.action_inspector.has_draft();
+    let pending_parameter = state.size_wizard.is_some()
+        || state.parameter_drafts.values().any(|draft| draft.dirty)
+        || state.kind_drafts.values().any(|draft| draft.dirty);
+    let status = state.status.clone();
+    // The edit frame caches this count when entering the definition. Do not
+    // traverse a large drawing on every UI frame just to paint the scope label.
     let references = app
-        .document
-        .as_deref()
-        .map(|document| count_block_references(document, &state.block_name))
-        .unwrap_or(0);
-    let mode_text = match state.mode {
-        AuthoringMode::Author => format!("Authoring definition — affects {references} references"),
-        AuthoringMode::Test => "Testing configuration".to_string(),
+        .block_edit
+        .current()
+        .filter(|frame| frame.block_name == block_name)
+        .map(|frame| frame.reference_count);
+    ui.separator();
+    ui.label(RichText::new(&block_name).strong());
+    let scope = match mode {
+        AuthoringMode::Test => "TEST PREVIEW — this occurrence only".to_owned(),
+        AuthoringMode::Author => match references {
+            Some(1) => "SHARED DEFINITION — 1 reference".to_owned(),
+            Some(count) => format!("SHARED DEFINITION — {count} references"),
+            None => "SHARED DEFINITION — all references".to_owned(),
+        },
     };
     ui.colored_label(
         egui::Color32::from_rgb(180, 210, 255),
-        RichText::new(mode_text).strong(),
+        RichText::new(scope).strong(),
     );
-    ui.label(RichText::new(&state.block_name).strong());
-    if let Some(status) = &state.status {
+    if mode == AuthoringMode::Test {
+        ui.weak("Test values are temporary. Return to authoring to save the definition.");
+    } else {
+        ui.weak(
+            "Editing source definition geometry. Changes affect every reference; Test starts from this instance’s values.",
+        );
+    }
+    if let Some(status) = status {
         ui.colored_label(egui::Color32::from_rgb(220, 160, 80), status);
     }
+    let dynamic = authoring_metadata(app);
     ui.add_space(6.0);
-    ui.vertical(|ui| {
-        match state.mode {
-            AuthoringMode::Author => {
-                if ui.button("Test mode").clicked() {
-                    if let Some(document) = app.document.as_deref() {
-                        if let Some(authoring) = app.dynamic_authoring.as_mut() {
-                            authoring.enter_test(document);
-                        }
-                    }
-                }
-            }
-            AuthoringMode::Test => {
-                if ui.button("Return to authoring").clicked() {
-                    if let Some(authoring) = app.dynamic_authoring.as_mut() {
-                        authoring.leave_test();
-                    }
-                    app.request_preview();
-                }
+    ui.horizontal_wrapped(|ui| {
+        let can_navigate = mode == AuthoringMode::Author && !pending_geometry && !pending_parameter;
+        if ui
+            .add_enabled(
+                can_navigate,
+                egui::Button::new("1 Parameter").selected(
+                    mode == AuthoringMode::Author
+                        && step == AuthoringStep::Parameter
+                        && !pending_geometry,
+                ),
+            )
+            .clicked()
+        {
+            if let Some(state) = app.dynamic_authoring.as_mut() {
+                state.step = AuthoringStep::Parameter;
             }
         }
         if ui
+            .add_enabled(
+                can_navigate && !dynamic.parameters.is_empty(),
+                egui::Button::new("2 Actions").selected(
+                    mode == AuthoringMode::Author
+                        && step == AuthoringStep::Actions
+                        && !pending_geometry,
+                ),
+            )
+            .clicked()
+        {
+            if let Some(state) = app.dynamic_authoring.as_mut() {
+                state.step = AuthoringStep::Actions;
+            }
+        }
+        ui.add_enabled(
+            false,
+            egui::Button::new("3 Geometry").selected(pending_geometry),
+        );
+        if ui
+            .add_enabled(
+                can_navigate && !dynamic.parameters.is_empty(),
+                egui::Button::new("4 Test").selected(mode == AuthoringMode::Test),
+            )
+            .clicked()
+        {
+            enter_authoring_test(app);
+        }
+    });
+    ui.separator();
+    // Read the live mode so switching into Test never exposes creation controls
+    // for one extra frame, and returning restores the correct step immediately.
+    if app
+        .dynamic_authoring
+        .as_ref()
+        .is_some_and(|state| state.mode == AuthoringMode::Test)
+    {
+        show_test_controls(ui, app, &dynamic);
+        if ui.button("Return to authoring").clicked() {
+            if let Some(state) = app.dynamic_authoring.as_mut() {
+                state.leave_test();
+            }
+            app.request_preview();
+        }
+        return;
+    }
+    if pending_geometry {
+        ui.label(RichText::new("3. Choose geometry and reference points").strong());
+        if app
+            .dynamic_authoring
+            .as_ref()
+            .is_some_and(|state| state.attach.is_some())
+        {
+            show_attach_controls(ui, app);
+        } else if app
+            .dynamic_authoring
+            .as_ref()
+            .is_some_and(|state| state.action_inspector.has_draft())
+        {
+            crate::dynamic_actions::show_editor(ui, app, &dynamic);
+        } else {
+            show_behavior_wizard(ui, app, &dynamic);
+        }
+        ui.weak("Finish or cancel this action to return to the action list.");
+        return;
+    }
+    if app
+        .dynamic_authoring
+        .as_ref()
+        .is_some_and(|state| state.size_wizard.is_some())
+    {
+        show_size_wizard(ui, app);
+        return;
+    }
+    let step = app
+        .dynamic_authoring
+        .as_ref()
+        .map(|state| state.step)
+        .unwrap_or_default();
+    if step == AuthoringStep::Parameter {
+        ui.label(RichText::new("1. Choose a parameter").strong());
+        ui.weak("A parameter is a value the block user can change: a size, angle, option, switch or label.");
+        ui.add_enabled_ui(!pending_parameter, |ui| {
+            show_parameter_creation(ui, app, &block_name)
+        });
+    } else {
+        ui.label(RichText::new("2. Choose what the parameter changes").strong());
+    }
+    // Creation can add a parameter during this frame. Refresh its small metadata
+    // snapshot before choosing the editor, preserving the new selection.
+    let dynamic = authoring_metadata(app);
+    let mut selected = app
+        .dynamic_authoring
+        .as_ref()
+        .and_then(|state| state.selected_parameter);
+    if selected.is_none() {
+        selected = dynamic.parameters.first().map(|parameter| parameter.id);
+    }
+    ui.add_enabled_ui(!pending_parameter, |ui| {
+        egui::ComboBox::from_id_salt("authoring-parameter")
+            .selected_text(
+                selected
+                    .and_then(|id| dynamic.parameter(id))
+                    .map(|parameter| parameter.name.as_str())
+                    .unwrap_or("Choose parameter"),
+            )
+            .show_ui(ui, |ui| {
+                for parameter in dynamic.sorted_parameters() {
+                    ui.selectable_value(&mut selected, Some(parameter.id), &parameter.name);
+                }
+            });
+    });
+    if let Some(state) = app.dynamic_authoring.as_mut() {
+        state.selected_parameter = selected;
+    }
+    if step == AuthoringStep::Parameter {
+        if let Some(parameter) = selected.and_then(|id| dynamic.parameter(id)).cloned() {
+            match &parameter.kind {
+                ParameterKind::Number(numeric) => show_parameter_editor(
+                    ui,
+                    app,
+                    &block_name,
+                    parameter.id,
+                    &parameter.name,
+                    numeric,
+                ),
+                ParameterKind::Choice(choice) => {
+                    show_choice_editor(ui, app, &block_name, &parameter, choice)
+                }
+                ParameterKind::Boolean(flag) => {
+                    show_boolean_editor(ui, app, &block_name, &parameter, flag)
+                }
+                ParameterKind::Text(text) => {
+                    show_text_editor(ui, app, &block_name, &parameter, text)
+                }
+            }
+        }
+        let pending = app.dynamic_authoring.as_ref().is_some_and(|state| {
+            state.parameter_drafts.values().any(|draft| draft.dirty)
+                || state.kind_drafts.values().any(|draft| draft.dirty)
+                || state.size_wizard.is_some()
+        });
+        if pending {
+            ui.weak("Apply or reset the parameter changes before continuing.");
+        }
+        if app
+            .dynamic_authoring
+            .as_ref()
+            .is_some_and(|state| !state.test_values.is_empty())
+        {
+            ui.add_enabled_ui(!pending, |ui| {
+                ui.collapsing("Keep the last test configuration", |ui| {
+                    ui.weak("These actions change the shared definition. Stored instance values stay unchanged.");
+                    if ui.button("Use last test values as definition defaults").clicked() {
+                        apply_test_values_as_defaults(app, &dynamic);
+                    }
+                    if ui.button("Save last test values as a shared preset").clicked() {
+                        save_preset_values(app, true);
+                    }
+                });
+            });
+        }
+        if ui
+            .add_enabled(
+                selected.is_some() && !pending,
+                egui::Button::new("Next: choose actions →"),
+            )
+            .clicked()
+        {
+            if let Some(state) = app.dynamic_authoring.as_mut() {
+                state.step = AuthoringStep::Actions;
+            }
+        }
+    } else {
+        show_selection_bindings(ui, app, &dynamic);
+        if let Some(parameter) = selected {
+            crate::dynamic_actions::show(ui, app, &dynamic, parameter);
+        }
+        egui::CollapsingHeader::new("Add an action")
+            .default_open(true)
+            .show(ui, |ui| {
+                show_attach_controls(ui, app);
+            });
+        ui.collapsing("Presets, ordering and advanced rules", |ui| {
+            show_phase3_authoring(ui, app, &dynamic);
+        });
+        ui.collapsing("Check existing bindings", |ui| {
+            let broken = app
+                .document
+                .as_deref()
+                .and_then(|document| document.block_by_name(&block_name))
+                .map(|block| collect_broken_bindings(&dynamic, &block.entities))
+                .unwrap_or_default();
+            if broken.is_empty() {
+                ui.weak("No broken geometry bindings found.");
+            }
+            show_repair_bindings(ui, app, &broken);
+        });
+        let pending = app.dynamic_authoring.as_ref().is_some_and(|state| {
+            state.wizard.is_some() || state.attach.is_some() || state.action_inspector.has_draft()
+        });
+        if ui
+            .add_enabled(!pending, egui::Button::new("Next: test the block →"))
+            .clicked()
+        {
+            enter_authoring_test(app);
+        }
+    }
+    show_option_migration(ui, app);
+    show_save_discard(ui, app);
+}
+
+fn enter_authoring_test(app: &mut MyCadApp) {
+    app.cancel_active_command();
+    if let Some(document) = app.document.as_deref() {
+        if let Some(state) = app.dynamic_authoring.as_mut() {
+            state.enter_test(document);
+        }
+    }
+    app.request_preview();
+}
+
+fn show_parameter_creation(ui: &mut Ui, app: &mut MyCadApp, block_name: &str) {
+    ui.horizontal_wrapped(|ui| {
+        if ui
             .button("Add size parameter…")
             .on_hover_text(
-                "Name a dimension, measure its current size, then optionally set limits.",
+                "Measure the current size and optionally set minimum and maximum values.",
             )
             .clicked()
         {
@@ -1176,7 +1465,7 @@ pub fn show_authoring(ui: &mut Ui, app: &mut MyCadApp) {
         }
         if ui
             .button("Add angle parameter")
-            .on_hover_text("Create a rotation angle in degrees; optional limits can be set below.")
+            .on_hover_text("A rotation angle in degrees, with optional limits.")
             .clicked()
         {
             add_angle_parameter(app);
@@ -1190,112 +1479,47 @@ pub fn show_authoring(ui: &mut Ui, app: &mut MyCadApp) {
         if ui.button("Add Text…").clicked() {
             add_text_parameter(app);
         }
-        ui.collapsing("Advanced", |ui| {
-            if ui.button("Add zero-based offset").clicked() {
-                let name = state.block_name.clone();
-                if let Some(document) = app.document.as_mut().map(std::sync::Arc::make_mut) {
-                    app.history.begin();
-                    add_number_parameter(document, &mut app.history, &name);
-                    app.history.commit_open();
-                    app.request_preview();
-                }
-            }
-        });
     });
-    if app
-        .dynamic_authoring
-        .as_ref()
-        .and_then(|s| s.size_wizard.as_ref())
-        .is_some()
-    {
-        show_size_wizard(ui, app);
-        show_save_discard(ui, app);
-        return;
-    }
-    let (dynamic, broken) = {
-        let Some(document) = app.document.as_deref() else {
-            return;
-        };
-        let Some(block) = document.block_by_name(&state.block_name) else {
-            ui.weak("The definition is no longer in the drawing.");
-            return;
-        };
-        let dynamic = block.dynamic.clone().unwrap_or_default();
-        let broken = if state.mode == AuthoringMode::Author {
-            collect_broken_bindings(&dynamic, &block.entities)
-        } else {
-            Vec::new()
-        };
-        (dynamic, broken)
-    };
-    ui.add_space(6.0);
-    ui.label(RichText::new("Parameters").small().weak());
-    // Parameter creation above can change selection during this frame.
-    // Read the live state so the new parameter remains ready for action linking.
-    let mut selected = app
-        .dynamic_authoring
-        .as_ref()
-        .and_then(|state| state.selected_parameter);
-    for parameter in dynamic.sorted_parameters() {
-        if ui
-            .selectable_label(selected == Some(parameter.id), &parameter.name)
-            .clicked()
-        {
-            selected = Some(parameter.id);
-        }
-    }
-    if let Some(authoring) = app.dynamic_authoring.as_mut() {
-        authoring.selected_parameter = selected;
-    }
-    if state.mode == AuthoringMode::Author {
-        show_repair_bindings(ui, app, &broken);
-        show_selection_bindings(ui, app, &dynamic);
-        if let Some(parameter) = selected.and_then(|id| dynamic.parameter(id)).cloned() {
-            match &parameter.kind {
-                ParameterKind::Number(numeric) => {
-                    show_parameter_editor(
-                        ui,
-                        app,
-                        &state.block_name,
-                        parameter.id,
-                        &parameter.name,
-                        numeric,
-                    );
-                    show_behavior_list(ui, app, &dynamic, parameter.id);
-                }
-                ParameterKind::Choice(choice) => {
-                    show_choice_editor(ui, app, &state.block_name, &parameter, choice);
-                }
-                ParameterKind::Boolean(flag) => {
-                    show_boolean_editor(ui, app, &state.block_name, &parameter, flag);
-                }
-                ParameterKind::Text(text) => {
-                    show_text_editor(ui, app, &state.block_name, &parameter, text);
-                }
+    ui.collapsing("Advanced parameter", |ui| {
+        if ui.button("Add zero-based offset").clicked() {
+            if let Some(document) = app.document.as_mut().and_then(std::sync::Arc::get_mut) {
+                app.history.begin();
+                add_number_parameter(document, &mut app.history, block_name);
+                app.history.commit_open();
+                app.request_preview();
+            } else {
+                report_authoring_error(
+                    app,
+                    "Wait for the current preview or save to finish, then try again.".into(),
+                );
             }
         }
-        show_attach_controls(ui, app);
-        show_behavior_wizard(ui, app, &dynamic);
-        show_option_migration(ui, app);
-        show_phase3_authoring(ui, app, &dynamic);
-    } else {
-        show_test_controls(ui, app, &dynamic);
-    }
-    show_save_discard(ui, app);
+    });
 }
 
 fn show_save_discard(ui: &mut Ui, app: &mut MyCadApp) {
     ui.add_space(12.0);
-    ui.vertical(|ui| {
-        if ui.button("Save").clicked() {
+    ui.separator();
+    let pending = app.dynamic_authoring.as_ref().is_some_and(|state| {
+        state.wizard.is_some()
+            || state.attach.is_some()
+            || state.action_inspector.has_draft()
+            || state.size_wizard.is_some()
+            || state.parameter_drafts.values().any(|draft| draft.dirty)
+            || state.kind_drafts.values().any(|draft| draft.dirty)
+    });
+    ui.horizontal_wrapped(|ui| {
+        if ui
+            .add_enabled(!pending, egui::Button::new("Save block definition"))
+            .clicked()
+        {
             app.save_active_block();
         }
-        if ui.button("Discard").clicked() {
+        if ui.button("Discard definition changes").clicked() {
             discard_authoring(app);
-            app.block_edit.pop();
-            app.request_preview();
         }
     });
+    ui.weak("Save the drawing separately to write these changes to its file.");
 }
 
 fn start_size_wizard(app: &mut MyCadApp) {
@@ -2194,14 +2418,15 @@ fn apply_parameter_settings(
     name: String,
     numeric: NumericParameter,
 ) -> Result<(), SettingsError> {
-    let Some(block) = document.block_by_name(block_name).cloned() else {
+    let Some(block) = document.block_by_name(block_name) else {
         return Err(SettingsError {
             field: "name".into(),
             message: "Block definition was not found".into(),
         });
     };
-    let mut after = block.clone();
-    if after.dynamic.as_ref().is_some_and(|dynamic| {
+    let before = block.dynamic.clone();
+    let mut after = before.clone();
+    if after.as_ref().is_some_and(|dynamic| {
         dynamic
             .parameters
             .iter()
@@ -2212,7 +2437,7 @@ fn apply_parameter_settings(
             message: "Another parameter already uses this name".into(),
         });
     }
-    let Some(parameter) = after.dynamic.as_mut().and_then(|dynamic| {
+    let Some(parameter) = after.as_mut().and_then(|dynamic| {
         dynamic
             .parameters
             .iter_mut()
@@ -2229,7 +2454,7 @@ fn apply_parameter_settings(
         let prev_dir = previous.size.as_ref().map(|item| item.direction);
         let prev_anchor = previous.size.as_ref().map(|item| item.anchor);
         parameter.kind = ParameterKind::Number(numeric.clone());
-        if let Some(dynamic) = after.dynamic.as_mut() {
+        if let Some(dynamic) = after.as_mut() {
             if prev_dir.is_some_and(|dir| dir != size.direction) {
                 apply_size_axis(dynamic, id, size.direction, numeric.reference);
             }
@@ -2240,8 +2465,8 @@ fn apply_parameter_settings(
     } else {
         parameter.kind = ParameterKind::Number(numeric.clone());
     }
-    if let Some(dynamic) = after.dynamic.as_ref() {
-        if let Err(err) = cad_core::validate_definition(dynamic, &after.entities) {
+    if let Some(dynamic) = after.as_ref() {
+        if let Err(err) = cad_core::validate_definition(dynamic, &block.entities) {
             return Err(settings_error_from_dynamic(err));
         }
     }
@@ -2261,13 +2486,16 @@ fn apply_parameter_settings(
             });
         }
     }
-    document.replace_block_definition(after.clone());
-    history.record(Edit::ReplaceBlockDefinition {
-        name: block_name.to_string(),
-        before: Some(block),
-        after: Some(after),
-    });
-    Ok(())
+    let after = after.ok_or_else(|| SettingsError {
+        field: "name".into(),
+        message: "Block is not dynamic".into(),
+    })?;
+    commit_dynamic_metadata(document, history, block_name, before, after).map_err(|message| {
+        SettingsError {
+            field: "name".into(),
+            message,
+        }
+    })
 }
 
 fn settings_error_from_dynamic(err: DynamicError) -> SettingsError {
@@ -2316,139 +2544,6 @@ fn affected_instance_values(
         }
     }
     affected
-}
-
-fn show_behavior_list(
-    ui: &mut Ui,
-    app: &mut MyCadApp,
-    dynamic: &DynamicDefinition,
-    parameter: ParameterId,
-) {
-    ui.add_space(6.0);
-    ui.label(RichText::new("Behaviors").small().weak());
-    let mut remove = None;
-    let mut select = None;
-    for behavior in dynamic
-        .behaviors
-        .iter()
-        .filter(|behavior| behavior.parameter == parameter)
-    {
-        let selected = app
-            .dynamic_authoring
-            .as_ref()
-            .is_some_and(|state| state.selected_behavior == Some(behavior.id));
-        ui.vertical(|ui| {
-            if ui
-                .selectable_label(selected, behavior.describe(dynamic))
-                .clicked()
-            {
-                select = Some(behavior.id);
-            }
-            ui.horizontal(|ui| {
-                if ui.small_button("Follow first side").clicked() {
-                    set_behavior_follow(app, behavior.id, FollowRole::First);
-                }
-                if ui.small_button("Follow second side").clicked() {
-                    set_behavior_follow(app, behavior.id, FollowRole::Second);
-                }
-                if ui.small_button("Follow center").clicked() {
-                    set_behavior_follow(app, behavior.id, FollowRole::Center);
-                }
-                if ui.small_button("Edit targets").clicked() {
-                    if let Some(authoring) = app.dynamic_authoring.as_mut() {
-                        authoring.attach = Some(AttachSession {
-                            kind: behavior.kind,
-                            parameter: behavior.parameter,
-                            follow: behavior.follow,
-                            handles: behavior.targets.clone(),
-                            unsupported: Vec::new(),
-                            window: None,
-                            replace: Some(behavior.id),
-                        });
-                        authoring.selected_behavior = Some(behavior.id);
-                        authoring.highlight = behavior.targets.clone();
-                        authoring.status =
-                            Some("Correct targets, then confirm to update this behavior.".into());
-                    }
-                }
-                if ui.small_button("Remove").clicked() {
-                    remove = Some(behavior.id);
-                }
-            });
-            ui.collapsing("Advanced", |ui| {
-                ui.label(format!("multiplier × {}", behavior.multiplier));
-            });
-        });
-    }
-    if let Some(id) = select {
-        if let Some(authoring) = app.dynamic_authoring.as_mut() {
-            authoring.selected_behavior = Some(id);
-            if let Some(behavior) = dynamic.behaviors.iter().find(|item| item.id == id) {
-                authoring.highlight = behavior.targets.clone();
-            }
-        }
-    }
-    if let Some(id) = remove {
-        let name = app
-            .dynamic_authoring
-            .as_ref()
-            .map(|state| state.block_name.clone())
-            .unwrap_or_default();
-        if let Some(document) = app.document.as_mut().map(std::sync::Arc::make_mut) {
-            app.history.begin();
-            remove_behavior(document, &mut app.history, &name, id);
-            app.history.commit_open();
-            app.request_preview();
-        }
-    }
-}
-
-fn set_behavior_follow(app: &mut MyCadApp, id: ActionId, follow: FollowRole) {
-    let Some(state) = app.dynamic_authoring.clone() else {
-        return;
-    };
-    let Some(document) = app.document.as_mut().map(std::sync::Arc::make_mut) else {
-        return;
-    };
-    let Some(block) = document.block_by_name(&state.block_name).cloned() else {
-        return;
-    };
-    let mut after = block.clone();
-    let Some(dynamic) = after.dynamic.as_mut() else {
-        return;
-    };
-    let Some(parameter) = dynamic
-        .behaviors
-        .iter()
-        .find(|item| item.id == id)
-        .map(|item| item.parameter)
-    else {
-        return;
-    };
-    let anchor = dynamic
-        .parameter(parameter)
-        .and_then(|item| match &item.kind {
-            ParameterKind::Number(numeric) => numeric.size.as_ref().map(|size| size.anchor),
-            _ => None,
-        })
-        .unwrap_or(AnchorPolicy::FirstFixed);
-    let Some(behavior) = dynamic.behaviors.iter_mut().find(|item| item.id == id) else {
-        return;
-    };
-    behavior.follow = follow;
-    behavior.multiplier = follow_multiplier(anchor, follow);
-    if cad_core::validate_definition(dynamic, &after.entities).is_err() {
-        return;
-    }
-    app.history.begin();
-    document.replace_block_definition(after.clone());
-    app.history.record(Edit::ReplaceBlockDefinition {
-        name: state.block_name,
-        before: Some(block),
-        after: Some(after),
-    });
-    app.history.commit_open();
-    app.request_preview();
 }
 
 fn show_parameter_action_buttons(ui: &mut Ui, app: &mut MyCadApp) {
@@ -2521,8 +2616,13 @@ fn show_parameter_action_buttons(ui: &mut Ui, app: &mut MyCadApp) {
 
 fn show_attach_controls(ui: &mut Ui, app: &mut MyCadApp) {
     ui.add_space(8.0);
-    ui.label(RichText::new("2. Choose what this parameter changes").strong());
-    show_parameter_action_buttons(ui, app);
+    let active_attach = app
+        .dynamic_authoring
+        .as_ref()
+        .is_some_and(|state| state.attach.is_some());
+    if !active_attach {
+        show_parameter_action_buttons(ui, app);
+    }
     let parameter = app.dynamic_authoring.as_ref().and_then(|state| {
         let id = state
             .attach
@@ -2551,6 +2651,7 @@ fn show_attach_controls(ui: &mut Ui, app: &mut MyCadApp) {
         ui.label(format!("{selected_count} objects selected for Move"));
     }
     ui.vertical(|ui| {
+        if !active_attach {
         if ui.add_enabled(selected_count > 0, egui::Button::new("Move objects with first point")).clicked() {
             attach_move_from_selection(app, FollowRole::First);
         }
@@ -2564,10 +2665,12 @@ fn show_attach_controls(ui: &mut Ui, app: &mut MyCadApp) {
             begin_stretch_handles(app);
         }
         if ui.button("Stretch: draw a selection window…").clicked() {
+            begin_stretch_handles(app);
             if let Some(authoring) = app.dynamic_authoring.as_mut() {
                 authoring.pick = AuthoringPick::StretchWindowA;
                 authoring.status = Some("Draw a stretch window first corner".into());
             }
+        }
         }
         if app.dynamic_authoring.as_ref().and_then(|state| state.attach.as_ref()).is_some() {
             let mut follow = app
@@ -2581,6 +2684,12 @@ fn show_attach_controls(ui: &mut Ui, app: &mut MyCadApp) {
                 .and_then(|state| state.attach.as_ref().map(|attach| attach.handles.len()))
                 .unwrap_or(0);
             ui.label(format!("{handle_count} targets selected"));
+            if app.dynamic_authoring.as_ref().and_then(|state| state.attach.as_ref()).is_some_and(|attach| attach.kind == BehaviorKind::Stretch) {
+                ui.weak("Click endpoints to toggle them; Shift adds and Ctrl removes.");
+                if ui.button("Draw a selection window…").clicked() {
+                    if let Some(state) = app.dynamic_authoring.as_mut() { state.pick = AuthoringPick::StretchWindowA; }
+                }
+            }
             if let Some(unsupported) = app
                 .dynamic_authoring
                 .as_ref()
@@ -2636,7 +2745,7 @@ fn show_attach_controls(ui: &mut Ui, app: &mut MyCadApp) {
 fn show_test_controls(ui: &mut Ui, app: &mut MyCadApp, dynamic: &DynamicDefinition) {
     ui.add_space(8.0);
     ui.label(RichText::new("Test configuration").small().weak());
-    ui.label("Source geometry stays at definition defaults. These values preview together.");
+    ui.label("Source definition geometry is unchanged. These values preview together.");
     let current = app
         .dynamic_authoring
         .as_ref()
@@ -2738,12 +2847,6 @@ fn show_test_controls(ui: &mut Ui, app: &mut MyCadApp, dynamic: &DynamicDefiniti
             if let Some(authoring) = app.dynamic_authoring.as_mut() {
                 authoring.show_inactive = show_inactive;
             }
-        }
-        if ui.button("Use these values as defaults").clicked() {
-            apply_test_values_as_defaults(app, dynamic);
-        }
-        if ui.button("Save current configuration as preset…").clicked() {
-            save_preset_from_test(app);
         }
     });
 }
@@ -3351,59 +3454,66 @@ fn replace_behavior_targets(
 }
 
 fn apply_test_values_as_defaults(app: &mut MyCadApp, _dynamic: &DynamicDefinition) {
-    let Some(state) = app.dynamic_authoring.clone() else {
+    let Some(state) = app.dynamic_authoring.as_ref() else {
         return;
     };
-    let Some(document) = app.document.as_mut().map(std::sync::Arc::make_mut) else {
+    if state.mode == AuthoringMode::Test {
+        report_authoring_error(
+            app,
+            "Return to authoring before changing shared definition defaults.".into(),
+        );
+        return;
+    }
+    let name = state.block_name.clone();
+    let values = state.test_values.clone();
+    let Some(document) = app.document.as_mut().and_then(std::sync::Arc::get_mut) else {
+        report_authoring_error(
+            app,
+            "Wait for the preview or save to finish, then try again.".into(),
+        );
         return;
     };
-    let Some(block) = document.block_by_name(&state.block_name).cloned() else {
+    let Some(before) = document
+        .block_by_name(&name)
+        .and_then(|block| block.dynamic.clone())
+    else {
         return;
     };
-    let affected = count_block_references(document, &state.block_name);
-    let mut after = block.clone();
-    let Some(after_dynamic) = after.dynamic.as_mut() else {
-        return;
-    };
-    for parameter in &mut after_dynamic.parameters {
-        if let Some(value) = state.test_values.get(&parameter.id) {
+    let mut after = before.clone();
+    for parameter in &mut after.parameters {
+        if let Some(value) = values.get(&parameter.id) {
             match (&mut parameter.kind, value) {
                 (ParameterKind::Number(numeric), ParameterValue::Number(number)) => {
-                    numeric.default = *number;
+                    numeric.default = *number
                 }
                 (ParameterKind::Choice(choice), ParameterValue::Choice(option)) => {
-                    choice.default = *option;
+                    choice.default = *option
                 }
-                (ParameterKind::Boolean(flag), ParameterValue::Boolean(on)) => {
-                    flag.default = *on;
+                (ParameterKind::Boolean(flag), ParameterValue::Boolean(value)) => {
+                    flag.default = *value
                 }
-                (ParameterKind::Text(text), ParameterValue::Text(content)) => {
-                    text.default = content.clone();
+                (ParameterKind::Text(text), ParameterValue::Text(value)) => {
+                    text.default = value.clone()
                 }
                 _ => {}
             }
         }
     }
-    if let Err(err) = cad_core::validate_definition(after_dynamic, &after.entities) {
-        if let Some(authoring) = app.dynamic_authoring.as_mut() {
-            authoring.status = Some(err.to_string());
-        }
-        return;
-    }
     app.history.begin();
-    document.replace_block_definition(after.clone());
-    app.history.record(Edit::ReplaceBlockDefinition {
-        name: state.block_name,
-        before: Some(block),
-        after: Some(after),
-    });
+    let result = commit_dynamic_metadata(document, &mut app.history, &name, Some(before), after);
     app.history.commit_open();
-    if let Some(authoring) = app.dynamic_authoring.as_mut() {
-        authoring.status = Some(format!(
-            "Defaults updated. {affected} references use this definition; stored instance values are unchanged."
-        ));
+    match result {
+        Ok(()) => {
+            if let Some(state) = app.dynamic_authoring.as_mut() {
+                state.status = Some(
+                    "Shared definition defaults updated. Stored instance values are unchanged."
+                        .into(),
+                );
+            }
+            app.request_preview();
+        }
+        Err(error) => report_authoring_error(app, error),
     }
-    app.request_preview();
 }
 
 fn show_repair_bindings(
@@ -4170,6 +4280,7 @@ fn show_phase3_authoring(ui: &mut Ui, app: &mut MyCadApp, dynamic: &DynamicDefin
         ui.horizontal(|ui| {
             ui.label(&preset.name);
             if ui.small_button("Apply in Test").clicked() {
+                enter_authoring_test(app);
                 if let Some(authoring) = app.dynamic_authoring.as_mut() {
                     authoring.test_values = preset.values.clone();
                     authoring.mode = AuthoringMode::Test;
@@ -4538,40 +4649,62 @@ fn start_member_wizard(
 }
 
 pub fn save_preset_from_test(app: &mut MyCadApp) {
-    let Some(state) = app.dynamic_authoring.clone() else {
+    save_preset_values(app, false);
+}
+
+fn save_preset_values(app: &mut MyCadApp, use_last_test: bool) {
+    let Some(state) = app.dynamic_authoring.as_ref() else {
         return;
     };
-    if let Some(document) = app.document.as_mut().map(std::sync::Arc::make_mut) {
-        app.history.begin();
-        let Some(block) = document.block_by_name(&state.block_name).cloned() else {
-            return;
-        };
-        let mut after = block.clone();
-        let Some(dynamic) = after.dynamic.as_mut() else {
-            return;
-        };
-        let values = if state.mode == AuthoringMode::Test {
-            state.test_values.clone()
-        } else {
-            cad_core::resolve_values(dynamic, None).unwrap_or_default()
-        };
-        let id = document.allocate_preset_id();
-        dynamic.presets.push(cad_core::Preset {
-            id,
-            name: format!("Preset {}", dynamic.presets.len() + 1),
-            values,
-        });
-        document.replace_block_definition(after.clone());
-        app.history.record(Edit::ReplaceBlockDefinition {
-            name: state.block_name,
-            before: Some(block),
-            after: Some(after),
-        });
-        app.history.commit_open();
-        if let Some(authoring) = app.dynamic_authoring.as_mut() {
-            authoring.status = Some("Saved preset".into());
+    if state.mode == AuthoringMode::Test {
+        report_authoring_error(
+            app,
+            "Return to authoring before saving a shared preset.".into(),
+        );
+        return;
+    }
+    let name = state.block_name.clone();
+    let test_values = use_last_test.then(|| state.test_values.clone());
+    let Some(document) = app.document.as_mut().and_then(std::sync::Arc::get_mut) else {
+        report_authoring_error(
+            app,
+            "Wait for the preview or save to finish, then try again.".into(),
+        );
+        return;
+    };
+    let Some(before) = document
+        .block_by_name(&name)
+        .and_then(|block| block.dynamic.clone())
+    else {
+        return;
+    };
+    let mut after = before.clone();
+    let values = match test_values {
+        Some(values) if !values.is_empty() => values,
+        _ => match cad_core::resolve_values(&after, None) {
+            Ok(values) => values,
+            Err(error) => {
+                report_authoring_error(app, error.to_string());
+                return;
+            }
+        },
+    };
+    after.presets.push(cad_core::Preset {
+        id: document.allocate_preset_id(),
+        name: format!("Preset {}", after.presets.len() + 1),
+        values,
+    });
+    app.history.begin();
+    let result = commit_dynamic_metadata(document, &mut app.history, &name, Some(before), after);
+    app.history.commit_open();
+    match result {
+        Ok(()) => {
+            if let Some(state) = app.dynamic_authoring.as_mut() {
+                state.status = Some("Saved shared preset".into());
+            }
+            app.request_preview();
         }
-        app.request_preview();
+        Err(error) => report_authoring_error(app, error),
     }
 }
 
@@ -4647,34 +4780,30 @@ fn commit_named_behavior(
         report_authoring_error(app, "Select objects first".into());
         return false;
     }
-    let Some(document) = app.document.as_mut().map(std::sync::Arc::make_mut) else {
+    let Some(document) = app.document.as_mut().and_then(std::sync::Arc::get_mut) else {
         return false;
     };
-    let Some(block) = document.block_by_name(&name).cloned() else {
+    let Some(block) = document.block_by_name(&name) else {
         return false;
     };
-    let mut after = block.clone();
-    let Some(dynamic) = after.dynamic.as_mut() else {
+    let before = block.dynamic.clone();
+    let Some(mut dynamic) = before.clone() else {
         return false;
     };
-    let status = match write(document, dynamic, members, parameter) {
+    let status = match write(document, &mut dynamic, members, parameter) {
         Ok(status) => status,
         Err(error) => {
             report_authoring_error(app, error);
             return false;
         }
     };
-    if let Err(error) = cad_core::validate_definition(dynamic, &after.entities) {
-        report_authoring_error(app, error.to_string());
+    app.history.begin();
+    if let Err(error) = commit_dynamic_metadata(document, &mut app.history, &name, before, dynamic)
+    {
+        app.history.commit_open();
+        report_authoring_error(app, error);
         return false;
     }
-    app.history.begin();
-    document.replace_block_definition(after.clone());
-    app.history.record(Edit::ReplaceBlockDefinition {
-        name,
-        before: Some(block),
-        after: Some(after),
-    });
     app.history.commit_open();
     app.status = status.clone();
     if let Some(state) = app.dynamic_authoring.as_mut() {
@@ -4940,6 +5069,9 @@ pub fn paint_authoring_overlays(painter: &egui::Painter, app: &MyCadApp, rect: e
             }
         }
     }
+    if state.mode == AuthoringMode::Test {
+        return;
+    }
     if let Some(wizard) = &state.wizard {
         match wizard {
             BehaviorWizard::Mirror { axis_a, axis_b, .. } => {
@@ -4971,24 +5103,84 @@ pub fn paint_authoring_overlays(painter: &egui::Painter, app: &MyCadApp, rect: e
             _ => {}
         }
     }
-    if let Some(dynamic) = &block.dynamic {
-        for anchor in &dynamic.anchors {
-            let p = to_screen(anchor.position);
-            painter.circle_filled(p, 4.0, egui::Color32::from_rgb(80, 180, 255));
-            if let Some(angle) = anchor.orientation {
-                let tip = to_screen(Point2::new(
-                    anchor.position.x + 12.0 * angle.cos(),
-                    anchor.position.y + 12.0 * angle.sin(),
-                ));
+    if state.action_inspector.has_draft() {
+        for (point, end) in crate::dynamic_actions::reference_guides(app) {
+            let color = egui::Color32::from_rgb(255, 190, 80);
+            painter.circle_stroke(to_screen(point), 6.0, egui::Stroke::new(2.0_f32, color));
+            if let Some(end) = end {
                 painter.line_segment(
-                    [p, tip],
-                    egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(80, 180, 255)),
+                    [to_screen(point), to_screen(end)],
+                    egui::Stroke::new(2.0_f32, color),
+                );
+            }
+        }
+    }
+    if let (Some(dynamic), Some(selected)) = (&block.dynamic, state.selected_behavior) {
+        let marker = |point: Point2, color: egui::Color32, label: &str| {
+            let position = to_screen(point);
+            painter.circle_stroke(position, 6.0, egui::Stroke::new(2.0_f32, color));
+            painter.text(
+                position + egui::vec2(9.0, -8.0),
+                egui::Align2::LEFT_BOTTOM,
+                label,
+                egui::FontId::proportional(12.0),
+                color,
+            );
+        };
+        if let Some(action) = dynamic
+            .reflections
+            .iter()
+            .find(|action| action.id == selected)
+        {
+            let color = egui::Color32::from_rgb(220, 120, 255);
+            painter.line_segment(
+                [to_screen(action.axis_a), to_screen(action.axis_b)],
+                egui::Stroke::new(2.0_f32, color),
+            );
+            marker(action.axis_a, color, "Mirror axis");
+            marker(action.axis_b, color, "");
+        }
+        if let Some(action) = dynamic
+            .rotations
+            .iter()
+            .find(|action| action.id == selected)
+        {
+            marker(
+                action.pivot,
+                egui::Color32::from_rgb(240, 180, 80),
+                "Rotation pivot",
+            );
+        }
+        if let Some(action) = dynamic
+            .placements
+            .iter()
+            .find(|action| action.id == selected)
+        {
+            marker(
+                action.attachment,
+                egui::Color32::from_rgb(80, 220, 140),
+                "Attachment",
+            );
+            for anchor in dynamic.anchors.iter().filter(|anchor| {
+                action.destinations.values().any(|id| *id == anchor.id)
+                    || action
+                        .boolean_destinations
+                        .is_some_and(|(a, b)| anchor.id == a || anchor.id == b)
+            }) {
+                marker(
+                    anchor.position,
+                    egui::Color32::from_rgb(80, 180, 255),
+                    &anchor.name,
                 );
             }
         }
     }
     if let Some(dynamic) = &block.dynamic {
-        for parameter in &dynamic.parameters {
+        for parameter in dynamic
+            .parameters
+            .iter()
+            .filter(|parameter| Some(parameter.id) == state.selected_parameter)
+        {
             let ParameterKind::Number(numeric) = &parameter.kind else {
                 continue;
             };
@@ -5016,11 +5208,7 @@ pub fn paint_authoring_overlays(painter: &egui::Painter, app: &MyCadApp, rect: e
         if let Some(id) = state.selected_behavior {
             if let Some(behavior) = dynamic.behaviors.iter().find(|item| item.id == id) {
                 for target in &behavior.targets {
-                    if let Some(entity) = block
-                        .entities
-                        .iter()
-                        .find(|entity| entity.id == target.entity_id())
-                    {
+                    if let Some(entity) = document.entity_by_id(target.entity_id()) {
                         for (point, handle) in stretch_handles(entity) {
                             if handle == *target {
                                 painter.circle_filled(
@@ -5037,11 +5225,7 @@ pub fn paint_authoring_overlays(painter: &egui::Painter, app: &MyCadApp, rect: e
     }
     if let Some(attach) = &state.attach {
         for target in &attach.handles {
-            if let Some(entity) = block
-                .entities
-                .iter()
-                .find(|entity| entity.id == target.entity_id())
-            {
+            if let Some(entity) = document.entity_by_id(target.entity_id()) {
                 for (point, handle) in stretch_handles(entity) {
                     if handle == *target {
                         painter.circle_stroke(
@@ -5063,31 +5247,37 @@ pub fn paint_authoring_overlays(painter: &egui::Painter, app: &MyCadApp, rect: e
             );
         }
     }
-    if let Some(pointer) = app.last_pointer {
-        let mut best: Option<(f64, Point2, String)> = None;
-        for entity in &block.entities {
-            for (point, _) in stretch_handles(entity) {
-                let screen = to_screen(point);
-                let distance = ((screen.x as f64 - pointer.x as f64).powi(2)
-                    + (screen.y as f64 - pointer.y as f64).powi(2))
-                .sqrt();
-                if best
-                    .as_ref()
-                    .is_none_or(|(best_distance, _, _)| distance < *best_distance)
-                {
-                    best = Some((distance, point, entity.geometry.type_name().to_string()));
+    if state
+        .attach
+        .as_ref()
+        .is_some_and(|attach| attach.kind == BehaviorKind::Stretch)
+    {
+        if let Some(pointer) = app.last_pointer {
+            let mut best: Option<(f64, Point2, String)> = None;
+            for entity in &block.entities {
+                for (point, _) in stretch_handles(entity) {
+                    let screen = to_screen(point);
+                    let distance = ((screen.x as f64 - pointer.x as f64).powi(2)
+                        + (screen.y as f64 - pointer.y as f64).powi(2))
+                    .sqrt();
+                    if best
+                        .as_ref()
+                        .is_none_or(|(best_distance, _, _)| distance < *best_distance)
+                    {
+                        best = Some((distance, point, entity.geometry.type_name().to_string()));
+                    }
                 }
             }
-        }
-        if let Some((distance, point, owner)) = best {
-            if distance <= HANDLE_PICK_PX {
-                painter.text(
-                    to_screen(point),
-                    egui::Align2::LEFT_BOTTOM,
-                    owner,
-                    egui::FontId::proportional(11.0),
-                    egui::Color32::from_rgb(240, 220, 160),
-                );
+            if let Some((distance, point, owner)) = best {
+                if distance <= HANDLE_PICK_PX {
+                    painter.text(
+                        to_screen(point),
+                        egui::Align2::LEFT_BOTTOM,
+                        owner,
+                        egui::FontId::proportional(11.0),
+                        egui::Color32::from_rgb(240, 220, 160),
+                    );
+                }
             }
         }
     }
@@ -5098,6 +5288,15 @@ pub fn show_selected_instance_parameters(ui: &mut Ui, app: &mut MyCadApp) {
         return;
     };
     ui.add_space(10.0);
+    ui.label(
+        RichText::new(if ids.len() == 1 {
+            "EDIT THIS INSTANCE".to_owned()
+        } else {
+            format!("EDIT {} SELECTED INSTANCES", ids.len())
+        })
+        .strong(),
+    );
+    ui.weak("Committed values apply only to these instances. The shared definition is unchanged.");
     let mut drafts = app.config_form_drafts.clone();
     let mut errors = app.config_form_errors.clone();
     let mut pending = app.config_pending.clone();
@@ -5291,11 +5490,13 @@ pub fn show_configure_dialog(ctx: &egui::Context, app: &mut MyCadApp) {
     };
     let mut open = true;
     let mut close = false;
-    egui::Window::new("Configure Block")
+    egui::Window::new("Edit block instances")
         .open(&mut open)
         .collapsible(false)
         .resizable(true)
         .show(ctx, |ui| {
+            ui.label(format!("Editing {} selected instance(s)", dialog.entity_ids.len()));
+            ui.weak("Values apply to these instances immediately when committed. The shared definition is unchanged.");
             let action = crate::config_form::show_configuration_form(
                 ui,
                 "configure-block",
@@ -5945,6 +6146,217 @@ mod tests {
             .unwrap();
         assert_eq!(definition.parameter(id).unwrap().name, "Angle");
         assert!(is_angle_parameter(&definition.parameter(id).unwrap().kind));
+    }
+
+    fn authoring_panel_text(app: &mut MyCadApp) -> Vec<String> {
+        let context = egui::Context::default();
+        let output = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(500.0, 1800.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| show_authoring(ui, app));
+            },
+        );
+        output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) => Some(text.galley.text().to_owned()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn authoring_metadata_cache_reuses_targets_and_invalidates_after_edits() {
+        let (mut app, _) = wizard_app();
+        let first = authoring_metadata(&mut app);
+        let again = authoring_metadata(&mut app);
+        assert!(std::sync::Arc::ptr_eq(&first, &again));
+        assert_eq!(
+            std::sync::Arc::strong_count(app.document.as_ref().unwrap()),
+            1
+        );
+        add_angle_parameter(&mut app);
+        let changed = authoring_metadata(&mut app);
+        assert!(!std::sync::Arc::ptr_eq(&first, &changed));
+        assert_eq!(changed.parameters.len(), first.parameters.len() + 1);
+        assert_eq!(
+            std::sync::Arc::strong_count(app.document.as_ref().unwrap()),
+            1
+        );
+    }
+
+    #[test]
+    fn test_mode_cannot_change_shared_defaults_or_presets() {
+        let (mut app, _) = wizard_app();
+        enter_authoring_test(&mut app);
+        let before = app
+            .document
+            .as_ref()
+            .unwrap()
+            .block_by_name("Offset")
+            .unwrap()
+            .dynamic
+            .clone();
+        let generation = app.document.as_ref().unwrap().content_generation();
+        apply_test_values_as_defaults(&mut app, before.as_ref().unwrap());
+        save_preset_from_test(&mut app);
+        assert_eq!(
+            app.document.as_ref().unwrap().content_generation(),
+            generation
+        );
+        assert_eq!(
+            app.document
+                .as_ref()
+                .unwrap()
+                .block_by_name("Offset")
+                .unwrap()
+                .dynamic,
+            before
+        );
+        app.dynamic_authoring.as_mut().unwrap().leave_test();
+        save_preset_values(&mut app, true);
+        assert_eq!(
+            app.document
+                .as_ref()
+                .unwrap()
+                .block_by_name("Offset")
+                .unwrap()
+                .dynamic
+                .as_ref()
+                .unwrap()
+                .presets
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn guided_test_entry_cancels_an_active_drawing_command() {
+        let (mut app, _) = wizard_app();
+        app.run_typed_command("LINE");
+        assert_eq!(app.command_kind(), crate::commands::CommandKind::Line);
+        enter_authoring_test(&mut app);
+        assert_eq!(app.command_kind(), crate::commands::CommandKind::Idle);
+        assert_eq!(
+            app.dynamic_authoring.as_ref().unwrap().mode,
+            AuthoringMode::Test
+        );
+    }
+
+    #[test]
+    fn guided_discard_closes_shared_definition_scope_and_restores_parameters() {
+        let (mut app, _) = wizard_app();
+        let instance = app.dynamic_authoring.as_ref().unwrap().instance_id;
+        app.block_edit
+            .enter(app.document.as_deref().unwrap(), &app.history, instance)
+            .unwrap();
+        let before = app
+            .document
+            .as_deref()
+            .unwrap()
+            .block_by_name("Offset")
+            .unwrap()
+            .dynamic
+            .clone();
+        add_angle_parameter(&mut app);
+        discard_authoring(&mut app);
+        assert!(app.dynamic_authoring.is_none());
+        assert!(!app.block_edit.is_active());
+        assert_eq!(
+            app.document
+                .as_deref()
+                .unwrap()
+                .block_by_name("Offset")
+                .unwrap()
+                .dynamic,
+            before
+        );
+    }
+
+    #[test]
+    fn guided_test_mode_exposes_only_temporary_configuration_controls() {
+        let (mut app, _) = wizard_app();
+        app.dynamic_authoring
+            .as_mut()
+            .unwrap()
+            .enter_test(app.document.as_deref().unwrap());
+        let text = authoring_panel_text(&mut app);
+        assert!(text.iter().any(|text| text.contains("TEST PREVIEW")));
+        assert!(text.iter().any(|text| text == "Return to authoring"));
+        for forbidden in [
+            "Add size parameter…",
+            "Add angle parameter",
+            "Save block definition",
+            "Add an action",
+        ] {
+            assert!(
+                !text.iter().any(|text| text == forbidden),
+                "Test mode must not expose {forbidden}"
+            );
+        }
+        app.dynamic_authoring.as_mut().unwrap().leave_test();
+        let text = authoring_panel_text(&mut app);
+        assert!(text.iter().any(|text| text == "Add size parameter…"));
+        assert!(text.iter().any(|text| text == "Save block definition"));
+    }
+
+    #[test]
+    fn guided_geometry_stage_keeps_required_pivot_draft_and_hides_unrelated_controls() {
+        let (mut app, _) = wizard_app();
+        add_angle_parameter(&mut app);
+        let state = app.dynamic_authoring.as_mut().unwrap();
+        let parameter = state.selected_parameter.unwrap();
+        state.step = AuthoringStep::Actions;
+        state.wizard = Some(BehaviorWizard::Rotate {
+            members: vec![EntityId(1)],
+            pivot: None,
+            parameter,
+        });
+        let text = authoring_panel_text(&mut app);
+        assert!(text.iter().any(|text| text == "Pick pivot"));
+        assert!(text.iter().any(|text| text == "Confirm"));
+        assert!(text.iter().any(|text| text == "Cancel"));
+        assert!(!text.iter().any(|text| text == "Add angle parameter"));
+        assert!(!text.iter().any(|text| text == "Save block definition"));
+        assert!(matches!(
+            app.dynamic_authoring.as_ref().unwrap().wizard,
+            Some(BehaviorWizard::Rotate { pivot: None, .. })
+        ));
+    }
+
+    #[test]
+    fn parameter_metadata_edits_and_undo_keep_geometry_allocation() {
+        let (mut document, _, _) = offset_document();
+        let geometry = document.block_by_name("Offset").unwrap().entities.as_ptr();
+        let before = document.block_by_name("Offset").unwrap().dynamic.clone();
+        let mut history = History::default();
+        history.begin();
+        add_size_parameter(
+            &mut document,
+            &mut history,
+            "Offset",
+            "Width".into(),
+            NumericParameter::length(10.0),
+        )
+        .unwrap();
+        history.commit_open();
+        assert_eq!(
+            document.block_by_name("Offset").unwrap().entities.as_ptr(),
+            geometry
+        );
+        history.undo(&mut document);
+        assert_eq!(
+            document.block_by_name("Offset").unwrap().entities.as_ptr(),
+            geometry
+        );
+        assert_eq!(document.block_by_name("Offset").unwrap().dynamic, before);
     }
 
     #[test]

@@ -101,9 +101,9 @@ pub use entity_transform::{
     validate_entities, EntityTransform, TransformError,
 };
 pub use evaluate::{
-    apply_definition_preview, apply_definition_preview_at_path, check_generation,
-    document_has_dynamic_content, evaluate_definition, export_materialized, generated_block_name,
-    is_generated_block_name, materialize_evaluated,
+    apply_definition_preview, apply_definition_preview_at_path, apply_definition_source_at_path,
+    check_generation, document_has_dynamic_content, evaluate_definition, export_materialized,
+    generated_block_name, is_generated_block_name, materialize_evaluated,
     materialize_evaluated_with, DynamicExportLink, EvalKey, EvaluatedBlock, EvaluationCache,
     EvaluationRequest, MaterializedExport, GENERATED_BLOCK_PREFIX,
 };

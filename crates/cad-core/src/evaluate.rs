@@ -1006,6 +1006,67 @@ pub fn apply_definition_preview_at_path(
     result
 }
 
+/// Show the source geometry of one edited occurrence while authoring its
+/// definition. The leaf's own actions are deliberately not evaluated: its
+/// endpoints and visibility members must remain selectable at their original
+/// positions, even when parameter defaults differ from action reference values.
+/// Nested dynamic INSERTs still use their own stored configurations.
+pub fn apply_definition_source_at_path(
+    source: &Document,
+    evaluated: &mut Document,
+    block_name: &str,
+    cache: &mut EvaluationCache,
+    request: EvaluationRequest,
+    path: &[EntityId],
+) -> Result<(), DynamicError> {
+    check_generation(source, request)?;
+    validate_preview_path(source, block_name, path)?;
+    let definition = source
+        .block_by_name(block_name)
+        .ok_or(DynamicError::MissingDefinition)?;
+    if evaluated.block_by_name(&definition.name).is_none() {
+        return Err(DynamicError::MissingDefinition);
+    }
+    // Validate the temporary occurrence too; reject missing members before
+    // changing any geometry in the evaluated drawing.
+    let mut entities = evaluated.model_space.as_slice();
+    for id in path {
+        let entity =
+            entities
+                .iter()
+                .find(|entity| entity.id == *id)
+                .ok_or(DynamicError::MissingEntity {
+                    target: GeometryTarget::Entity(*id),
+                })?;
+        let name = entity
+            .geometry
+            .insert_block_name()
+            .ok_or(DynamicError::NestedEditUnsupported)?;
+        entities = &evaluated
+            .block_by_name(name)
+            .ok_or(DynamicError::MissingDefinition)?
+            .entities;
+    }
+    let mut entities = definition.entities.clone();
+    rewrite_entities(
+        source,
+        evaluated,
+        cache,
+        request,
+        &mut entities,
+        0,
+        &mut MaterializationCache::default(),
+    )?;
+    if let Some(block) = evaluated.block_by_name_mut(&definition.name) {
+        block.entities = entities;
+        block.dynamic = None;
+    }
+    let mut model = std::mem::take(&mut evaluated.model_space);
+    let result = retarget_preview_path(evaluated, &mut model, &definition.name, path);
+    evaluated.model_space = model;
+    result
+}
+
 fn validate_preview_path(
     source: &Document,
     block_name: &str,
@@ -1505,6 +1566,260 @@ mod tests {
             panic!("top line");
         };
         end.x - start.x
+    }
+
+    fn authoring_source_fixture() -> (Document, EntityId, EntityId, EntityId, EntityId) {
+        let mut document = Document::default();
+        let width = document.allocate_parameter_id();
+        let visible = document.allocate_parameter_id();
+        let mut edge = Entity::new(Geometry::Line {
+            start: Point3::default(),
+            end: Point3::from_xy(100.0, 0.0),
+        });
+        edge.id = document.allocate_id();
+        let edge_id = edge.id;
+        let mut hidden = Entity::new(Geometry::Line {
+            start: Point3::from_xy(0.0, 10.0),
+            end: Point3::from_xy(100.0, 10.0),
+        });
+        hidden.id = document.allocate_id();
+        let hidden_id = hidden.id;
+        let mut number = NumericParameter::length(200.0);
+        number.reference = 100.0;
+        let mut definition =
+            BlockDefinition::plain("SourcePart", Point3::default(), vec![edge, hidden]);
+        definition.dynamic = Some(DynamicDefinition {
+            parameters: vec![
+                ParameterDef::number(width, "Width", number),
+                ParameterDef::boolean(visible, "Show detail", crate::BooleanParameter::default()),
+            ],
+            behaviors: vec![DynamicBehavior {
+                id: document.allocate_action_id(),
+                kind: BehaviorKind::Stretch,
+                parameter: width,
+                targets: vec![GeometryTarget::LineEnd(edge_id)],
+                local_direction: Point2::new(1.0, 0.0),
+                reference_value: 100.0,
+                multiplier: 1.0,
+                composition: CompositionRule::Additive,
+                follow: crate::FollowRole::Second,
+                name: None,
+            }],
+            visibility: vec![crate::VisibilityGroup {
+                id: document.allocate_action_id(),
+                name: "Detail".into(),
+                members: vec![hidden_id],
+                conditions: vec![crate::ParameterCondition::Boolean {
+                    parameter: visible,
+                    state: true,
+                }],
+            }],
+            ..Default::default()
+        });
+        document.replace_block_definition(definition);
+        let edited = document.add_entity(Entity::new(identity_insert(
+            "SourcePart".into(),
+            Point3::default(),
+        )));
+        let other = document.add_entity(Entity::new(identity_insert(
+            "SourcePart".into(),
+            Point3::from_xy(500.0, 0.0),
+        )));
+        (document, edited.id, other.id, edge_id, hidden_id)
+    }
+
+    fn entity_line_end_x(block: &BlockDefinition, id: EntityId) -> f64 {
+        match block
+            .entities
+            .iter()
+            .find(|entity| entity.id == id)
+            .map(|entity| &entity.geometry)
+        {
+            Some(Geometry::Line { end, .. }) => end.x,
+            _ => panic!("expected source line"),
+        }
+    }
+
+    #[test]
+    fn authoring_source_keeps_raw_endpoints_and_hidden_members_while_other_instances_stay_evaluated(
+    ) {
+        let (document, edited, other, edge, hidden) = authoring_source_fixture();
+        let before = format!("{document:?}");
+        let request = EvaluationRequest {
+            generation: document.content_generation(),
+        };
+        let mut cache = EvaluationCache::default();
+        let mut evaluated = materialize_evaluated(&document, &mut cache, request).unwrap();
+        assert_eq!(
+            entity_line_end_x(preview_path_block(&evaluated, &[edited]), edge),
+            200.0
+        );
+        assert!(!preview_path_block(&evaluated, &[edited])
+            .entities
+            .iter()
+            .any(|entity| entity.id == hidden && entity.visible));
+        apply_definition_source_at_path(
+            &document,
+            &mut evaluated,
+            "sourcepart",
+            &mut cache,
+            request,
+            &[edited],
+        )
+        .unwrap();
+        let source_view = preview_path_block(&evaluated, &[edited]);
+        assert_eq!(entity_line_end_x(source_view, edge), 100.0);
+        assert!(source_view
+            .entities
+            .iter()
+            .any(|entity| entity.id == hidden && entity.visible));
+        assert!(source_view.dynamic.is_none());
+        let other_view = preview_path_block(&evaluated, &[other]);
+        assert_eq!(entity_line_end_x(other_view, edge), 200.0);
+        assert!(!other_view
+            .entities
+            .iter()
+            .any(|entity| entity.id == hidden && entity.visible));
+        assert_eq!(format!("{document:?}"), before);
+        assert_eq!(document.identity_counters(), evaluated.identity_counters());
+    }
+
+    #[test]
+    fn authoring_source_isolates_nested_ancestors_and_evaluates_nested_children() {
+        let (mut document, edited, other, edge, hidden) = authoring_source_fixture();
+        let mut nested_edge = Entity::new(Geometry::Line {
+            start: Point3::default(),
+            end: Point3::from_xy(10.0, 0.0),
+        });
+        nested_edge.id = document.allocate_id();
+        let nested_edge_id = nested_edge.id;
+        let parameter = document.allocate_parameter_id();
+        let mut nested = BlockDefinition::plain("Child", Point3::default(), vec![nested_edge]);
+        nested.dynamic = Some(DynamicDefinition {
+            parameters: vec![ParameterDef::number(
+                parameter,
+                "Width",
+                NumericParameter::length(20.0),
+            )],
+            behaviors: vec![DynamicBehavior {
+                id: document.allocate_action_id(),
+                kind: BehaviorKind::Stretch,
+                parameter,
+                targets: vec![GeometryTarget::LineEnd(nested_edge_id)],
+                local_direction: Point2::new(1.0, 0.0),
+                reference_value: 10.0,
+                multiplier: 1.0,
+                composition: CompositionRule::Additive,
+                follow: crate::FollowRole::Second,
+                name: None,
+            }],
+            ..Default::default()
+        });
+        document.replace_block_definition(nested);
+        let mut child = Entity::new(identity_insert("Child".into(), Point3::default()));
+        child.id = document.allocate_id();
+        let child_id = child.id;
+        let mut leaf = document.block_by_name("SourcePart").unwrap().clone();
+        leaf.entities.push(child);
+        document.replace_block_definition(leaf);
+        let first = document
+            .remove_entity_from(&crate::EntitySpace::ModelSpace, edited)
+            .unwrap()
+            .1;
+        let second = document
+            .remove_entity_from(&crate::EntitySpace::ModelSpace, other)
+            .unwrap()
+            .1;
+        document.replace_block_definition(BlockDefinition::plain(
+            "Wrapper",
+            Point3::default(),
+            vec![first, second],
+        ));
+        let selected = document.add_entity(Entity::new(identity_insert(
+            "Wrapper".into(),
+            Point3::default(),
+        )));
+        let sibling = document.add_entity(Entity::new(identity_insert(
+            "Wrapper".into(),
+            Point3::from_xy(1000.0, 0.0),
+        )));
+        let before = format!("{document:?}");
+        let request = EvaluationRequest {
+            generation: document.content_generation(),
+        };
+        let mut cache = EvaluationCache::default();
+        let mut evaluated = materialize_evaluated(&document, &mut cache, request).unwrap();
+        apply_definition_source_at_path(
+            &document,
+            &mut evaluated,
+            "SourcePart",
+            &mut cache,
+            request,
+            &[selected.id, edited],
+        )
+        .unwrap();
+        let raw = preview_path_block(&evaluated, &[selected.id, edited]);
+        assert_eq!(entity_line_end_x(raw, edge), 100.0);
+        assert!(raw
+            .entities
+            .iter()
+            .any(|entity| entity.id == hidden && entity.visible));
+        for path in [vec![selected.id, other], vec![sibling.id, edited]] {
+            let block = preview_path_block(&evaluated, &path);
+            assert_eq!(entity_line_end_x(block, edge), 200.0);
+            assert!(!block
+                .entities
+                .iter()
+                .any(|entity| entity.id == hidden && entity.visible));
+        }
+        assert_eq!(
+            entity_line_end_x(
+                preview_path_block(&evaluated, &[selected.id, edited, child_id]),
+                nested_edge_id
+            ),
+            20.0
+        );
+        assert_eq!(format!("{document:?}"), before);
+        assert_eq!(document.identity_counters(), evaluated.identity_counters());
+    }
+
+    #[test]
+    fn authoring_source_rejects_invalid_paths_and_stale_generation_without_mutation() {
+        let (document, edited, _, _, _) = authoring_source_fixture();
+        let request = EvaluationRequest {
+            generation: document.content_generation(),
+        };
+        let mut cache = EvaluationCache::default();
+        let mut evaluated = materialize_evaluated(&document, &mut cache, request).unwrap();
+        let before = format!("{evaluated:?}");
+        for path in [
+            vec![],
+            vec![EntityId(u64::MAX)],
+            vec![edited; crate::MAX_BLOCK_DEPTH + 1],
+        ] {
+            assert!(apply_definition_source_at_path(
+                &document,
+                &mut evaluated,
+                "SourcePart",
+                &mut cache,
+                request,
+                &path
+            )
+            .is_err());
+            assert_eq!(format!("{evaluated:?}"), before);
+        }
+        assert!(apply_definition_source_at_path(
+            &document,
+            &mut evaluated,
+            "SourcePart",
+            &mut cache,
+            EvaluationRequest {
+                generation: request.generation + 1
+            },
+            &[edited]
+        )
+        .is_err());
+        assert_eq!(format!("{evaluated:?}"), before);
     }
 
     #[test]

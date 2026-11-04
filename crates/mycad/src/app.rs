@@ -8,9 +8,9 @@ use std::thread;
 use std::time::Instant;
 
 use cad_core::{
-    apply_definition_preview_at_path, create_block_from_entities, document_has_dynamic_content,
-    duplicate_block_definition, export_materialized, identity_insert, insert_instance_ids,
-    insert_instance_ids_in_space, make_unique_block, materialize_evaluated,
+    apply_definition_preview_at_path, apply_definition_source_at_path, create_block_from_entities,
+    document_has_dynamic_content, duplicate_block_definition, export_materialized, identity_insert,
+    insert_instance_ids, insert_instance_ids_in_space, make_unique_block, materialize_evaluated,
     materialize_evaluated_with, membership_matrix, purge_unused_user_blocks, reference_radius,
     transfer_entity, transform_entity_matrix, transform_geometry, validate_block_rename,
     validate_entities, warm_document_fonts, would_create_block_cycle, BlockTreeIndex, Document,
@@ -20,10 +20,10 @@ use cad_core::{
     Transform2, TransformError, GEOM_TOLERANCE,
 };
 use cad_io::{
-    apply_companion_for_drawing, companion_path, drawing_for_companion, export_pdf,
-    legacy_companion_path, read_drawing_companion, read_mycad, remove_drawing_companion,
-    write_companion, write_dxf, CadFileFormat, DxfExportOptions, PdfExportOptions, PdfOrientation,
-    PdfPaperSize, PdfPlotArea, PdfPlotStyle, SaveReport, PDF_MARGIN_MM, PDF_STROKE_WEIGHTS,
+    companion_path, drawing_for_companion, export_pdf, legacy_companion_path, read_mycad,
+    remove_drawing_companion, write_companion, write_dxf, CadFileFormat, DxfExportOptions,
+    PdfExportOptions, PdfOrientation, PdfPaperSize, PdfPlotArea, PdfPlotStyle, SaveReport,
+    PDF_MARGIN_MM, PDF_STROKE_WEIGHTS,
 };
 use cad_render::{
     tessellate_document_for_block_edit_on, tessellate_document_on, upload_for_ranges,
@@ -34,6 +34,10 @@ use cad_viewport::Camera2;
 use dwg_import::{write_dwg, DwgWriteError, ExportError as DwgExportError, ImportError};
 use eframe::egui::{self, PointerButton, Rect, Ui};
 use egui_phosphor::regular::FLOPPY_DISK;
+
+use crate::compatibility::{
+    CompatibilityAction, CompatibilityPanel, CompatibilitySummary, HelperStatus,
+};
 
 use crate::block_edit::{
     self, insert_is_editable, BlockEditSession, BlockUi, CreateBlockDialog, CreateDialogResult,
@@ -165,6 +169,8 @@ enum LoadMsg {
         snaps: Box<SnapIndex>,
         measures: Box<MeasureIndex>,
         companion_note: Option<String>,
+        compatibility: CompatibilitySummary,
+        helper: HelperStatus,
     },
     Failure {
         path: PathBuf,
@@ -182,6 +188,8 @@ enum PreviewMsg {
         snaps: Box<SnapIndex>,
         measures: Box<MeasureIndex>,
         extents: Option<Extents2>,
+        compatibility: CompatibilitySummary,
+        block_tree: BlockTreeIndex,
     },
     Failed {
         document_generation: u64,
@@ -359,6 +367,7 @@ enum IoMsg {
         kind: IoKind,
         path: PathBuf,
         report: SaveReport,
+        helper: HelperStatus,
         source: std::sync::Weak<Document>,
         generation: u64,
     },
@@ -502,6 +511,7 @@ pub struct MyCadApp {
     pub(crate) capture: Option<CaptureTarget>,
     pub(crate) settings_tab: SettingsTab,
     pub(crate) dock_state: egui_dock::DockState<WorkspaceTab>,
+    pub(crate) pending_workspace_focus: Option<WorkspaceTab>,
     pub(crate) selection: Selection,
     pub(crate) drafting: DraftingState,
     command: CommandState,
@@ -521,6 +531,8 @@ pub struct MyCadApp {
     pending_open: Option<PathBuf>,
     pending_discard: Option<PendingDiscard>,
     pending_lossy_save: bool,
+    pending_save_review: Option<PathBuf>,
+    pub(crate) compatibility: CompatibilityPanel,
     /// True after MyCAD wrote `document.source_path` this session.
     source_written_by_mycad: bool,
     pdf_plot: PdfPlotUi,
@@ -635,6 +647,7 @@ impl MyCadApp {
             error: None,
             settings_draft: settings.clone(),
             dock_state: settings.dock_state(),
+            pending_workspace_focus: None,
             settings,
             show_settings: false,
             settings_message: None,
@@ -660,6 +673,8 @@ impl MyCadApp {
             pending_open: initial_path,
             pending_discard: None,
             pending_lossy_save: false,
+            pending_save_review: None,
+            compatibility: CompatibilityPanel::default(),
             source_written_by_mycad: false,
             pdf_plot: PdfPlotUi::Closed,
             last_pointer: None,
@@ -724,7 +739,13 @@ impl MyCadApp {
         app
     }
 
+    #[cfg(test)]
+    pub(crate) fn property_test_indexes(&self) -> (&SnapIndex, &MeasureIndex) {
+        (&self.snaps, &self.measures)
+    }
+
     fn start_load_now(&mut self, path: PathBuf) {
+        crate::blocks::cancel_library_placement(self);
         self.blocks_panel.cancel_library_insert_for_open();
         if self.load_rx.is_some() {
             self.pending_open = Some(path);
@@ -768,7 +789,9 @@ impl MyCadApp {
                     match loaded {
                         Ok(mut document) => {
                             warm_document_fonts(&mut document);
-                            let companion_note = apply_open_companion(&path, &mut document);
+                            let (companion_note, helper) =
+                                crate::compatibility::apply_open_companion(&path, &mut document);
+                            let compatibility = CompatibilitySummary::from_document(&document);
                             let prepare = Instant::now();
                             let _prepare_span = cad_core::perf::span("import_prepare");
                             let request = EvaluationRequest {
@@ -789,6 +812,8 @@ impl MyCadApp {
                                 snaps: Box::new(snaps),
                                 measures: Box::new(measures),
                                 companion_note,
+                                compatibility,
+                                helper,
                             });
                         }
                         Err(message) => {
@@ -821,7 +846,12 @@ impl MyCadApp {
                 snaps,
                 measures,
                 companion_note,
+                compatibility,
+                helper,
             }) => {
+                self.compatibility.summary = Some(compatibility);
+                self.compatibility.helper = helper;
+                self.pending_save_review = None;
                 let document = *document;
                 let display = *display;
                 if let Some(extents) = document
@@ -927,6 +957,7 @@ impl MyCadApp {
     }
 
     fn install_blank_document(&mut self) {
+        crate::blocks::cancel_library_placement(self);
         self.error = None;
         self.selection.clear();
         self.box_select = None;
@@ -952,7 +983,11 @@ impl MyCadApp {
         self.geometry_generation = None;
         self.tree_generation = None;
         self.loading_path = None;
-        self.document = Some(Arc::new(blank_drawing()));
+        let document = blank_drawing();
+        self.compatibility = CompatibilityPanel::default();
+        self.compatibility.summary = Some(CompatibilitySummary::from_document(&document));
+        self.pending_save_review = None;
+        self.document = Some(Arc::new(document));
         self.rebuild_block_tree();
         self.refresh_derived();
         self.status = "New drawing".into();
@@ -1067,7 +1102,10 @@ impl MyCadApp {
             return false;
         };
         let path = with_save_extension(path, prefer_dwg);
-        self.write_cad_to(&path)
+        self.pending_save_review = Some(path);
+        self.focus_workspace_tab(WorkspaceTab::Compatibility);
+        self.status = "Review the selected format in Drawing compatibility, then save.".into();
+        false
     }
 
     fn write_cad_to(&mut self, path: &Path) -> bool {
@@ -1382,12 +1420,16 @@ impl MyCadApp {
     // Clicking a different CAD tool cancels the current interaction with
     // the same cleanup as Esc, then starts the new tool immediately.
     fn start_kind(&mut self, kind: CommandKind) {
+        if !kind.is_measure() && self.prevent_test_source_edit() {
+            return;
+        }
         if kind == CommandKind::Idle || self.command.kind() == kind {
             return;
         }
         if self.command.is_active() {
             self.cancel_command();
         }
+        crate::blocks::cancel_library_placement(self);
         self.box_select = None;
         self.context_menu = None;
         self.measurement = None;
@@ -1640,6 +1682,10 @@ impl MyCadApp {
     }
 
     pub(crate) fn undo(&mut self) {
+        if self.prevent_test_source_edit() {
+            return;
+        }
+        crate::blocks::cancel_library_placement(self);
         self.finish_active_transaction();
         self.command.cancel();
         self.measurement = None;
@@ -1687,6 +1733,10 @@ impl MyCadApp {
     }
 
     pub(crate) fn redo(&mut self) {
+        if self.prevent_test_source_edit() {
+            return;
+        }
+        crate::blocks::cancel_library_placement(self);
         self.finish_active_transaction();
         self.command.cancel();
         self.measurement = None;
@@ -1882,13 +1932,21 @@ impl MyCadApp {
                                 .map_err(|err| format_save_failed(&err))
                         }
                     };
-                    result.map(|report| (dest, report))
+                    result.map(|report| {
+                        let helper = HelperStatus::after_save(
+                            &dest,
+                            document_has_dynamic_content(&snapshot),
+                            &report,
+                        );
+                        (dest, report, helper)
+                    })
                 }));
                 let message = match finished {
-                    Ok(Ok((dest, report))) => IoMsg::Success {
+                    Ok(Ok((dest, report, helper))) => IoMsg::Success {
                         kind,
                         path: dest,
                         report,
+                        helper,
                         source,
                         generation,
                     },
@@ -1921,6 +1979,7 @@ impl MyCadApp {
                 kind,
                 path,
                 report,
+                helper,
                 source,
                 generation,
             }) => {
@@ -1943,6 +2002,7 @@ impl MyCadApp {
                         kind,
                         path,
                         report,
+                        helper,
                         source,
                         generation,
                     });
@@ -1964,6 +2024,7 @@ impl MyCadApp {
                         self.remember_recent(&path);
                         return;
                     }
+                    self.compatibility.helper = helper;
                     let complete = self.finish_cad_save(&path, report);
                     if complete && self.pending_discard.is_some() {
                         self.continue_pending_discard(ctx);
@@ -2044,16 +2105,30 @@ impl MyCadApp {
                     Ok(mut evaluated) => {
                         let mut apply_display = true;
                         if let Some(authoring) = authoring.as_ref() {
-                            if let Some(test) = authoring.test_config(document) {
-                                if let Err(err) = apply_definition_preview_at_path(
-                                    document,
-                                    &mut evaluated,
-                                    &authoring.block_name,
-                                    &test,
-                                    &mut cache,
-                                    request,
-                                    &preview_path,
-                                ) {
+                            if let Some(test) = authoring.preview_config(document) {
+                                let result = if authoring.mode
+                                    == crate::dynamic_block::AuthoringMode::Author
+                                {
+                                    apply_definition_source_at_path(
+                                        document,
+                                        &mut evaluated,
+                                        &authoring.block_name,
+                                        &mut cache,
+                                        request,
+                                        &preview_path,
+                                    )
+                                } else {
+                                    apply_definition_preview_at_path(
+                                        document,
+                                        &mut evaluated,
+                                        &authoring.block_name,
+                                        &test,
+                                        &mut cache,
+                                        request,
+                                        &preview_path,
+                                    )
+                                };
+                                if let Err(err) = result {
                                     status = Some(err.to_string());
                                     apply_display = !self.last_eval_ok;
                                 }
@@ -2295,6 +2370,7 @@ impl MyCadApp {
         // still owns a Weak freshness token. Do not detach it for cache-only
         // changes before poll_io has accepted the completed save.
         if !self.io_busy()
+            && !crate::blocks::library_source_pending(self)
             && self
                 .document
                 .as_ref()
@@ -2875,6 +2951,8 @@ impl MyCadApp {
                 let result = catch_worker(|| {
                     let _span = cad_core::perf::span("preview_worker");
                     let mut cache = EvaluationCache::default();
+                    let compatibility = CompatibilitySummary::from_document(&document);
+                    let block_tree = BlockTreeIndex::build(&document);
                     let mut source = Some((*document).clone());
                     drop(document);
                     let dynamic = source.as_ref().is_some_and(document_has_dynamic_content);
@@ -2902,16 +2980,30 @@ impl MyCadApp {
                         Ok(mut evaluated) => {
                             if let Some(authoring) = authoring.as_ref() {
                                 let source = source.as_ref().expect("authoring keeps the source");
-                                if let Some(test) = authoring.test_config(source) {
-                                    if let Err(err) = apply_definition_preview_at_path(
-                                        source,
-                                        &mut evaluated,
-                                        &authoring.block_name,
-                                        &test,
-                                        &mut cache,
-                                        request,
-                                        &view_frames,
-                                    ) {
+                                if let Some(test) = authoring.preview_config(source) {
+                                    let result = if authoring.mode
+                                        == crate::dynamic_block::AuthoringMode::Author
+                                    {
+                                        apply_definition_source_at_path(
+                                            source,
+                                            &mut evaluated,
+                                            &authoring.block_name,
+                                            &mut cache,
+                                            request,
+                                            &view_frames,
+                                        )
+                                    } else {
+                                        apply_definition_preview_at_path(
+                                            source,
+                                            &mut evaluated,
+                                            &authoring.block_name,
+                                            &test,
+                                            &mut cache,
+                                            request,
+                                            &view_frames,
+                                        )
+                                    };
+                                    if let Err(err) = result {
                                         let _ = tx.send(PreviewMsg::Failed {
                                             document_generation,
                                             session_generation,
@@ -2947,6 +3039,8 @@ impl MyCadApp {
                                 snaps: Box::new(snaps),
                                 measures: Box::new(measures),
                                 extents,
+                                compatibility,
+                                block_tree,
                             });
                         }
                         Err(err) => {
@@ -3027,7 +3121,6 @@ impl MyCadApp {
                 };
                 if !current || !frames_match {
                     if !current {
-                        self.status = "Discarded superseded preview".into();
                         self.preview_pending = true;
                     }
                     self.view_pending = false;
@@ -3038,12 +3131,29 @@ impl MyCadApp {
                             snaps,
                             measures,
                             extents,
+                            compatibility,
+                            block_tree,
                             ..
                         } => {
+                            self.compatibility.summary = Some(compatibility);
+                            self.block_tree = block_tree;
+                            self.tree_generation = Some(current_doc);
+                            if let Some(document) = self.document.as_ref() {
+                                self.selection.retain_valid(document);
+                                if self
+                                    .blocks_panel
+                                    .selected
+                                    .as_deref()
+                                    .is_some_and(|name| document.block_by_name(name).is_none())
+                                {
+                                    self.blocks_panel.selected = None;
+                                }
+                            }
                             // A metadata-only refresh must not detach the
                             // Weak token of a save that just finished in this
                             // frame, before its reply reaches poll_io.
                             if !self.io_busy()
+                                && !crate::blocks::library_source_pending(self)
                                 && self
                                     .document
                                     .as_ref()
@@ -3383,6 +3493,9 @@ impl MyCadApp {
     }
 
     fn commit_geometry(&mut self, geometry: Geometry) {
+        if self.prevent_test_source_edit() {
+            return;
+        }
         let type_name = geometry.type_name();
         let space = self.block_edit.active_space();
         let to_local = self.block_edit.local_from_world();
@@ -3536,6 +3649,9 @@ impl MyCadApp {
     }
 
     fn commit_modify(&mut self, transform: EntityTransform, copies: bool) {
+        if self.prevent_test_source_edit() {
+            return;
+        }
         let kind = self.command.kind();
         let requested = self.command.modify_targets().to_vec();
         let targets = self.editable_ids(&requested);
@@ -3633,11 +3749,122 @@ impl MyCadApp {
         };
     }
 
+    fn prevent_test_source_edit(&mut self) -> bool {
+        let testing = self
+            .dynamic_authoring
+            .as_ref()
+            .is_some_and(|state| state.mode == crate::dynamic_block::AuthoringMode::Test);
+        if testing {
+            self.status = "Test preview does not change source geometry. Return to authoring to edit the definition.".into();
+        }
+        testing
+    }
+
+    pub(crate) fn properties_edit_block_reason(&self) -> Option<&'static str> {
+        if self.document.is_none() {
+            return Some("Open a drawing before editing properties.");
+        }
+        if self.command.is_active() || crate::blocks::library_placement_active(self) {
+            return Some("Finish or cancel the current command before applying properties.");
+        }
+        if self
+            .dynamic_authoring
+            .as_ref()
+            .is_some_and(|state| state.mode == crate::dynamic_block::AuthoringMode::Test)
+        {
+            return Some("Return to authoring to edit source geometry; Test values are temporary.");
+        }
+        if self.loading_path.is_some()
+            || self.io_busy()
+            || self.view_pending
+            || self
+                .document
+                .as_ref()
+                .is_some_and(|document| Arc::strong_count(document) > 1)
+        {
+            return Some(
+                "Wait for drawing preparation or saving to finish, then apply these values.",
+            );
+        }
+        None
+    }
+
+    pub(crate) fn commit_property_changes(
+        &mut self,
+        replacements: Vec<(EntitySpace, Entity, Entity)>,
+    ) -> Result<(), String> {
+        if replacements.is_empty() {
+            return Ok(());
+        }
+        if let Some(reason) = self.properties_edit_block_reason() {
+            return Err(reason.into());
+        }
+        let Some(document) = self.document.as_ref() else {
+            return Err("No drawing is open.".into());
+        };
+        let active = self.block_edit.active_space();
+        let mut seen = std::collections::HashSet::new();
+        for (space, before, after) in &replacements {
+            if *space != active || before.id != after.id || !seen.insert(before.id) {
+                return Err("The property edit does not match the active selection space.".into());
+            }
+            if document.entity_by_id(before.id) != Some(before)
+                || document
+                    .find_entity_location(before.id)
+                    .is_none_or(|(actual, _)| actual != *space)
+            {
+                return Err(
+                    "These objects changed. Refresh the properties before applying them.".into(),
+                );
+            }
+            if document.entity_on_locked_layer(before.id) {
+                return Err(
+                    "Unlock the selected objects' layers before changing their properties.".into(),
+                );
+            }
+        }
+        let replacements: Vec<_> = replacements
+            .into_iter()
+            .filter(|(_, before, after)| before != after)
+            .collect();
+        if replacements.is_empty() {
+            return Ok(());
+        }
+        let selected = self.selection.ids().to_vec();
+        let count = replacements.len();
+        self.history.commit_open();
+        self.history.begin();
+        // INSERTs and edited definitions must be evaluated before painting:
+        // a raw incremental patch would show a dynamic block's default shape.
+        let evaluate = self.block_edit.is_active()
+            || replacements
+                .iter()
+                .any(|(_, _, entity)| matches!(entity.geometry, Geometry::Insert { .. }));
+        self.apply_entity_changes_with_refresh(Vec::new(), replacements, Vec::new(), evaluate);
+        self.finish_active_transaction();
+        self.selection.replace_all(selected);
+        self.status = format!(
+            "Updated properties on {count} object{}",
+            if count == 1 { "" } else { "s" }
+        );
+        Ok(())
+    }
+
     fn apply_entity_changes(
         &mut self,
         removed: Vec<(EntitySpace, Entity)>,
         replaced: Vec<(EntitySpace, Entity, Entity)>,
         created: Vec<(EntitySpace, Entity)>,
+    ) {
+        self.apply_entity_changes_with_refresh(removed, replaced, created, false);
+    }
+
+    fn apply_entity_changes_with_refresh(
+        &mut self,
+        removed: Vec<(EntitySpace, Entity)>,
+        replaced: Vec<(EntitySpace, Entity, Entity)>,
+        created: Vec<(EntitySpace, Entity)>,
+        evaluated_refresh: bool,
     ) {
         let model_only = removed.iter().all(|(space, _)| space.is_model())
             && replaced.iter().all(|(space, _, _)| space.is_model())
@@ -3726,7 +3953,7 @@ impl MyCadApp {
         } else {
             model_only
         };
-        if !in_active_space {
+        if evaluated_refresh || !in_active_space {
             self.schedule_full_refresh();
             return;
         }
@@ -3746,6 +3973,9 @@ impl MyCadApp {
     }
 
     fn commit_curve_edit(&mut self, pick: Point2, trim: bool) {
+        if self.prevent_test_source_edit() {
+            return;
+        }
         let aperture = measurement::world_aperture(&self.camera, self.viewport_size.y);
         let active = self.block_edit.active_space();
         let to_world = self.block_edit.world_from_local();
@@ -3836,6 +4066,9 @@ impl MyCadApp {
     }
 
     fn commit_offset(&mut self, id: EntityId, side: Point2, distance: f64) {
+        if self.prevent_test_source_edit() {
+            return;
+        }
         let active = self.block_edit.active_space();
         let to_world = self.block_edit.world_from_local();
         let to_local = self.block_edit.local_from_world();
@@ -3875,6 +4108,9 @@ impl MyCadApp {
     }
 
     fn commit_stretch(&mut self, corner_a: Point2, corner_b: Point2, dx: f64, dy: f64) {
+        if self.prevent_test_source_edit() {
+            return;
+        }
         let active = self.block_edit.active_space();
         let to_world = self.block_edit.world_from_local();
         let to_local = self.block_edit.local_from_world();
@@ -3949,6 +4185,9 @@ impl MyCadApp {
     }
 
     fn erase_ids(&mut self, ids: &[cad_core::EntityId], stay_in_erase: bool) {
+        if self.prevent_test_source_edit() {
+            return;
+        }
         if ids.is_empty() {
             return;
         }
@@ -4339,6 +4578,9 @@ impl MyCadApp {
     }
 
     fn commit_create_block(&mut self, mut dialog: CreateBlockDialog) {
+        if self.prevent_test_source_edit() {
+            return;
+        }
         let Ok(x) = dialog.base_x.trim().parse::<f64>() else {
             dialog.error = Some("Base point X is not a number".into());
             self.block_edit.ui = BlockUi::Create(dialog);
@@ -4410,6 +4652,7 @@ impl MyCadApp {
     }
 
     pub(crate) fn enter_block_edit(&mut self, instance_id: EntityId) {
+        crate::blocks::cancel_library_placement(self);
         self.remember_current_display();
         let entered = {
             let Some(document) = self.document.as_ref() else {
@@ -4488,7 +4731,7 @@ impl MyCadApp {
         }
     }
 
-    fn close_block_level(&mut self, discard: bool) {
+    pub(crate) fn close_block_level(&mut self, discard: bool) {
         self.remember_current_display();
         if discard {
             if let Some(document) = self.document.as_mut().map(Arc::make_mut) {
@@ -4535,6 +4778,7 @@ impl MyCadApp {
     }
 
     fn request_leave_block(&mut self, intent: LeaveIntent) {
+        crate::blocks::cancel_library_placement(self);
         if self.block_edit.request_leave(intent.clone()) {
             self.apply_leave_intent(intent);
         }
@@ -4587,6 +4831,9 @@ impl MyCadApp {
     }
 
     fn commit_add_to_block(&mut self, ids: &[EntityId]) {
+        if self.prevent_test_source_edit() {
+            return;
+        }
         let dest = self.block_edit.active_space();
         let dest_world = self.block_edit.world_from_local();
         let Some(document) = self.document.as_ref() else {
@@ -4647,6 +4894,9 @@ impl MyCadApp {
     }
 
     fn remove_selected_from_block(&mut self) {
+        if self.prevent_test_source_edit() {
+            return;
+        }
         let ids = self.editable_selection_ids();
         if ids.is_empty() {
             self.status = "Select objects in the active block to remove".into();
@@ -4711,6 +4961,9 @@ impl MyCadApp {
     }
 
     fn make_selected_unique(&mut self) {
+        if self.prevent_test_source_edit() {
+            return;
+        }
         if self.selection.len() != 1 {
             self.status = "Select one block reference".into();
             return;
@@ -4749,6 +5002,9 @@ impl MyCadApp {
     }
 
     pub(crate) fn insert_named_block(&mut self, name: &str) {
+        if self.prevent_test_source_edit() {
+            return;
+        }
         let space = self.block_edit.active_space();
         let local = self.block_edit.local_from_world().apply(self.camera.center);
         if let EntitySpace::Block(dest) = &space {
@@ -4881,6 +5137,9 @@ impl MyCadApp {
     }
 
     pub(crate) fn make_named_block_unique(&mut self, name: &str) {
+        if self.prevent_test_source_edit() {
+            return;
+        }
         let ids = self
             .document
             .as_ref()
@@ -4904,6 +5163,9 @@ impl MyCadApp {
     }
 
     pub(crate) fn duplicate_named_block(&mut self, name: &str) {
+        if self.prevent_test_source_edit() {
+            return;
+        }
         self.history.begin();
         let duplicated = {
             let Some(document) = self.document.as_mut().map(Arc::make_mut) else {
@@ -4934,6 +5196,9 @@ impl MyCadApp {
     }
 
     pub(crate) fn rename_named_block(&mut self, from: &str, to: &str) {
+        if self.prevent_test_source_edit() {
+            return;
+        }
         let Some(document) = self.document.as_ref() else {
             return;
         };
@@ -4981,6 +5246,9 @@ impl MyCadApp {
     }
 
     pub(crate) fn purge_unused_blocks(&mut self) {
+        if self.prevent_test_source_edit() {
+            return;
+        }
         let skip: Vec<String> = self
             .block_edit
             .stack
@@ -5028,6 +5296,14 @@ impl MyCadApp {
     fn apply_toolbar_action(&mut self, action: ToolbarAction) {
         match action {
             ToolbarAction::None => {}
+            ToolbarAction::ReturnToAuthoring => {
+                if let Some(state) = self.dynamic_authoring.as_mut() {
+                    state.leave_test();
+                }
+                self.request_preview();
+                self.status =
+                    "Editing the shared block definition. Test values were temporary.".into();
+            }
             ToolbarAction::AddToBlock => self.add_selected_to_block(),
             ToolbarAction::RemoveFromBlock => self.remove_selected_from_block(),
             ToolbarAction::Save => self.save_active_block(),
@@ -5127,12 +5403,77 @@ impl MyCadApp {
         }
     }
 
+    pub(crate) fn focus_workspace_tab(&mut self, tab: WorkspaceTab) {
+        self.pending_workspace_focus = Some(tab);
+    }
+
+    pub(crate) fn show_compatibility(&mut self, ui: &mut Ui) {
+        let mut save = false;
+        let mut cancel = false;
+        if let Some(path) = self.pending_save_review.as_ref() {
+            ui.heading("Save drawing copy");
+            ui.label(path.display().to_string());
+            let format = CadFileFormat::from_path(path).unwrap_or(CadFileFormat::Dxf);
+            crate::compatibility::show_export_summary(
+                ui,
+                format,
+                self.compatibility.summary.as_ref(),
+            );
+            ui.horizontal_wrapped(|ui| {
+                save = ui
+                    .add_enabled(
+                        !self.io_busy()
+                            && self.loading_path.is_none()
+                            && !self.block_edit.current_is_dirty(),
+                        egui::Button::new("Save this copy"),
+                    )
+                    .clicked();
+                cancel = ui.button("Cancel save").clicked();
+            });
+            if self.loading_path.is_some() {
+                ui.weak("Wait for the drawing to finish opening.");
+            } else if self.block_edit.current_is_dirty() {
+                ui.weak("Save or discard the block definition changes before saving the drawing.");
+            }
+            ui.separator();
+        }
+        if cancel {
+            self.pending_save_review = None;
+            self.pending_discard = None;
+            self.status = "Save canceled".into();
+        } else if save {
+            if let Some(path) = self.pending_save_review.take() {
+                self.write_cad_to(&path);
+            }
+        }
+        let generation = self
+            .document
+            .as_ref()
+            .map(|document| document.content_generation());
+        let dirty = self.is_dirty();
+        match crate::compatibility::show(ui, &mut self.compatibility, generation, dirty) {
+            Some(CompatibilityAction::RevealBlock(name)) => {
+                self.blocks_panel.reveal_definition(name, &self.block_tree);
+                self.focus_workspace_tab(WorkspaceTab::Blocks);
+            }
+            Some(CompatibilityAction::ShowDiagnostics) => {
+                self.focus_workspace_tab(WorkspaceTab::Diagnostics);
+            }
+            Some(CompatibilityAction::Refresh) => self.request_preview(),
+            None => {}
+        }
+    }
+
     pub(crate) fn show_viewport(&mut self, ui: &mut Ui) {
         let toolbar_action = if self.block_edit.is_active() {
             let can_add = self.can_add_to_block();
             let can_remove = self.can_remove_from_block();
             if self.document.is_some() {
-                block_edit::show_toolbar(ui, &self.block_edit, can_add, can_remove)
+                let test_preview = self
+                    .dynamic_authoring
+                    .as_ref()
+                    .is_some_and(|state| state.mode == crate::dynamic_block::AuthoringMode::Test);
+                block_edit::show_toolbar(ui, &self.block_edit, can_add, can_remove, test_preview)
             } else {
                 ToolbarAction::None
             }
@@ -5269,7 +5610,9 @@ impl MyCadApp {
                 interactive: settling.is_some(),
             },
         ));
-        if response.hovered() && self.command.requests_point() {
+        if response.hovered()
+            && (self.command.requests_point() || crate::blocks::library_placement_active(self))
+        {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
         }
         if let Some((start, current, color)) = box_rect {
@@ -5299,11 +5642,10 @@ impl MyCadApp {
                     .base_point()
                     .is_some_and(|base| start.distance(base) <= GEOM_TOLERANCE)
         });
-        let acquired_snap = self
-            .command
-            .requests_point()
-            .then_some(self.drafting.acquired_snap)
-            .flatten();
+        let acquired_snap = (self.command.requests_point()
+            || crate::blocks::library_placement_active(self))
+        .then_some(self.drafting.acquired_snap)
+        .flatten();
         let close_hint = self.command.can_close()
             && start.is_some_and(|start| {
                 acquired_snap.is_some_and(|snap| snap.point.distance(start) <= GEOM_TOLERANCE)
@@ -5320,6 +5662,13 @@ impl MyCadApp {
             self.drafting.tracking_hint.as_ref(),
         );
         crate::dynamic_block::paint_authoring_overlays(&painter, self, rect);
+        let camera = self.camera;
+        let origin = Point2::new(rect.min.x as f64, rect.min.y as f64);
+        let size = Point2::new(rect.width() as f64, rect.height() as f64);
+        crate::blocks::paint_library_placement(self, &painter, |point| {
+            let screen = camera.world_to_screen(point, origin, size);
+            egui::pos2(screen.x as f32, screen.y as f32)
+        });
         if let Some([start, end]) = self
             .command
             .preview_mirror_axis(self.drafting.current_point)
@@ -5701,6 +6050,25 @@ impl MyCadApp {
     }
 
     fn apply_context_action(&mut self, action: ContextAction, width: f64, height: f64) {
+        let read_only = matches!(
+            action,
+            ContextAction::Finish
+                | ContextAction::UndoLast
+                | ContextAction::Close
+                | ContextAction::Back
+                | ContextAction::Cancel
+                | ContextAction::Properties
+                | ContextAction::SetCurrentLayerFromObject
+                | ContextAction::Deselect
+                | ContextAction::RepeatLast
+                | ContextAction::ZoomExtents
+                | ContextAction::SnapOverride(_)
+                | ContextAction::SnapNone
+                | ContextAction::OsnapSettings
+        );
+        if !read_only && self.prevent_test_source_edit() {
+            return;
+        }
         match action {
             ContextAction::Finish => self.finish_command(),
             ContextAction::UndoLast => self.undo_last_in_command(),
@@ -5708,7 +6076,7 @@ impl MyCadApp {
             ContextAction::Back => self.back_in_command(),
             ContextAction::Cancel => self.cancel_command(),
             ContextAction::Properties => {
-                workspace::ensure_tab(&mut self.dock_state, WorkspaceTab::Properties);
+                self.focus_workspace_tab(WorkspaceTab::Properties);
             }
             ContextAction::SetCurrentLayerFromObject => self.set_selected_layer_current(),
             ContextAction::Deselect => self.selection.clear(),
@@ -6070,7 +6438,7 @@ impl MyCadApp {
         if self.io_busy() {
             return;
         }
-        if self.pending_lossy_save {
+        if self.pending_lossy_save || self.pending_save_review.is_some() {
             return;
         }
         if matches!(self.pending_discard, Some(PendingDiscard::Quit))
@@ -6243,6 +6611,11 @@ impl eframe::App for MyCadApp {
                 let _ = self.save_drawing();
             } else if keys.save_as {
                 let _ = self.save_as_drawing();
+            } else if keys.escape && crate::blocks::cancel_library_placement(self) {
+                self.drafting.clear_acquisition();
+                self.input_consumed_escape = true;
+            } else if keys.rectangle && crate::blocks::library_placement_active(self) {
+                crate::blocks::rotate_library_placement(self, 90.0);
             } else if keys.escape && self.context_menu.take().is_some() {
                 self.input_consumed_escape = true;
             } else if keys.escape && self.blocks_panel.is_renaming() {
@@ -6572,27 +6945,31 @@ impl eframe::App for MyCadApp {
                     }
                     if ui.button("Show Home").clicked() {
                         ui.close();
-                        workspace::ensure_tab(&mut self.dock_state, WorkspaceTab::Home);
+                        self.focus_workspace_tab(WorkspaceTab::Home);
                     }
                     if ui.button("Show Properties").clicked() {
                         ui.close();
-                        workspace::ensure_tab(&mut self.dock_state, WorkspaceTab::Properties);
+                        self.focus_workspace_tab(WorkspaceTab::Properties);
+                    }
+                    if ui.button("Drawing compatibility").clicked() {
+                        ui.close();
+                        self.focus_workspace_tab(WorkspaceTab::Compatibility);
                     }
                     if ui.button("Show Diagnostics").clicked() {
                         ui.close();
-                        workspace::ensure_tab(&mut self.dock_state, WorkspaceTab::Diagnostics);
+                        self.focus_workspace_tab(WorkspaceTab::Diagnostics);
                     }
                     if ui.button("Show Blocks").clicked() {
                         ui.close();
-                        workspace::ensure_tab(&mut self.dock_state, WorkspaceTab::Blocks);
+                        self.focus_workspace_tab(WorkspaceTab::Blocks);
                     }
                     if ui.button("Show Dynamic Block").clicked() {
                         ui.close();
-                        workspace::ensure_tab(&mut self.dock_state, WorkspaceTab::DynamicBlock);
+                        self.focus_workspace_tab(WorkspaceTab::DynamicBlock);
                     }
                     if ui.button("Show Command Line").clicked() {
                         ui.close();
-                        workspace::ensure_tab(&mut self.dock_state, WorkspaceTab::CommandLine);
+                        self.focus_workspace_tab(WorkspaceTab::CommandLine);
                     }
                     if ui.button("Reset layout").clicked() {
                         ui.close();
@@ -6636,6 +7013,14 @@ impl eframe::App for MyCadApp {
                 ui.monospace(&self.status_text.file_label);
                 ui.separator();
                 ui.label(&self.status).on_hover_text(self.command.prompt());
+                if self.document.is_some()
+                    && ui
+                        .small_button("Compatibility")
+                        .on_hover_text("Drawing behavior, helper status and save formats")
+                        .clicked()
+                {
+                    self.focus_workspace_tab(WorkspaceTab::Compatibility);
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let otrack = ui
                         .selectable_label(self.drafting.preferences.otrack_enabled, "OTRACK  F11")
@@ -6949,6 +7334,7 @@ fn handle_viewport_input(app: &mut MyCadApp, ui: &Ui, response: &egui::Response,
     consider_block_prefetch(app, ui, response, origin, size);
     let modifiers = ui.input(|i| i.modifiers);
     let typing = crate::input::text_field_has_focus(ui.ctx());
+    let library_placing = crate::blocks::library_placement_active(app);
 
     let pointer_pos = if response.hovered() || response.dragged() {
         ui.input(|input| input.pointer.latest_pos())
@@ -6960,10 +7346,18 @@ fn handle_viewport_input(app: &mut MyCadApp, ui: &Ui, response: &egui::Response,
             app.camera
                 .screen_to_world(Point2::new(screen.x as f64, screen.y as f64), origin, size);
         app.cursor_world = Some(raw);
-        if app.command.requests_point() {
-            if app.command.uses_osnap() {
-                let base = app.command.base_point();
-                app.command.write_snap_features(&mut app.command_snaps);
+        if app.command.requests_point() || library_placing {
+            if app.command.uses_osnap() || library_placing {
+                let base = if library_placing {
+                    None
+                } else {
+                    app.command.base_point()
+                };
+                if library_placing {
+                    app.command_snaps.clear();
+                } else {
+                    app.command.write_snap_features(&mut app.command_snaps);
+                }
                 let time = ui.input(|input| input.time);
                 let resolved = app.drafting.resolve_point(
                     raw,
@@ -6979,9 +7373,12 @@ fn handle_viewport_input(app: &mut MyCadApp, ui: &Ui, response: &egui::Response,
                     },
                     time,
                 );
-                let constrained =
+                let constrained = if library_placing {
+                    resolved
+                } else {
                     app.dynamic_input
-                        .constrain_along(base, resolved, app.drafting.along_path());
+                        .constrain_along(base, resolved, app.drafting.along_path())
+                };
                 if let Some(delay) = app.drafting.dwell_remaining(time) {
                     ui.ctx()
                         .request_repaint_after(std::time::Duration::from_secs_f64(delay));
@@ -6998,6 +7395,13 @@ fn handle_viewport_input(app: &mut MyCadApp, ui: &Ui, response: &egui::Response,
                 app.drafting.current_point = Some(raw);
                 app.cursor_world = Some(raw);
             }
+        }
+    }
+
+    if library_placing {
+        if let Some(world) = app.cursor_world {
+            let local = app.block_edit.local_from_world().apply(world);
+            crate::blocks::update_library_placement(app, local);
         }
     }
 
@@ -7065,6 +7469,7 @@ fn handle_viewport_input(app: &mut MyCadApp, ui: &Ui, response: &egui::Response,
     }
 
     if !typing
+        && !library_placing
         && !app.input_consumed_escape
         && ui.input(|i| {
             app.settings
@@ -7086,7 +7491,7 @@ fn handle_viewport_input(app: &mut MyCadApp, ui: &Ui, response: &egui::Response,
     }
 
     let box_was_active = app.box_select.is_some();
-    if !app.command.requests_point() {
+    if !app.command.requests_point() && !library_placing {
         update_box_select(app, ui, response, origin, size, modifiers);
     }
     let box_active = box_was_active || app.box_select.is_some();
@@ -7123,7 +7528,7 @@ fn handle_viewport_input(app: &mut MyCadApp, ui: &Ui, response: &egui::Response,
     let mut opened_menu = false;
     if !panning
         && !box_active
-        && app.command.requests_point()
+        && (app.command.requests_point() || library_placing)
         && modifiers.shift
         && response.clicked_by(PointerButton::Secondary)
     {
@@ -7137,7 +7542,7 @@ fn handle_viewport_input(app: &mut MyCadApp, ui: &Ui, response: &egui::Response,
         ));
         opened_menu = true;
     }
-    if !panning && !box_active && !opened_menu {
+    if !panning && !box_active && !opened_menu && !library_placing {
         for button in [
             PointerButton::Primary,
             PointerButton::Middle,
@@ -7162,6 +7567,11 @@ fn handle_viewport_input(app: &mut MyCadApp, ui: &Ui, response: &egui::Response,
 
     if app.view_pending {
         // The picture still belongs to the previous space until tessellation finishes.
+    } else if library_placing {
+        if !opened_menu && !panning && response.clicked_by(PointerButton::Primary) {
+            crate::blocks::commit_library_placement(app);
+            app.drafting.clear_acquisition();
+        }
     } else if !opened_menu && !app.measure_card_hovered && app.command.requests_point() {
         if response.clicked_by(PointerButton::Primary) {
             if let Some(point) = app.drafting.current_point {
@@ -7654,33 +8064,9 @@ fn resolve_open_path(path: PathBuf) -> PathBuf {
     drawing_for_companion(&path).unwrap_or(path)
 }
 
+#[cfg(test)]
 fn apply_open_companion(path: &Path, document: &mut Document) -> Option<String> {
-    if CadFileFormat::from_path(path) == Some(CadFileFormat::Mycad) {
-        return None;
-    }
-    match read_drawing_companion(path) {
-        Ok(Some(companion)) => match apply_companion_for_drawing(path, document, companion) {
-            Ok(report) => {
-                if let Some(warning) = &report.warning {
-                    document
-                        .diagnostics
-                        .note_lossy(format!("Companion file was not fully applied: {warning}"));
-                }
-                report.status_line()
-            }
-            Err(err) => {
-                let warning = format!("Companion file was not applied: {err}");
-                document.diagnostics.note_lossy(warning.clone());
-                Some(warning)
-            }
-        },
-        Ok(None) => None,
-        Err(err) => {
-            let warning = format!("Companion file was not applied: {err}");
-            document.diagnostics.note_lossy(warning.clone());
-            Some(warning)
-        }
-    }
+    crate::compatibility::apply_open_companion(path, document).0
 }
 
 fn is_saved_copy_dwg(path: &Path) -> bool {
@@ -8902,6 +9288,8 @@ mod interaction_tests {
         app.preview_rx = Some(receiver);
         sender
             .send(PreviewMsg::Ready {
+                compatibility: CompatibilitySummary::default(),
+                block_tree: BlockTreeIndex::default(),
                 document_generation: stale,
                 session_generation: 0,
                 preview_generation: 0,
@@ -8912,8 +9300,9 @@ mod interaction_tests {
                 extents: None,
             })
             .unwrap();
+        app.status = "Updated properties on 1 object".into();
         app.poll_preview(&egui::Context::default());
-        assert!(app.status.contains("Discarded"));
+        assert_eq!(app.status, "Updated properties on 1 object");
         assert!(app.preview_rx.is_some());
     }
 
@@ -9727,11 +10116,13 @@ mod io_job_tests {
         assert_eq!(replacement.content_generation(), generation);
         app.document = Some(Arc::new(replacement));
         app.history.mark_dirty();
+        app.compatibility.helper = HelperStatus::Missing;
         app.pending_discard = Some(PendingDiscard::NewDrawing);
         let (sender, receiver) = mpsc::channel();
         app.io_rx = Some(receiver);
         sender
             .send(IoMsg::Success {
+                helper: HelperStatus::NotRequired,
                 kind: IoKind::SavingDxf,
                 path: PathBuf::from("original-copy.dxf"),
                 report: SaveReport::default(),
@@ -9753,6 +10144,7 @@ mod io_job_tests {
         ));
         assert!(!app.source_written_by_mycad);
         assert!(!app.io_busy());
+        assert_eq!(app.compatibility.helper, HelperStatus::Missing);
     }
 
     #[test]
@@ -9771,6 +10163,7 @@ mod io_job_tests {
         app.poll_io(&context);
         io_sender
             .send(IoMsg::Success {
+                helper: HelperStatus::NotRequired,
                 kind: IoKind::SavingDxf,
                 path: PathBuf::from("preview-completed.dxf"),
                 report: SaveReport::default(),
@@ -9787,6 +10180,8 @@ mod io_job_tests {
         app.preview_rx = Some(receiver);
         sender
             .send(PreviewMsg::Ready {
+                compatibility: CompatibilitySummary::default(),
+                block_tree: BlockTreeIndex::default(),
                 document_generation: generation,
                 session_generation: 0,
                 preview_generation: 0,
@@ -9829,6 +10224,7 @@ mod io_job_tests {
         app.io_kind = Some(IoKind::SavingDxf);
         sender
             .send(IoMsg::Success {
+                helper: HelperStatus::NotRequired,
                 kind: IoKind::SavingDxf,
                 path: PathBuf::from("view-completed.dxf"),
                 report: SaveReport::default(),
@@ -9864,6 +10260,7 @@ mod io_job_tests {
         app.io_kind = Some(IoKind::SavingDxf);
         sender
             .send(IoMsg::Success {
+                helper: HelperStatus::NotRequired,
                 kind: IoKind::SavingDxf,
                 path: PathBuf::from("completed.dxf"),
                 report: SaveReport::default(),
@@ -9945,5 +10342,246 @@ mod io_job_tests {
         assert!(path.is_file(), "expected {}", path.display());
         assert!(app.status.starts_with("Exported "));
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod gui_workflow_tests {
+    use super::*;
+
+    #[test]
+    fn test_preview_rejects_source_edits_but_allows_measurement() {
+        let mut app = MyCadApp::for_test();
+        app.start_line_command();
+        app.accept_command_point(Point2::new(0.0, 0.0));
+        app.accept_command_point(Point2::new(10.0, 0.0));
+        app.cancel_command();
+        let before = app.document.as_ref().unwrap().model_space.clone();
+        app.ensure_document()
+            .unwrap()
+            .replace_block_definition(cad_core::BlockDefinition::plain(
+                "Unused",
+                Point3::default(),
+                Vec::new(),
+            ));
+        let original_blocks = app.document.as_ref().unwrap().blocks.clone();
+        let generation = app.document.as_ref().unwrap().content_generation();
+        let history = app.history.undo_len();
+        let id = before[0].id;
+        let mut state = AuthoringState::new("Preview".into(), id, false, None);
+        state.mode = crate::dynamic_block::AuthoringMode::Test;
+        app.dynamic_authoring = Some(state);
+        for command in [CommandKind::Line, CommandKind::Move, CommandKind::Erase] {
+            app.start_kind(command);
+            assert_eq!(app.command.kind(), CommandKind::Idle);
+        }
+        app.selection.replace(id);
+        app.erase_selected();
+        app.commit_geometry(Geometry::Point {
+            position: Point3::from_xy(30.0, 40.0),
+        });
+        app.undo();
+        app.redo();
+        app.duplicate_named_block("Unused");
+        app.insert_named_block("Unused");
+        app.rename_named_block("Unused", "Changed");
+        app.purge_unused_blocks();
+        app.apply_context_action(ContextAction::NewSize, 800.0, 600.0);
+        assert!(app
+            .dynamic_authoring
+            .as_ref()
+            .unwrap()
+            .size_wizard
+            .is_none());
+        assert_eq!(app.document.as_ref().unwrap().blocks, original_blocks);
+        assert_eq!(app.document.as_ref().unwrap().model_space, before);
+        assert_eq!(
+            app.document.as_ref().unwrap().content_generation(),
+            generation
+        );
+        assert_eq!(app.history.undo_len(), history);
+        assert!(app.status.contains("Return to authoring"));
+        app.start_kind(CommandKind::Distance);
+        assert_eq!(app.command.kind(), CommandKind::Distance);
+    }
+
+    #[test]
+    fn panel_focus_request_survives_workspace_rendering() {
+        let mut app = MyCadApp::for_test();
+        if let Some(location) = app.dock_state.find_tab(&WorkspaceTab::DynamicBlock) {
+            app.dock_state.remove_tab(location);
+        }
+        app.focus_workspace_tab(WorkspaceTab::DynamicBlock);
+        let context = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        let _ = context.run(input, |context| {
+            egui::CentralPanel::default()
+                .show(context, |ui| workspace::show_workspace(ui, &mut app));
+        });
+        let (surface, node, tab) = app
+            .dock_state
+            .find_tab(&WorkspaceTab::DynamicBlock)
+            .unwrap();
+        assert_eq!(
+            app.dock_state[surface][node].get_leaf().unwrap().active,
+            tab
+        );
+        assert!(app.pending_workspace_focus.is_none());
+        assert!(app.dock_state.find_tab(&WorkspaceTab::Viewport).is_some());
+    }
+    fn draw_compatibility(
+        app: &mut MyCadApp,
+        context: &egui::Context,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(700.0, 1000.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        context.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.show_compatibility(ui));
+        })
+    }
+
+    fn click_review(app: &mut MyCadApp, context: &egui::Context, label: &str) {
+        let output = draw_compatibility(app, context, Vec::new());
+        let point = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) if text.galley.text() == label => {
+                    Some(text.pos + text.galley.size() * 0.5)
+                }
+                _ => None,
+            })
+            .expect("review button exists");
+        let events = vec![
+            egui::Event::PointerMoved(point),
+            egui::Event::PointerButton {
+                pos: point,
+                button: PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos: point,
+                button: PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ];
+        let _ = draw_compatibility(app, context, events);
+    }
+
+    #[test]
+    fn save_review_commits_only_after_click_and_cancel_preserves_drawing() {
+        let directory = std::env::temp_dir().join(format!(
+            "mycad-review-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("review.dxf");
+        let mut app = MyCadApp::for_test();
+        app.install_blank_document();
+        app.commit_geometry(Geometry::Point {
+            position: Point3::from_xy(12.0, 34.0),
+        });
+        app.finish_active_transaction();
+        let generation = app.document.as_ref().unwrap().content_generation();
+        app.pending_save_review = Some(path.clone());
+        app.pending_discard = Some(PendingDiscard::NewDrawing);
+        let context = egui::Context::default();
+        let _ = draw_compatibility(&mut app, &context, Vec::new());
+        assert!(!path.exists());
+        click_review(&mut app, &context, "Cancel save");
+        assert!(app.pending_save_review.is_none());
+        assert!(app.pending_discard.is_none());
+        assert_eq!(
+            app.document.as_ref().unwrap().content_generation(),
+            generation
+        );
+        assert!(!path.exists());
+        app.pending_save_review = Some(path.clone());
+        click_review(&mut app, &context, "Save this copy");
+        assert!(app.pending_save_review.is_none());
+        app.wait_for_io();
+        assert!(path.is_file(), "{}", app.status);
+        assert!(!app.is_dirty());
+        assert_eq!(app.compatibility.helper, HelperStatus::NotRequired);
+        let imported = dwg_import::import_dxf(&path).unwrap();
+        assert_eq!(imported.model_space.len(), 1);
+        assert!(
+            matches!(imported.model_space[0].geometry, Geometry::Point { position } if position == Point3::from_xy(12.0, 34.0))
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn preview_worker_refreshes_source_block_tree_after_insert_and_removal() {
+        fn refresh(app: &mut MyCadApp) {
+            app.spawn_preview();
+            let message = app
+                .preview_rx
+                .take()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            let (sender, receiver) = mpsc::channel();
+            sender.send(message).unwrap();
+            app.preview_rx = Some(receiver);
+            app.poll_preview(&egui::Context::default());
+        }
+        let mut app = MyCadApp::for_test();
+        app.install_blank_document();
+        let document = app.ensure_document().unwrap();
+        let line = document.new_entity(Geometry::Line {
+            start: Point3::default(),
+            end: Point3::from_xy(15.0, 0.0),
+        });
+        document.replace_block_definition(cad_core::BlockDefinition::plain(
+            "Library part",
+            Point3::default(),
+            vec![line],
+        ));
+        let inserted = document
+            .add_entity(Entity::new(identity_insert(
+                "Library part".into(),
+                Point3::default(),
+            )))
+            .id;
+        assert_eq!(app.block_tree.reference_count("Library part"), 0);
+        refresh(&mut app);
+        assert_eq!(app.block_tree.reference_count("Library part"), 1);
+        assert_eq!(
+            app.tree_generation,
+            Some(app.document.as_ref().unwrap().content_generation())
+        );
+        app.selection.replace(inserted);
+        app.blocks_panel.selected = Some("Library part".into());
+        let document = app.ensure_document().unwrap();
+        document.remove_entity_from(&EntitySpace::ModelSpace, inserted);
+        document.remove_block_definition("Library part");
+        refresh(&mut app);
+        assert_eq!(app.block_tree.reference_count("Library part"), 0);
+        assert!(app.selection.is_empty());
+        assert!(app.blocks_panel.selected.is_none());
+        assert_eq!(
+            app.tree_generation,
+            Some(app.document.as_ref().unwrap().content_generation())
+        );
     }
 }

@@ -1111,6 +1111,25 @@ impl Document {
         self.blocks.get_mut(&key)
     }
 
+    /// Replace only a block's dynamic metadata, preserving its geometry storage
+    /// and entity index. Callers validate the new definition before committing.
+    pub fn replace_dynamic_definition(
+        &mut self,
+        name: &str,
+        dynamic: Option<crate::DynamicDefinition>,
+    ) -> bool {
+        let Some(block) = self.block_by_name_mut(name) else {
+            return false;
+        };
+        if block.dynamic == dynamic {
+            return false;
+        }
+        block.dynamic = dynamic;
+        block.content_revision = block.content_revision.saturating_add(1);
+        self.bump_generation();
+        true
+    }
+
     pub fn replace_block_definition(
         &mut self,
         mut definition: BlockDefinition,

@@ -1,6 +1,8 @@
 //! Reversible document transactions for editor commands.
 
-use cad_core::{BlockDefinition, Document, Entity, EntitySpace, Layer, LineType, TextStyle};
+use cad_core::{
+    BlockDefinition, Document, DynamicDefinition, Entity, EntitySpace, Layer, LineType, TextStyle,
+};
 
 // ------------------------------------------------------------
 // Enum: Edit
@@ -28,6 +30,11 @@ pub enum Edit {
         name: String,
         before: Option<BlockDefinition>,
         after: Option<BlockDefinition>,
+    },
+    ReplaceDynamicDefinition {
+        name: String,
+        before: Option<DynamicDefinition>,
+        after: Option<DynamicDefinition>,
     },
     ReplaceLayer {
         name: String,
@@ -114,6 +121,9 @@ impl Edit {
                     let _ = document.remove_block_definition(name);
                 }
             },
+            Self::ReplaceDynamicDefinition { name, after, .. } => {
+                document.replace_dynamic_definition(name, after.clone());
+            }
             Self::ReplaceLayer { name, after, .. } => {
                 match after {
                     Some(layer) => {
@@ -189,6 +199,15 @@ impl Edit {
                 before,
                 after,
             } => Self::ReplaceBlockDefinition {
+                name: name.clone(),
+                before: after.clone(),
+                after: before.clone(),
+            },
+            Self::ReplaceDynamicDefinition {
+                name,
+                before,
+                after,
+            } => Self::ReplaceDynamicDefinition {
                 name: name.clone(),
                 before: after.clone(),
                 after: before.clone(),
@@ -607,7 +626,10 @@ mod tests {
             for edit in edits {
                 // Table changes affect any entity using them, including block members.
                 let mixed = Transaction {
-                    edits: vec![Edit::insert_model(0, line(0.0, 0.0, 1.0, 0.0)), edit.clone()],
+                    edits: vec![
+                        Edit::insert_model(0, line(0.0, 0.0, 1.0, 0.0)),
+                        edit.clone(),
+                    ],
                 };
                 assert!(mixed.model_space_change().is_none());
                 edit.apply(&mut document);

@@ -125,8 +125,7 @@ impl DisplaySettings {
 // ------------------------------------------------------------
 // Type: LibraryPreviewSettings
 // Purpose: Thumbnail display, generation, and refresh are independent.
-//          The library browser is a later phase; these settings are
-//          the contract that browser will honor.
+//          The browser honors these without decoding files on hover.
 // ------------------------------------------------------------
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -134,6 +133,45 @@ pub struct LibraryPreviewSettings {
     pub show_thumbnails: bool,
     pub generate_missing: bool,
     pub refresh_policy: ThumbnailRefreshPolicySetting,
+}
+
+/// Personal library navigation and annotations; portable with settings.
+/// Descriptions do not modify library assets or other users' metadata.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LibraryBrowserSettings {
+    pub selected_folder: Option<std::path::PathBuf>,
+    pub recent_folders: Vec<std::path::PathBuf>,
+    pub favorites: Vec<std::path::PathBuf>,
+    pub descriptions: std::collections::BTreeMap<std::path::PathBuf, String>,
+}
+
+impl LibraryBrowserSettings {
+    pub fn remember_folder(&mut self, folder: std::path::PathBuf) {
+        self.recent_folders.retain(|old| old != &folder);
+        self.recent_folders.insert(0, folder.clone());
+        self.recent_folders.truncate(12);
+        self.selected_folder = Some(folder);
+    }
+
+    fn sanitize(&mut self) {
+        self.recent_folders.truncate(12);
+        self.favorites.truncate(2_000);
+        let mut seen = std::collections::HashSet::new();
+        self.recent_folders.retain(|path| seen.insert(path.clone()));
+        seen.clear();
+        self.favorites.retain(|path| seen.insert(path.clone()));
+        self.descriptions.retain(|_, description| {
+            let end = description.char_indices().nth(500).map(|(index, _)| index);
+            if let Some(end) = end {
+                description.truncate(end);
+            }
+            !description.trim().is_empty()
+        });
+        while self.descriptions.len() > 2_000 {
+            self.descriptions.pop_last();
+        }
+    }
 }
 
 impl Default for LibraryPreviewSettings {
@@ -221,6 +259,8 @@ pub struct AppSettings {
     #[serde(default)]
     pub library_preview: LibraryPreviewSettings,
     #[serde(default)]
+    pub library_browser: LibraryBrowserSettings,
+    #[serde(default)]
     pub wheel_acceleration: WheelAccelerationSettings,
     /// Offscreen viewport samples. The window itself stays at one sample.
     #[serde(default = "default_viewport_msaa")]
@@ -264,6 +304,7 @@ impl Default for AppSettings {
             responsive_ribbon_recovered: false,
             compact_home_height_applied: false,
             library_preview: LibraryPreviewSettings::default(),
+            library_browser: LibraryBrowserSettings::default(),
             wheel_acceleration: WheelAccelerationSettings::default(),
             viewport_msaa: DEFAULT_VIEWPORT_MSAA,
             smooth_zoom: default_smooth_zoom(),
@@ -292,6 +333,7 @@ impl AppSettings {
         self.wheel_acceleration.sanitize();
         self.viewport_msaa = sanitize_viewport_msaa(self.viewport_msaa);
         self.bindings.sanitize();
+        self.library_browser.sanitize();
         let mut state = decode_dock_layout(self.dock_layout.as_ref());
         self.home_layout_migrated = migrate_home_tab(&mut state, self.home_layout_migrated);
         self.blocks_tab_migrated = migrate_blocks_tab(&mut state, self.blocks_tab_migrated);
@@ -391,6 +433,38 @@ pub fn scroll_to_zoom_factor(scroll_y: f64, zoom_speed: f64) -> f64 {
 mod tests {
     use super::*;
     use crate::input::{Binding, InputAction, MouseButtonKind};
+
+    #[test]
+    fn library_preferences_persist_navigation_favorites_and_descriptions() {
+        let mut settings = AppSettings::default();
+        let folder = std::path::PathBuf::from("workshop/library");
+        let asset = folder.join("Door.mycadblock");
+        settings.library_browser.remember_folder(folder.clone());
+        settings.library_browser.remember_folder(folder.clone());
+        settings.library_browser.favorites = vec![asset.clone(), asset.clone()];
+        settings
+            .library_browser
+            .descriptions
+            .insert(asset.clone(), "Steel fire door".into());
+        let decoded =
+            AppSettings::from_portable_json(&settings.to_portable_json().unwrap()).unwrap();
+        assert_eq!(
+            decoded.library_browser.selected_folder,
+            Some(folder.clone())
+        );
+        assert_eq!(decoded.library_browser.recent_folders, vec![folder]);
+        assert_eq!(decoded.library_browser.favorites, vec![asset.clone()]);
+        assert_eq!(
+            decoded
+                .library_browser
+                .descriptions
+                .get(&asset)
+                .map(String::as_str),
+            Some("Steel fire door")
+        );
+        let legacy = AppSettings::from_portable_json("{}").unwrap();
+        assert_eq!(legacy.library_browser, LibraryBrowserSettings::default());
+    }
 
     #[test]
     fn default_zoom_speed_is_one() {
