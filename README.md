@@ -20,6 +20,9 @@ This deliberately includes edits that keep the same block bounds. Keep legacy
 helpers with their original drawings; they are not silently migrated. Missing
 helpers leave the normal drawing geometry usable.
 
+For creating parameters, connecting stretch/move actions, and building reusable
+folder libraries, see the [dynamic block and library guide](docs/dynamic-blocks-and-libraries.md).
+
 ## Layout
 
 | Crate | Role |

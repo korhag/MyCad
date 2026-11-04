@@ -40,6 +40,12 @@ struct WireBlockFile {
     schema: u32,
     block: WireBlock,
     dependencies: Vec<WireBlock>,
+    #[serde(default)]
+    layers: Vec<WireLayer>,
+    #[serde(default)]
+    linetypes: Vec<WireLineType>,
+    #[serde(default)]
+    text_styles: Vec<WireTextStyle>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -987,11 +993,16 @@ pub fn write_mycadblock(
     };
     let mut dependencies = Vec::new();
     collect_dependencies(document, root, &mut dependencies, &mut Vec::new())?;
+    dependencies.retain(|block| !block.name.eq_ignore_ascii_case(&root.name));
+    let (layers, linetypes, text_styles) = block_asset_resources(document, root, &dependencies);
     let wire = WireBlockFile {
         format: MYCAD_BLOCK_FORMAT.into(),
         schema: MYCAD_SCHEMA,
         block: to_wire_block(root),
         dependencies,
+        layers,
+        linetypes,
+        text_styles,
     };
     write_json(path, &wire)
 }
@@ -1017,27 +1028,67 @@ pub fn read_mycadblock(path: &Path) -> Result<BlockAsset, ExportError> {
         blocks.push(from_wire_block(dep)?);
     }
     blocks.push(from_wire_block(wire.block)?);
-    Ok(BlockAsset { blocks })
+    Ok(BlockAsset {
+        blocks,
+        layers: wire.layers.into_iter().map(from_wire_layer).collect(),
+        linetypes: wire.linetypes.into_iter().map(from_wire_linetype).collect(),
+        text_styles: wire
+            .text_styles
+            .into_iter()
+            .map(from_wire_text_style)
+            .collect(),
+    })
 }
 
 pub struct BlockAsset {
     pub blocks: Vec<BlockDefinition>,
+    pub layers: Vec<Layer>,
+    pub linetypes: Vec<LineType>,
+    pub text_styles: Vec<cad_core::TextStyle>,
 }
 
 pub fn import_block_asset(
     document: &mut Document,
-    asset: BlockAsset,
+    mut asset: BlockAsset,
 ) -> Result<String, ExportError> {
-    let mut definition_map = BTreeMap::new();
+    if asset.blocks.is_empty() {
+        return Err(ExportError::Validation(
+            "the library file contains no blocks".into(),
+        ));
+    }
+    let mut names = BTreeMap::new();
+    let mut occupied: BTreeSet<String> = document
+        .blocks
+        .keys()
+        .map(|name| name.to_ascii_uppercase())
+        .collect();
+    for block in &asset.blocks {
+        let key = block.name.to_ascii_uppercase();
+        if block.name.trim().is_empty() || names.contains_key(&key) {
+            return Err(ExportError::Validation(
+                "the library file contains empty or duplicate block names".into(),
+            ));
+        }
+        let mut name = block.name.clone();
+        let mut suffix = 1;
+        while occupied.contains(&name.to_ascii_uppercase()) {
+            name = format!("{}_{suffix:03}", block.name);
+            suffix += 1;
+        }
+        occupied.insert(name.to_ascii_uppercase());
+        names.insert(key, name);
+    }
+    // Allocate all identities before remapping: a static assembly may contain
+    // configured dynamic children, and inputs can refer to later definitions.
     let mut entity_map = BTreeMap::new();
+    let mut vertex_map = BTreeMap::new();
     let mut parameter_map = BTreeMap::new();
     let mut option_map = BTreeMap::new();
     let mut action_map = BTreeMap::new();
-    let mut last_name = String::new();
-    for mut block in asset.blocks {
-        let old_id = block.id;
+    let mut anchor_map = BTreeMap::new();
+    let mut preset_map = BTreeMap::new();
+    for block in &mut asset.blocks {
         block.id = document.allocate_definition_id();
-        definition_map.insert(old_id, block.id);
         for entity in &mut block.entities {
             let old = entity.id;
             entity.id = document.allocate_id();
@@ -1045,10 +1096,8 @@ pub fn import_block_asset(
                 entity_map.insert(old, entity.id);
             }
         }
-        let vertex_map = document.remap_entity_vertex_ids(&mut block.entities);
-        if let Some(dynamic) = block.dynamic.as_mut() {
-            let mut anchors = BTreeMap::new();
-            let mut presets = BTreeMap::new();
+        vertex_map.extend(document.remap_entity_vertex_ids(&mut block.entities));
+        if let Some(dynamic) = &block.dynamic {
             for parameter in &dynamic.parameters {
                 parameter_map.insert(parameter.id, document.allocate_parameter_id());
                 if let ParameterKind::Choice(choice) = &parameter.kind {
@@ -1061,48 +1110,169 @@ pub fn import_block_asset(
                 action_map.insert(id, document.allocate_action_id());
             }
             for anchor in &dynamic.anchors {
-                anchors.insert(anchor.id, document.allocate_anchor_id());
+                anchor_map.insert(anchor.id, document.allocate_anchor_id());
             }
             for preset in &dynamic.presets {
-                presets.insert(preset.id, document.allocate_preset_id());
+                preset_map.insert(preset.id, document.allocate_preset_id());
             }
+        }
+    }
+    for block in &mut asset.blocks {
+        if let Some(dynamic) = block.dynamic.as_mut() {
             dynamic
                 .remap_ids_with(
                     &parameter_map,
                     &option_map,
                     &action_map,
-                    &anchors,
-                    &presets,
+                    &anchor_map,
+                    &preset_map,
                     &entity_map,
                     &vertex_map,
                 )
                 .map_err(|err| ExportError::Validation(err.to_string()))?;
-            for entity in &mut block.entities {
-                if let Some(config) = entity.geometry.insert_configuration_mut() {
-                    if let Some(values) = config.as_mut() {
-                        values.remap_identities(&parameter_map, &option_map);
-                    }
-                }
+            validate_definition(dynamic, &block.entities)
+                .map_err(|err| ExportError::Validation(err.to_string()))?;
+        }
+        remap_resource_name(&mut block.name, &names);
+        for entity in &mut block.entities {
+            if let Some(name) = referenced_block_mut(&mut entity.geometry) {
+                remap_resource_name(name, &names);
+            }
+            if let Some(Some(config)) = entity.geometry.insert_configuration_mut() {
+                config.remap_identities(&parameter_map, &option_map);
             }
         }
-        if document.block_key(&block.name).is_some() {
-            block.name = unique_imported_name(document, &block.name);
+    }
+    let mut styles = BTreeMap::new();
+    for style in asset.text_styles {
+        let source = style.name.clone();
+        let name = import_resource(
+            &mut document.text_styles,
+            style,
+            &source,
+            |a, b| {
+                a.font_file == b.font_file
+                    && a.bigfont_file == b.bigfont_file
+                    && a.height == b.height
+                    && a.width_factor == b.width_factor
+                    && a.oblique == b.oblique
+            },
+            |style, name| style.name = name,
+        );
+        styles.insert(source.to_ascii_uppercase(), name);
+    }
+    let mut linetypes = BTreeMap::new();
+    for mut linetype in asset.linetypes {
+        // These names describe inheritance, never a reusable dash pattern.
+        if cad_core::is_bylayer_name(&linetype.name) || cad_core::is_byblock_name(&linetype.name) {
+            continue;
+        }
+        for shape in linetype.shapes.iter_mut().flatten() {
+            remap_resource_name(&mut shape.style, &styles);
+        }
+        let source = linetype.name.clone();
+        let name = import_resource(
+            &mut document.linetypes,
+            linetype,
+            &source,
+            |a, b| a.dashes == b.dashes && a.shapes == b.shapes,
+            |linetype, name| linetype.name = name,
+        );
+        linetypes.insert(source.to_ascii_uppercase(), name);
+    }
+    let mut layers = BTreeMap::new();
+    for mut layer in asset.layers {
+        // Layer 0 geometry must keep inheriting the INSERT's layer.
+        if layer.name == "0" {
+            continue;
+        }
+        remap_resource_name(&mut layer.linetype, &linetypes);
+        let source = layer.name.clone();
+        let name = import_resource(
+            &mut document.layers,
+            layer,
+            &source,
+            |a, b| {
+                a.visible == b.visible
+                    && a.frozen == b.frozen
+                    && a.locked == b.locked
+                    && a.plot == b.plot
+                    && a.color == b.color
+                    && a.linetype == b.linetype
+                    && a.lineweight == b.lineweight
+            },
+            |layer, name| layer.name = name,
+        );
+        layers.insert(source.to_ascii_uppercase(), name);
+    }
+    let mut last_name = String::new();
+    for mut block in asset.blocks {
+        for entity in &mut block.entities {
+            remap_resource_name(&mut entity.layer, &layers);
+            remap_resource_name(&mut entity.linetype, &linetypes);
+            match &mut entity.geometry {
+                Geometry::Text(data) => remap_resource_name(&mut data.style, &styles),
+                Geometry::MText(data) => remap_resource_name(&mut data.style, &styles),
+                Geometry::Insert { attribs, .. } => {
+                    for attrib in attribs {
+                        remap_resource_name(&mut attrib.style, &styles);
+                    }
+                }
+                _ => {}
+            }
         }
         last_name = block.name.clone();
         document.replace_block_definition(block);
     }
-    let _ = definition_map;
     Ok(last_name)
 }
 
-fn unique_imported_name(document: &Document, source: &str) -> String {
-    for index in 1..10_000 {
-        let candidate = format!("{source}_{index:03}");
-        if document.block_key(&candidate).is_none() {
+fn remap_resource_name(name: &mut String, names: &BTreeMap<String, String>) {
+    if let Some(mapped) = names.get(&name.to_ascii_uppercase()) {
+        *name = mapped.clone();
+    }
+}
+
+fn import_resource<T>(
+    table: &mut BTreeMap<String, T>,
+    mut resource: T,
+    source: &str,
+    equivalent: impl Fn(&T, &T) -> bool,
+    rename: impl Fn(&mut T, String),
+) -> String {
+    let mut suffix = 0;
+    loop {
+        let candidate = if suffix == 0 {
+            source.to_string()
+        } else {
+            format!("{source}_{suffix:03}")
+        };
+        if let Some((name, existing)) = table
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(&candidate))
+        {
+            if equivalent(existing, &resource) {
+                return name.clone();
+            }
+        } else {
+            rename(&mut resource, candidate.clone());
+            table.insert(candidate.clone(), resource);
             return candidate;
         }
+        suffix += 1;
     }
-    format!("{source}_imported")
+}
+
+fn referenced_block_mut(geometry: &mut Geometry) -> Option<&mut String> {
+    match geometry {
+        Geometry::Insert { block_name, .. } => Some(block_name),
+        Geometry::Dimension(data) => Some(&mut data.block_name),
+        Geometry::MultiLeader {
+            content: LeaderContent::Block { name, .. },
+            ..
+        } => Some(name),
+        _ => None,
+    }
 }
 
 fn write_json(path: &Path, value: &impl Serialize) -> Result<SaveReport, ExportError> {
@@ -1129,8 +1299,14 @@ fn collect_dependencies(
     }
     stack.push(block.name.clone());
     for entity in &block.entities {
-        if let Some(name) = entity.geometry.insert_block_name() {
+        if let Some(name) = referenced_block(&entity.geometry) {
             if let Some(child) = document.block_by_name(name) {
+                if out
+                    .iter()
+                    .any(|item| item.name.eq_ignore_ascii_case(&child.name))
+                {
+                    continue;
+                }
                 collect_dependencies(document, child, out, stack)?;
                 if !out
                     .iter()
@@ -1143,6 +1319,198 @@ fn collect_dependencies(
     }
     stack.pop();
     Ok(())
+}
+
+fn referenced_block(geometry: &Geometry) -> Option<&str> {
+    match geometry {
+        Geometry::MultiLeader {
+            content: LeaderContent::Block { name, .. },
+            ..
+        } => Some(name),
+        _ => geometry.insert_block_name(),
+    }
+}
+
+fn block_asset_resources(
+    document: &Document,
+    root: &BlockDefinition,
+    dependencies: &[WireBlock],
+) -> (Vec<WireLayer>, Vec<WireLineType>, Vec<WireTextStyle>) {
+    let mut layer_names = BTreeSet::new();
+    let mut linetype_names = BTreeSet::new();
+    let mut style_names = BTreeSet::new();
+    let blocks = std::iter::once(root).chain(
+        dependencies
+            .iter()
+            .filter_map(|block| document.block_by_name(&block.name)),
+    );
+    for entity in blocks.flat_map(|block| &block.entities) {
+        layer_names.insert(entity.layer.to_ascii_uppercase());
+        linetype_names.insert(entity.linetype.to_ascii_uppercase());
+        match &entity.geometry {
+            Geometry::Text(data) => {
+                style_names.insert(style_or_standard(&data.style).to_ascii_uppercase());
+            }
+            Geometry::MText(data) => {
+                style_names.insert(style_or_standard(&data.style).to_ascii_uppercase());
+            }
+            Geometry::Insert { attribs, .. } => {
+                for attrib in attribs {
+                    style_names.insert(style_or_standard(&attrib.style).to_ascii_uppercase());
+                }
+            }
+            _ => {}
+        }
+    }
+    // Layer 0 intentionally keeps the host INSERT's inheritance semantics.
+    let layers: Vec<_> = document
+        .layers
+        .values()
+        .filter(|layer| layer.name != "0" && layer_names.contains(&layer.name.to_ascii_uppercase()))
+        .map(|layer| {
+            linetype_names.insert(layer.linetype.to_ascii_uppercase());
+            to_wire_layer(layer)
+        })
+        .collect();
+    let linetypes: Vec<_> = document
+        .linetypes
+        .values()
+        .filter(|linetype| {
+            linetype_names.contains(&linetype.name.to_ascii_uppercase())
+                && !cad_core::is_bylayer_name(&linetype.name)
+                && !cad_core::is_byblock_name(&linetype.name)
+        })
+        .map(|linetype| {
+            for shape in linetype.shapes.iter().flatten() {
+                if !shape.style.is_empty() {
+                    style_names.insert(shape.style.to_ascii_uppercase());
+                }
+            }
+            to_wire_linetype(linetype)
+        })
+        .collect();
+    let text_styles = document
+        .text_styles
+        .values()
+        .filter(|style| style_names.contains(&style.name.to_ascii_uppercase()))
+        .map(to_wire_text_style)
+        .collect();
+    (layers, linetypes, text_styles)
+}
+
+fn to_wire_layer(layer: &Layer) -> WireLayer {
+    WireLayer {
+        name: layer.name.clone(),
+        visible: layer.visible,
+        frozen: layer.frozen,
+        color: to_color(layer.color),
+        linetype: layer.linetype.clone(),
+        locked: layer.locked,
+        plot: layer.plot,
+        lineweight: layer.lineweight,
+    }
+}
+
+fn from_wire_layer(layer: WireLayer) -> Layer {
+    Layer {
+        name: layer.name,
+        visible: layer.visible,
+        frozen: layer.frozen,
+        color: from_color(layer.color),
+        linetype: layer.linetype,
+        locked: layer.locked,
+        plot: layer.plot,
+        lineweight: layer.lineweight,
+    }
+}
+
+fn to_wire_text_style(style: &cad_core::TextStyle) -> WireTextStyle {
+    WireTextStyle {
+        name: style.name.clone(),
+        font_file: style.font_file.clone(),
+        bigfont_file: style.bigfont_file.clone(),
+        height: style.height,
+        width_factor: style.width_factor,
+        oblique: style.oblique,
+    }
+}
+
+fn from_wire_text_style(style: WireTextStyle) -> cad_core::TextStyle {
+    cad_core::TextStyle {
+        name: style.name,
+        font_file: if style.font_file.trim().is_empty() {
+            "txt".into()
+        } else {
+            style.font_file
+        },
+        bigfont_file: style.bigfont_file,
+        height: style.height,
+        width_factor: if style.width_factor.is_finite() && style.width_factor > 1e-9 {
+            style.width_factor
+        } else {
+            1.0
+        },
+        oblique: style.oblique,
+    }
+}
+
+fn to_wire_linetype(lt: &LineType) -> WireLineType {
+    WireLineType {
+        name: lt.name.clone(),
+        dashes: lt.dashes.clone(),
+        shapes: lt
+            .shapes
+            .iter()
+            .map(|shape| {
+                shape.as_ref().map(|shape| WireLineTypeShape {
+                    flag: shape.flag,
+                    shapecode: shape.shapecode,
+                    text: shape.text.clone(),
+                    scale: shape.scale,
+                    rotation: shape.rotation,
+                    x_offset: shape.x_offset,
+                    y_offset: shape.y_offset,
+                    style: shape.style.clone(),
+                    shape_file: shape.shape_file.clone(),
+                })
+            })
+            .collect(),
+    }
+}
+
+fn from_wire_linetype(lt: WireLineType) -> LineType {
+    let mut shapes = lt
+        .shapes
+        .into_iter()
+        .map(|shape| {
+            shape.map(|shape| cad_core::LineTypeShape {
+                flag: shape.flag,
+                shapecode: shape.shapecode,
+                text: shape.text,
+                scale: if shape.scale.is_finite() {
+                    shape.scale
+                } else {
+                    1.0
+                },
+                rotation: if shape.rotation.is_finite() {
+                    shape.rotation
+                } else {
+                    0.0
+                },
+                x_offset: shape.x_offset,
+                y_offset: shape.y_offset,
+                style: shape.style,
+                shape_file: shape.shape_file,
+            })
+        })
+        .collect::<Vec<_>>();
+    shapes.truncate(lt.dashes.len());
+    shapes.resize(lt.dashes.len(), None);
+    LineType {
+        name: lt.name,
+        dashes: lt.dashes,
+        shapes,
+    }
 }
 
 fn to_wire_document(document: &Document) -> WireDocument {
@@ -1169,56 +1537,12 @@ fn to_wire_document(document: &Document) -> WireDocument {
         next_preset_id: document.next_preset_id(),
         content_generation,
         saved_revision,
-        layers: document
-            .layers
-            .values()
-            .map(|layer| WireLayer {
-                name: layer.name.clone(),
-                visible: layer.visible,
-                frozen: layer.frozen,
-                color: to_color(layer.color),
-                linetype: layer.linetype.clone(),
-                locked: layer.locked,
-                plot: layer.plot,
-                lineweight: layer.lineweight,
-            })
-            .collect(),
-        linetypes: document
-            .linetypes
-            .values()
-            .map(|lt| WireLineType {
-                name: lt.name.clone(),
-                dashes: lt.dashes.clone(),
-                shapes: lt
-                    .shapes
-                    .iter()
-                    .map(|shape| {
-                        shape.as_ref().map(|shape| WireLineTypeShape {
-                            flag: shape.flag,
-                            shapecode: shape.shapecode,
-                            text: shape.text.clone(),
-                            scale: shape.scale,
-                            rotation: shape.rotation,
-                            x_offset: shape.x_offset,
-                            y_offset: shape.y_offset,
-                            style: shape.style.clone(),
-                            shape_file: shape.shape_file.clone(),
-                        })
-                    })
-                    .collect(),
-            })
-            .collect(),
+        layers: document.layers.values().map(to_wire_layer).collect(),
+        linetypes: document.linetypes.values().map(to_wire_linetype).collect(),
         text_styles: document
             .text_styles
             .values()
-            .map(|style| WireTextStyle {
-                name: style.name.clone(),
-                font_file: style.font_file.clone(),
-                bigfont_file: style.bigfont_file.clone(),
-                height: style.height,
-                width_factor: style.width_factor,
-                oblique: style.oblique,
-            })
+            .map(to_wire_text_style)
             .collect(),
         blocks: document.blocks.values().map(to_wire_block).collect(),
         model_space: document.model_space.iter().map(to_wire_entity).collect(),
@@ -1240,81 +1564,22 @@ fn from_wire_document(wire: WireDocument) -> Result<Document, ExportError> {
     document.current_layer = wire.current_layer;
     document.layers.clear();
     for layer in wire.layers {
-        document.layers.insert(
-            layer.name.clone(),
-            Layer {
-                name: layer.name,
-                visible: layer.visible,
-                frozen: layer.frozen,
-                locked: layer.locked,
-                plot: layer.plot,
-                color: from_color(layer.color),
-                linetype: layer.linetype,
-                lineweight: layer.lineweight,
-            },
-        );
+        document
+            .layers
+            .insert(layer.name.clone(), from_wire_layer(layer));
     }
     document.ensure_layer_zero();
     for style in wire.text_styles {
-        if style.name.trim().is_empty() {
-            continue;
+        if !style.name.trim().is_empty() {
+            document
+                .text_styles
+                .insert(style.name.clone(), from_wire_text_style(style));
         }
-        document.text_styles.insert(
-            style.name.clone(),
-            cad_core::TextStyle {
-                name: style.name,
-                font_file: if style.font_file.trim().is_empty() {
-                    "txt".into()
-                } else {
-                    style.font_file
-                },
-                bigfont_file: style.bigfont_file,
-                height: style.height,
-                width_factor: if style.width_factor.is_finite() && style.width_factor > 1e-9 {
-                    style.width_factor
-                } else {
-                    1.0
-                },
-                oblique: style.oblique,
-            },
-        );
     }
-    for lt in wire.linetypes {
-        let mut shapes = lt
-            .shapes
-            .into_iter()
-            .map(|shape| {
-                shape.map(|shape| cad_core::LineTypeShape {
-                    flag: shape.flag,
-                    shapecode: shape.shapecode,
-                    text: shape.text,
-                    scale: if shape.scale.is_finite() {
-                        shape.scale
-                    } else {
-                        1.0
-                    },
-                    rotation: if shape.rotation.is_finite() {
-                        shape.rotation
-                    } else {
-                        0.0
-                    },
-                    x_offset: shape.x_offset,
-                    y_offset: shape.y_offset,
-                    style: shape.style,
-                    shape_file: shape.shape_file,
-                })
-            })
-            .collect::<Vec<_>>();
-        shapes.truncate(lt.dashes.len());
-        shapes.resize(lt.dashes.len(), None);
-        document.linetypes.insert(
-            lt.name.clone(),
-            LineType {
-                name: lt.name,
-                dashes: lt.dashes,
-                shapes,
-            },
-        );
+    for linetype in wire.linetypes {
+        document
+            .linetypes
+            .insert(linetype.name.clone(), from_wire_linetype(linetype));
     }
     let mut seen_defs = BTreeSet::new();
     let mut entity_total = wire.model_space.len();
@@ -3804,6 +4069,264 @@ mod tests {
             imported.dynamic.as_ref().unwrap().behaviors[0].targets[0].entity_id(),
             imported.entities[0].id
         );
+    }
+
+    #[test]
+    fn block_asset_preserves_styles_nested_configurations_and_host_definitions() {
+        let mut source = Document::default();
+        let style = cad_core::TextStyle {
+            name: "LibraryText".into(),
+            font_file: "library.shx".into(),
+            width_factor: 0.65,
+            ..cad_core::TextStyle::standard()
+        };
+        source.text_styles.insert(style.name.clone(), style);
+        source.linetypes.insert(
+            "LibraryDash".into(),
+            LineType {
+                name: "LibraryDash".into(),
+                dashes: vec![4.0, -2.0],
+                shapes: vec![
+                    Some(cad_core::LineTypeShape {
+                        style: "LibraryText".into(),
+                        text: "GAS".into(),
+                        flag: 2,
+                        ..Default::default()
+                    }),
+                    None,
+                ],
+            },
+        );
+        source.layers.insert(
+            "Parts".into(),
+            Layer {
+                name: "Parts".into(),
+                color: CadColor::Aci(3),
+                linetype: "LibraryDash".into(),
+                lineweight: 35,
+                ..Layer::default()
+            },
+        );
+        source.layers.insert(
+            "Unused".into(),
+            Layer {
+                name: "Unused".into(),
+                ..Layer::default()
+            },
+        );
+        let parameter = source.allocate_parameter_id();
+        let mut line = Entity::new(Geometry::Line {
+            start: Point3::default(),
+            end: Point3::from_xy(10.0, 0.0),
+        });
+        line.id = source.allocate_id();
+        line.layer = "Parts".into();
+        let label = Entity::new(Geometry::Text(TextData {
+            value: "Frame".into(),
+            style: "LibraryText".into(),
+            ..Default::default()
+        }));
+        let mut child =
+            BlockDefinition::plain("Frame", Point3::default(), vec![line.clone(), label]);
+        child.dynamic = Some(DynamicDefinition {
+            parameters: vec![ParameterDef::number(
+                parameter,
+                "Length",
+                NumericParameter::length(10.0),
+            )],
+            behaviors: vec![DynamicBehavior {
+                id: source.allocate_action_id(),
+                kind: BehaviorKind::Stretch,
+                parameter,
+                targets: vec![GeometryTarget::LineEnd(line.id)],
+                local_direction: Point2::new(1.0, 0.0),
+                reference_value: 10.0,
+                multiplier: 1.0,
+                composition: CompositionRule::Additive,
+                follow: FollowRole::Second,
+                name: None,
+            }],
+            ..Default::default()
+        });
+        source.replace_block_definition(child);
+        for name in ["DimensionGraphic", "ArrowSymbol"] {
+            let mut geometry = line.clone();
+            geometry.id = EntityId::UNASSIGNED;
+            source.replace_block_definition(BlockDefinition::plain(
+                name,
+                Point3::default(),
+                vec![geometry],
+            ));
+        }
+        let mut insert = Entity::new(identity_insert("Frame".into(), Point3::default()));
+        let mut config = InstanceConfiguration::default();
+        config.set(parameter, ParameterValue::Number(25.0));
+        insert.geometry.set_insert_configuration(Some(config));
+        insert.linetype = "LibraryDash".into();
+        if let Geometry::Insert { attribs, .. } = &mut insert.geometry {
+            attribs.push(TextData {
+                value: "A".into(),
+                style: "LibraryText".into(),
+                ..Default::default()
+            });
+        }
+        let dimension = Entity::new(Geometry::Dimension(cad_core::DimensionData {
+            block_name: "DimensionGraphic".into(),
+            ..Default::default()
+        }));
+        let leader = Entity::new(Geometry::MultiLeader {
+            lines: Vec::new(),
+            arrow_size: 1.0,
+            content: LeaderContent::Block {
+                name: "ArrowSymbol".into(),
+                location: Point3::default(),
+                scale: Point3::new(1.0, 1.0, 1.0),
+                rotation: 0.0,
+            },
+        });
+        source.replace_block_definition(BlockDefinition::plain(
+            "Assembly",
+            Point3::default(),
+            vec![insert, dimension, leader],
+        ));
+        let path = temp("styled.mycadblock");
+        write_mycadblock(&source, "Assembly", &path).unwrap();
+        let asset = read_mycadblock(&path).unwrap();
+        assert_eq!(
+            asset.blocks.len(),
+            4,
+            "all symbol dependencies travel with the asset"
+        );
+        assert_eq!(
+            asset.layers.len(),
+            1,
+            "unused layers and layer 0 stay out of the library"
+        );
+        assert_eq!(asset.text_styles.len(), 1);
+        assert_eq!(asset.linetypes.len(), 1);
+        let mut host = source.clone();
+        host.layers.get_mut("Parts").unwrap().color = CadColor::Aci(1);
+        host.linetypes.get_mut("LibraryDash").unwrap().dashes[0] = 20.0;
+        host.text_styles.get_mut("LibraryText").unwrap().font_file = "host.shx".into();
+        let original_blocks = host.blocks.clone();
+        let name = import_block_asset(&mut host, asset).unwrap();
+        assert_ne!(name, "Assembly");
+        for (key, original) in original_blocks {
+            assert_eq!(
+                &host.blocks[&key], &original,
+                "existing block {key} changed"
+            );
+        }
+        assert_eq!(host.layers["Parts"].color, CadColor::Aci(1));
+        assert_eq!(host.linetypes["LibraryDash"].dashes[0], 20.0);
+        assert_eq!(host.text_styles["LibraryText"].font_file, "host.shx");
+        let assembly = host.block_by_name(&name).unwrap();
+        for (entity, original) in
+            assembly
+                .entities
+                .iter()
+                .zip(["Frame", "DimensionGraphic", "ArrowSymbol"])
+        {
+            let renamed = referenced_block(&entity.geometry).unwrap();
+            assert_ne!(renamed, original);
+            assert!(host.block_by_name(renamed).is_some());
+        }
+        let insert = &assembly.entities[0];
+        let child = host
+            .block_by_name(referenced_block(&insert.geometry).unwrap())
+            .unwrap();
+        let new_parameter = child.dynamic.as_ref().unwrap().parameters[0].id;
+        assert_ne!(new_parameter, parameter);
+        let config = insert.geometry.insert_configuration().unwrap();
+        assert_eq!(
+            config.get(new_parameter),
+            Some(&ParameterValue::Number(25.0))
+        );
+        assert_eq!(config.get(parameter), None);
+        let evaluated = cad_core::evaluate_definition(
+            &host,
+            child,
+            Some(config),
+            &mut cad_core::EvaluationCache::default(),
+            cad_core::EvaluationRequest {
+                generation: host.content_generation(),
+            },
+        )
+        .unwrap();
+        let Geometry::Line { end, .. } = evaluated.entities[0].geometry else {
+            panic!("line")
+        };
+        assert_eq!(end.x, 25.0, "configured child keeps its saved geometry");
+        let layer = &host.layers[&child.entities[0].layer];
+        assert_ne!(layer.name, "Parts");
+        assert_eq!(layer.color, CadColor::Aci(3));
+        assert_eq!(layer.lineweight, 35);
+        assert_eq!(
+            child.entities[1].layer, "0",
+            "inherited layer stays inherited"
+        );
+        let linetype = host.linetype(&layer.linetype).unwrap();
+        assert_ne!(linetype.name, "LibraryDash");
+        assert_eq!(linetype.dashes, vec![4.0, -2.0]);
+        assert_eq!(insert.linetype, linetype.name);
+        let Geometry::Text(text) = &child.entities[1].geometry else {
+            panic!("text")
+        };
+        let imported_style = &host.text_styles[&text.style];
+        assert_ne!(imported_style.name, "LibraryText");
+        assert_eq!(imported_style.font_file, "library.shx");
+        assert_eq!(imported_style.width_factor, 0.65);
+        assert_eq!(
+            linetype.shapes[0].as_ref().unwrap().style,
+            imported_style.name
+        );
+        let Geometry::Insert { attribs, .. } = &insert.geometry else {
+            panic!("insert")
+        };
+        assert_eq!(attribs[0].style, imported_style.name);
+        let table_sizes = (
+            host.layers.len(),
+            host.linetypes.len(),
+            host.text_styles.len(),
+        );
+        import_block_asset(&mut host, read_mycadblock(&path).unwrap()).unwrap();
+        assert_eq!(
+            (
+                host.layers.len(),
+                host.linetypes.len(),
+                host.text_styles.len()
+            ),
+            table_sizes,
+            "repeated imports reuse equivalent resources"
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn block_asset_reads_schema_one_without_resource_tables() {
+        let mut source = Document::default();
+        source.replace_block_definition(BlockDefinition::plain(
+            "OldSymbol",
+            Point3::default(),
+            Vec::new(),
+        ));
+        let path = temp("legacy.mycadblock");
+        write_mycadblock(&source, "OldSymbol", &path).unwrap();
+        let mut wire: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        for table in ["layers", "linetypes", "text_styles"] {
+            wire.as_object_mut().unwrap().remove(table);
+        }
+        std::fs::write(&path, serde_json::to_vec(&wire).unwrap()).unwrap();
+        let asset = read_mycadblock(&path).unwrap();
+        assert!(
+            asset.layers.is_empty() && asset.linetypes.is_empty() && asset.text_styles.is_empty()
+        );
+        assert_eq!(
+            import_block_asset(&mut Document::default(), asset).unwrap(),
+            "OldSymbol"
+        );
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

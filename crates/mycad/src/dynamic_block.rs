@@ -86,6 +86,8 @@ pub struct SizeWizard {
     pub anchor: AnchorPolicy,
     pub list_mode: bool,
     pub allowed_text: String,
+    pub minimum: Option<f64>,
+    pub maximum: Option<f64>,
     pub error: Option<String>,
     pub replace: Option<ParameterId>,
 }
@@ -102,6 +104,8 @@ impl SizeWizard {
             anchor: AnchorPolicy::FirstFixed,
             list_mode: false,
             allowed_text: String::new(),
+            minimum: None,
+            maximum: None,
             error: None,
             replace: None,
         }
@@ -1087,6 +1091,7 @@ pub fn show_convert_dialog(ctx: &egui::Context, dialog: &mut ConvertDialog) -> C
 
 pub fn show_authoring(ui: &mut Ui, app: &mut MyCadApp) {
     ui.heading("Dynamic Block");
+    ui.weak("1. Add a parameter  →  2. Choose what changes  →  3. Test and save");
     ui.separator();
     let Some(state) = app.dynamic_authoring.clone() else {
         ui.weak("Use Create a Dynamic Block… on a block reference.");
@@ -1130,7 +1135,13 @@ pub fn show_authoring(ui: &mut Ui, app: &mut MyCadApp) {
                 }
             }
         }
-        if ui.button("Add Size…").clicked() {
+        if ui
+            .button("Add size parameter…")
+            .on_hover_text(
+                "Name a dimension, measure its current size, then optionally set limits.",
+            )
+            .clicked()
+        {
             start_size_wizard(app);
         }
         if ui.button("Add Choice…").clicked() {
@@ -1277,16 +1288,18 @@ fn show_size_wizard(ui: &mut Ui, app: &mut MyCadApp) {
     if let Some(error) = &wizard.error {
         ui.colored_label(egui::Color32::from_rgb(220, 90, 70), error);
     }
+    let mut confirm = false;
+    let mut cancel = false;
     ui.vertical(|ui| {
-        ui.label("Name");
-        ui.text_edit_singleline(&mut wizard.name);
+        ui.label("Parameter name");
+        ui.add(egui::TextEdit::singleline(&mut wizard.name).hint_text("For example: Width or Length"));
         let stage = match wizard.stage {
             SizeWizardStage::Name => "Enter a name, then pick the first point.",
             SizeWizardStage::PickA => "Pick the first reference point.",
             SizeWizardStage::PickB => "Pick the second reference point.",
             SizeWizardStage::Measure => "Choose the measurement direction.",
             SizeWizardStage::Anchor => "Choose which side stays fixed.",
-            SizeWizardStage::Domain => "Any valid size, or a list of available sizes.",
+            SizeWizardStage::Domain => "Set optional limits, or choose a list of available sizes.",
             SizeWizardStage::Review => "Review the measured size and confirm.",
         };
         ui.weak(stage);
@@ -1323,7 +1336,10 @@ fn show_size_wizard(ui: &mut Ui, app: &mut MyCadApp) {
                     ui.label("Available sizes (one per line, or semicolon-separated)");
                     ui.text_edit_multiline(&mut wizard.allowed_text);
                 } else {
-                    ui.label("Any valid size");
+                    let initial = wizard.measured().map(|(_, size)| size).unwrap_or(0.0);
+                    optional_size_limit(ui, "Minimum", &mut wizard.minimum, initial);
+                    optional_size_limit(ui, "Maximum", &mut wizard.maximum, initial);
+                    ui.weak("Leave either limit unchecked for no limit on that side.");
                 }
             }
             SizeWizardStage::Review => {
@@ -1333,7 +1349,12 @@ fn show_size_wizard(ui: &mut Ui, app: &mut MyCadApp) {
                     ui.label("Available sizes:");
                     ui.monospace(&wizard.allowed_text);
                 } else {
-                    ui.label("Input: any valid size");
+                    ui.label(format!("Minimum: {}", wizard.minimum.map(|v| format_display_number(v, 4)).unwrap_or_else(|| "No limit".into())));
+                    ui.label(format!("Maximum: {}", wizard.maximum.map(|v| format_display_number(v, 4)).unwrap_or_else(|| "No limit".into())));
+                }
+                ui.weak("The measured size is the starting value, so creating a parameter keeps the block's current shape.");
+                if let Err(error) = size_wizard_parameter(&wizard) {
+                    ui.colored_label(egui::Color32::from_rgb(220, 90, 70), error);
                 }
             }
             _ => {}
@@ -1346,8 +1367,8 @@ fn show_size_wizard(ui: &mut Ui, app: &mut MyCadApp) {
                 direction.y
             ));
         }
-        ui.horizontal(|ui| {
-            if wizard.stage == SizeWizardStage::Name && ui.button("Pick points").clicked() {
+        ui.horizontal_wrapped(|ui| {
+            if wizard.stage == SizeWizardStage::Name && ui.add_enabled(!wizard.name.trim().is_empty(), egui::Button::new("Pick two points in the block")).clicked() {
                 wizard.stage = SizeWizardStage::PickA;
                 if let Some(authoring) = app.dynamic_authoring.as_mut() {
                     authoring.pick = AuthoringPick::SizePointA;
@@ -1365,9 +1386,10 @@ fn show_size_wizard(ui: &mut Ui, app: &mut MyCadApp) {
                     _ => SizeWizardStage::Review,
                 };
             }
-            if wizard.stage == SizeWizardStage::Review && ui.button("Confirm").clicked() {
-                confirm_size_wizard(app, &wizard);
-                return;
+            if wizard.stage == SizeWizardStage::Review
+                && ui.add_enabled(size_wizard_parameter(&wizard).is_ok(), egui::Button::new(if wizard.replace.is_some() { "Update parameter" } else { "Create parameter" })).clicked()
+            {
+                confirm = true;
             }
             if !matches!(
                 wizard.stage,
@@ -1382,17 +1404,37 @@ fn show_size_wizard(ui: &mut Ui, app: &mut MyCadApp) {
                 };
             }
             if ui.button("Cancel").clicked() {
-                if let Some(authoring) = app.dynamic_authoring.as_mut() {
-                    authoring.size_wizard = None;
-                    authoring.pick = AuthoringPick::Idle;
-                    authoring.status = Some("Size creation cancelled".into());
-                }
-                return;
+                cancel = true;
             }
         });
     });
+    finish_size_wizard_frame(app, wizard, confirm, cancel);
+}
+
+fn optional_size_limit(ui: &mut Ui, label: &str, limit: &mut Option<f64>, initial: f64) {
+    let mut enabled = limit.is_some();
+    let mut value = limit.unwrap_or(initial);
+    ui.horizontal_wrapped(|ui| {
+        ui.checkbox(&mut enabled, label);
+        ui.add_enabled(enabled, egui::DragValue::new(&mut value).speed(1.0));
+    });
+    *limit = enabled.then_some(value);
+}
+
+fn finish_size_wizard_frame(app: &mut MyCadApp, wizard: SizeWizard, confirm: bool, cancel: bool) {
     if let Some(authoring) = app.dynamic_authoring.as_mut() {
-        authoring.size_wizard = Some(wizard);
+        if cancel {
+            authoring.size_wizard = None;
+            authoring.pick = AuthoringPick::Idle;
+            authoring.status = Some("Parameter creation cancelled".into());
+            return;
+        }
+        // Store edits before applying: confirmation may clear the form or put a
+        // validation error on it. Never overwrite that result with a stale clone.
+        authoring.size_wizard = Some(wizard.clone());
+    }
+    if confirm {
+        confirm_size_wizard(app, &wizard);
     }
 }
 
@@ -1423,6 +1465,8 @@ fn start_retarget_wizard(
                     .join("\n"),
                 NumericDomain::Continuous => String::new(),
             },
+            minimum: numeric.min,
+            maximum: numeric.max,
             error: None,
             replace: Some(id),
         });
@@ -1431,54 +1475,51 @@ fn start_retarget_wizard(
     }
 }
 
-fn confirm_size_wizard(app: &mut MyCadApp, wizard: &SizeWizard) {
-    let Some(state) = app.dynamic_authoring.clone() else {
-        return;
-    };
-    let Some(point_a) = wizard.point_a else {
-        return;
-    };
-    let Some(point_b) = wizard.point_b else {
-        return;
-    };
-    let Ok((direction, reference)) = measure_size(point_a, point_b, wizard.measure) else {
-        if let Some(authoring) = app.dynamic_authoring.as_mut() {
-            if let Some(wizard) = authoring.size_wizard.as_mut() {
-                wizard.error = Some("Points must have a measurable distance.".into());
-            }
-        }
-        return;
-    };
+fn size_wizard_parameter(wizard: &SizeWizard) -> Result<(Point2, NumericParameter), String> {
+    if wizard.name.trim().is_empty() {
+        return Err("Enter a parameter name, such as Width.".into());
+    }
+    let point_a = wizard.point_a.ok_or("Pick the first reference point.")?;
+    let point_b = wizard.point_b.ok_or("Pick the second reference point.")?;
+    let (direction, reference) = measure_size(point_a, point_b, wizard.measure)
+        .map_err(|_| "Pick two points with a measurable distance.".to_string())?;
     let mut numeric = NumericParameter::length(reference);
     numeric.reference = reference;
     numeric.default = reference;
     if wizard.list_mode {
-        match parse_allowed_value_list(&wizard.allowed_text) {
-            Ok(values) => {
-                if !values
-                    .iter()
-                    .any(|value| cad_core::numbers_equal(*value, reference))
-                {
-                    if let Some(authoring) = app.dynamic_authoring.as_mut() {
-                        if let Some(wizard) = authoring.size_wizard.as_mut() {
-                            wizard.error = Some(format!(
-                                "Measured size {} is not in the list. Add it or cancel — the block will not be deformed.",
-                                format_display_number(reference, 4)
-                            ));
-                        }
-                    }
-                    return;
-                }
-                numeric.domain = NumericDomain::AllowedValues(values);
-            }
-            Err(err) => {
-                if let Some(authoring) = app.dynamic_authoring.as_mut() {
-                    if let Some(wizard) = authoring.size_wizard.as_mut() {
-                        wizard.error = Some(err);
-                    }
-                }
-                return;
-            }
+        let values = parse_allowed_value_list(&wizard.allowed_text)?;
+        if !values
+            .iter()
+            .any(|value| cad_core::numbers_equal(*value, reference))
+        {
+            return Err(format!(
+                "Include the current size {} in the list so the block keeps its shape.",
+                format_display_number(reference, 4)
+            ));
+        }
+        numeric.domain = NumericDomain::AllowedValues(values);
+    } else {
+        numeric.min = wizard.minimum;
+        numeric.max = wizard.maximum;
+        if numeric
+            .min
+            .into_iter()
+            .chain(numeric.max)
+            .any(|value| !value.is_finite())
+        {
+            return Err("Minimum and maximum must be finite numbers.".into());
+        }
+        if numeric
+            .min
+            .zip(numeric.max)
+            .is_some_and(|(min, max)| min > max)
+        {
+            return Err("Minimum must be less than or equal to maximum.".into());
+        }
+        if numeric.min.is_some_and(|min| reference < min)
+            || numeric.max.is_some_and(|max| reference > max)
+        {
+            return Err(format!("The current size {} must be within the limits. Adjust the limits to keep the block's shape.", format_display_number(reference, 4)));
         }
     }
     numeric.size = Some(SizeAuthoring {
@@ -1490,7 +1531,27 @@ fn confirm_size_wizard(app: &mut MyCadApp, wizard: &SizeWizard) {
         label_offset: Point2::new(0.0, 0.0),
         bound_anchor: None,
     });
-    let name = wizard.name.clone();
+    Ok((direction, numeric))
+}
+
+fn confirm_size_wizard(app: &mut MyCadApp, wizard: &SizeWizard) {
+    let Some(state) = app.dynamic_authoring.clone() else {
+        return;
+    };
+    let (direction, numeric) = match size_wizard_parameter(wizard) {
+        Ok(value) => value,
+        Err(error) => {
+            if let Some(wizard) = app
+                .dynamic_authoring
+                .as_mut()
+                .and_then(|state| state.size_wizard.as_mut())
+            {
+                wizard.error = Some(error);
+            }
+            return;
+        }
+    };
+    let name = wizard.name.trim().to_string();
     if let Some(document) = app.document.as_mut().map(std::sync::Arc::make_mut) {
         app.history.begin();
         let result = if let Some(id) = wizard.replace {
@@ -1518,7 +1579,7 @@ fn confirm_size_wizard(app: &mut MyCadApp, wizard: &SizeWizard) {
                     authoring.status = Some(if wizard.replace.is_some() {
                         "Reference points updated".into()
                     } else {
-                        "Size created from measured geometry".into()
+                        "Parameter created. Choose Stretch or Move below, then test a different value.".into()
                     });
                 }
                 app.request_preview();
@@ -1989,12 +2050,12 @@ fn show_parameter_editor(
             }
         } else {
             let mut has_min = draft.numeric.min.is_some();
-            let mut min = draft.numeric.min.unwrap_or(0.0);
+            let mut min = draft.numeric.min.unwrap_or(draft.numeric.default);
             ui.checkbox(&mut has_min, "Minimum");
             ui.add_enabled(has_min, egui::DragValue::new(&mut min).speed(1.0));
             draft.numeric.min = has_min.then_some(min);
             let mut has_max = draft.numeric.max.is_some();
-            let mut max = draft.numeric.max.unwrap_or(0.0);
+            let mut max = draft.numeric.max.unwrap_or(draft.numeric.default);
             ui.checkbox(&mut has_max, "Maximum");
             ui.add_enabled(has_max, egui::DragValue::new(&mut max).speed(1.0));
             draft.numeric.max = has_max.then_some(max);
@@ -2010,6 +2071,11 @@ fn show_parameter_editor(
             } else {
                 StepPolicy::IncrementOnly
             };
+        }
+        for (field, error) in &draft.errors {
+            if !matches!(field.as_str(), "name" | "default" | "domain") {
+                ui.colored_label(egui::Color32::from_rgb(220, 90, 70), error);
+            }
         }
         ui.horizontal(|ui| {
             if ui.button("Apply parameter").clicked() {
@@ -2340,22 +2406,48 @@ fn set_behavior_follow(app: &mut MyCadApp, id: ActionId, follow: FollowRole) {
 
 fn show_attach_controls(ui: &mut Ui, app: &mut MyCadApp) {
     ui.add_space(8.0);
-    ui.label(RichText::new("Attach").small().weak());
-    ui.label("Select geometry, then attach Move or Stretch. Stretch uses handles or a window.");
+    ui.label(RichText::new("2. Choose what this parameter changes").strong());
+    let parameter = app.dynamic_authoring.as_ref().and_then(|state| {
+        let id = state
+            .attach
+            .as_ref()
+            .map(|attach| attach.parameter)
+            .or(state.selected_parameter)?;
+        let definition = app
+            .document
+            .as_deref()?
+            .block_by_name(&state.block_name)?
+            .dynamic
+            .as_ref()?;
+        let parameter = definition.parameter(id)?;
+        matches!(parameter.kind, ParameterKind::Number(_)).then(|| parameter.name.clone())
+    });
+    let Some(parameter) = parameter else {
+        ui.weak("Select a size or numeric parameter above to connect it to geometry.");
+        return;
+    };
+    ui.label(format!("Changing: {parameter}"));
+    ui.weak("Stretch moves chosen endpoints; Move shifts whole selected objects.");
+    let selected_count = app.selection.ids().len();
+    if selected_count == 0 {
+        ui.weak("For Move, select objects in the block first. For Stretch, choose handles or draw a window.");
+    } else {
+        ui.label(format!("{selected_count} objects selected for Move"));
+    }
     ui.vertical(|ui| {
-        if ui.button("Attach Move — follow first side").clicked() {
+        if ui.add_enabled(selected_count > 0, egui::Button::new("Move objects with first point")).clicked() {
             attach_move_from_selection(app, FollowRole::First);
         }
-        if ui.button("Attach Move — follow second side").clicked() {
+        if ui.add_enabled(selected_count > 0, egui::Button::new("Move objects with second point")).clicked() {
             attach_move_from_selection(app, FollowRole::Second);
         }
-        if ui.button("Attach Move — follow center").clicked() {
+        if ui.add_enabled(selected_count > 0, egui::Button::new("Move objects with center")).clicked() {
             attach_move_from_selection(app, FollowRole::Center);
         }
-        if ui.button("Select stretch handles").clicked() {
+        if ui.button("Stretch: pick endpoints…").clicked() {
             begin_stretch_handles(app);
         }
-        if ui.button("Stretch window").clicked() {
+        if ui.button("Stretch: draw a selection window…").clicked() {
             if let Some(authoring) = app.dynamic_authoring.as_mut() {
                 authoring.pick = AuthoringPick::StretchWindowA;
                 authoring.status = Some("Draw a stretch window first corner".into());
@@ -2397,7 +2489,7 @@ fn show_attach_controls(ui: &mut Ui, app: &mut MyCadApp) {
             if let Some(attach) = app.dynamic_authoring.as_mut().and_then(|state| state.attach.as_mut()) {
                 attach.follow = follow;
             }
-            if ui.button("Confirm attachment").clicked() {
+            if ui.add_enabled(handle_count > 0, egui::Button::new("Connect to parameter")).clicked() {
                 if let Some(attach) = app.dynamic_authoring.as_ref().and_then(|state| state.attach.clone()) {
                     if !attach.unsupported.is_empty() {
                         if let Some(authoring) = app.dynamic_authoring.as_mut() {
@@ -2417,6 +2509,8 @@ fn show_attach_controls(ui: &mut Ui, app: &mut MyCadApp) {
                 if let Some(authoring) = app.dynamic_authoring.as_mut() {
                     authoring.attach = None;
                     authoring.highlight.clear();
+                    authoring.pick = AuthoringPick::Idle;
+                    authoring.direction_start = None;
                 }
             }
         }
@@ -5174,6 +5268,220 @@ mod tests {
         .unwrap();
         assert!((reversed.1 - 800.0).abs() < 1e-12);
         assert!((direction.x + reversed.0.x).abs() < 1e-12);
+    }
+
+    fn wizard_app() -> (MyCadApp, SizeWizard) {
+        let (document, instance, _) = offset_document();
+        let mut app = MyCadApp::for_test();
+        app.document = Some(std::sync::Arc::new(document));
+        app.dynamic_authoring = Some(AuthoringState::new("Offset".into(), instance, false, None));
+        let mut wizard = SizeWizard::new(" Width ".into());
+        wizard.point_a = Some(Point2::new(0.0, 0.0));
+        wizard.point_b = Some(Point2::new(10.0, 0.0));
+        wizard.stage = SizeWizardStage::Review;
+        (app, wizard)
+    }
+
+    #[test]
+    fn size_creation_optional_limits_preserve_geometry_and_undo_as_one_step() {
+        for (min, max) in [
+            (None, None),
+            (Some(5.0), None),
+            (None, Some(20.0)),
+            (Some(5.0), Some(20.0)),
+        ] {
+            let (mut app, mut wizard) = wizard_app();
+            wizard.minimum = min;
+            wizard.maximum = max;
+            let before = app
+                .document
+                .as_ref()
+                .unwrap()
+                .block_by_name("Offset")
+                .unwrap()
+                .clone();
+            finish_size_wizard_frame(&mut app, wizard, true, false);
+            let state = app.dynamic_authoring.as_ref().unwrap();
+            assert!(
+                state.size_wizard.is_none(),
+                "completed form must stay closed"
+            );
+            let id = state
+                .selected_parameter
+                .expect("new parameter selected for action linking");
+            let after = app
+                .document
+                .as_ref()
+                .unwrap()
+                .block_by_name("Offset")
+                .unwrap();
+            let parameter = after.dynamic.as_ref().unwrap().parameter(id).unwrap();
+            assert_eq!(parameter.name, "Width");
+            let ParameterKind::Number(numeric) = &parameter.kind else {
+                panic!("numeric parameter");
+            };
+            assert_eq!((numeric.default, numeric.reference), (10.0, 10.0));
+            assert_eq!((numeric.min, numeric.max), (min, max));
+            assert_eq!(before.entities, after.entities);
+            app.history
+                .undo(std::sync::Arc::make_mut(app.document.as_mut().unwrap()));
+            let restored = app
+                .document
+                .as_ref()
+                .unwrap()
+                .block_by_name("Offset")
+                .unwrap();
+            // Undo restores the content but advances the revision so cached
+            // evaluations of the edited definition cannot survive the undo.
+            assert!(restored.content_revision > before.content_revision);
+            let mut expected = before;
+            expected.content_revision = restored.content_revision;
+            assert_eq!(restored, &expected);
+        }
+    }
+
+    #[test]
+    fn size_creation_invalid_limits_keep_error_and_do_not_change_block() {
+        for (min, max) in [
+            (Some(12.0), Some(8.0)),
+            (Some(11.0), None),
+            (None, Some(9.0)),
+            (Some(f64::NAN), None),
+        ] {
+            let (mut app, mut wizard) = wizard_app();
+            wizard.minimum = min;
+            wizard.maximum = max;
+            let before = format!(
+                "{:?}",
+                app.document.as_ref().unwrap().block_by_name("Offset")
+            );
+            finish_size_wizard_frame(&mut app, wizard, true, false);
+            let form = app
+                .dynamic_authoring
+                .as_ref()
+                .unwrap()
+                .size_wizard
+                .as_ref()
+                .unwrap();
+            assert!(
+                form.error.is_some(),
+                "validation feedback must survive the frame"
+            );
+            assert_eq!(
+                format!(
+                    "{:?}",
+                    app.document.as_ref().unwrap().block_by_name("Offset")
+                ),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn cancel_size_creation_does_not_reopen_form_or_change_block() {
+        let (mut app, wizard) = wizard_app();
+        let before = format!(
+            "{:?}",
+            app.document.as_ref().unwrap().block_by_name("Offset")
+        );
+        app.dynamic_authoring.as_mut().unwrap().pick = AuthoringPick::SizePointB;
+        finish_size_wizard_frame(&mut app, wizard, false, true);
+        let state = app.dynamic_authoring.as_ref().unwrap();
+        assert!(state.size_wizard.is_none());
+        assert_eq!(state.pick, AuthoringPick::Idle);
+        assert_eq!(
+            format!(
+                "{:?}",
+                app.document.as_ref().unwrap().block_by_name("Offset")
+            ),
+            before
+        );
+    }
+
+    #[test]
+    fn size_creation_list_includes_measured_value_and_rejects_empty_name() {
+        let (_, mut wizard) = wizard_app();
+        wizard.list_mode = true;
+        wizard.allowed_text = "5; 20".into();
+        assert!(size_wizard_parameter(&wizard)
+            .unwrap_err()
+            .contains("current size 10"));
+        wizard.allowed_text = "5; 10; 20".into();
+        assert!(size_wizard_parameter(&wizard).is_ok());
+        wizard.name = "  ".into();
+        assert!(size_wizard_parameter(&wizard)
+            .unwrap_err()
+            .contains("parameter name"));
+    }
+
+    #[test]
+    fn size_creation_connects_stretch_and_tests_bounded_values() {
+        let (mut app, mut wizard) = wizard_app();
+        wizard.minimum = Some(5.0);
+        wizard.maximum = Some(20.0);
+        finish_size_wizard_frame(&mut app, wizard, true, false);
+        let parameter = app
+            .dynamic_authoring
+            .as_ref()
+            .unwrap()
+            .selected_parameter
+            .unwrap();
+        let endpoint = GeometryTarget::LineEnd(
+            app.document
+                .as_ref()
+                .unwrap()
+                .block_by_name("Offset")
+                .unwrap()
+                .entities[0]
+                .id,
+        );
+        begin_stretch_handles(&mut app);
+        assert_eq!(
+            app.dynamic_authoring
+                .as_ref()
+                .unwrap()
+                .attach
+                .as_ref()
+                .unwrap()
+                .parameter,
+            parameter
+        );
+        commit_follow_targets(
+            &mut app,
+            BehaviorKind::Stretch,
+            vec![endpoint],
+            FollowRole::Second,
+        );
+        assert!(app.dynamic_authoring.as_ref().unwrap().attach.is_none());
+
+        let document = app.document.as_deref().unwrap();
+        let definition = document.block_by_name("Offset").unwrap();
+        let mut config = InstanceConfiguration::default();
+        config.set(parameter, ParameterValue::Number(15.0));
+        let request = cad_core::EvaluationRequest {
+            generation: document.content_generation(),
+        };
+        let evaluated = cad_core::evaluate_definition(
+            document,
+            definition,
+            Some(&config),
+            &mut cad_core::EvaluationCache::default(),
+            request,
+        )
+        .unwrap();
+        let Geometry::Line { start, end } = &evaluated.entities[0].geometry else {
+            panic!("stretched line");
+        };
+        assert_eq!((start.x, end.x), (0.0, 15.0));
+        config.set(parameter, ParameterValue::Number(25.0));
+        assert!(cad_core::evaluate_definition(
+            document,
+            definition,
+            Some(&config),
+            &mut cad_core::EvaluationCache::default(),
+            request,
+        )
+        .is_err());
     }
 
     #[test]

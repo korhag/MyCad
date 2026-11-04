@@ -1,6 +1,6 @@
 //! Sidecar data EntoCAD keeps next to a DWG or DXF.
 //!
-//! `Plant.dwg` stays a normal static-block drawing. `Plant.dwg.mycad` stores
+//! `Plant.dwg` stays a normal static-block drawing. `.Plant.dwg.mycad` stores
 //! the dynamic block definitions and which flattened block stands for which
 //! instance. Opening the DWG without the companion still shows the geometry.
 
@@ -131,26 +131,25 @@ struct PreparedBlock {
     vertices: BTreeMap<cad_core::VertexId, cad_core::VertexId>,
 }
 
-// ------------------------------------------------------------
-// Function: companion_path
-// Purpose: Plant.dwg → Plant.dwg.mycad. Appending keeps the DWG
-//          extension, so the sidecar cannot be mistaken for an
-//          older full .mycad drawing.
-// ------------------------------------------------------------
+// New helpers have a dot prefix on every platform and the hidden attribute on
+// Windows. Always add one dot, even for a drawing that already starts with one,
+// so .Plant.dwg and Plant.dwg have distinct new helper names.
 pub fn companion_path(cad_path: &Path) -> PathBuf {
-    let mut name = cad_path
-        .file_name()
-        .map(|name| name.to_os_string())
-        .unwrap_or_default();
+    let mut name = std::ffi::OsString::from(".");
+    name.push(cad_path.file_name().unwrap_or_default());
     name.push(".mycad");
     cad_path.with_file_name(name)
 }
 
-// ------------------------------------------------------------
-// Function: drawing_for_companion
-// Purpose: Opening Plant.dwg.mycad loads Plant.dwg instead of
-//          treating the sidecar as a full drawing.
-// ------------------------------------------------------------
+pub fn legacy_companion_path(cad_path: &Path) -> PathBuf {
+    let mut name = cad_path.file_name().unwrap_or_default().to_os_string();
+    name.push(".mycad");
+    cad_path.with_file_name(name)
+}
+
+// Opening a helper uses the new naming convention. For an already-hidden
+// drawing's legacy helper, accept the old name when only that drawing exists.
+// If both drawings exist, the new convention wins; hashes still gate restore.
 pub fn drawing_for_companion(path: &Path) -> Option<PathBuf> {
     let name = path.file_name()?.to_str()?;
     let lower = name.to_ascii_lowercase();
@@ -158,10 +157,89 @@ pub fn drawing_for_companion(path: &Path) -> Option<PathBuf> {
         return None;
     }
     let drawing = &name[..name.len() - ".mycad".len()];
-    if drawing.is_empty() {
-        return None;
+    let legacy = path.with_file_name(drawing);
+    if let Some(visible) = drawing.strip_prefix('.') {
+        let hidden_convention = path.with_file_name(visible);
+        if !hidden_convention.exists() && legacy.is_file() {
+            return Some(legacy);
+        }
+        return Some(hidden_convention);
     }
-    Some(path.with_file_name(drawing))
+    Some(legacy)
+}
+
+/// Discover a helper without ever falling back from a corrupt or stale new
+/// helper to older metadata. The caller must still verify the drawing digest.
+pub fn read_drawing_companion(cad_path: &Path) -> Result<Option<Companion>, ExportError> {
+    match read_companion_optional(&companion_path(cad_path))? {
+        Some(companion) => Ok(Some(companion)),
+        None => read_companion_optional(&legacy_companion_path(cad_path)),
+    }
+}
+
+// Removing a hidden helper has the same legacy-name ambiguity as replacing it.
+pub fn remove_drawing_companion(drawing_path: &Path) -> Result<(), ExportError> {
+    let path = companion_path(drawing_path);
+    check_companion_destination(&path, drawing_path)?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(ExportError::io(&path, err)),
+    }
+}
+
+fn check_companion_destination(path: &Path, drawing_path: &Path) -> Result<(), ExportError> {
+    if path == companion_path(drawing_path) {
+        // This new hidden name is also the old helper name for a drawing whose
+        // filename starts with one more dot. Do not overwrite that drawing's
+        // possible metadata; ambiguous ownership cannot be inferred from dates.
+        let mut other_name = std::ffi::OsString::from(".");
+        other_name.push(drawing_path.file_name().unwrap_or_default());
+        let other_drawing = drawing_path.with_file_name(other_name);
+        let helper_exists = path
+            .try_exists()
+            .map_err(|source| ExportError::io(path, source))?;
+        let other_exists = other_drawing
+            .try_exists()
+            .map_err(|source| ExportError::io(&other_drawing, source))?;
+        if helper_exists && other_exists {
+            return Err(ExportError::Validation(format!("companion filename conflicts with the legacy helper for {}; save the drawing under a different name", other_drawing.display())));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn hide_companion(path: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    const INVALID_FILE_ATTRIBUTES: u32 = u32::MAX;
+    const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetFileAttributesW(name: *const u16) -> u32;
+        fn SetFileAttributesW(name: *const u16, attributes: u32) -> i32;
+    }
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    if wide[..wide.len() - 1].contains(&0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path contains a null character",
+        ));
+    }
+    // Both calls receive a valid, null-terminated UTF-16 buffer for their full
+    // duration. Preserve all other flags rather than replacing file attributes.
+    let attributes = unsafe { GetFileAttributesW(wide.as_ptr()) };
+    if attributes == INVALID_FILE_ATTRIBUTES {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { SetFileAttributesW(wide.as_ptr(), attributes | FILE_ATTRIBUTE_HIDDEN) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 // ------------------------------------------------------------
@@ -177,6 +255,7 @@ pub fn write_companion(
     links: &[DynamicExportLink],
     generated_blocks: &[String],
 ) -> Result<SaveReport, ExportError> {
+    check_companion_destination(path, drawing_path)?;
     // Bind to the bytes that were actually written, including any conversion
     // performed by the DWG writer. A helper left behind after a failed update
     // must never replace newer drawing geometry on the next open.
@@ -223,6 +302,8 @@ pub fn write_companion(
     let bytes = serde_json::to_vec_pretty(&wire)
         .map_err(|err| ExportError::Validation(format!("serialize failed: {err}")))?;
     crate::atomic::write_atomic(path, &bytes).map_err(|source| ExportError::io(path, source))?;
+    #[cfg(windows)]
+    hide_companion(path).map_err(|source| ExportError::io(path, source))?;
     Ok(SaveReport::default())
 }
 
@@ -872,11 +953,11 @@ mod tests {
     fn companion_path_keeps_the_drawing_extension() {
         assert_eq!(
             companion_path(Path::new("drawings/Plant.dwg")),
-            PathBuf::from("drawings/Plant.dwg.mycad")
+            PathBuf::from("drawings/.Plant.dwg.mycad")
         );
         assert_eq!(
             companion_path(Path::new("Plant.dxf")),
-            PathBuf::from("Plant.dxf.mycad")
+            PathBuf::from(".Plant.dxf.mycad")
         );
     }
 
@@ -892,6 +973,126 @@ mod tests {
         );
         assert!(drawing_for_companion(Path::new("Plant.mycad")).is_none());
         assert!(drawing_for_companion(Path::new("Plant.dwg")).is_none());
+    }
+
+    #[test]
+    fn hidden_companion_names_are_distinct_and_resolve_to_the_drawing() {
+        for drawing in ["Plant.dwg", ".Plant.dwg", "..Plant.DXF"] {
+            let path = Path::new(drawing);
+            let helper = companion_path(path);
+            assert!(helper
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with('.'));
+            assert_eq!(drawing_for_companion(&helper).unwrap(), path);
+        }
+        assert_ne!(
+            companion_path(Path::new("Plant.dwg")),
+            companion_path(Path::new(".Plant.dwg"))
+        );
+        assert_eq!(
+            legacy_companion_path(Path::new("Plant.dwg")),
+            PathBuf::from("Plant.dwg.mycad")
+        );
+    }
+
+    #[test]
+    fn companion_discovery_keeps_legacy_files_and_prefers_hidden_without_fallback() {
+        let (drawing, imported) = write_bound_fixture();
+        let hidden = companion_path(&drawing);
+        let legacy = legacy_companion_path(&drawing);
+        std::fs::rename(&hidden, &legacy).unwrap();
+        let original_legacy = std::fs::read(&legacy).unwrap();
+        let mut restored = imported.clone();
+        let report = apply_companion_for_drawing(
+            &drawing,
+            &mut restored,
+            read_drawing_companion(&drawing).unwrap().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(report.restored, 1);
+
+        // An empty hidden helper supersedes legacy extensions after static save.
+        write_companion(
+            &hidden,
+            &drawing,
+            &Document::default(),
+            &Document::default(),
+            &[],
+            &[],
+        )
+        .unwrap();
+        let mut restored = imported.clone();
+        let report = apply_companion_for_drawing(
+            &drawing,
+            &mut restored,
+            read_drawing_companion(&drawing).unwrap().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(report.restored, 0);
+        assert_eq!(std::fs::read(&legacy).unwrap(), original_legacy);
+
+        std::fs::write(&hidden, b"corrupt").unwrap();
+        assert!(
+            read_drawing_companion(&drawing).is_err(),
+            "corrupt hidden helper must not activate older metadata"
+        );
+        std::fs::copy(&legacy, &hidden).unwrap();
+        std::fs::write(&drawing, b"drawing changed externally").unwrap();
+        let mut restored = imported;
+        let report = apply_companion_for_drawing(
+            &drawing,
+            &mut restored,
+            read_drawing_companion(&drawing).unwrap().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(report.restored, 0);
+        assert!(report.warning.unwrap().contains("Drawing changed"));
+        std::fs::remove_file(legacy).unwrap();
+        remove_bound_fixture(&drawing);
+    }
+
+    #[test]
+    fn hidden_companion_collision_keeps_other_drawings_legacy_helper() {
+        let directory = temp_path("hidden-collision");
+        std::fs::create_dir(&directory).unwrap();
+        let drawing = directory.join("Plant.dwg");
+        let other = directory.join(".Plant.dwg");
+        let helper = legacy_companion_path(&other);
+        assert_eq!(helper, companion_path(&drawing));
+        std::fs::write(&drawing, b"visible drawing").unwrap();
+        std::fs::write(&other, b"hidden drawing").unwrap();
+        std::fs::write(&helper, b"other drawing's legacy helper").unwrap();
+        let result = write_companion(
+            &helper,
+            &drawing,
+            &Document::default(),
+            &Document::default(),
+            &[],
+            &[],
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("filename conflicts"));
+        assert!(remove_drawing_companion(&drawing).is_err());
+        assert_eq!(
+            std::fs::read(helper).unwrap(),
+            b"other drawing's legacy helper"
+        );
+        assert_eq!(std::fs::read(other).unwrap(), b"hidden drawing");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn saved_companion_has_windows_hidden_attribute() {
+        use std::os::windows::fs::MetadataExt;
+        let (drawing, _) = write_bound_fixture();
+        let metadata = std::fs::metadata(companion_path(&drawing)).unwrap();
+        assert_ne!(metadata.file_attributes() & 0x2, 0);
+        remove_bound_fixture(&drawing);
     }
 
     #[test]

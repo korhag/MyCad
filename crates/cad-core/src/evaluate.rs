@@ -871,8 +871,17 @@ pub fn materialize_evaluated_with(
             apply_overrides(&mut block.entities, overrides);
         }
     }
+    let mut materialization = MaterializationCache::default();
     let mut model = std::mem::take(&mut evaluated.model_space);
-    rewrite_entities(source, &mut evaluated, cache, request, &mut model, 0)?;
+    rewrite_entities(
+        source,
+        &mut evaluated,
+        cache,
+        request,
+        &mut model,
+        0,
+        &mut materialization,
+    )?;
     evaluated.model_space = model;
     let source_names: Vec<String> = source.blocks.keys().cloned().collect();
     for name in source_names {
@@ -885,7 +894,15 @@ pub fn materialize_evaluated_with(
         else {
             continue;
         };
-        rewrite_entities(source, &mut evaluated, cache, request, &mut entities, 0)?;
+        rewrite_entities(
+            source,
+            &mut evaluated,
+            cache,
+            request,
+            &mut entities,
+            0,
+            &mut materialization,
+        )?;
         if let Some(block) = evaluated.block_by_name_mut(&name) {
             block.entities = entities;
         }
@@ -921,11 +938,71 @@ pub fn apply_definition_preview(
     };
     let preview = evaluate_definition(source, &definition, Some(config), cache, request)?;
     let mut entities = preview.entities.clone();
-    rewrite_entities(source, evaluated, cache, request, &mut entities, 0)?;
+    rewrite_entities(
+        source,
+        evaluated,
+        cache,
+        request,
+        &mut entities,
+        0,
+        &mut MaterializationCache::default(),
+    )?;
     if let Some(block) = evaluated.block_by_name_mut(block_name) {
         block.entities = entities;
     }
     Ok(())
+}
+
+#[derive(Clone)]
+struct MaterializedInstance {
+    block: Arc<EvaluatedBlock>,
+    has_dynamic_children: bool,
+}
+
+/// Reuse work only while the source document is immutably borrowed by one
+/// materialization pass. The persistent evaluation cache must still validate
+/// definitions, but identical occurrences in this pass share that validation,
+/// dependency scan and evaluated geometry.
+#[derive(Default)]
+struct MaterializationCache {
+    instances: BTreeMap<(String, Vec<(u64, NormalizedValue)>), MaterializedInstance>,
+    generated_leaves: BTreeMap<String, EvalKey>,
+}
+
+impl MaterializationCache {
+    fn evaluate(
+        &mut self,
+        source: &Document,
+        definition: &BlockDefinition,
+        config: Option<&InstanceConfiguration>,
+        cache: &mut EvaluationCache,
+        request: EvaluationRequest,
+    ) -> Result<MaterializedInstance, DynamicError> {
+        let values = config
+            .into_iter()
+            .flat_map(|config| config.values.iter())
+            .map(|(id, value)| (id.raw(), value.normalize()))
+            .collect();
+        let key = (definition.name.clone(), values);
+        if let Some(hit) = self.instances.get(&key) {
+            return Ok(hit.clone());
+        }
+        let block = evaluate_definition(source, definition, config, cache, request)?;
+        let has_dynamic_children = block.entities.iter().any(|entity| {
+            entity
+                .geometry
+                .insert_block_name()
+                .filter(|name| !is_generated_block_name(name))
+                .and_then(|name| source.block_by_name(name))
+                .is_some_and(BlockDefinition::is_dynamic)
+        });
+        let instance = MaterializedInstance {
+            block,
+            has_dynamic_children,
+        };
+        self.instances.insert(key, instance.clone());
+        Ok(instance)
+    }
 }
 
 fn rewrite_entities(
@@ -935,37 +1012,52 @@ fn rewrite_entities(
     request: EvaluationRequest,
     entities: &mut [Entity],
     depth: usize,
+    materialization: &mut MaterializationCache,
 ) -> Result<(), DynamicError> {
     if depth >= crate::MAX_BLOCK_DEPTH {
         return Ok(());
     }
     for entity in entities.iter_mut() {
-        let Some(block_name) = entity.geometry.insert_block_name().map(str::to_string) else {
+        let Some(block_name) = entity.geometry.insert_block_name() else {
             continue;
         };
-        if is_generated_block_name(&block_name) {
+        if is_generated_block_name(block_name) {
             continue;
         }
-        let Some(definition) = source.block_by_name(&block_name) else {
+        let Some(definition) = source.block_by_name(block_name) else {
             continue;
         };
         if !definition.is_dynamic() {
             continue;
         }
-        let config = entity.geometry.insert_configuration().cloned();
-        let evaluated_block =
-            evaluate_definition(source, definition, config.as_ref(), cache, request)?;
-        let mut generated = evaluated_definition(definition, evaluated_block.as_ref());
-        rewrite_entities(
-            source,
-            evaluated,
-            cache,
-            request,
-            &mut generated.entities,
-            depth + 1,
-        )?;
-        let generated_name = generated.name.clone();
-        evaluated.blocks.insert(generated_name.clone(), generated);
+        let config = entity.geometry.insert_configuration();
+        let instance = materialization.evaluate(source, definition, config, cache, request)?;
+        let generated_name = generated_block_name(&instance.block.key);
+        if instance.has_dynamic_children
+            || materialization.generated_leaves.get(&generated_name) != Some(&instance.block.key)
+        {
+            let mut generated = evaluated_definition(definition, instance.block.as_ref());
+            rewrite_entities(
+                source,
+                evaluated,
+                cache,
+                request,
+                &mut generated.entities,
+                depth + 1,
+                materialization,
+            )?;
+            // Nested definitions still recurse at each occurrence so the
+            // existing depth limit and cyclic-reference behavior are retained.
+            // A leaf is independent of traversal depth and can be shared.
+            if instance.has_dynamic_children {
+                materialization.generated_leaves.remove(&generated_name);
+            } else {
+                materialization
+                    .generated_leaves
+                    .insert(generated_name.clone(), instance.block.key.clone());
+            }
+            evaluated.blocks.insert(generated_name.clone(), generated);
+        }
         if let Some(name) = entity.geometry.insert_block_name_mut() {
             *name = generated_name;
         }
@@ -1044,6 +1136,19 @@ pub fn export_materialized(
         definition.name = export_name;
         definition.dynamic = None;
         evaluated.replace_block_definition(definition);
+    }
+    // The companion retains the original definitions separately. Exported
+    // source definitions are static too, including library definitions which
+    // currently have no INSERT; otherwise downstream writers may evaluate an
+    // already-materialized document a second time.
+    for block in evaluated.blocks.values_mut() {
+        block.dynamic = None;
+        for entity in &mut block.entities {
+            entity.geometry.set_insert_configuration(None);
+        }
+    }
+    for entity in &mut evaluated.model_space {
+        entity.geometry.set_insert_configuration(None);
     }
     Ok(MaterializedExport {
         document: evaluated,
@@ -1252,6 +1357,90 @@ mod tests {
         assert!((spans[0] - 800.0).abs() < 1e-9);
         assert!((spans[1] - 1200.0).abs() < 1e-9);
         assert!((spans[2] - 1600.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn repeated_occurrences_share_geometry_and_keep_their_values() {
+        let (mut document, _, param) = span_frame();
+        for index in 0..64 {
+            let span = if index % 2 == 0 { 800.0 } else { 1200.0 };
+            insert_with_span(&mut document, index as f64 * 2000.0, span, param);
+        }
+        let request = EvaluationRequest {
+            generation: document.content_generation(),
+        };
+        let evaluated =
+            materialize_evaluated(&document, &mut EvaluationCache::default(), request).unwrap();
+        assert_eq!(evaluated.blocks.len(), document.blocks.len() + 2);
+        for (index, entity) in evaluated.model_space.iter().enumerate() {
+            let name = entity.geometry.insert_block_name().unwrap();
+            let block = evaluated.block_by_name(name).unwrap();
+            let Geometry::Line { start, .. } = block.entities[1].geometry else {
+                panic!("right post");
+            };
+            let expected = if index % 2 == 0 { 800.0 } else { 1200.0 };
+            assert!((start.x - expected).abs() < 1e-9);
+            assert_eq!(
+                entity.geometry.insert_configuration(),
+                document.model_space[index].geometry.insert_configuration()
+            );
+        }
+    }
+
+    #[test]
+    fn materialization_overrides_do_not_leak_into_the_next_pass() {
+        let (mut document, _, param) = span_frame();
+        let first = insert_with_span(&mut document, 0.0, 800.0, param);
+        insert_with_span(&mut document, 2000.0, 800.0, param);
+        let mut config = InstanceConfiguration::default();
+        config.set(param, ParameterValue::Number(1200.0));
+        let overrides = [(first.id, config)].into_iter().collect();
+        let request = EvaluationRequest {
+            generation: document.content_generation(),
+        };
+        let mut cache = EvaluationCache::default();
+        let preview =
+            materialize_evaluated_with(&document, &mut cache, request, Some(&overrides)).unwrap();
+        assert_ne!(
+            preview.model_space[0].geometry.insert_block_name(),
+            preview.model_space[1].geometry.insert_block_name()
+        );
+        let restored = materialize_evaluated(&document, &mut cache, request).unwrap();
+        assert_eq!(
+            restored.model_space[0].geometry.insert_block_name(),
+            restored.model_space[1].geometry.insert_block_name()
+        );
+        let name = restored.model_space[0]
+            .geometry
+            .insert_block_name()
+            .unwrap();
+        let block = restored.block_by_name(name).unwrap();
+        let Geometry::Line { start, .. } = block.entities[1].geometry else {
+            panic!("right post");
+        };
+        assert!((start.x - 800.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn materialization_revalidates_definitions_between_passes() {
+        let (mut document, _, param) = span_frame();
+        insert_with_span(&mut document, 0.0, 800.0, param);
+        let request = EvaluationRequest {
+            generation: document.content_generation(),
+        };
+        let mut cache = EvaluationCache::default();
+        materialize_evaluated(&document, &mut cache, request).unwrap();
+        // Even a direct source mutation without a revision bump must not reuse
+        // the previous pass's successful validation of a now-broken binding.
+        document
+            .block_by_name_mut("AdjustableFrame")
+            .unwrap()
+            .entities
+            .clear();
+        assert!(matches!(
+            materialize_evaluated(&document, &mut cache, request),
+            Err(DynamicError::BrokenBinding { .. })
+        ));
     }
 
     #[test]
@@ -1532,6 +1721,8 @@ mod tests {
         };
         let exported =
             export_materialized(&document, &mut EvaluationCache::default(), request).unwrap();
+        assert!(!document_has_dynamic_content(&exported.document));
+        assert!(document_has_dynamic_content(&document));
         let names: Vec<_> = exported
             .document
             .model_space

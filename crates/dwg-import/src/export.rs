@@ -490,6 +490,201 @@ mod tests {
     }
 
     #[test]
+    fn direct_exports_keep_last_dynamic_states_without_a_companion() {
+        use cad_core::{
+            export_materialized, identity_insert, AttributeInfo, BlockDefinition, Entity, EntityId,
+            EvaluationCache, EvaluationRequest, Geometry, InstanceConfiguration, ParameterValue,
+            Point3, TextData,
+        };
+
+        let mut source = companion_test_document();
+        let parameter = source
+            .block_by_name("AdjustableFrame")
+            .unwrap()
+            .dynamic
+            .as_ref()
+            .unwrap()
+            .parameters[0]
+            .id;
+        let mut second = source.model_space[0].clone();
+        second.id = EntityId::UNASSIGNED;
+        let mut configuration = InstanceConfiguration::default();
+        configuration.set(parameter, ParameterValue::Number(1600.0));
+        second
+            .geometry
+            .set_insert_configuration(Some(configuration));
+        if let Geometry::Insert {
+            insertion,
+            scale,
+            rotation,
+            attribs,
+            ..
+        } = &mut second.geometry
+        {
+            *insertion = Point3::from_xy(2000.0, 100.0);
+            *scale = Point3::new(2.0, 0.5, 1.0);
+            *rotation = std::f64::consts::FRAC_PI_2;
+            attribs.push(TextData {
+                value: "FRAME-B".into(),
+                insertion: Point3::from_xy(2000.0, 110.0),
+                alignment: Point3::from_xy(2000.0, 110.0),
+                valign: cad_core::TextVAlign::Top,
+                attribute: Some(AttributeInfo {
+                    tag: "LABEL".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            attribs.push(TextData {
+                value: "ZONE-2".into(),
+                insertion: Point3::from_xy(2000.0, 120.0),
+                alignment: Point3::default(),
+                valign: cad_core::TextVAlign::Top,
+                attribute: Some(AttributeInfo {
+                    tag: "ZONE".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        }
+        source.add_entity(second);
+
+        let mut child = source.model_space[0].clone();
+        child.id = source.allocate_id();
+        let mut configuration = InstanceConfiguration::default();
+        configuration.set(parameter, ParameterValue::Number(1000.0));
+        child.geometry.set_insert_configuration(Some(configuration));
+        source.replace_block_definition(BlockDefinition::plain(
+            "Assembly",
+            Point3::default(),
+            vec![child],
+        ));
+        source.add_entity(Entity::new(identity_insert(
+            "Assembly".into(),
+            Point3::from_xy(-50.0, 70.0),
+        )));
+        let expected = export_materialized(
+            &source,
+            &mut EvaluationCache::default(),
+            EvaluationRequest {
+                generation: source.content_generation(),
+            },
+        )
+        .unwrap()
+        .document;
+        let snapshot = format!("{source:?}");
+
+        for extension in ["dxf", "dwg"] {
+            let dest =
+                std::env::temp_dir().join(format!("mycad-last-state-{}.{}", stamp(), extension));
+            let loaded = if extension == "dwg" {
+                write_dwg(&source, &dest).expect("write configured DWG");
+                crate::import_dwg(&dest).expect("read configured DWG")
+            } else {
+                cad_io::write_dxf(&source, &dest, &DxfExportOptions::default())
+                    .expect("write configured DXF");
+                crate::import_dxf(&dest).expect("read configured DXF")
+            };
+            assert!(!cad_io::companion_path(&dest).exists());
+            fs::remove_file(&dest).unwrap();
+            assert_eq!(loaded.model_space.len(), 3);
+            assert!(!cad_core::document_has_dynamic_content(&loaded));
+            for (index, length) in [(0, 1200.0), (1, 1600.0), (2, 1000.0)] {
+                let mut name = loaded.model_space[index]
+                    .geometry
+                    .insert_block_name()
+                    .expect("INSERT");
+                let mut block = loaded.block_by_name(name).unwrap();
+                if index == 2 {
+                    name = block.entities[0]
+                        .geometry
+                        .insert_block_name()
+                        .expect("nested INSERT");
+                    block = loaded.block_by_name(name).unwrap();
+                }
+                let Geometry::Line { start, end } = block.entities[0].geometry else {
+                    panic!("line");
+                };
+                assert!(
+                    (end.x - start.x - length).abs() < 1e-6,
+                    "{extension}: configuration {index}"
+                );
+            }
+            let Geometry::Insert {
+                insertion,
+                scale,
+                rotation,
+                attribs,
+                ..
+            } = &loaded.model_space[1].geometry
+            else {
+                panic!("INSERT");
+            };
+            assert!((insertion.x - 2000.0).abs() < 1e-6);
+            assert!((insertion.y - 100.0).abs() < 1e-6);
+            assert!((scale.x - 2.0).abs() < 1e-6 && (scale.y - 0.5).abs() < 1e-6);
+            assert!((*rotation - std::f64::consts::FRAC_PI_2).abs() < 1e-6);
+            assert_eq!(attribs.len(), 2, "{extension}: attached attributes");
+            assert_eq!(attribs[0].value, "FRAME-B");
+            assert_eq!(attribs[0].attribute.as_ref().unwrap().tag, "LABEL");
+            assert_eq!(attribs[0].valign, cad_core::TextVAlign::Top);
+            assert!(
+                (attribs[0].alignment.x - 2000.0).abs() < 1e-6
+                    && (attribs[0].alignment.y - 110.0).abs() < 1e-6,
+                "{extension}: attribute alignment {:?}",
+                attribs[0].alignment
+            );
+            assert_eq!(attribs[1].value, "ZONE-2");
+            assert_eq!(attribs[1].attribute.as_ref().unwrap().tag, "ZONE");
+            assert_eq!(attribs[1].alignment, Point3::default());
+            let before = expected.compute_extents().unwrap();
+            let after = loaded.compute_extents().unwrap();
+            assert!(
+                before.min.distance(after.min) < 1e-4 && before.max.distance(after.max) < 1e-4,
+                "{extension}: {before:?} != {after:?}"
+            );
+            assert_eq!(
+                format!("{source:?}"),
+                snapshot,
+                "export must not change the editor document"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_export_evaluation_failure_preserves_existing_drawing() {
+        let mut source = companion_test_document();
+        let dynamic = source
+            .block_by_name_mut("AdjustableFrame")
+            .unwrap()
+            .dynamic
+            .as_mut()
+            .unwrap();
+        dynamic.parameters.push(dynamic.parameters[0].clone());
+        for extension in ["dxf", "dwg"] {
+            let dest = std::env::temp_dir().join(format!(
+                "mycad-invalid-dynamic-{}.{}",
+                stamp(),
+                extension
+            ));
+            fs::write(&dest, b"original drawing").unwrap();
+            let message = if extension == "dwg" {
+                write_dwg(&source, &dest).unwrap_err().to_string()
+            } else {
+                cad_io::write_dxf(&source, &dest, &DxfExportOptions::default())
+                    .unwrap_err()
+                    .to_string()
+            };
+            assert!(
+                message.contains("could not evaluate dynamic blocks"),
+                "{message}"
+            );
+            assert_eq!(fs::read(&dest).unwrap(), b"original drawing");
+            fs::remove_file(dest).unwrap();
+        }
+    }
+
+    #[test]
     fn stale_companion_preserves_reimported_dxf_edits_with_unchanged_bounds() {
         use cad_core::{
             export_materialized, fingerprint_block, CadColor, EvaluationCache, EvaluationRequest,
@@ -618,10 +813,6 @@ mod tests {
                     .and_then(|value| value.as_number())
                     .expect("span");
                 assert!((span - 1200.0).abs() < 1e-6);
-            }
-            Err(DwgWriteError::Convert(ExportError::Critical { .. })) => {
-                let _ = fs::remove_file(&dest);
-                let _ = fs::remove_file(&sidecar);
             }
             Err(other) => {
                 let _ = fs::remove_file(&dest);

@@ -283,6 +283,49 @@ fn reference_dwg_save_reimports() {
         original.diagnostics.entity_total() > 0,
         "reference drawing imported no entities\nunsupported: {unsupported}\nlayouts: {layouts}"
     );
+    // Direct writers now store the current dynamic configurations as additional
+    // static definitions. Import diagnostics still describe the source file,
+    // so retain that accounting and add exactly the newly generated entities.
+    let prepared = cad_core::export_materialized(
+        &original,
+        &mut cad_core::EvaluationCache::default(),
+        cad_core::EvaluationRequest {
+            generation: original.content_generation(),
+        },
+    )
+    .expect("materialize reference drawing");
+    let expected = &prepared.document;
+    assert!(!cad_core::document_has_dynamic_content(expected));
+    let mut expected_counts = original.diagnostics.entity_counts.clone();
+    for name in &prepared.generated_blocks {
+        assert!(
+            original.block_by_name(name).is_none(),
+            "generated block replaced {name}"
+        );
+        let block = expected.block_by_name(name).expect("generated definition");
+        for (kind, count) in stored_entity_counts(&block.entities) {
+            *expected_counts.entry(kind).or_default() += count;
+        }
+    }
+    // Materialization may retarget references, but must keep every preexisting
+    // entity in its original container. This makes the added-count baseline
+    // independent of any loss or duplication in those definitions.
+    assert_eq!(
+        stored_entity_counts(&original.model_space),
+        stored_entity_counts(&expected.model_space)
+    );
+    for (name, block) in &original.blocks {
+        assert_eq!(
+            stored_entity_counts(&block.entities),
+            stored_entity_counts(
+                &expected
+                    .block_by_name(name)
+                    .expect("original definition")
+                    .entities
+            ),
+            "materialization changed the original entity inventory in {name}"
+        );
+    }
 
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -345,12 +388,19 @@ fn reference_dwg_save_reimports() {
         from_dwg.diagnostics.entity_total() > 0,
         "saved DWG reimported no entities"
     );
-    assert_same_entity_counts(&original, &from_dxf, "DXF", true, &[]);
+    assert_same_entity_counts(&expected_counts, &from_dxf, "DXF", true, &[]);
     // Constant-Z POLYLINE_3D is written as POLYLINE. The fold flag accounts
     // for that. Every other type, including ATTDEF, must match.
-    assert_same_entity_counts(&original, &from_dwg, "DWG", true, &[]);
-    assert_same_lwpolylines(&original, &from_dxf, "DXF");
-    assert_same_lwpolylines(&original, &from_dwg, "DWG");
+    assert_same_entity_counts(&expected_counts, &from_dwg, "DWG", true, &[]);
+    assert_same_lwpolylines(expected, &from_dxf, "DXF");
+    assert_same_lwpolylines(expected, &from_dwg, "DWG");
+    for (label, actual) in [("DXF", &from_dxf), ("DWG", &from_dwg)] {
+        assert_eq!(
+            attached_attribute_count(expected),
+            attached_attribute_count(actual),
+            "{label} changed attached ATTRIB count"
+        );
+    }
 }
 
 #[test]
@@ -479,15 +529,100 @@ fn audit_with_oda(converter: &Path, input: &Path, output: &Path, format: &str, f
     );
 }
 
+fn stored_entity_counts(entities: &[cad_core::Entity]) -> BTreeMap<String, u64> {
+    use cad_core::Geometry;
+    let mut counts = BTreeMap::new();
+    for entity in entities {
+        // Use interchange entity names, not Geometry::type_name(), which
+        // combines both polyline variants and hides the ATTDEF distinction.
+        let kind = match &entity.geometry {
+            Geometry::Line { .. } => "LINE",
+            Geometry::Point { .. } => "POINT",
+            Geometry::Circle { .. } => "CIRCLE",
+            Geometry::Arc { .. } => "ARC",
+            Geometry::Ellipse { .. } => "ELLIPSE",
+            Geometry::LwPolyline { .. } => "LWPOLYLINE",
+            Geometry::Polyline { .. } => "POLYLINE_2D",
+            Geometry::Spline { .. } => "SPLINE",
+            Geometry::Insert { .. } => "INSERT",
+            Geometry::Text(text) if text.is_attrib_def => "ATTDEF",
+            Geometry::Text(_) => "TEXT",
+            Geometry::MText(_) => "MTEXT",
+            Geometry::Hatch(_) => "HATCH",
+            Geometry::Dimension(_) => "DIMENSION",
+            Geometry::Solid { .. } => "SOLID",
+            Geometry::Leader { .. } => "LEADER",
+            Geometry::MLine { .. } => "MLINE",
+            Geometry::MultiLeader { .. } => "MULTILEADER",
+            Geometry::Region { .. } => "REGION",
+            Geometry::Viewport(_) => "VIEWPORT",
+            Geometry::Image(_) => "IMAGE",
+            Geometry::Wipeout(_) => "WIPEOUT",
+        };
+        *counts.entry(kind.to_string()).or_default() += 1;
+    }
+    counts
+}
+
+fn attached_attribute_count(document: &cad_core::Document) -> usize {
+    let mut count = 0;
+    for_each_entity(document, |entity| {
+        if let cad_core::Geometry::Insert { attribs, .. } = &entity.geometry {
+            count += attribs.len();
+        }
+    });
+    count
+}
+
+#[test]
+fn materialized_count_baseline_keeps_polyline_and_attribute_types_distinct() {
+    use cad_core::{identity_insert, Entity, Geometry, Point3, TextData};
+    let mut document = cad_core::Document::default();
+    document.add_entity(Entity::new(Geometry::LwPolyline {
+        vertices: Vec::new(),
+        closed: false,
+        extrusion: Point3::new(0.0, 0.0, 1.0),
+        linetype_generation_continuous: false,
+    }));
+    document.add_entity(Entity::new(Geometry::Polyline {
+        vertices: Vec::new(),
+        closed: false,
+        linetype_generation_continuous: false,
+    }));
+    document.add_entity(Entity::new(Geometry::Text(TextData {
+        is_attrib_def: true,
+        ..Default::default()
+    })));
+    document.add_entity(Entity::new(Geometry::Text(TextData::default())));
+    let mut insert = identity_insert("Tagged".into(), Point3::default());
+    if let Geometry::Insert { attribs, .. } = &mut insert {
+        attribs.push(TextData::default());
+        attribs.push(TextData::default());
+    }
+    document.add_entity(Entity::new(insert));
+    let counts = stored_entity_counts(&document.model_space);
+    assert_eq!(
+        counts,
+        BTreeMap::from([
+            ("LWPOLYLINE".into(), 1),
+            ("POLYLINE_2D".into(), 1),
+            ("ATTDEF".into(), 1),
+            ("TEXT".into(), 1),
+            ("INSERT".into(), 1),
+        ])
+    );
+    assert_eq!(attached_attribute_count(&document), 2);
+}
+
 fn assert_same_entity_counts(
-    original: &cad_core::Document,
+    expected_counts: &BTreeMap<String, u64>,
     actual: &cad_core::Document,
     label: &str,
     fold_polyline_3d: bool,
     ignore: &[&str],
 ) {
     let diffs = count_diffs(
-        &original.diagnostics.entity_counts,
+        expected_counts,
         &actual.diagnostics.entity_counts,
         fold_polyline_3d,
         ignore,

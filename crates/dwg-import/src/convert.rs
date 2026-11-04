@@ -1292,7 +1292,8 @@ unsafe fn convert_geometry(
                             .filter(|name| !name.is_empty())
                     })
                     .unwrap_or_default();
-            let attribs = insert_attribs(dwg, obj, entity_ptr, dxf);
+            let attribs =
+                insert_attribs(dwg, obj, entity_ptr, dxf, diagnostics.dwg_version != "DXF");
             Geometry::Insert {
                 block_name,
                 insertion: pt_field(entity_ptr, dxf, "ins_pt")?,
@@ -1320,7 +1321,7 @@ unsafe fn convert_geometry(
         }
         libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_TEXT => {
             let (halign, valign, alignment, width_factor, oblique) =
-                text_layout(entity_ptr, "TEXT");
+                text_layout(entity_ptr, "TEXT", diagnostics.dwg_version != "DXF");
             Geometry::Text(TextData {
                 insertion: pt_field(entity_ptr, "TEXT", "ins_pt")?,
                 height: get_field::<f64>(entity_ptr, "TEXT", "height").unwrap_or(1.0),
@@ -1337,12 +1338,14 @@ unsafe fn convert_geometry(
                 ..Default::default()
             })
         }
-        libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_ATTRIB => {
-            Geometry::Text(attrib_text(dwg, entity_ptr)?)
-        }
+        libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_ATTRIB => Geometry::Text(attrib_text(
+            dwg,
+            entity_ptr,
+            diagnostics.dwg_version != "DXF",
+        )?),
         libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_ATTDEF => {
             let (halign, valign, alignment, width_factor, oblique) =
-                text_layout(entity_ptr, "ATTDEF");
+                text_layout(entity_ptr, "ATTDEF", diagnostics.dwg_version != "DXF");
             Geometry::Text(TextData {
                 insertion: pt_field(entity_ptr, "ATTDEF", "ins_pt")?,
                 height: get_field::<f64>(entity_ptr, "ATTDEF", "height").unwrap_or(1.0),
@@ -1700,8 +1703,13 @@ fn image_def_path(dwg: *mut libredwg_sys::Dwg_Data, entity_ptr: *mut c_void, dxf
     get_utf8_field(object_ptr, "IMAGEDEF", "file_path").unwrap_or_default()
 }
 
-fn attrib_text(dwg: *mut libredwg_sys::Dwg_Data, entity_ptr: *mut c_void) -> Option<TextData> {
-    let (halign, valign, alignment, width_factor, oblique) = text_layout(entity_ptr, "ATTRIB");
+fn attrib_text(
+    dwg: *mut libredwg_sys::Dwg_Data,
+    entity_ptr: *mut c_void,
+    from_dwg: bool,
+) -> Option<TextData> {
+    let (halign, valign, alignment, width_factor, oblique) =
+        text_layout(entity_ptr, "ATTRIB", from_dwg);
     Some(TextData {
         insertion: pt_field(entity_ptr, "ATTRIB", "ins_pt")?,
         height: get_field::<f64>(entity_ptr, "ATTRIB", "height").unwrap_or(1.0),
@@ -1777,6 +1785,7 @@ fn insert_attribs(
     obj: *mut libredwg_sys::Dwg_Object,
     entity_ptr: *mut c_void,
     dxf: &str,
+    from_dwg: bool,
 ) -> Vec<TextData> {
     let mut attribs = Vec::new();
     let mut sub = unsafe { libredwg_sys::get_first_owned_subentity(obj) };
@@ -1792,7 +1801,7 @@ fn insert_attribs(
     while !sub.is_null() {
         if object_fixedtype(sub) == libredwg_sys::DWG_OBJECT_TYPE_DWG_TYPE_ATTRIB {
             let ap = unsafe { libredwg_sys::uncad_object_entity_ptr(sub) };
-            if let Some(text) = attrib_text(dwg, ap) {
+            if let Some(text) = attrib_text(dwg, ap, from_dwg) {
                 attribs.push(text);
             }
         }
@@ -1818,7 +1827,7 @@ fn insert_attribs(
             continue;
         }
         let ap = unsafe { libredwg_sys::uncad_object_entity_ptr(owned) };
-        if let Some(text) = attrib_text(dwg, ap) {
+        if let Some(text) = attrib_text(dwg, ap, from_dwg) {
             attribs.push(text);
         }
     }
@@ -1845,10 +1854,24 @@ fn attribute_fields(
     Some(AttributeInfo { tag, prompt, flags })
 }
 
-fn text_layout(entity_ptr: *mut c_void, dxf: &str) -> (TextHAlign, TextVAlign, Point3, f64, f64) {
+fn text_layout(
+    entity_ptr: *mut c_void,
+    dxf: &str,
+    from_dwg: bool,
+) -> (TextHAlign, TextVAlign, Point3, f64, f64) {
     let horiz = get_field::<u16>(entity_ptr, dxf, "horiz_alignment").unwrap_or(0) as i16;
     let vert = get_field::<u16>(entity_ptr, dxf, "vert_alignment").unwrap_or(0) as i16;
-    let alignment = pt_field(entity_ptr, dxf, "alignment_pt").unwrap_or_default();
+    // R2000+ DWG omits an alignment point equal to the insertion point.
+    // LibreDWG leaves the decoded field zero instead of restoring that default.
+    // DXF's in-memory dataflags do not indicate omission, so keep its coordinates.
+    let alignment_field = if from_dwg
+        && get_field::<u8>(entity_ptr, dxf, "dataflags").is_some_and(|flags| flags & 0x02 != 0)
+    {
+        "ins_pt"
+    } else {
+        "alignment_pt"
+    };
+    let alignment = pt_field(entity_ptr, dxf, alignment_field).unwrap_or_default();
     let width_factor = get_field::<f64>(entity_ptr, dxf, "width_factor")
         .filter(|v| v.is_finite() && *v > 1e-9)
         .unwrap_or(1.0);

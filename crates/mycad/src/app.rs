@@ -21,9 +21,9 @@ use cad_core::{
 };
 use cad_io::{
     apply_companion_for_drawing, companion_path, drawing_for_companion, export_pdf,
-    read_companion_optional, read_mycad, write_companion, write_dxf, CadFileFormat,
-    DxfExportOptions, PdfExportOptions, PdfOrientation, PdfPaperSize, PdfPlotArea, PdfPlotStyle,
-    SaveReport, PDF_MARGIN_MM, PDF_STROKE_WEIGHTS,
+    legacy_companion_path, read_drawing_companion, read_mycad, remove_drawing_companion,
+    write_companion, write_dxf, CadFileFormat, DxfExportOptions, PdfExportOptions, PdfOrientation,
+    PdfPaperSize, PdfPlotArea, PdfPlotStyle, SaveReport, PDF_MARGIN_MM, PDF_STROKE_WEIGHTS,
 };
 use cad_render::{
     tessellate_document_for_block_edit_on, tessellate_document_on, upload_for_ranges,
@@ -721,6 +721,7 @@ impl MyCadApp {
     }
 
     fn start_load_now(&mut self, path: PathBuf) {
+        self.blocks_panel.cancel_library_insert_for_open();
         if self.load_rx.is_some() {
             self.pending_open = Some(path);
             return;
@@ -1308,6 +1309,27 @@ impl MyCadApp {
                 self.start_kind(kind);
             }
             return;
+        }
+        // View/history commands do not replace the last drawing tool, so Enter
+        // can still repeat it after navigating around the drawing.
+        match text.to_ascii_uppercase().as_str() {
+            "U" | "UNDO" => {
+                self.undo();
+                return;
+            }
+            "REDO" => {
+                self.redo();
+                return;
+            }
+            "ZE" | "ZOOM EXTENTS" => {
+                self.zoom_extents(self.viewport_size.x, self.viewport_size.y);
+                return;
+            }
+            "ZS" | "ZOOM SELECTION" => {
+                self.zoom_selection(self.viewport_size.x, self.viewport_size.y);
+                return;
+            }
+            _ => {}
         }
         match crate::commands::command_for_name(text) {
             Some(kind) => self.start_kind(kind),
@@ -5388,16 +5410,30 @@ impl MyCadApp {
     }
 
     fn zoom_extents(&mut self, width: f64, height: f64) {
+        // Loading and edit workers maintain these bounds. Reading the cache
+        // avoids cloning a shared drawing just to move the camera.
         let extents = self
             .document
-            .as_mut()
-            .map(Arc::make_mut)
-            .and_then(|document| {
-                document.ensure_cached_extents();
-                document.diagnostics.extents
-            });
+            .as_ref()
+            .and_then(|document| document.diagnostics.extents)
+            .filter(|extents| extents.is_valid());
         if let Some(extents) = extents {
-            self.camera.zoom_extents(extents, width, height);
+            self.camera.zoom_extents(extents, width.max(1.0), height.max(1.0));
+        }
+    }
+
+    fn zoom_selection(&mut self, width: f64, height: f64) {
+        let mut extents = Extents2::empty();
+        for id in self.selection.ids() {
+            if let Some(pick) = self.display.pick_for(*id).filter(|pick| !pick.is_empty()) {
+                extents.union(pick.bounds);
+            }
+        }
+        if extents.is_valid() {
+            self.camera.zoom_extents(extents, width.max(1.0), height.max(1.0));
+            self.status = "Zoomed to selection".into();
+        } else {
+            self.status = "Select visible geometry to zoom to".into();
         }
     }
 
@@ -6053,6 +6089,7 @@ impl eframe::App for MyCadApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         let _span = cad_core::perf::span("MyCadApp::update");
         self.poll_io(ctx);
+        crate::blocks::poll_library_job(self);
         self.poll_preview(ctx);
         self.poll_view_refresh(ctx);
         self.poll_block_prefetch();
@@ -6464,6 +6501,13 @@ impl eframe::App for MyCadApp {
                         ui.close();
                         let size = ctx.available_rect();
                         self.zoom_extents(size.width() as f64, size.height() as f64);
+                    }
+                    if ui
+                        .add_enabled(!self.selection.is_empty(), egui::Button::new("Zoom Selection    ZS"))
+                        .clicked()
+                    {
+                        ui.close();
+                        self.zoom_selection(self.viewport_size.x, self.viewport_size.y);
                     }
                     if ui.button("Show Home").clicked() {
                         ui.close();
@@ -7522,12 +7566,16 @@ fn sync_companion(
                 .warnings
                 .push(format!("companion file was not written: {err}"));
         }
-    } else if let Err(err) = std::fs::remove_file(&path) {
-        if err.kind() != std::io::ErrorKind::NotFound {
-            report
-                .warnings
-                .push(format!("companion file was not removed: {err}"));
+    } else if legacy_companion_path(dest).exists() {
+        // Keep the older helper intact, but supersede it so removing dynamic
+        // behavior cannot accidentally restore old controls on the next open.
+        if let Err(err) = write_companion(&path, dest, source, source, &[], &[]) {
+            report.warnings.push(format!("companion file was not written: {err}"));
         }
+    } else if let Err(err) = remove_drawing_companion(dest) {
+        report
+            .warnings
+            .push(format!("companion file was not removed: {err}"));
     }
     report
 }
@@ -7547,7 +7595,7 @@ fn apply_open_companion(path: &Path, document: &mut Document) -> Option<String> 
     if CadFileFormat::from_path(path) == Some(CadFileFormat::Mycad) {
         return None;
     }
-    match read_companion_optional(&companion_path(path)) {
+    match read_drawing_companion(path) {
         Ok(Some(companion)) => match apply_companion_for_drawing(path, document, companion) {
             Ok(report) => {
                 if let Some(warning) = &report.warning {
@@ -7957,7 +8005,26 @@ mod save_as_tests {
     }
 
     #[test]
+    fn static_save_supersedes_legacy_helper_without_deleting_it() {
+        let directory = std::env::temp_dir().join(format!("mycad-static-companion-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir(&directory).unwrap();
+        let drawing = directory.join("Plant.dxf");
+        std::fs::write(&drawing, b"saved static drawing").unwrap();
+        let legacy = legacy_companion_path(&drawing);
+        std::fs::write(&legacy, b"old helper retained").unwrap();
+        let report = sync_companion(&Document::default(), None, &drawing, SaveReport::default());
+        assert!(report.warnings.is_empty());
+        assert_eq!(std::fs::read(&legacy).unwrap(), b"old helper retained");
+        let mut document = Document::default();
+        assert!(apply_open_companion(&drawing, &mut document).is_none());
+        assert!(companion_path(&drawing).is_file());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn companion_open_path_uses_the_drawing() {
+        assert_eq!(resolve_open_path(PathBuf::from(".Plant.dwg.mycad")), PathBuf::from("Plant.dwg"));
+        assert_eq!(resolve_open_path(PathBuf::from("..Plant.dxf.mycad")), PathBuf::from(".Plant.dxf"));
         assert_eq!(
             resolve_open_path(PathBuf::from("Plant.dwg.mycad")),
             PathBuf::from("Plant.dwg")
@@ -8187,6 +8254,85 @@ mod save_as_tests {
             app.document.as_ref().expect("kept").units,
             DrawingUnits::Millimeters
         );
+    }
+}
+
+#[cfg(test)]
+mod navigation_command_tests {
+    use super::*;
+
+    #[test]
+    fn typed_history_commands_undo_and_redo_real_geometry() {
+        let mut app = MyCadApp::for_test();
+        app.new_drawing();
+        app.run_typed_command("L");
+        app.accept_command_point(Point2::new(0.0, 0.0));
+        app.accept_command_point(Point2::new(10.0, 0.0));
+        assert_eq!(app.document.as_ref().unwrap().model_space.len(), 1);
+        app.run_typed_command("u");
+        assert!(app.document.as_ref().unwrap().model_space.is_empty());
+        app.run_typed_command("redo");
+        assert_eq!(app.document.as_ref().unwrap().model_space.len(), 1);
+        app.run_typed_command("UNDO");
+        assert!(app.document.as_ref().unwrap().model_space.is_empty());
+    }
+
+    #[test]
+    fn zoom_extents_preserves_shared_document_and_last_drawing_command() {
+        let mut document = Document::default();
+        document.diagnostics.extents = Some(Extents2::from_corners(
+            Point2::new(20.0, 30.0), Point2::new(120.0, 90.0),
+        ));
+        let document = Arc::new(document);
+        let mut app = MyCadApp::for_test();
+        app.document = Some(Arc::clone(&document));
+        app.last_command = Some(CommandKind::Line);
+        app.run_typed_command("ze");
+        assert_eq!(app.camera.center, Point2::new(70.0, 60.0));
+        assert!(Arc::ptr_eq(app.document.as_ref().unwrap(), &document));
+        app.run_typed_command("");
+        assert_eq!(app.command.kind(), CommandKind::Line);
+        assert!(app.command.is_active());
+    }
+
+    #[test]
+    fn zoom_selection_fits_transformed_block_without_unselected_geometry() {
+        let mut document = Document::default();
+        document.replace_block_definition(cad_core::BlockDefinition::plain(
+            "Widget", Point3::default(),
+            vec![Entity::new(Geometry::Line {
+                start: Point3::from_xy(0.0, 0.0),
+                end: Point3::from_xy(10.0, 0.0),
+            })],
+        ));
+        let mut insert = identity_insert("Widget".into(), Point3::from_xy(100.0, 200.0));
+        if let Geometry::Insert { scale, rotation, .. } = &mut insert {
+            *scale = Point3::new(2.0, 2.0, 1.0);
+            *rotation = std::f64::consts::FRAC_PI_2;
+        }
+        let selected = document.add_entity(Entity::new(insert)).id;
+        document.add_entity(Entity::new(Geometry::Line {
+            start: Point3::from_xy(-10000.0, -10000.0),
+            end: Point3::from_xy(-9000.0, -9000.0),
+        }));
+        let mut app = MyCadApp::for_test();
+        app.display = Arc::new(cad_render::tessellate_document(&document));
+        app.document = Some(Arc::new(document));
+        app.selection.replace(selected);
+        app.run_typed_command("ZS");
+        assert!((app.camera.center.x - 100.0).abs() < 1e-8);
+        assert!((app.camera.center.y - 210.0).abs() < 1e-8);
+        assert!(app.camera.view_height >= 20.0 && app.camera.view_height < 30.0);
+    }
+
+    #[test]
+    fn zoom_selection_without_visible_selection_preserves_view() {
+        let mut app = MyCadApp::for_test();
+        let before = app.camera;
+        app.run_typed_command("ZOOM SELECTION");
+        assert_eq!(app.camera.center, before.center);
+        assert_eq!(app.camera.view_height, before.view_height);
+        assert!(app.status.contains("Select visible geometry"));
     }
 }
 

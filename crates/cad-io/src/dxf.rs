@@ -143,6 +143,32 @@ fn render_dxf(
     document: &Document,
     options: &DxfExportOptions,
 ) -> Result<(SaveReport, String), ExportError> {
+    // Every caller, including direct DWG conversion and library export, must
+    // write the instance's current appearance rather than its reference state.
+    // The GUI already supplies a static materialized snapshot, so its normal
+    // path does not clone or evaluate the document again.
+    let prepared = if cad_core::document_has_dynamic_content(document) {
+        Some(
+            cad_core::export_materialized(
+                document,
+                &mut cad_core::EvaluationCache::default(),
+                cad_core::EvaluationRequest {
+                    generation: document.content_generation(),
+                },
+            )
+            .map_err(|error| {
+                ExportError::Validation(format!(
+                    "could not evaluate dynamic blocks for export: {error}"
+                ))
+            })?,
+        )
+    } else {
+        None
+    };
+    let document = prepared
+        .as_ref()
+        .map(|exported| &exported.document)
+        .unwrap_or(document);
     let mut writer = DxfWriter::new(document, options.version);
     writer.write_document();
     if writer.nonfinite {
@@ -1846,7 +1872,7 @@ impl<'a> DxfWriter<'a> {
         self.pair(100, "AcDbAttribute");
         self.pair(2, &export_attribute_tag(tag));
         self.pair_i(70, i32::from(flags & 0x0F));
-        self.pair_i(73, i32::from(data.valign.to_dxf()));
+        self.pair_i(74, i32::from(data.valign.to_dxf()));
         self.report.entities_written += 1;
     }
 

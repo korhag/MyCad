@@ -5,9 +5,26 @@ All notable changes to EntoCAD are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project versions with [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Workspace version is `0.56.1` (`Cargo.toml`).
+Workspace version is `0.57.0` (`Cargo.toml`).
 
 ## [Unreleased]
+
+## [0.57.0] - 2026-11-04
+
+### Added
+- Add optional minimum and maximum values while creating dynamic parameters, with clearer guidance for linking geometry actions and testing configurations.
+- Add folder-based block libraries in the Blocks panel to save, browse and reuse native block assets.
+- Add Zoom Selection and familiar typed navigation and undo/redo aliases.
+
+### Changed
+- Reuse evaluated geometry for repeated dynamic block instances within each materialization pass, reducing work on drawings with repeated library parts.
+- Save new drawing helpers with hidden filenames and discover existing legacy helpers without trusting stale metadata.
+
+### Fixed
+- Close parameter creation correctly after confirmation or cancellation, and keep validation errors visible.
+- Preserve the last evaluated dynamic-block geometry in direct DXF/DWG export as well as application saves.
+- Preserve referenced layers, linetypes and text styles in library assets, and rename conflicting imported definitions without replacing existing drawing content.
+- Preserve attached block attributes when converting DXF to DWG, write their vertical alignment using the correct DXF field, and restore omitted DWG text alignment points.
 
 ## [0.56.1] - 2026-11-01
 

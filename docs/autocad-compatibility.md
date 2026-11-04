@@ -7,6 +7,11 @@ and open-source dependencies; commercial SDK adoption is outside this plan. This
 document records the target behavior and the audited gaps; it does not claim
 that the current implementation meets this contract.
 
+The subsequent authoring request explicitly permits EntoCAD-created dynamic
+blocks to appear as ordinary blocks in AutoCAD, provided their last saved
+appearance is retained. This does not establish preservation of original
+AutoCAD controls through the exchange writer.
+
 ## Required behavior
 
 The DWG is the authoritative drawing. A user must be able to open an AutoCAD
@@ -97,6 +102,27 @@ This milestone does not implement native AutoCAD dynamic-block preservation,
 hidden-helper migration, or a complete two-file transaction. The gap table above
 records the audit baseline; the implemented safeguards supersede its helper,
 error-fallback and warning entries.
+
+## Authoring and exchange milestone (0.57.0)
+
+- Public DXF and DWG export materializes native dynamic configurations before
+  serialization, including callers outside the application save worker. Frozen
+  output removes dynamic configurations as well as definitions, preventing
+  accidental reevaluation of an already evaluated drawing.
+- Native library assets carry referenced layers, linetypes and text styles with
+  nested block definitions. Imports preserve existing definitions and rename
+  conflicts. Source font files and automatic unit conversion are not included.
+- New companions use `.Plant.dwg.mycad` / `.Plant.dxf.mycad`; Windows also marks
+  new helpers hidden. Discovery retains the legacy visible filename when no new
+  helper exists. A corrupt or mismatched new helper never falls back to older
+  metadata. Ambiguous filenames belonging to another drawing are protected.
+- Repeated dynamic instances reuse evaluation and generated geometry within one
+  immutable materialization pass. Different configurations and later edits
+  retain their own validation and evaluation.
+
+Native AutoCAD control-graph preservation and complete two-file transactions
+remain unresolved. The new hidden naming supersedes that item in the audit
+baseline; it does not change the conservative drawing-byte binding rules.
 
 ## Backend decision
 

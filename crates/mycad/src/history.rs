@@ -1,10 +1,10 @@
 //! Reversible document transactions for editor commands.
 
-use cad_core::{BlockDefinition, Document, Entity, EntitySpace};
+use cad_core::{BlockDefinition, Document, Entity, EntitySpace, Layer, LineType, TextStyle};
 
 // ------------------------------------------------------------
 // Enum: Edit
-// Purpose: One reversible mutation of an entity container or block definition.
+// Purpose: One reversible mutation of entities, blocks, or drawing tables.
 // ------------------------------------------------------------
 #[derive(Debug, Clone)]
 pub enum Edit {
@@ -28,6 +28,21 @@ pub enum Edit {
         name: String,
         before: Option<BlockDefinition>,
         after: Option<BlockDefinition>,
+    },
+    ReplaceLayer {
+        name: String,
+        before: Option<Layer>,
+        after: Option<Layer>,
+    },
+    ReplaceLineType {
+        name: String,
+        before: Option<LineType>,
+        after: Option<LineType>,
+    },
+    ReplaceTextStyle {
+        name: String,
+        before: Option<TextStyle>,
+        after: Option<TextStyle>,
     },
     RenameBlock {
         before: String,
@@ -99,6 +114,39 @@ impl Edit {
                     let _ = document.remove_block_definition(name);
                 }
             },
+            Self::ReplaceLayer { name, after, .. } => {
+                match after {
+                    Some(layer) => {
+                        document.layers.insert(name.clone(), layer.clone());
+                    }
+                    None => {
+                        document.layers.remove(name);
+                    }
+                }
+                document.bump_generation();
+            }
+            Self::ReplaceLineType { name, after, .. } => {
+                match after {
+                    Some(linetype) => {
+                        document.linetypes.insert(name.clone(), linetype.clone());
+                    }
+                    None => {
+                        document.linetypes.remove(name);
+                    }
+                }
+                document.bump_generation();
+            }
+            Self::ReplaceTextStyle { name, after, .. } => {
+                match after {
+                    Some(style) => {
+                        document.text_styles.insert(name.clone(), style.clone());
+                    }
+                    None => {
+                        document.text_styles.remove(name);
+                    }
+                }
+                document.bump_generation();
+            }
             Self::RenameBlock { before, after } => {
                 let _ = document.rename_block(before, after);
             }
@@ -141,6 +189,33 @@ impl Edit {
                 before,
                 after,
             } => Self::ReplaceBlockDefinition {
+                name: name.clone(),
+                before: after.clone(),
+                after: before.clone(),
+            },
+            Self::ReplaceLayer {
+                name,
+                before,
+                after,
+            } => Self::ReplaceLayer {
+                name: name.clone(),
+                before: after.clone(),
+                after: before.clone(),
+            },
+            Self::ReplaceLineType {
+                name,
+                before,
+                after,
+            } => Self::ReplaceLineType {
+                name: name.clone(),
+                before: after.clone(),
+                after: before.clone(),
+            },
+            Self::ReplaceTextStyle {
+                name,
+                before,
+                after,
+            } => Self::ReplaceTextStyle {
                 name: name.clone(),
                 before: after.clone(),
                 after: before.clone(),
@@ -478,6 +553,90 @@ mod tests {
             start: Point3::from_xy(x0, y0),
             end: Point3::from_xy(x1, y1),
         })
+    }
+
+    #[test]
+    fn drawing_table_edits_undo_and_redo_added_and_replaced_records() {
+        for replace_existing in [false, true] {
+            let mut document = Document::default();
+            let mut history = History::default();
+            let name = "LIBRARY";
+            let layer = Layer {
+                name: name.into(),
+                ..Layer::default()
+            };
+            let linetype = LineType::continuous(name);
+            let style = TextStyle {
+                name: name.into(),
+                ..TextStyle::standard()
+            };
+            if replace_existing {
+                document.layers.insert(name.into(), layer.clone());
+                document.linetypes.insert(name.into(), linetype.clone());
+                document.text_styles.insert(name.into(), style.clone());
+            }
+            let edits = vec![
+                Edit::ReplaceLayer {
+                    name: name.into(),
+                    before: document.layers.get(name).cloned(),
+                    after: Some(Layer {
+                        visible: false,
+                        ..layer
+                    }),
+                },
+                Edit::ReplaceLineType {
+                    name: name.into(),
+                    before: document.linetypes.get(name).cloned(),
+                    after: Some(LineType {
+                        dashes: vec![6.0, -3.0],
+                        shapes: vec![None, None],
+                        ..linetype
+                    }),
+                },
+                Edit::ReplaceTextStyle {
+                    name: name.into(),
+                    before: document.text_styles.get(name).cloned(),
+                    after: Some(TextStyle {
+                        width_factor: 0.75,
+                        ..style
+                    }),
+                },
+            ];
+            let generation = document.content_generation();
+            history.begin();
+            for edit in edits {
+                // Table changes affect any entity using them, including block members.
+                let mixed = Transaction {
+                    edits: vec![Edit::insert_model(0, line(0.0, 0.0, 1.0, 0.0)), edit.clone()],
+                };
+                assert!(mixed.model_space_change().is_none());
+                edit.apply(&mut document);
+                history.record(edit);
+            }
+            history.commit_open();
+            assert_eq!(history.undo_len(), 1);
+            assert_eq!(document.content_generation(), generation + 3);
+            assert!(!document.layers[name].visible);
+            assert_eq!(document.linetypes[name].dashes, vec![6.0, -3.0]);
+            assert_eq!(document.text_styles[name].width_factor, 0.75);
+
+            assert!(history.undo(&mut document));
+            assert_eq!(document.content_generation(), generation + 6);
+            assert_eq!(document.layers.contains_key(name), replace_existing);
+            assert_eq!(document.linetypes.contains_key(name), replace_existing);
+            assert_eq!(document.text_styles.contains_key(name), replace_existing);
+            if replace_existing {
+                assert!(document.layers[name].visible);
+                assert!(document.linetypes[name].is_continuous());
+                assert_eq!(document.text_styles[name].width_factor, 1.0);
+            }
+
+            assert!(history.redo(&mut document));
+            assert_eq!(document.content_generation(), generation + 9);
+            assert!(!document.layers[name].visible);
+            assert_eq!(document.linetypes[name].dashes, vec![6.0, -3.0]);
+            assert_eq!(document.text_styles[name].width_factor, 0.75);
+        }
     }
 
     #[test]
